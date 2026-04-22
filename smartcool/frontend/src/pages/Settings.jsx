@@ -9,17 +9,31 @@ function Label({ children }) {
   return <label className="text-sm text-gray-400 block mb-1">{children}</label>
 }
 
-function Select({ label, value, onChange, options, placeholder = 'Select…' }) {
+function Select({ label, value, onChange, options, placeholder = 'Select…', searchable = false }) {
+  const [query, setQuery] = useState('')
+  const filteredOptions = searchable
+    ? options.filter(o => `${o.label} ${o.value}`.toLowerCase().includes(query.toLowerCase()))
+    : options
+  
   return (
     <div>
       <Label>{label}</Label>
+      {searchable && (
+        <input
+          type="search"
+          placeholder="Search…"
+          value={query}
+          onChange={e => setQuery(e.target.value)}
+          className="w-full mb-2 bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm text-gray-100 focus:outline-none focus:border-blue-500"
+        />
+      )}
       <select
         className="w-full bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm text-gray-100 focus:outline-none focus:border-blue-500"
         value={value || ''}
         onChange={e => onChange(e.target.value)}
       >
         <option value="">{placeholder}</option>
-        {options.map(o => (
+        {filteredOptions.map(o => (
           <option key={o.value} value={o.value}>{o.label}</option>
         ))}
       </select>
@@ -94,7 +108,7 @@ function EntitySelect({ label, value, onChange, entityList }) {
     value: e.entity_id,
     label: `${e.friendly_name} (${e.entity_id})`,
   }))
-  return <Select label={label} value={value} onChange={onChange} options={options} />
+  return <Select label={label} value={value} onChange={onChange} options={options} searchable={true} />
 }
 
 // ── Main Settings page ────────────────────────────────────────────────────────
@@ -125,9 +139,20 @@ export default function Settings() {
     setSaving(true)
     setSaveStatus(null)
     try {
-      await patchConfig(cfg)
+      // Don't send masked secrets or empty secret fields
+      const payload = { ...cfg }
+      // Remove secrets if they're masked (***) or empty
+      if (!payload.ha_token || payload.ha_token === '***') {
+        delete payload.ha_token
+      }
+      if (!payload.weather_api_key || payload.weather_api_key === '***') {
+        delete payload.weather_api_key
+      }
+      console.log('Saving config:', payload)
+      await patchConfig(payload)
       setSaveStatus('ok')
-    } catch {
+    } catch (err) {
+      console.error('Save failed:', err)
       setSaveStatus('error')
     } finally {
       setSaving(false)
@@ -291,14 +316,19 @@ export default function Settings() {
           value={cfg.weather_provider}
           onChange={v => patch('weather_provider', v)}
           options={PROVIDER_OPTIONS}
+          searchable={true}
         />
-        <Input
-          label="API Key"
-          value={cfg.weather_api_key === '***' ? '' : cfg.weather_api_key}
-          onChange={v => patch('weather_api_key', v)}
-          placeholder="Enter API key"
-          type="password"
-        />
+        <div>
+          <Label>API Key</Label>
+          <input
+            type="text"
+            className="w-full bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm text-gray-100 focus:outline-none focus:border-blue-500 font-mono"
+            value={cfg.weather_api_key === '***' ? '' : (cfg.weather_api_key || '')}
+            onChange={e => patch('weather_api_key', e.target.value)}
+            placeholder="Enter API key (leave blank to keep existing)"
+          />
+          <p className="text-xs text-gray-500 mt-1">Paste your weather API key. Leave blank if already configured.</p>
+        </div>
         <Input
           label="City or Lat,Lon"
           value={cfg.weather_city}
@@ -322,6 +352,7 @@ export default function Settings() {
           value={cfg.currency}
           onChange={v => patch('currency', v)}
           options={CURRENCY_OPTIONS}
+          searchable={true}
         />
       </div>
 

@@ -46,10 +46,16 @@ async def get_weather(force: bool = False) -> Optional[WeatherData]:
     city = config_manager.get("weather_city", "")
 
     if not api_key or not city:
-        logger.debug("Weather API not configured — skipping fetch")
+        logger.warning(
+            "Weather API not fully configured — provider=%s, has_key=%s, city=%s. Skipping fetch.",
+            provider,
+            bool(api_key),
+            city or "(empty)"
+        )
         return _cache  # Return stale data rather than None if available
 
     try:
+        logger.debug("Fetching weather from %s for city=%s", provider, city)
         if provider == "openweathermap":
             _cache = await _fetch_openweathermap(api_key, city)
         elif provider == "weatherapi":
@@ -60,7 +66,7 @@ async def get_weather(force: bool = False) -> Optional[WeatherData]:
             logger.warning("Unknown weather provider: %s", provider)
             return _cache
     except Exception as exc:
-        logger.error("Weather fetch failed (%s): %s", provider, exc)
+        logger.error("Weather fetch failed (%s, city=%s): %s", provider, city, exc, exc_info=True)
         # Return stale cache rather than propagating the error
 
     return _cache

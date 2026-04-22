@@ -78,7 +78,7 @@ async def lifespan(app: FastAPI):
     logger.info("SmartCool stopped")
 
 
-app = FastAPI(title="SmartCool API", version="1.0.0", lifespan=lifespan)
+app = FastAPI(title="SmartCool API", version="1.0.5", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -146,9 +146,18 @@ class ConfigPatch(BaseModel):
 @app.post("/api/config")
 async def update_config(patch: ConfigPatch):
     data = patch.dict(exclude_none=True)
-    # Prevent clearing secret fields via masked values
-    data = {k: v for k, v in data.items() if v != "***"}
+    # Prevent clearing secret fields via masked values or empty strings
+    # Don't send masked "***" or empty strings for secrets
+    current = config_manager.get_all()
+    for secret_key in ("ha_token", "weather_api_key"):
+        val = data.get(secret_key, "")
+        # Remove if masked, empty, or not provided
+        if not val or val == "***":
+            if secret_key in data:
+                del data[secret_key]
+    
     updated = config_manager.update(data)
+    logger.info("Config updated with keys: %s", list(data.keys()))
     return {"ok": True, "config": {k: v for k, v in updated.items() if k not in ("ha_token", "weather_api_key")}}
 
 

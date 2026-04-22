@@ -1,5 +1,7 @@
+import { useState } from 'react'
+
 /**
- * ACSelector — cascading Brand → Model dropdowns.
+ * ACSelector — cascading Brand → Model dropdowns with search.
  *
  * Props:
  *   brands          Array from /api/brands
@@ -15,11 +17,24 @@ export default function ACSelector({
   onBrandChange,
   onModelChange,
 }) {
+  const [brandQuery, setBrandQuery] = useState('')
+  const [modelQuery, setModelQuery] = useState('')
+
   const currentBrand = brands.find(b => b.id === selectedBrand)
   const models       = currentBrand?.models || []
 
+  const filteredBrands = brands.filter(b =>
+    b.name.toLowerCase().includes(brandQuery.toLowerCase())
+  )
+  const filteredModels = models.filter(m =>
+    `${m.name} ${m.series}`.toLowerCase().includes(modelQuery.toLowerCase())
+  )
+
   const selectClass =
     'w-full bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm text-gray-100 ' +
+    'focus:outline-none focus:border-blue-500'
+  const searchClass =
+    'w-full mb-2 bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm text-gray-100 ' +
     'focus:outline-none focus:border-blue-500'
 
   return (
@@ -27,13 +42,23 @@ export default function ACSelector({
       {/* Brand */}
       <div>
         <label className="text-sm text-gray-400 block mb-1">AC Brand</label>
+        <input
+          type="search"
+          placeholder="Search brands…"
+          value={brandQuery}
+          onChange={e => setBrandQuery(e.target.value)}
+          className={searchClass}
+        />
         <select
           className={selectClass}
           value={selectedBrand || ''}
-          onChange={e => onBrandChange(e.target.value)}
+          onChange={e => {
+            setBrandQuery('')
+            onBrandChange(e.target.value)
+          }}
         >
           <option value="">Select brand…</option>
-          {brands.map(b => (
+          {filteredBrands.map(b => (
             <option key={b.id} value={b.id}>{b.name}</option>
           ))}
         </select>
@@ -42,14 +67,25 @@ export default function ACSelector({
       {/* Model */}
       <div>
         <label className="text-sm text-gray-400 block mb-1">AC Model</label>
+        <input
+          type="search"
+          placeholder="Search models…"
+          value={modelQuery}
+          onChange={e => setModelQuery(e.target.value)}
+          className={searchClass}
+          disabled={!selectedBrand}
+        />
         <select
           className={selectClass}
           value={selectedModel || ''}
-          onChange={e => onModelChange(e.target.value)}
+          onChange={e => {
+            setModelQuery('')
+            onModelChange(e.target.value)
+          }}
           disabled={!selectedBrand}
         >
           <option value="">Select model…</option>
-          {models.map(m => (
+          {filteredModels.map(m => (
             <option key={m.id} value={m.id}>{m.name} — {m.series}</option>
           ))}
         </select>
