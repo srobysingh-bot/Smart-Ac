@@ -8,74 +8,57 @@ Supported providers:
 """
 
 import logging
-import time
-from dataclasses import dataclass, field
-from typing import Optional
+from datetime import datetime, timezone
+from typing import Any, Dict, Optional
 
 import aiohttp
-
-from . import config_manager
 
 logger = logging.getLogger(__name__)
 
 CACHE_TTL_SECONDS = 600  # 10 minutes
 
-
-@dataclass
-class WeatherData:
-    temp_c: float
-    humidity_pct: float
-    description: str = ""
-    fetched_at: float = field(default_factory=time.monotonic)
-
-    def is_fresh(self) -> bool:
-        return (time.monotonic() - self.fetched_at) < CACHE_TTL_SECONDS
+_cache: Dict[str, Any] = {}
+_cached_at: Optional[float] = None
 
 
-_cache: Optional[WeatherData] = None
+async def get_cached() -> Dict[str, Any]:
+    """Return cached weather data dict, or empty dict if none fetched yet."""
+    return dict(_cache) if _cache else {}
 
 
-async def get_weather(force: bool = False) -> Optional[WeatherData]:
-    """Return cached weather data, fetching fresh data if stale or forced."""
-    global _cache
-    if not force and _cache and _cache.is_fresh():
-        return _cache
+async def refresh(cfg: Dict[str, Any]) -> None:
+    """Fetch fresh weather data and update the cache."""
+    global _cache, _cached_at
 
-    provider = config_manager.get("weather_provider", "openweathermap")
-    api_key = config_manager.get("weather_api_key", "")
-    city = config_manager.get("weather_city", "")
+    api_key = cfg.get("weather_api_key", "")
+    city = cfg.get("weather_city", "")
+    provider = cfg.get("weather_provider", "openweathermap")
 
     if not api_key or not city:
-        logger.warning(
-            "Weather API not fully configured — provider=%s, has_key=%s, city=%s. Skipping fetch.",
-            provider,
-            bool(api_key),
-            city or "(empty)"
-        )
-        return _cache  # Return stale data rather than None if available
+        logger.warning("[HawaAI] Weather API not configured (key=%s, city=%s) — skipping", bool(api_key), city or "(empty)")
+        return
 
     try:
-        logger.debug("Fetching weather from %s for city=%s", provider, city)
         if provider == "openweathermap":
-            _cache = await _fetch_openweathermap(api_key, city)
+            data = await _fetch_openweathermap(api_key, city)
         elif provider == "weatherapi":
-            _cache = await _fetch_weatherapi(api_key, city)
+            data = await _fetch_weatherapi(api_key, city)
         elif provider == "tomorrow":
-            _cache = await _fetch_tomorrow(api_key, city)
+            data = await _fetch_tomorrow(api_key, city)
         else:
-            logger.warning("Unknown weather provider: %s", provider)
-            return _cache
-    except Exception as exc:
-        logger.error("Weather fetch failed (%s, city=%s): %s", provider, city, exc, exc_info=True)
-        # Return stale cache rather than propagating the error
+            logger.warning("[HawaAI] Unknown weather provider: %s", provider)
+            return
 
-    return _cache
+        if data:
+            _cache = data
+            _cached_at = datetime.now(timezone.utc).timestamp()
+            logger.info("[HawaAI] Weather updated: %.1f°C, %d%% humidity", data.get("temp", 0), data.get("humidity", 0))
+
+    except Exception as e:
+        logger.error("[HawaAI] Weather fetch error (%s, city=%s): %s", provider, city, e)
 
 
-# ── Provider implementations ──────────────────────────────────────────────────
-
-async def _fetch_openweathermap(api_key: str, city: str) -> WeatherData:
-    # city can be "Chennai" or "13.08,80.27" (lat,lon)
+async def _fetch_openweathermap(api_key: str, city: str) -> Optional[Dict[str, Any]]:
     if "," in city and _looks_like_latlon(city):
         lat, lon = city.split(",", 1)
         url = (
@@ -91,50 +74,51 @@ async def _fetch_openweathermap(api_key: str, city: str) -> WeatherData:
     async with aiohttp.ClientSession() as session:
         async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
             resp.raise_for_status()
-            data = await resp.json()
+            raw = await resp.json()
 
-    temp_c = data["main"]["temp"]
-    humidity = data["main"]["humidity"]
-    description = data["weather"][0]["description"] if data.get("weather") else ""
-    logger.info("OWM weather: %.1f°C, %d%% humidity — %s", temp_c, humidity, description)
-    return WeatherData(temp_c=temp_c, humidity_pct=humidity, description=description)
+    return {
+        "temp": raw["main"]["temp"],
+        "humidity": raw["main"]["humidity"],
+        "feels_like": raw["main"].get("feels_like"),
+        "description": raw["weather"][0]["description"] if raw.get("weather") else "",
+        "fetched_at": datetime.now(timezone.utc).isoformat(),
+    }
 
 
-async def _fetch_weatherapi(api_key: str, city: str) -> WeatherData:
+async def _fetch_weatherapi(api_key: str, city: str) -> Optional[Dict[str, Any]]:
     url = f"https://api.weatherapi.com/v1/current.json?key={api_key}&q={city}&aqi=no"
     async with aiohttp.ClientSession() as session:
         async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
             resp.raise_for_status()
-            data = await resp.json()
+            raw = await resp.json()
 
-    current = data["current"]
-    return WeatherData(
-        temp_c=current["temp_c"],
-        humidity_pct=current["humidity"],
-        description=current.get("condition", {}).get("text", ""),
-    )
+    current = raw["current"]
+    return {
+        "temp": current["temp_c"],
+        "humidity": current["humidity"],
+        "feels_like": current.get("feelslike_c"),
+        "description": current.get("condition", {}).get("text", ""),
+        "fetched_at": datetime.now(timezone.utc).isoformat(),
+    }
 
 
-async def _fetch_tomorrow(api_key: str, city: str) -> WeatherData:
-    # Requires lat,lon format
-    location = city if "," in city else city
+async def _fetch_tomorrow(api_key: str, city: str) -> Optional[Dict[str, Any]]:
     url = (
         f"https://api.tomorrow.io/v4/timelines"
-        f"?location={location}&fields=temperature,humidity"
+        f"?location={city}&fields=temperature,humidity"
         f"&timesteps=current&units=metric&apikey={api_key}"
     )
     async with aiohttp.ClientSession() as session:
         async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
             resp.raise_for_status()
-            data = await resp.json()
+            raw = await resp.json()
 
-    values = (
-        data["data"]["timelines"][0]["intervals"][0]["values"]
-    )
-    return WeatherData(
-        temp_c=values["temperature"],
-        humidity_pct=values["humidity"],
-    )
+    values = raw["data"]["timelines"][0]["intervals"][0]["values"]
+    return {
+        "temp": values["temperature"],
+        "humidity": values["humidity"],
+        "fetched_at": datetime.now(timezone.utc).isoformat(),
+    }
 
 
 def _looks_like_latlon(s: str) -> bool:

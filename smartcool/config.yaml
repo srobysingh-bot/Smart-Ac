@@ -1,6 +1,6 @@
-name: SmartCool AC Optimizer
-version: 1.0.6
-slug: smartcool
+name: HawaAI AC Optimizer
+version: 1.0.7
+slug: hawaai
 description: AI-powered AC optimization using presence, temperature, and energy data
 url: https://github.com/srobysingh-bot/Smart-Ac
 arch:
@@ -14,11 +14,10 @@ homeassistant_api: true
 hassio_api: true
 homeassistant: "2023.1.0"
 panel_icon: mdi:air-conditioner
-panel_title: SmartCool
+panel_title: HawaAI
 ingress: true
 ingress_port: 8099
 options:
-  ha_token: ""
   weather_api_key: ""
   weather_city: ""
   weather_provider: "openweathermap"
@@ -40,8 +39,7 @@ options:
   use_outdoor_temp: true
   manual_override: false
 schema:
-  ha_token: password
-  weather_api_key: password
+  weather_api_key: password?
   weather_city: str?
   weather_provider: str
   target_temp: int

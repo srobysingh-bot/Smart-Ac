@@ -5,24 +5,16 @@ from datetime import datetime, timezone
 from typing import Optional
 
 from . import config_manager
-from .ha_client import HAClient
 
 logger = logging.getLogger(__name__)
 
 
 class PresenceHandler:
-    """
-    Tracks occupancy state and vacancy duration.
+    """Legacy class — not used by the main engine; kept for compatibility."""
 
-    Presence is derived from whatever entity the user configured
-    (typically an Aqara FP2 or any binary_sensor).
-    """
-
-    def __init__(self, ha: HAClient) -> None:
-        self._ha = ha
+    def __init__(self) -> None:
         self._occupied: bool = False
         self._vacancy_since: Optional[datetime] = None
-        ha.on_state_change(self._on_state_change)
 
     # ── Public API ────────────────────────────────────────────────────────────
 

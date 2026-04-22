@@ -1,81 +1,44 @@
-"""
-Periodic background tasks.
-
-  • Weather refresh   — every 10 min
-  • Logic tick        — every N seconds (config: logic_interval_seconds)
-  • Archive old data  — once per day at 02:00
-"""
+"""Periodic background tasks — simple asyncio loop, no external scheduler."""
 
 import asyncio
 import logging
 
-from apscheduler.schedulers.asyncio import AsyncIOScheduler
-from apscheduler.triggers.cron import CronTrigger
-from apscheduler.triggers.interval import IntervalTrigger
-
-from . import config_manager, database
-from .logic_engine import LogicEngine
-from .weather_api import get_weather
+from . import config_manager, logic_engine, weather_api
 
 logger = logging.getLogger(__name__)
 
-_scheduler: AsyncIOScheduler | None = None
 
+async def start() -> None:
+    """
+    Main scheduler loop. Runs forever:
+      - logic_engine.tick()  every logic_interval_seconds
+      - weather_api.refresh() every 10 minutes
+    """
+    logger.info("[HawaAI] Scheduler started")
+    weather_accumulator = 0
 
-def start(engine: LogicEngine) -> None:
-    """Start the APScheduler with all background jobs."""
-    global _scheduler
-
-    _scheduler = AsyncIOScheduler(timezone="UTC")
-
-    # ── Logic tick ────────────────────────────────────────────────────────────
-    interval = config_manager.get("logic_interval_seconds", 60)
-    _scheduler.add_job(
-        engine.tick,
-        trigger=IntervalTrigger(seconds=interval),
-        id="logic_tick",
-        max_instances=1,
-        coalesce=True,
-    )
-    logger.info("Logic tick scheduled every %d seconds", interval)
-
-    # ── Weather refresh ───────────────────────────────────────────────────────
-    _scheduler.add_job(
-        _refresh_weather,
-        trigger=IntervalTrigger(minutes=10),
-        id="weather_refresh",
-        max_instances=1,
-    )
-
-    # ── Daily archival at 02:00 UTC ───────────────────────────────────────────
-    _scheduler.add_job(
-        _archive_sessions,
-        trigger=CronTrigger(hour=2, minute=0),
-        id="archive_sessions",
-    )
-
-    _scheduler.start()
-    logger.info("Scheduler started")
-
-
-def stop() -> None:
-    if _scheduler and _scheduler.running:
-        _scheduler.shutdown(wait=False)
-        logger.info("Scheduler stopped")
-
-
-async def _refresh_weather() -> None:
+    # Initial weather fetch
     try:
-        data = await get_weather(force=True)
-        if data:
-            logger.debug("Weather refreshed: %.1f°C", data.temp_c)
-    except Exception as exc:
-        logger.error("Weather refresh error: %s", exc)
+        cfg = config_manager.load_config()
+        await weather_api.refresh(cfg)
+    except Exception as e:
+        logger.error("[HawaAI] Initial weather fetch error: %s", e)
 
+    while True:
+        cfg = config_manager.load_config()
+        interval = int(cfg.get("logic_interval_seconds", 60))
 
-async def _archive_sessions() -> None:
-    try:
-        archived = await database.archive_old_sessions(days=90)
-        logger.info("Archived %d old sessions", archived)
-    except Exception as exc:
-        logger.error("Session archival error: %s", exc)
+        try:
+            await logic_engine.tick()
+        except Exception as e:
+            logger.error("[HawaAI] Logic tick error: %s", e)
+
+        weather_accumulator += interval
+        if weather_accumulator >= 600:
+            try:
+                await weather_api.refresh(cfg)
+            except Exception as e:
+                logger.error("[HawaAI] Weather refresh error: %s", e)
+            weather_accumulator = 0
+
+        await asyncio.sleep(interval)

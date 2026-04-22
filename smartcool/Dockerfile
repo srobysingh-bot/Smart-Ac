@@ -14,7 +14,7 @@ RUN npm run build
 FROM ghcr.io/home-assistant/base-python:3.12-alpine3.23
 
 LABEL \
-    io.hass.name="SmartCool AC Optimizer" \
+    io.hass.name="HawaAI AC Optimizer" \
     io.hass.description="AI-powered AC optimization using presence, temperature, and energy data" \
     io.hass.type="addon" \
     org.opencontainers.image.source="https://github.com/srobysingh-bot/Smart-Ac" \

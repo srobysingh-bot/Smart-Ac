@@ -4,22 +4,15 @@ import logging
 from typing import Optional
 
 from . import config_manager
-from .ha_client import HAClient
 
 logger = logging.getLogger(__name__)
 
 
 class TemperatureHandler:
-    """
-    Reads the indoor temperature from the configured HA sensor.
-    Updates automatically via WebSocket state_changed events and
-    can also be polled manually.
-    """
+    """Legacy class — not used by the main engine; kept for compatibility."""
 
-    def __init__(self, ha: HAClient) -> None:
-        self._ha = ha
+    def __init__(self) -> None:
         self._indoor_temp: Optional[float] = None
-        ha.on_state_change(self._on_state_change)
 
     # ── Public API ────────────────────────────────────────────────────────────
 

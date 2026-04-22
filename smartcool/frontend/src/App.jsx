@@ -46,7 +46,7 @@ export default function App() {
           {/* Brand */}
           <div className="flex items-center gap-2 mb-6 px-1">
             <Wind size={22} className="text-blue-400" />
-            <span className="font-bold text-lg text-white">SmartCool</span>
+            <span className="font-bold text-lg text-white">HawaAI</span>
           </div>
 
           {NAV_ITEMS.map(item => (

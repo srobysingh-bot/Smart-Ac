@@ -1,4 +1,4 @@
-"""SQLite database schema and query helpers for SmartCool."""
+"""SQLite database schema and query helpers for HawaAI."""
 
 import aiosqlite
 import logging
@@ -8,7 +8,7 @@ from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
 
-DB_PATH = "/data/smartcool.db"
+DB_PATH = "/data/hawaai.db"
 
 
 # ─────────────────────────────────────────────────────────────────────────────

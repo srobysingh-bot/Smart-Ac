@@ -59,4 +59,4 @@ async def export_json() -> str:
 def export_filename(ext: str = "csv") -> str:
     """Generate a timestamped export filename."""
     ts = datetime.utcnow().strftime("%Y%m%d")
-    return f"smartcool_data_{ts}.{ext}"
+    return f"hawaai_data_{ts}.{ext}"

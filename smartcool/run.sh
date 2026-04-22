@@ -1,13 +1,13 @@
 #!/usr/bin/with-contenv bashio
 set -e
 
-bashio::log.info "Starting SmartCool AC Optimizer..."
+bashio::log.info "Starting HawaAI AC Optimizer..."
 
 # Expose HA Supervisor token to the app
 export SUPERVISOR_TOKEN="${SUPERVISOR_TOKEN}"
 export HA_BASE_URL="http://supervisor/core"
 
-# Data directory for SQLite
+# Ensure data directory exists for SQLite + config
 mkdir -p /data
 
 cd /app

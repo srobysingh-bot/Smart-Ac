@@ -1,227 +1,189 @@
 """
-SmartCool core decision engine — THE BRAIN.
+HawaAI core decision engine — THE BRAIN.
 
-Runs every `logic_interval_seconds` (default 60 s).
-Reads presence, indoor temp, outdoor temp, energy, and AC state,
-then decides whether to turn the AC on or off.
+Called every `logic_interval_seconds` by the scheduler.
+Reads fresh config each tick so settings changes apply immediately.
 """
 
-import asyncio
 import logging
 from datetime import datetime, timezone
 from typing import Optional
 
-from . import config_manager
-from .ac_controller import ACController
-from .energy_monitor import EnergyMonitor
-from .ha_client import HAClient
-from .presence_handler import PresenceHandler
-from .session_logger import SessionLogger
-from .temperature_handler import TemperatureHandler
-from .weather_api import WeatherData, get_weather
+from . import config_manager, ha_client, session_logger, weather_api
 
 logger = logging.getLogger(__name__)
 
+# Runtime state (in-memory, not persisted across restarts)
+_ac_is_on: bool = False
+_vacant_since: Optional[datetime] = None
 
-class LogicEngine:
-    def __init__(
-        self,
-        ha: HAClient,
-        presence: PresenceHandler,
-        temp_handler: TemperatureHandler,
-        energy: EnergyMonitor,
-        ac: ACController,
-        session_log: SessionLogger,
-    ) -> None:
-        self._ha = ha
-        self._presence = presence
-        self._temp = temp_handler
-        self._energy = energy
-        self._ac = ac
-        self._log = session_log
 
-        self._ac_on: bool = False
-        self._last_action: str = "none"
+async def tick() -> None:
+    """
+    Single decision-loop iteration.
+    Reads fresh config every tick — settings changes apply immediately.
+    """
+    global _ac_is_on, _vacant_since
 
-        # Live status dict consumed by the /api/status endpoint
-        self.status: dict = {
-            "ac_on": False,
-            "indoor_temp": None,
-            "outdoor_temp": None,
-            "outdoor_humidity": None,
-            "presence": False,
+    cfg = config_manager.load_config()
+
+    presence_entity = cfg.get("presence_entity", "")
+    indoor_temp_entity = cfg.get("indoor_temp_entity", "")
+    ac_switch_entity = cfg.get("ac_switch_entity", "")
+
+    if not indoor_temp_entity:
+        logger.warning("[HawaAI] Logic skipped — indoor_temp_entity not configured")
+        return
+
+    # --- Manual override: skip all automation ---
+    if cfg.get("manual_override", False):
+        logger.debug("[HawaAI] Manual override active — skipping logic")
+        return
+
+    # --- Read live sensor states from HA ---
+    indoor_temp_raw = await ha_client.get_state(indoor_temp_entity)
+    if indoor_temp_raw is None:
+        logger.warning("[HawaAI] Cannot read indoor temp from %s", indoor_temp_entity)
+        return
+
+    try:
+        indoor_temp = float(indoor_temp_raw)
+    except ValueError:
+        logger.error("[HawaAI] Invalid temp value: %s", indoor_temp_raw)
+        return
+
+    presence_raw = await ha_client.get_state(presence_entity) if presence_entity else None
+    is_occupied = presence_raw in ("on", "occupied", "home", "detected")
+    use_presence = cfg.get("use_presence", True)
+
+    target_temp = float(cfg.get("target_temp", 24))
+    hysteresis = float(cfg.get("hysteresis", 1.5))
+    vacancy_timeout = int(cfg.get("vacancy_timeout_minutes", 5)) * 60
+
+    logger.info(
+        "[HawaAI] TICK | indoor=%.1f°C | presence=%s | ac=%s | target=%.1f°C",
+        indoor_temp,
+        "occupied" if is_occupied else "vacant",
+        "ON" if _ac_is_on else "OFF",
+        target_temp,
+    )
+
+    now = datetime.now(timezone.utc)
+
+    # --- Write snapshot every tick ---
+    weather = await weather_api.get_cached()
+    await session_logger.add_snapshot(
+        session_logger.current_session_id(),
+        {
+            "timestamp": now.isoformat(),
+            "indoor_temp": indoor_temp,
+            "outdoor_temp": weather.get("temp") if weather else None,
+            "ac_state": _ac_is_on,
             "watt_draw": 0.0,
-            "session_kwh": 0.0,
-            "session_id": None,
-            "session_start": None,
-            "last_action": "none",
-            "manual_override": False,
-        }
+            "presence": is_occupied,
+        },
+    )
 
-    # ── Main tick ─────────────────────────────────────────────────────────────
+    # --- VACANCY LOGIC ---
+    if use_presence and presence_entity and not is_occupied:
+        if _vacant_since is None:
+            _vacant_since = now
+            logger.info("[HawaAI] Room just became vacant — starting vacancy timer")
 
-    async def tick(self) -> None:
-        """Single decision-loop iteration. Called by the scheduler."""
-        # Reload config from disk each tick to pick up runtime changes
-        cfg = config_manager.load_config()
+        vacant_seconds = (now - _vacant_since).total_seconds()
 
-        # Validate required configuration before running logic
-        required = ["indoor_temp_entity", "ac_switch_entity"]
-        if cfg.get("use_presence", True):
-            required.append("presence_entity")
-        missing = [k for k in required if not cfg.get(k)]
-        if missing:
-            logger.warning("SmartCool disabled — missing config: %s", missing)
-            # Still publish live status placeholders
-            self.status.update({"manual_override": False, "ac_on": False})
-            return
+        if _ac_is_on and vacant_seconds >= vacancy_timeout:
+            logger.info("[HawaAI] Room vacant for %.0fs — turning AC OFF", vacant_seconds)
+            await _turn_ac_off(ac_switch_entity, cfg, indoor_temp, reason="vacant")
+        return
 
-        if cfg.get("manual_override"):
-            self.status["manual_override"] = True
-            logger.debug("Manual override active — skipping logic")
-            return
+    # Room is occupied (or presence detection disabled)
+    _vacant_since = None
 
-        self.status["manual_override"] = False
-        interval = cfg.get("logic_interval_seconds", 60)
-
-        # ── 1. Gather inputs ────────────────────────────────────────────────
-        indoor_temp = await self._temp.refresh()
-        presence = await self._presence.refresh() if cfg.get("use_presence", True) else True
-        watt_draw = await self._energy.refresh()
-
-        weather: Optional[WeatherData] = None
-        outdoor_temp: Optional[float] = None
-        outdoor_humidity: Optional[float] = None
-        if cfg.get("use_outdoor_temp", True):
-            weather = await get_weather()
-            if weather:
-                outdoor_temp = weather.temp_c
-                outdoor_humidity = weather.humidity_pct
-
-        # ── 2. AC state (best-effort from HA entity) ────────────────────────
-        ac_entity = cfg.get("ac_switch_entity", "")
-        if ac_entity:
-            state_str = await self._ha.get_state_value(ac_entity)
-            if state_str is not None:
-                self._ac_on = state_str.lower() in ("on", "true", "1")
-
-        # ── 3. Update live status ───────────────────────────────────────────
-        self.status.update(
-            {
-                "ac_on": self._ac_on,
-                "indoor_temp": indoor_temp,
-                "outdoor_temp": outdoor_temp,
-                "outdoor_humidity": outdoor_humidity,
-                "presence": presence,
-                "watt_draw": watt_draw,
-                "session_kwh": self._energy.session_kwh,
-                "session_id": self._log.current_session_id,
-                "session_start": (
-                    self._log.session_start_time.isoformat()
-                    if self._log.session_start_time
-                    else None
-                ),
-                "last_action": self._last_action,
-            }
+    # --- TEMPERATURE LOGIC ---
+    if indoor_temp > (target_temp + hysteresis) and not _ac_is_on:
+        logger.info(
+            "[HawaAI] Too warm (%.1f°C > %.1f°C) — turning AC ON",
+            indoor_temp, target_temp + hysteresis,
         )
+        await _turn_ac_on(ac_switch_entity, cfg, indoor_temp)
 
-        # Publish live sensor data to HA regardless of AC state
-        await self._log.publish_live(indoor_temp, outdoor_temp, self._energy.session_kwh)
+    elif indoor_temp <= (target_temp - hysteresis) and _ac_is_on:
+        logger.info(
+            "[HawaAI] Room cooled (%.1f°C ≤ %.1f°C) — turning AC OFF",
+            indoor_temp, target_temp - hysteresis,
+        )
+        session_logger.mark_cooled()
+        await _turn_ac_off(ac_switch_entity, cfg, indoor_temp, reason="cooled")
 
-        # ── 4. Decision tree ────────────────────────────────────────────────
-        target = float(cfg.get("target_temp", 24))
-        hysteresis = float(cfg.get("hysteresis", 1.5))
-        vacancy_timeout = float(cfg.get("vacancy_timeout_minutes", 5))
+    elif indoor_temp <= target_temp and _ac_is_on:
+        session_logger.mark_cooled()
 
-        # A. VACANT path
-        if not presence:
-            vacancy_min = self._presence.vacancy_minutes
-            if self._ac_on and vacancy_min >= vacancy_timeout:
-                logger.info(
-                    "Vacant for %.1f min (timeout %.1f min) — turning AC off",
-                    vacancy_min,
-                    vacancy_timeout,
-                )
-                await self._turn_off("vacant")
-            # Always record snapshot even while vacant
-            await self._log.write_snapshot(indoor_temp, outdoor_temp, self._ac_on, watt_draw, False)
-            return
 
-        # B. OCCUPIED path
-        if indoor_temp is None:
-            logger.warning("No indoor temperature reading — cannot make decision")
-            await self._log.write_snapshot(indoor_temp, outdoor_temp, self._ac_on, watt_draw, True)
-            return
+async def _turn_ac_on(switch_entity: str, cfg: dict, indoor_temp: float) -> None:
+    global _ac_is_on
 
-        # Turn ON if too hot
-        if indoor_temp > (target + hysteresis):
-            if not self._ac_on:
-                logger.info(
-                    "Indoor %.1f°C > target+hyst %.1f°C — turning AC ON",
-                    indoor_temp,
-                    target + hysteresis,
-                )
-                await self._turn_on(indoor_temp, outdoor_temp, outdoor_humidity)
+    success = False
+    if switch_entity:
+        success = await ha_client.turn_on_ac(switch_entity)
 
-        # Turn OFF if sufficiently cool
-        elif indoor_temp <= (target - hysteresis):
-            if self._ac_on:
-                logger.info(
-                    "Indoor %.1f°C <= target-hyst %.1f°C — turning AC OFF",
-                    indoor_temp,
-                    target - hysteresis,
-                )
-                self._log.mark_cooled()
-                await self._turn_off("cooled")
-
-        # Mark cooldown milestone even if AC stays on
-        elif indoor_temp <= target and self._ac_on:
-            self._log.mark_cooled()
-
-        # Accumulate energy for running session
-        if self._ac_on:
-            self._energy.record_tick(interval)
-
-        await self._log.write_snapshot(indoor_temp, outdoor_temp, self._ac_on, watt_draw, True)
-
-    # ── Actions ───────────────────────────────────────────────────────────────
-
-    async def _turn_on(
-        self,
-        indoor_temp: float,
-        outdoor_temp: Optional[float],
-        outdoor_humidity: Optional[float],
-    ) -> None:
-        cfg = config_manager.get_all()
+    broadlink_entity = cfg.get("broadlink_entity", "")
+    if broadlink_entity:
         target = int(cfg.get("target_temp", 24))
+        await ha_client.send_broadlink_command(broadlink_entity, f"cool_{target}")
 
-        ok = await self._ac.turn_on(mode="cool", temp=target, fan="auto")
-        if ok:
-            self._ac_on = True
-            self._last_action = "turn_on"
-            self.status["ac_on"] = True
-            self._energy.reset_session()
-            await self._log.start_session(
-                indoor_temp=indoor_temp,
-                outdoor_temp=outdoor_temp,
-                outdoor_humidity=outdoor_humidity,
-                energy_start_kwh=self._energy.watt_draw,
-            )
-        else:
-            logger.error("Failed to turn AC on")
+    if success or broadlink_entity:
+        _ac_is_on = True
+        weather = await weather_api.get_cached()
+        await session_logger.start_session({
+            "start_time": datetime.now(timezone.utc).isoformat(),
+            "indoor_temp_start": indoor_temp,
+            "outdoor_temp_start": weather.get("temp") if weather else None,
+            "outdoor_humidity_start": weather.get("humidity") if weather else None,
+            "target_temp": cfg.get("target_temp"),
+            "ac_switch_entity": switch_entity,
+            "ac_brand": cfg.get("ac_brand"),
+            "ac_model": cfg.get("ac_model"),
+            "room_name": cfg.get("room_name"),
+        })
+        logger.info("[HawaAI] AC ON — session started")
+    else:
+        logger.error("[HawaAI] Failed to turn AC on (no switch or broadlink configured)")
 
-    async def _turn_off(self, reason: str) -> None:
-        ok = await self._ac.turn_off()
-        if ok:
-            self._ac_on = False
-            self._last_action = f"turn_off:{reason}"
-            self.status["ac_on"] = False
-            await self._log.end_session(
-                reason=reason,
-                indoor_temp=self._temp.indoor_temp,
-                session_kwh=self._energy.session_kwh,
-                peak_watts=self._energy.peak_watts,
-                avg_watts=self._energy.avg_watts,
-            )
-        else:
-            logger.error("Failed to turn AC off")
+
+async def _turn_ac_off(
+    switch_entity: str, cfg: dict, indoor_temp: float, reason: str
+) -> None:
+    global _ac_is_on
+
+    success = False
+    if switch_entity:
+        success = await ha_client.turn_off_ac(switch_entity)
+
+    broadlink_entity = cfg.get("broadlink_entity", "")
+    if broadlink_entity:
+        await ha_client.send_broadlink_command(broadlink_entity, "power_off")
+
+    if success or broadlink_entity:
+        _ac_is_on = False
+        await session_logger.end_session({
+            "end_time": datetime.now(timezone.utc).isoformat(),
+            "indoor_temp_end": indoor_temp,
+            "reason_stopped": reason,
+        })
+        logger.info("[HawaAI] AC OFF — reason: %s", reason)
+    else:
+        logger.error("[HawaAI] Failed to turn AC off (no switch or broadlink configured)")
+
+
+def get_runtime_state() -> dict:
+    """Returns current in-memory runtime state for the /api/status endpoint."""
+    return {
+        "ac_is_on": _ac_is_on,
+        "session_id": session_logger.current_session_id(),
+        "session_start_time": (
+            session_logger.session_start_time().isoformat()
+            if session_logger.session_start_time()
+            else None
+        ),
+    }

@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Any, Dict, Optional
 
 from . import config_manager
-from .ha_client import HAClient
+from . import ha_client
 
 logger = logging.getLogger(__name__)
 
@@ -49,13 +49,9 @@ def get_model(brand_id: str, model_id: str) -> Optional[Dict[str, Any]]:
 
 
 class ACController:
-    """Send IR commands to the AC via Broadlink remote entity."""
-
-    def __init__(self, ha: HAClient) -> None:
-        self._ha = ha
+    """Send IR commands to the AC via Broadlink remote entity (legacy class)."""
 
     async def turn_on(self, mode: str = "cool", temp: int = 24, fan: str = "auto") -> bool:
-        """Turn the AC on at the given mode/temp/fan setting."""
         command = self._build_command("on", mode=mode, temp=temp, fan=fan)
         success = await self._send(command)
         if success:
@@ -63,7 +59,6 @@ class ACController:
         return success
 
     async def turn_off(self) -> bool:
-        """Turn the AC off."""
         command = self._build_command("off")
         success = await self._send(command)
         if success:
@@ -71,7 +66,6 @@ class ACController:
         return success
 
     async def set_temperature(self, temp: int) -> bool:
-        """Change AC target temperature without changing mode."""
         command = self._build_command("set_temp", temp=temp)
         return await self._send(command)
 
@@ -129,22 +123,19 @@ class ACController:
         ac_entity = config_manager.get("ac_switch_entity", "")
 
         if entity:
-            # Send IR command via Broadlink remote
             brand_id = config_manager.get("ac_brand", "")
             model_id = config_manager.get("ac_model", "")
             device_name = f"{brand_id}_{model_id}" if brand_id else "ac"
-
-            ok = await self._ha.send_ir_command(entity, device_name, command)
+            ok = await ha_client.send_broadlink_command(entity, command, device_name)
             if ok:
                 return True
             logger.warning("IR send failed, falling back to switch control")
 
         if ac_entity:
-            # Fallback: toggle smart switch directly (no IR, just power)
             if command == "off":
-                return await self._ha.turn_off(ac_entity)
+                return await ha_client.turn_off_ac(ac_entity)
             else:
-                return await self._ha.turn_on(ac_entity)
+                return await ha_client.turn_on_ac(ac_entity)
 
         logger.error("No Broadlink entity or AC switch entity configured")
         return False

@@ -1,5 +1,5 @@
 /**
- * SmartCool API client.
+ * HawaAI API client.
  *
  * When served via HA ingress the page URL is:
  *   https://ha-host/api/hassio_ingress/TOKEN/
@@ -65,7 +65,7 @@ export async function downloadExport(format = 'csv') {
   const blob = await res.blob()
   const cd   = res.headers.get('Content-Disposition') || ''
   const match = cd.match(/filename="(.+)"/)
-  const filename = match ? match[1] : `smartcool_data.${format}`
+  const filename = match ? match[1] : `hawaai_data.${format}`
   const url = URL.createObjectURL(blob)
   const a   = document.createElement('a')
   a.href = url; a.download = filename; a.click()

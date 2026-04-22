@@ -4,7 +4,6 @@ import logging
 from typing import Optional
 
 from . import config_manager
-from .ha_client import HAClient
 
 logger = logging.getLogger(__name__)
 
@@ -17,14 +16,12 @@ class EnergyMonitor:
     kWh is approximated by integrating watt readings over time.
     """
 
-    def __init__(self, ha: HAClient) -> None:
-        self._ha = ha
+    def __init__(self) -> None:
         self._watt_draw: float = 0.0
         self._session_kwh: float = 0.0
         self._peak_watts: float = 0.0
         self._watt_samples: list[float] = []
         self._energy_start_kwh: float = 0.0
-        ha.on_state_change(self._on_state_change)
 
     # ── Public API ────────────────────────────────────────────────────────────
 
@@ -68,11 +65,12 @@ class EnergyMonitor:
 
     async def refresh(self) -> float:
         """Poll the energy sensor entity. Returns current watt draw."""
+        from . import ha_client
         entity = config_manager.get("energy_sensor_entity")
         if not entity:
             return self._watt_draw
 
-        state_str = await self._ha.get_state_value(entity)
+        state_str = await ha_client.get_state(entity)
         if state_str is None:
             return self._watt_draw
 
@@ -82,14 +80,3 @@ class EnergyMonitor:
             logger.debug("Could not parse watt draw from '%s'", state_str)
 
         return self._watt_draw
-
-    # ── Internal ──────────────────────────────────────────────────────────────
-
-    def _on_state_change(self, entity_id: str, state: str, _attrs: dict) -> None:
-        configured = config_manager.get("energy_sensor_entity")
-        if entity_id != configured:
-            return
-        try:
-            self._watt_draw = float(state)
-        except (ValueError, TypeError):
-            pass

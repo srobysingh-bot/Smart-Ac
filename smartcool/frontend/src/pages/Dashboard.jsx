@@ -1,11 +1,31 @@
 import { useEffect, useRef, useState } from 'react'
-import { connectLive, getSessionStats, getSnapshots } from '../api/smartcool.js'
+import { useNavigate } from 'react-router-dom'
+import { getStatus, getSessionStats, getSnapshots } from '../api/smartcool.js'
 import ACStatusCard  from '../components/ACStatusCard.jsx'
 import TempGauge     from '../components/TempGauge.jsx'
 import EnergyChart   from '../components/EnergyChart.jsx'
 import PresenceBadge from '../components/PresenceBadge.jsx'
 import SessionTable  from '../components/SessionTable.jsx'
-import { Thermometer, Wind, Zap, Cloud } from 'lucide-react'
+import { Thermometer, Wind, Zap, Cloud, AlertTriangle } from 'lucide-react'
+
+// ── Config warning banner ─────────────────────────────────────────────────────
+function ConfigWarning() {
+  const navigate = useNavigate()
+  return (
+    <div className="flex items-center gap-3 mx-6 mt-4 px-4 py-3 bg-yellow-900/40 border border-yellow-700 rounded-lg text-sm">
+      <AlertTriangle size={16} className="text-yellow-400 shrink-0" />
+      <span className="text-yellow-200 flex-1">
+        Sensors not configured — go to Settings to set up your devices
+      </span>
+      <button
+        onClick={() => navigate('/settings')}
+        className="px-3 py-1 bg-yellow-700 hover:bg-yellow-600 rounded text-yellow-100 text-xs font-medium transition-colors"
+      >
+        Go to Settings
+      </button>
+    </div>
+  )
+}
 
 // ── Live status bar ───────────────────────────────────────────────────────────
 function LiveStatusBar({ status }) {
@@ -14,19 +34,24 @@ function LiveStatusBar({ status }) {
     <div className="flex flex-wrap items-center gap-3 px-6 py-3 bg-gray-900 border-b border-gray-800 text-sm">
       <span className="flex items-center gap-1.5">
         <Thermometer size={15} className="text-orange-400" />
-        Indoor: <strong>{indoor_temp != null ? `${indoor_temp.toFixed(1)}°C` : '—'}</strong>
+        Indoor:{' '}
+        <strong>{indoor_temp != null ? `${indoor_temp.toFixed(1)}°C` : '—'}</strong>
       </span>
       <span className="text-gray-700">|</span>
       <span className="flex items-center gap-1.5">
         <Cloud size={15} className="text-sky-400" />
-        Outside: <strong>{outdoor_temp != null ? `${outdoor_temp.toFixed(1)}°C` : '—'}</strong>
+        Outside:{' '}
+        <strong>{outdoor_temp != null ? `${outdoor_temp.toFixed(1)}°C` : '—'}</strong>
       </span>
       <span className="text-gray-700">|</span>
       <PresenceBadge present={presence} />
       <span className="text-gray-700">|</span>
       <span className="flex items-center gap-1.5">
         <Zap size={15} className={ac_on ? 'text-green-400' : 'text-gray-500'} />
-        AC: <strong className={ac_on ? 'text-green-400' : 'text-gray-500'}>{ac_on ? 'ON' : 'OFF'}</strong>
+        AC:{' '}
+        <strong className={ac_on ? 'text-green-400' : 'text-gray-500'}>
+          {ac_on ? 'ON' : 'OFF'}
+        </strong>
         {ac_on && watt_draw > 0 && (
           <span className="text-gray-400">· {watt_draw.toFixed(0)} W</span>
         )}
@@ -82,26 +107,39 @@ export default function Dashboard() {
   const [status,    setStatus]    = useState(null)
   const [snapshots, setSnapshots] = useState([])
   const [stats,     setStats]     = useState(null)
-  const wsRef = useRef(null)
+  const pollRef = useRef(null)
 
-  // Initial data load
+  const fetchStatus = () => {
+    getStatus()
+      .then(setStatus)
+      .catch(err => console.warn('[HawaAI] Status poll error:', err))
+  }
+
+  // Initial data load + polling every 10 seconds
   useEffect(() => {
+    fetchStatus()
     getSessionStats().then(setStats).catch(console.error)
     getSnapshots(120).then(setSnapshots).catch(console.error)
+
+    pollRef.current = setInterval(fetchStatus, 10_000)
+    return () => clearInterval(pollRef.current)
   }, [])
 
-  // WebSocket live updates
+  // Refresh snapshots every 30 seconds
   useEffect(() => {
-    wsRef.current = connectLive(
-      (data) => setStatus(data),
-      (err)  => console.warn('WS error', err),
-    )
-    return () => wsRef.current?.close()
+    const id = setInterval(() => {
+      getSnapshots(120).then(setSnapshots).catch(console.error)
+    }, 30_000)
+    return () => clearInterval(id)
   }, [])
+
+  const configIncomplete = status && status.config_complete === false
 
   return (
     <div className="flex flex-col h-full">
       <LiveStatusBar status={status} />
+
+      {configIncomplete && <ConfigWarning />}
 
       <div className="flex-1 overflow-y-auto p-6 space-y-6">
         {/* Top cards row */}
@@ -120,12 +158,25 @@ export default function Dashboard() {
           <div className="card flex flex-col gap-3">
             <p className="text-xs text-gray-500 uppercase tracking-wide">Energy Now</p>
             <div className="flex-1 flex flex-col justify-center items-center gap-1">
-              <span className="text-4xl font-bold text-yellow-400">
-                {status?.watt_draw ? `${status.watt_draw.toFixed(0)} W` : '— W'}
-              </span>
-              <span className="text-sm text-gray-400">
-                {status?.session_kwh ? `${status.session_kwh.toFixed(3)} kWh this session` : 'No active session'}
-              </span>
+              {status?.watt_draw != null && status.watt_draw > 0 ? (
+                <>
+                  <span className="text-4xl font-bold text-yellow-400">
+                    {status.watt_draw.toFixed(0)} W
+                  </span>
+                  <span className="text-sm text-gray-400">
+                    {status.session_kwh
+                      ? `${status.session_kwh.toFixed(3)} kWh this session`
+                      : 'No active session'}
+                  </span>
+                </>
+              ) : (
+                <span className="text-2xl font-bold text-gray-600">— W</span>
+              )}
+              {status && !status.energy_sensor_entity_configured && (
+                <span className="text-xs text-gray-600 text-center">
+                  Configure energy sensor in Settings
+                </span>
+              )}
             </div>
           </div>
         </div>
@@ -135,7 +186,13 @@ export default function Dashboard() {
           <p className="text-xs text-gray-500 uppercase tracking-wide mb-4">
             Real-time · Last 2 hours
           </p>
-          <EnergyChart snapshots={snapshots} />
+          {snapshots.length === 0 ? (
+            <p className="text-sm text-gray-600 py-8 text-center">
+              Waiting for first session to start
+            </p>
+          ) : (
+            <EnergyChart snapshots={snapshots} />
+          )}
         </div>
 
         {/* Session table + today/ML stats */}
