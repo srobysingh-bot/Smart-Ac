@@ -1,4 +1,4 @@
-import { BrowserRouter, NavLink, Route, Routes } from 'react-router-dom'
+import { HashRouter, NavLink, Route, Routes } from 'react-router-dom'
 import {
   LayoutDashboard,
   History,
@@ -39,7 +39,7 @@ function NavItem({ to, icon: Icon, label }) {
 
 export default function App() {
   return (
-    <BrowserRouter>
+    <HashRouter>
       <div className="flex h-screen overflow-hidden">
         {/* Sidebar */}
         <aside className="w-56 shrink-0 flex flex-col bg-gray-900 border-r border-gray-800 p-4 gap-1">
@@ -54,7 +54,7 @@ export default function App() {
           ))}
 
           <div className="mt-auto text-xs text-gray-600 px-1 pt-4">
-            v1.0.0 · All data local
+            v1.0.4 · All data local
           </div>
         </aside>
 
@@ -68,6 +68,6 @@ export default function App() {
           </Routes>
         </main>
       </div>
-    </BrowserRouter>
+    </HashRouter>
   )
 }

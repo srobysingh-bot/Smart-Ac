@@ -34,7 +34,11 @@ class HAClient:
     """
 
     def __init__(self, token: Optional[str] = None) -> None:
-        self._token = token or _SUPERVISOR_TOKEN
+        # SUPERVISOR_TOKEN is injected by HA Supervisor into every add-on container
+        # and is always valid for add-on → HA Core communication through the proxy.
+        # A user-provided LLAT (ha_token) is used ONLY as a fallback for local dev
+        # outside of the HA add-on context (where SUPERVISOR_TOKEN is absent).
+        self._token = _SUPERVISOR_TOKEN or token or ""
         self._ws: Optional[aiohttp.ClientWebSocketResponse] = None
         self._session: Optional[aiohttp.ClientSession] = None
         self._msg_id: int = 1

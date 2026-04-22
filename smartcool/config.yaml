@@ -1,5 +1,5 @@
 name: SmartCool AC Optimizer
-version: 1.0.3
+version: 1.0.4
 slug: smartcool
 description: AI-powered AC optimization using presence, temperature, and energy data
 url: https://github.com/srobysingh-bot/Smart-Ac
