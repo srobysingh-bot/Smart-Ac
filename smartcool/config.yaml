@@ -1,5 +1,5 @@
 name: SmartCool AC Optimizer
-version: 1.0.2
+version: 1.0.3
 slug: smartcool
 description: AI-powered AC optimization using presence, temperature, and energy data
 url: https://github.com/srobysingh-bot/Smart-Ac
@@ -10,6 +10,8 @@ startup: application
 boot: auto
 init: false
 auto_update: true
+homeassistant_api: true
+hassio_api: true
 homeassistant: "2023.1.0"
 panel_icon: mdi:air-conditioner
 panel_title: SmartCool

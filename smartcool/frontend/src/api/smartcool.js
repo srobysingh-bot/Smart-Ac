@@ -1,9 +1,16 @@
 /**
  * SmartCool API client.
- * All fetch calls target /api/* which is proxied to the FastAPI backend.
+ *
+ * When served via HA ingress the page URL is:
+ *   https://ha-host/api/hassio_ingress/TOKEN/
+ * The backend injects:
+ *   window.__INGRESS_PATH__ = "/api/hassio_ingress/TOKEN"
+ * so we can construct correct absolute URLs that go through the ingress proxy.
+ * When accessed directly (dev / port-forward), __INGRESS_PATH__ is "".
  */
 
-const BASE = '/api'
+const INGRESS_PATH = (typeof window !== 'undefined' && window.__INGRESS_PATH__) || ''
+const BASE = INGRESS_PATH + '/api'
 
 async function request(path, options = {}) {
   const res = await fetch(`${BASE}${path}`, {
@@ -67,8 +74,12 @@ export async function downloadExport(format = 'csv') {
 
 // ── WebSocket live updates ────────────────────────────────────────────────────
 export function connectLive(onMessage, onError) {
-  const proto = location.protocol === 'https:' ? 'wss' : 'ws'
-  const ws    = new WebSocket(`${proto}://${location.host}/ws`)
+  const proto  = location.protocol === 'https:' ? 'wss' : 'ws'
+  // Include ingress path prefix so the request routes through HA ingress
+  // e.g.  wss://ha-host/api/hassio_ingress/TOKEN/ws  (via ingress)
+  //   or  ws://localhost:8099/ws                       (direct access)
+  const wsPath = INGRESS_PATH + '/ws'
+  const ws     = new WebSocket(`${proto}://${location.host}${wsPath}`)
 
   ws.onmessage = (evt) => {
     try { onMessage(JSON.parse(evt.data)) } catch {}

@@ -24,10 +24,9 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from fastapi import FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, HTTPException, Query, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import PlainTextResponse, Response
-from fastapi.staticfiles import StaticFiles
+from fastapi.responses import FileResponse, HTMLResponse, PlainTextResponse, Response
 from pydantic import BaseModel
 
 from . import config_manager, database, export_manager, scheduler
@@ -240,5 +239,31 @@ async def _broadcast_loop():
 
 _FRONTEND_DIST = Path(__file__).parent.parent / "frontend" / "dist"
 
-if _FRONTEND_DIST.exists():
-    app.mount("/", StaticFiles(directory=str(_FRONTEND_DIST), html=True), name="frontend")
+
+@app.get("/{full_path:path}", include_in_schema=False)
+async def serve_frontend(full_path: str, request: Request):
+    """Serve the React SPA, injecting the HA ingress base path into index.html
+    so the frontend can construct correct absolute API + WebSocket URLs.
+    Real static assets (JS/CSS/images) are served directly by FileResponse.
+    All other paths fall through to index.html for client-side routing.
+    """
+    if not _FRONTEND_DIST.exists():
+        return HTMLResponse("<h1>Frontend not built</h1>", status_code=503)
+
+    # Serve real static assets directly
+    asset = _FRONTEND_DIST / full_path
+    if asset.is_file():
+        return FileResponse(asset)
+
+    # For SPA routes (/, /history, /analytics, /settings …) serve index.html
+    # and inject the HA ingress base path so the frontend knows its URL prefix.
+    index = _FRONTEND_DIST / "index.html"
+    if not index.exists():
+        return HTMLResponse("<h1>index.html not found</h1>", status_code=503)
+
+    # HA Supervisor sets X-Ingress-Path header, e.g. /api/hassio_ingress/TOKEN
+    ingress_path = request.headers.get("X-Ingress-Path", "")
+    html = index.read_text(encoding="utf-8")
+    snippet = f'<script>window.__INGRESS_PATH__="{ingress_path}";</script>'
+    html = html.replace("</head>", snippet + "\n</head>")
+    return HTMLResponse(html)
