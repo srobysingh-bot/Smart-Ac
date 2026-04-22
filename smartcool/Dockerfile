@@ -1,23 +1,31 @@
 # ── Stage 1: Build React frontend ──────────────────────────────────────────────
-FROM node:18-alpine AS frontend-builder
+FROM node:20-alpine AS frontend-builder
 
 WORKDIR /app/frontend
-COPY frontend/package.json frontend/package-lock.json* ./
-RUN npm ci --legacy-peer-deps
+# Copy only package.json first (no package-lock.json — use npm install)
+COPY frontend/package.json ./
+RUN npm install --legacy-peer-deps
 COPY frontend/ ./
 RUN npm run build
 
 # ── Stage 2: Runtime ────────────────────────────────────────────────────────────
-ARG BUILD_FROM
-FROM ${BUILD_FROM}
+# Use the current multi-arch HA base-python image (supports amd64 + aarch64).
+# build.yaml is NOT used; this FROM is the single source of truth (HA 2026.04+).
+FROM ghcr.io/home-assistant/base-python:3.12-alpine3.23
+
+LABEL \
+    io.hass.name="SmartCool AC Optimizer" \
+    io.hass.description="AI-powered AC optimization using presence, temperature, and energy data" \
+    io.hass.type="addon" \
+    org.opencontainers.image.source="https://github.com/srobysingh-bot/Smart-Ac" \
+    org.opencontainers.image.licenses="MIT"
 
 ENV LANG=C.UTF-8 \
     PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1
 
-# Only add C-extension build deps not already in the base-python image.
-# Do NOT reinstall python3/py3-pip (already in base) or cargo (Rust is huge
-# and causes ARM build timeouts).
+# gcc + musl-dev needed for aiosqlite/aiohttp C extensions on Alpine.
+# openssl-dev + libffi-dev for cryptographic packages.
 RUN apk add --no-cache \
     gcc \
     musl-dev \
