@@ -6,5 +6,5 @@ labels:
   io.hass.type: "addon"
   org.opencontainers.image.title: "SmartCool AC Optimizer"
   org.opencontainers.image.description: "AI-powered AC optimization"
-  org.opencontainers.image.source: "https://github.com/yourusername/smartcool"
+  org.opencontainers.image.source: "https://github.com/srobysingh-bot/Smart-Ac"
   org.opencontainers.image.licenses: "MIT"
