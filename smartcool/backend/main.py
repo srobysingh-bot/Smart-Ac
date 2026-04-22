@@ -78,7 +78,7 @@ async def lifespan(app: FastAPI):
     logger.info("SmartCool stopped")
 
 
-app = FastAPI(title="SmartCool API", version="1.0.5", lifespan=lifespan)
+app = FastAPI(title="SmartCool API", version="1.0.6", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
