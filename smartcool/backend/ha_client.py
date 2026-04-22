@@ -80,6 +80,15 @@ class HAClient:
         state = await self.get_state(entity_id)
         return state.get("state") if state else None
 
+    async def get_ac_state(self, entity_id: str) -> Optional[bool]:
+        """Return True if the given AC/switch entity is currently ON according to HA."""
+        if not entity_id:
+            return None
+        state_str = await self.get_state_value(entity_id)
+        if state_str is None:
+            return None
+        return str(state_str).lower() in ("on", "true", "1")
+
     async def get_state_attribute(
         self, entity_id: str, attribute: str
     ) -> Optional[Any]:

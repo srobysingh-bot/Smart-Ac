@@ -94,7 +94,18 @@ app.add_middleware(
 async def get_status():
     if engine is None:
         raise HTTPException(503, "Engine not ready")
-    return engine.status
+    # Ensure status reflects current HA entity state for AC
+    status = dict(engine.status)
+    try:
+        cfg = config_manager.get_all()
+        ac_entity = cfg.get("ac_switch_entity")
+        if ac_entity and ha is not None:
+            ac_state = await ha.get_ac_state(ac_entity)
+            if ac_state is not None:
+                status["ac_on"] = ac_state
+    except Exception:
+        pass
+    return status
 
 
 @app.get("/api/sessions")

@@ -9,6 +9,7 @@ from typing import Any, Dict
 logger = logging.getLogger(__name__)
 
 OPTIONS_PATH = Path("/data/options.json")
+PERSIST_PATH = Path("/data/hawaai_config.json")
 
 # Defaults — must mirror config.yaml options block
 _DEFAULTS: Dict[str, Any] = {
@@ -52,7 +53,19 @@ def load() -> Dict[str, Any]:
         logger.error("Failed to read options.json: %s", exc)
         data = {}
 
-    _cache = {**_DEFAULTS, **data}
+    # Also load any runtime-saved config from /data which persists across restarts
+    try:
+        if PERSIST_PATH.exists():
+            raw_p = PERSIST_PATH.read_text(encoding="utf-8")
+            data_p = json.loads(raw_p)
+        else:
+            data_p = {}
+    except (json.JSONDecodeError, OSError) as exc:
+        logger.error("Failed to read persisted config %s: %s", PERSIST_PATH, exc)
+        data_p = {}
+
+    # Merge: defaults <- supervisor options.json <- runtime persisted config
+    _cache = {**_DEFAULTS, **data, **data_p}
     return _cache
 
 
@@ -89,14 +102,15 @@ def update(patch: Dict[str, Any]) -> Dict[str, Any]:
 
     _cache.update(patch)
 
+    # Persist runtime changes to a dedicated file under /data so they survive restarts
     try:
-        OPTIONS_PATH.write_text(
+        PERSIST_PATH.write_text(
             json.dumps(_cache, indent=2, ensure_ascii=False),
             encoding="utf-8",
         )
-        logger.info("Config saved to %s", OPTIONS_PATH)
+        logger.info("Runtime config saved to %s", PERSIST_PATH)
     except OSError as exc:
-        logger.error("Failed to write options.json: %s", exc)
+        logger.error("Failed to write persisted config %s: %s", PERSIST_PATH, exc)
 
     return dict(_cache)
 
@@ -106,3 +120,11 @@ def reload() -> Dict[str, Any]:
     global _cache
     _cache = {}
     return load()
+
+
+def load_config() -> Dict[str, Any]:
+    """Explicit helper to reload configuration from disk and return it.
+
+    Use this from long-running components to pick up runtime changes.
+    """
+    return reload()

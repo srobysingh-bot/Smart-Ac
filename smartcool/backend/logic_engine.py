@@ -62,7 +62,19 @@ class LogicEngine:
 
     async def tick(self) -> None:
         """Single decision-loop iteration. Called by the scheduler."""
-        cfg = config_manager.get_all()
+        # Reload config from disk each tick to pick up runtime changes
+        cfg = config_manager.load_config()
+
+        # Validate required configuration before running logic
+        required = ["indoor_temp_entity", "ac_switch_entity"]
+        if cfg.get("use_presence", True):
+            required.append("presence_entity")
+        missing = [k for k in required if not cfg.get(k)]
+        if missing:
+            logger.warning("SmartCool disabled — missing config: %s", missing)
+            # Still publish live status placeholders
+            self.status.update({"manual_override": False, "ac_on": False})
+            return
 
         if cfg.get("manual_override"):
             self.status["manual_override"] = True
