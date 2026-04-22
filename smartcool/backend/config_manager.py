@@ -12,7 +12,6 @@ CONFIG_PATH = "/data/hawaai_config.json"
 DEFAULT_CONFIG: Dict[str, Any] = {
     "presence_entity": "",
     "indoor_temp_entity": "",
-    "ac_switch_entity": "",
     "energy_sensor_entity": "",
     "broadlink_entity": "",
     "ac_brand": "",

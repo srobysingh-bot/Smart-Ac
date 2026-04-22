@@ -49,7 +49,7 @@ async def lifespan(app: FastAPI):
     logger.info("[HawaAI] Add-on stopped")
 
 
-app = FastAPI(title="HawaAI API", version="1.0.7", lifespan=lifespan)
+app = FastAPI(title="HawaAI API", version="1.0.8", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -103,7 +103,6 @@ async def get_status():
 
     indoor_temp_raw = await ha_client.get_state(cfg.get("indoor_temp_entity", ""))
     presence_raw = await ha_client.get_state(cfg.get("presence_entity", ""))
-    ac_switch_raw = await ha_client.get_state(cfg.get("ac_switch_entity", ""))
     energy_raw = await ha_client.get_state(cfg.get("energy_sensor_entity", ""))
 
     is_occupied = presence_raw in ("on", "occupied", "home", "detected")
@@ -116,7 +115,7 @@ async def get_status():
             return None
 
     return {
-        "ac_on": runtime["ac_is_on"] or (ac_switch_raw == "on"),
+        "ac_on": runtime["ac_is_on"],  # single source of truth: logic engine memory
         "indoor_temp": safe_float(indoor_temp_raw),
         "outdoor_temp": weather.get("temp") if weather else None,
         "outdoor_humidity": weather.get("humidity") if weather else None,

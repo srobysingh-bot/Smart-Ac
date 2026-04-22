@@ -109,31 +109,36 @@ function Toggle({ label, description, checked, onChange, danger }) {
   )
 }
 
-// ── Entity dropdown with search ───────────────────────────────────────────────
-function EntitySelect({ label, value, onChange, entities }) {
-  const [query, setQuery] = useState('')
-  const filtered = query
+// ── Entity dropdown: search state lives HERE, passed in as props ──────────────
+// Each field uses its own search string so they don't interfere.
+function EntityDropdown({ label, value, onChange, entities, search, onSearchChange }) {
+  const q = search.toLowerCase()
+  const filtered = q
     ? entities.filter(
         e =>
-          e.entity_id.toLowerCase().includes(query.toLowerCase()) ||
-          e.friendly_name.toLowerCase().includes(query.toLowerCase())
+          e.entity_id.toLowerCase().includes(q) ||
+          (e.friendly_name || '').toLowerCase().includes(q)
       )
     : entities
 
   return (
     <div>
       <Label>{label}</Label>
+      {/* Search input — onChange updates parent state, causing real filtered render */}
       <input
-        type="search"
-        placeholder="Search entities…"
-        value={query}
-        onChange={e => setQuery(e.target.value)}
+        type="text"
+        placeholder="Type to filter…"
+        value={search}
+        onChange={e => onSearchChange(e.target.value)}
         className="w-full mb-2 bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm text-gray-100 focus:outline-none focus:border-blue-500"
       />
       <select
         className="w-full bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm text-gray-100 focus:outline-none focus:border-blue-500"
         value={value || ''}
-        onChange={e => onChange(e.target.value)}
+        onChange={e => {
+          onChange(e.target.value)
+          onSearchChange('') // clear search after selection
+        }}
       >
         <option value="">— Not configured —</option>
         {filtered.map(e => (
@@ -142,6 +147,9 @@ function EntitySelect({ label, value, onChange, entities }) {
           </option>
         ))}
       </select>
+      {q && filtered.length === 0 && (
+        <p className="text-xs text-gray-600 mt-1">No matches — try a different search term</p>
+      )}
     </div>
   )
 }
@@ -171,14 +179,22 @@ export default function Settings() {
   const [cfg,        setCfg]        = useState({})
   const [entities,   setEntities]   = useState([])
   const [saving,     setSaving]     = useState(false)
-  const [saveStatus, setSaveStatus] = useState(null) // 'ok' | 'error' | null
+  const [saveStatus, setSaveStatus] = useState(null)
   const [saveMsg,    setSaveMsg]    = useState('')
   const [loading,    setLoading]    = useState(true)
+
+  // Per-dropdown search state (FIX 3 — each search is independent)
+  const [presenceSearch, setPresenceSearch]   = useState('')
+  const [tempSearch,     setTempSearch]       = useState('')
+  const [energySearch,   setEnergySearch]     = useState('')
+  const [broadlinkSearch, setBroadlinkSearch] = useState('')
+
+  // Energy fallback: show ALL sensors when the smart filter misses a device
+  const [energyShowAll, setEnergyShowAll] = useState(false)
 
   useEffect(() => {
     Promise.all([getConfig(), getEntities()])
       .then(([c, e]) => {
-        // Unmask secrets so the field shows blank (not "***")
         const cleaned = { ...c }
         if (cleaned.weather_api_key === '***') cleaned.weather_api_key = ''
         setCfg(cleaned)
@@ -197,7 +213,6 @@ export default function Settings() {
     setSaveStatus(null)
     try {
       const payload = { ...cfg }
-      // Remove empty string weather key so we don't overwrite an existing stored key
       if (!payload.weather_api_key) delete payload.weather_api_key
       await patchConfig(payload)
       setSaveStatus('ok')
@@ -212,13 +227,30 @@ export default function Settings() {
     }
   }
 
-  // Domain-filtered entity helpers
+  // ── Entity filter helpers ─────────────────────────────────────────────────
   const byDomain = domain => entities.filter(e => e.entity_id.startsWith(`${domain}.`))
-  const tempSensors = entities.filter(e => e.entity_id.startsWith('sensor.'))
-  const energySensors = entities.filter(
-    e => e.entity_id.startsWith('sensor.') &&
-      (e.entity_id.includes('power') || e.entity_id.includes('energy') || e.entity_id.includes('watt'))
-  )
+
+  const allSensors = entities.filter(e => e.entity_id.startsWith('sensor.'))
+
+  // FIX 2 — broad energy filter catches breakers, Tuya circuits, etc.
+  const smartEnergySensors = entities.filter(e => {
+    if (e.domain !== 'sensor' && !e.entity_id.startsWith('sensor.')) return false
+    const id   = e.entity_id.toLowerCase()
+    const name = (e.friendly_name || '').toLowerCase()
+    return (
+      id.includes('power')   || id.includes('energy')  ||
+      id.includes('watt')    || id.includes('current')  ||
+      id.includes('voltage') || id.includes('breaker')  ||
+      id.includes('circuit') || id.includes('kwh')      ||
+      name.includes('power') || name.includes('energy') ||
+      name.includes('watt')  || name.includes('breaker')||
+      name.includes('circuit')|| name.includes('30a')   ||
+      name.includes('amp')
+    )
+  })
+
+  // Use smart filter unless user switched to "show all"
+  const energyEntities = energyShowAll ? allSensors : smartEnergySensors
 
   if (loading) {
     return (
@@ -259,35 +291,66 @@ export default function Settings() {
       {/* Sensors & Devices */}
       <div className="card space-y-4">
         <SectionHeader>Sensors &amp; Devices</SectionHeader>
-        <EntitySelect
+
+        {/* Presence sensor */}
+        <EntityDropdown
           label="Presence Sensor (binary_sensor.*)"
           value={cfg.presence_entity}
           onChange={v => patch('presence_entity', v)}
           entities={byDomain('binary_sensor')}
+          search={presenceSearch}
+          onSearchChange={setPresenceSearch}
         />
-        <EntitySelect
+
+        {/* Indoor temp */}
+        <EntityDropdown
           label="Indoor Temperature Sensor (sensor.*)"
           value={cfg.indoor_temp_entity}
           onChange={v => patch('indoor_temp_entity', v)}
-          entities={tempSensors}
+          entities={allSensors}
+          search={tempSearch}
+          onSearchChange={setTempSearch}
         />
-        <EntitySelect
-          label="AC Smart Switch (switch.*)"
-          value={cfg.ac_switch_entity}
-          onChange={v => patch('ac_switch_entity', v)}
-          entities={byDomain('switch')}
-        />
-        <EntitySelect
-          label="Energy / Power Sensor (sensor.*power/energy)"
-          value={cfg.energy_sensor_entity}
-          onChange={v => patch('energy_sensor_entity', v)}
-          entities={energySensors.length ? energySensors : tempSensors}
-        />
-        <EntitySelect
+
+        {/* Energy / Power sensor — FIX 2: broader filter + show-all fallback */}
+        <div>
+          <EntityDropdown
+            label="Energy / Power Sensor"
+            value={cfg.energy_sensor_entity}
+            onChange={v => {
+              if (v === '__all__') {
+                setEnergyShowAll(true)
+              } else {
+                patch('energy_sensor_entity', v)
+                setEnergyShowAll(false)
+              }
+            }}
+            entities={energyEntities}
+            search={energySearch}
+            onSearchChange={setEnergySearch}
+          />
+          {/* Fallback toggle */}
+          <div className="flex items-center gap-2 mt-1">
+            <button
+              type="button"
+              onClick={() => setEnergyShowAll(v => !v)}
+              className="text-xs text-blue-400 hover:text-blue-300 underline"
+            >
+              {energyShowAll
+                ? `Smart filter (${smartEnergySensors.length} sensors)`
+                : `Not seeing your device? Show all ${allSensors.length} sensors`}
+            </button>
+          </div>
+        </div>
+
+        {/* Broadlink remote */}
+        <EntityDropdown
           label="Broadlink Remote Entity (remote.*)"
           value={cfg.broadlink_entity}
           onChange={v => patch('broadlink_entity', v)}
           entities={byDomain('remote')}
+          search={broadlinkSearch}
+          onSearchChange={setBroadlinkSearch}
         />
       </div>
 
