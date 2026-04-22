@@ -1,0 +1,61 @@
+name: SmartCool AC Optimizer
+version: 1.0.0
+slug: smartcool
+description: AI-powered AC optimization using presence, temperature, and energy data
+url: https://github.com/yourusername/smartcool
+arch:
+  - aarch64
+  - amd64
+  - armv7
+startup: application
+boot: auto
+panel_icon: mdi:air-conditioner
+panel_title: SmartCool
+ingress: true
+ingress_port: 8099
+options:
+  ha_token: ""
+  weather_api_key: ""
+  weather_city: ""
+  weather_provider: "openweathermap"
+  target_temp: 24
+  hysteresis: 1.5
+  vacancy_timeout_minutes: 5
+  energy_tariff_per_kwh: 8.0
+  logic_interval_seconds: 60
+  currency: "INR"
+  presence_entity: ""
+  indoor_temp_entity: ""
+  ac_switch_entity: ""
+  energy_sensor_entity: ""
+  broadlink_entity: ""
+  ac_brand: ""
+  ac_model: ""
+  room_name: "Living Room"
+  use_presence: true
+  use_outdoor_temp: true
+  manual_override: false
+schema:
+  ha_token: str
+  weather_api_key: str
+  weather_city: str
+  weather_provider: str
+  target_temp: int
+  hysteresis: float
+  vacancy_timeout_minutes: int
+  energy_tariff_per_kwh: float
+  logic_interval_seconds: int
+  currency: str
+  presence_entity: str
+  indoor_temp_entity: str
+  ac_switch_entity: str
+  energy_sensor_entity: str
+  broadlink_entity: str
+  ac_brand: str
+  ac_model: str
+  room_name: str
+  use_presence: bool
+  use_outdoor_temp: bool
+  manual_override: bool
+map:
+  - data:rw

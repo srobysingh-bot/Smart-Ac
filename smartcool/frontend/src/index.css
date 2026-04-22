@@ -1,0 +1,27 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  color-scheme: dark;
+}
+
+body {
+  @apply bg-gray-950 text-gray-100 font-sans antialiased;
+}
+
+/* Scrollbar */
+::-webkit-scrollbar        { width: 6px; height: 6px; }
+::-webkit-scrollbar-track  { @apply bg-gray-900; }
+::-webkit-scrollbar-thumb  { @apply bg-gray-600 rounded-full; }
+::-webkit-scrollbar-thumb:hover { @apply bg-gray-500; }
+
+/* Card base */
+.card {
+  @apply bg-gray-900 border border-gray-800 rounded-xl p-4;
+}
+
+/* Stat chip */
+.chip {
+  @apply inline-flex items-center gap-1.5 px-3 py-1 rounded-full text-sm font-medium;
+}

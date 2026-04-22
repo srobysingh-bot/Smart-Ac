@@ -1,0 +1,10 @@
+build_from:
+  aarch64: "ghcr.io/home-assistant/aarch64-base-python:3.11-alpine3.17"
+  amd64: "ghcr.io/home-assistant/amd64-base-python:3.11-alpine3.17"
+  armv7: "ghcr.io/home-assistant/armv7-base-python:3.11-alpine3.17"
+labels:
+  io.hass.type: "addon"
+  org.opencontainers.image.title: "SmartCool AC Optimizer"
+  org.opencontainers.image.description: "AI-powered AC optimization"
+  org.opencontainers.image.source: "https://github.com/yourusername/smartcool"
+  org.opencontainers.image.licenses: "MIT"
