@@ -32,7 +32,7 @@ async def start_session(data: Dict[str, Any]) -> str:
         "outdoor_temp_start": data.get("outdoor_temp_start"),
         "outdoor_humidity_start": data.get("outdoor_humidity_start"),
         "target_temp": data.get("target_temp"),
-        "ac_entity_id": data.get("ac_switch_entity"),
+        "ac_entity_id": data.get("ac_entity_id"),
         "ac_brand": data.get("ac_brand"),
         "ac_model": data.get("ac_model"),
         "room_name": data.get("room_name"),
