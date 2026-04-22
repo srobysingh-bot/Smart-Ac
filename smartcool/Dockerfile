@@ -15,23 +15,20 @@ ENV LANG=C.UTF-8 \
     PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1
 
-# System deps for Python packages that need compilation
+# Only add C-extension build deps not already in the base-python image.
+# Do NOT reinstall python3/py3-pip (already in base) or cargo (Rust is huge
+# and causes ARM build timeouts).
 RUN apk add --no-cache \
-    python3 \
-    py3-pip \
-    python3-dev \
     gcc \
     musl-dev \
     libffi-dev \
-    openssl-dev \
-    cargo
+    openssl-dev
 
 WORKDIR /app
 
 # Install Python dependencies first (layer cache)
 COPY backend/requirements.txt ./
-RUN pip3 install --no-cache-dir --upgrade pip \
- && pip3 install --no-cache-dir -r requirements.txt
+RUN pip3 install --no-cache-dir -r requirements.txt
 
 # Copy backend source
 COPY backend/ ./backend/

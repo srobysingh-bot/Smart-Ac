@@ -140,12 +140,13 @@ async def read_config():
 
 
 class ConfigPatch(BaseModel):
-    model_config = {"extra": "allow"}
+    class Config:
+        extra = "allow"
 
 
 @app.post("/api/config")
 async def update_config(patch: ConfigPatch):
-    data = patch.model_dump(exclude_none=True)
+    data = patch.dict(exclude_none=True)
     # Prevent clearing secret fields via masked values
     data = {k: v for k, v in data.items() if v != "***"}
     updated = config_manager.update(data)
