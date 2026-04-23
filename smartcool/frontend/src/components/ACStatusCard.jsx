@@ -1,3 +1,14 @@
+/**
+ * ACStatusCard — displays current AC state and session info.
+ *
+ * IMPORTANT: `acOn` must come exclusively from /api/status → ac_on
+ * (which reflects the backend _ac_is_on internal flag, set only by
+ * Broadlink IR commands). Never derive it from climate entity state.
+ *
+ * "Running" is shown only when acOn === true (backend truth).
+ * Watt draw is shown as supplementary info when available, but does NOT
+ * gate the Running status — power sensors have their own read delays.
+ */
 import { useEffect, useState } from 'react'
 import { Wind, Timer, Zap, Thermometer } from 'lucide-react'
 
@@ -24,11 +35,12 @@ const MODE_LABELS = {
 }
 
 export default function ACStatusCard({
+  // ac_on comes from /api/status.ac_on → backend _ac_is_on flag only
   acOn,
   sessionStart,
   wattDraw,
   sessionKwh,
-  // Live climate entity data (from /api/status ac_* fields)
+  // Climate entity display data (read-only, not used for acOn)
   acCurrentTemp,
   acTargetTemp,
   acMode,
@@ -45,20 +57,24 @@ export default function ACStatusCard({
     return () => clearInterval(id)
   }, [acOn, sessionStart])
 
+  // "Running" is shown ONLY when backend confirms AC is ON.
+  // Do not show Running based on watt reading or climate entity state.
+  const isRunning = acOn === true
+
   return (
     <div className="card flex flex-col gap-3">
       {/* Header row */}
       <div className="flex items-center justify-between">
         <p className="text-xs text-gray-500 uppercase tracking-wide">AC Status</p>
-        <span className={`chip ${acOn ? 'bg-green-900/50 text-green-300' : 'bg-gray-800 text-gray-500'}`}>
+        <span className={`chip ${isRunning ? 'bg-green-900/50 text-green-300' : 'bg-gray-800 text-gray-500'}`}>
           <Wind size={12} />
-          {acOn ? 'Running' : 'Off'}
+          {isRunning ? 'Running' : 'Off'}
         </span>
       </div>
 
-      {/* Running timer */}
+      {/* Timer / idle message */}
       <div className="flex flex-col gap-2">
-        {acOn && timer ? (
+        {isRunning && timer ? (
           <>
             <div className="flex items-center gap-2 text-sm text-gray-400">
               <Timer size={14} className="text-blue-400" />
@@ -70,7 +86,7 @@ export default function ACStatusCard({
           <span className="text-gray-600 text-sm">Not running</span>
         )}
 
-        {acOn && sessionKwh > 0 && (
+        {isRunning && sessionKwh > 0 && (
           <div className="flex items-center gap-1.5 text-sm text-yellow-400">
             <Zap size={13} />
             {sessionKwh.toFixed(3)} kWh this session
@@ -78,28 +94,23 @@ export default function ACStatusCard({
         )}
       </div>
 
-      {/* Live climate entity data — shown when climate entity is configured */}
-      {hasClimateEntity && acOn && (
+      {/* Live climate entity data — display only, shown when available */}
+      {hasClimateEntity && isRunning && (
         <div className="border-t border-gray-800 pt-3 grid grid-cols-2 gap-y-1.5 text-xs">
-          {/* Current temp */}
           {acCurrentTemp != null && (
             <>
               <span className="text-gray-500 flex items-center gap-1">
                 <Thermometer size={11} /> AC reads
               </span>
-              <span className="font-semibold text-blue-300">{acCurrentTemp.toFixed(1)}°C</span>
+              <span className="font-semibold text-blue-300">{Number(acCurrentTemp).toFixed(1)}°C</span>
             </>
           )}
-
-          {/* Setpoint */}
           {acTargetTemp != null && (
             <>
               <span className="text-gray-500">Setpoint</span>
               <span className="font-semibold text-gray-200">{acTargetTemp}°C</span>
             </>
           )}
-
-          {/* Mode */}
           {acMode && (
             <>
               <span className="text-gray-500">Mode</span>
@@ -108,8 +119,6 @@ export default function ACStatusCard({
               </span>
             </>
           )}
-
-          {/* Fan */}
           {acFanMode && (
             <>
               <span className="text-gray-500 flex items-center gap-1">
@@ -118,8 +127,6 @@ export default function ACStatusCard({
               <span className="font-semibold text-gray-200">{acFanMode}</span>
             </>
           )}
-
-          {/* Swing */}
           {acSwingMode && (
             <>
               <span className="text-gray-500">Swing</span>
@@ -129,11 +136,11 @@ export default function ACStatusCard({
         </div>
       )}
 
-      {/* Watt draw when running and no climate entity */}
-      {acOn && !hasClimateEntity && wattDraw > 0 && (
+      {/* Watt draw — supplementary info only when no climate entity */}
+      {isRunning && !hasClimateEntity && wattDraw > 0 && (
         <div className="flex items-center gap-1.5 text-xs text-gray-400">
           <Zap size={11} className="text-yellow-400" />
-          {wattDraw.toFixed(0)} W
+          {Number(wattDraw).toFixed(0)} W
         </div>
       )}
     </div>

@@ -29,11 +29,15 @@ function ConfigWarning() {
 
 // ── Live status bar ───────────────────────────────────────────────────────────
 function LiveStatusBar({ status }) {
-  const { indoor_temp, outdoor_temp, presence, ac_on, watt_draw, ac_current_temp } = status || {}
+  const {
+    indoor_temp, outdoor_temp, presence, ac_on, watt_draw,
+    ac_current_temp, cooldown_active, last_command, secs_since_cmd,
+  } = status || {}
 
-  // When WiFi switch sensor is offline, fall back to AC unit's own thermistor
-  const displayTemp   = indoor_temp ?? ac_current_temp
-  const tempFromAC    = indoor_temp == null && ac_current_temp != null
+  // indoor_temp from /api/status already has the fallback applied server-side.
+  // ac_current_temp is kept for the ⁽ᴬᶜ⁾ indicator only.
+  const displayTemp = indoor_temp
+  const tempFromAC  = status != null && indoor_temp == null && ac_current_temp != null
 
   return (
     <div className="flex flex-wrap items-center gap-3 px-6 py-3 bg-gray-900 border-b border-gray-800 text-sm">
@@ -41,7 +45,7 @@ function LiveStatusBar({ status }) {
         <Thermometer size={15} className={tempFromAC ? 'text-blue-400' : 'text-orange-400'} />
         Indoor:{' '}
         <strong>
-          {displayTemp != null ? `${displayTemp.toFixed(1)}°C` : '—'}
+          {displayTemp != null ? `${Number(displayTemp).toFixed(1)}°C` : '—'}
         </strong>
         {tempFromAC && (
           <span className="text-xs text-blue-400 ml-0.5" title="Reading from AC unit (WiFi sensor offline)">
@@ -53,11 +57,12 @@ function LiveStatusBar({ status }) {
       <span className="flex items-center gap-1.5">
         <Cloud size={15} className="text-sky-400" />
         Outside:{' '}
-        <strong>{outdoor_temp != null ? `${outdoor_temp.toFixed(1)}°C` : '—'}</strong>
+        <strong>{outdoor_temp != null ? `${Number(outdoor_temp).toFixed(1)}°C` : '—'}</strong>
       </span>
       <span className="text-gray-700">|</span>
       <PresenceBadge present={presence} />
       <span className="text-gray-700">|</span>
+      {/* AC state comes from backend _ac_is_on flag — never from climate entity */}
       <span className="flex items-center gap-1.5">
         <Zap size={15} className={ac_on ? 'text-green-400' : 'text-gray-500'} />
         AC:{' '}
@@ -68,6 +73,16 @@ function LiveStatusBar({ status }) {
           <span className="text-gray-400">· {watt_draw.toFixed(0)} W</span>
         )}
       </span>
+      {/* Cooldown indicator — shows briefly after every IR command */}
+      {cooldown_active && (
+        <>
+          <span className="text-gray-700">|</span>
+          <span className="text-xs text-yellow-400 flex items-center gap-1" title={`${secs_since_cmd?.toFixed(0)}s since ${last_command} command`}>
+            <Loader size={11} className="animate-spin" />
+            Cooldown {secs_since_cmd != null ? `${Math.round(secs_since_cmd)}s` : ''}
+          </span>
+        </>
+      )}
     </div>
   )
 }
@@ -309,21 +324,23 @@ export default function Dashboard() {
   const [stats,     setStats]     = useState(null)
   const pollRef = useRef(null)
 
-  const fetchStatus = () => {
+  const fetchStatus = useCallback(() => {
+    // /api/status is the ONLY source of truth for ac_on, presence, watts, indoor_temp.
+    // No other endpoint or local state should override these values.
     getStatus()
       .then(setStatus)
       .catch(err => console.warn('[HawaAI] Status poll error:', err))
-  }
+  }, [])
 
-  // Initial data load + polling every 10 seconds
+  // Initial data load + poll /api/status every 5 seconds
   useEffect(() => {
     fetchStatus()
     getSessionStats().then(setStats).catch(console.error)
     getSnapshots(120).then(setSnapshots).catch(console.error)
 
-    pollRef.current = setInterval(fetchStatus, 10_000)
+    pollRef.current = setInterval(fetchStatus, 5_000)
     return () => clearInterval(pollRef.current)
-  }, [])
+  }, [fetchStatus])
 
   // Refresh snapshots every 30 seconds
   useEffect(() => {

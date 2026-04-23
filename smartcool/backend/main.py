@@ -55,7 +55,7 @@ async def lifespan(app: FastAPI):
     logger.info("[HawaAI] Add-on stopped")
 
 
-app = FastAPI(title="HawaAI API", version="1.1.13", lifespan=lifespan)
+app = FastAPI(title="HawaAI API", version="1.1.14", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -104,12 +104,11 @@ async def reload_config():
 @app.get("/api/status")
 async def get_status():
     """
-    Called by Dashboard every 10 seconds. Reads LIVE data from HA.
+    Called by Dashboard every 5 seconds. Single source of truth for all UI state.
 
-    AC state truth priority:
-      1. HA climate entity (if configured)
-      2. Live power sensor > 50 W
-      3. Logic engine internal flag
+    AC state rule (v1.1.13+):
+      ac_on = logic_engine._ac_is_on (internal flag, set only by Broadlink IR commands)
+      Climate entity is NEVER used to determine ac_on — display only.
     """
     cfg     = config_manager.load_config()
     runtime = logic_engine.get_runtime_state()
@@ -131,50 +130,53 @@ async def get_status():
     energy_watts = safe_float(energy_power_raw)
     energy_kwh   = safe_float(energy_kwh_raw)
 
-    # Read live climate entity data (the real AC state source of truth)
+    # AC state = internal flag ONLY. Never override with climate entity or power.
+    # This mirrors the logic_engine architecture: Broadlink IR commands set the flag.
+    ac_on = runtime["ac_is_on"]
+
+    # Climate entity — display data only (temp, mode, fan, swing for ClimateCard)
     climate_entity = cfg.get("climate_entity", "")
     climate_data: dict = {}
     if climate_entity:
         climate_data = await ha_client.get_climate_state(climate_entity)
 
-    # Determine ac_on from best available source.
-    # Climate entity is always the source of truth when configured —
-    # power sensor is used ONLY for energy/cost calculations, not for state.
-    if climate_entity:
-        ac_on = climate_data.get("is_on", False)
-    else:
-        ac_from_power = energy_watts is not None and energy_watts > 50.0
-        ac_on = runtime["ac_is_on"] or ac_from_power
+    # Indoor temp: prefer dedicated sensor; fall back to climate entity thermistor
+    indoor_temp = safe_float(indoor_temp_raw)
+    if indoor_temp is None and climate_data:
+        indoor_temp = climate_data.get("current_temp")
 
     return {
-        # ── Core state ───────────────────────────────────────────────────────
-        "ac_on":          ac_on,
-        "indoor_temp":    safe_float(indoor_temp_raw),
-        "outdoor_temp":   weather.get("temp")      if weather else None,
-        "outdoor_humidity": weather.get("humidity") if weather else None,
-        "presence":       is_occupied,
-        # ── Energy ───────────────────────────────────────────────────────────
-        "watt_draw":      energy_watts or 0.0,
-        "energy_watts":   energy_watts,
+        # ── Core state (always from internal engine flag) ─────────────────────
+        "ac_on":            ac_on,
+        "indoor_temp":      indoor_temp,
+        "outdoor_temp":     weather.get("temp")      if weather else None,
+        "outdoor_humidity": weather.get("humidity")  if weather else None,
+        "presence":         is_occupied,
+        # ── Energy (from power sensor — display only, not used for ac_on) ──────
+        "watt_draw":        energy_watts or 0.0,
+        "energy_watts":     energy_watts,
         "energy_kwh_total": energy_kwh,
-        # ── Session ──────────────────────────────────────────────────────────
-        "session_kwh":    runtime.get("session_start_kwh"),   # kWh at session start
-        "session_id":     runtime["session_id"],
-        "session_start":  runtime["session_start_time"],
-        # ── Config ───────────────────────────────────────────────────────────
-        "last_action":    "none",
-        "manual_override": cfg.get("manual_override", False),
-        "config_complete": bool(
+        # ── Session ───────────────────────────────────────────────────────────
+        "session_kwh":      runtime.get("session_start_kwh"),
+        "session_id":       runtime["session_id"],
+        "session_start":    runtime["session_start_time"],
+        # ── Engine diagnostics ────────────────────────────────────────────────
+        "cooldown_active":  runtime.get("cooldown_active", False),
+        "last_command":     runtime.get("last_command"),
+        "secs_since_cmd":   runtime.get("secs_since_cmd"),
+        # ── Config ────────────────────────────────────────────────────────────
+        "manual_override":  cfg.get("manual_override", False),
+        "config_complete":  bool(
             cfg.get("presence_entity") and cfg.get("indoor_temp_entity")
         ),
-        "target_temp":    cfg.get("target_temp", 24),
-        "climate_entity": climate_entity,
-        # ── Live AC climate data (real state from climate entity) ─────────────
-        "ac_current_temp": climate_data.get("current_temp"),
-        "ac_target_temp":  climate_data.get("target_temp"),
-        "ac_mode":         climate_data.get("mode"),
-        "ac_fan_mode":     climate_data.get("fan_mode"),
-        "ac_swing_mode":   climate_data.get("swing_mode"),
+        "target_temp":      cfg.get("target_temp", 24),
+        "climate_entity":   climate_entity,
+        # ── Climate display data (read-only, not used for ac_on) ──────────────
+        "ac_current_temp":  climate_data.get("current_temp"),
+        "ac_target_temp":   climate_data.get("target_temp"),
+        "ac_mode":          climate_data.get("mode"),
+        "ac_fan_mode":      climate_data.get("fan_mode"),
+        "ac_swing_mode":    climate_data.get("swing_mode"),
     }
 
 
