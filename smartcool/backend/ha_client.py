@@ -102,32 +102,76 @@ async def turn_off_ac(switch_entity: str) -> bool:
     return await call_service(domain, "turn_off", {"entity_id": switch_entity})
 
 
-async def send_broadlink_command(remote_entity: str, command: str) -> bool:
+async def send_broadlink_command(remote_entity: str, command: str, device_name: str = "") -> bool:
     """
     Send a learned IR command via Broadlink RM device.
 
     CRITICAL:
       - 'command' must be a LIST — plain string is silently ignored by HA.
-      - Do NOT include a 'device' field — Broadlink RM rejects it with HTTP 500.
+      - 'device' must match the device name used when the command was learned.
+        Without it, HA searches at root level → not found → HTTP 500.
+        Omit only if commands were learned at root (no device name).
     """
     if not remote_entity or not command:
         logger.error("[HawaAI] send_broadlink_command: missing entity=%r or command=%r", remote_entity, command)
         return False
 
-    payload = {
+    payload: Dict[str, Any] = {
         "entity_id": remote_entity,
-        "command": [command],   # must be a list — DO NOT add "device" key
+        "command": [command],   # must be a list
         "num_repeats": 1,
         "delay_secs": 0.4,
     }
+    if device_name:
+        payload["device"] = device_name   # required when commands were learned under a device name
 
-    logger.info("[HawaAI] Sending IR: entity=%s command=%s", remote_entity, command)
+    logger.info(
+        "[HawaAI] IR send: entity=%s device=%s command=%s",
+        remote_entity, device_name or "none", command,
+    )
     success = await call_service("remote", "send_command", payload)
     if success:
-        logger.info("[HawaAI] IR command '%s' sent successfully", command)
+        logger.info("[HawaAI] IR '%s' sent OK", command)
     else:
-        logger.error("[HawaAI] IR command '%s' FAILED — check HA logs for details", command)
+        logger.error(
+            "[HawaAI] IR '%s' FAILED — verify device name '%s' matches what was used during learning",
+            command, device_name,
+        )
     return success
+
+
+async def get_device_registry() -> List[Dict[str, Any]]:
+    """Returns all HA devices from the device registry."""
+    url = f"{HA_BASE_URL}/api/config/device_registry/list"
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(
+                url, headers=_headers(), timeout=aiohttp.ClientTimeout(total=10)
+            ) as resp:
+                if resp.status == 200:
+                    return await resp.json()
+                logger.error("[HawaAI] get_device_registry HTTP %s", resp.status)
+                return []
+    except Exception as e:
+        logger.error("[HawaAI] get_device_registry exception: %s", e)
+        return []
+
+
+async def get_entity_registry() -> List[Dict[str, Any]]:
+    """Returns all HA entity registry entries (includes device_id per entity)."""
+    url = f"{HA_BASE_URL}/api/config/entity_registry/list"
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(
+                url, headers=_headers(), timeout=aiohttp.ClientTimeout(total=10)
+            ) as resp:
+                if resp.status == 200:
+                    return await resp.json()
+                logger.error("[HawaAI] get_entity_registry HTTP %s", resp.status)
+                return []
+    except Exception as e:
+        logger.error("[HawaAI] get_entity_registry exception: %s", e)
+        return []
 
 
 async def publish_sensor_state(

@@ -164,11 +164,15 @@ export default function Dashboard() {
                     {status.energy_watts.toFixed(0)} W
                   </span>
                   <span className="text-xs text-gray-500">Room total consumption</span>
-                  {status.session_start && status.energy_kwh != null && (
-                    <span className="text-sm text-gray-400 mt-1">
-                      Session: tracking kWh…
+                  {status.energy_kwh_total != null && (
+                    <span className="text-xs text-gray-400 mt-1">
+                      Meter: {status.energy_kwh_total.toFixed(2)} kWh
                     </span>
                   )}
+                  {status.session_start
+                    ? <span className="text-xs text-blue-400 mt-1">Session: tracking kWh…</span>
+                    : <span className="text-xs text-gray-600">No active session</span>
+                  }
                 </>
               ) : (
                 <>

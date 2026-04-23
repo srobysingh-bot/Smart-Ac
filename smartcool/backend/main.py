@@ -24,6 +24,7 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+import aiohttp
 from fastapi import Body, FastAPI, HTTPException, Query, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, HTMLResponse, Response
@@ -50,7 +51,7 @@ async def lifespan(app: FastAPI):
     logger.info("[HawaAI] Add-on stopped")
 
 
-app = FastAPI(title="HawaAI API", version="1.1.2", lifespan=lifespan)
+app = FastAPI(title="HawaAI API", version="1.1.3", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -133,9 +134,9 @@ async def get_status():
         "outdoor_temp": weather.get("temp") if weather else None,
         "outdoor_humidity": weather.get("humidity") if weather else None,
         "presence": is_occupied,
-        "watt_draw": energy_watts or 0.0,     # kept for LiveStatusBar in Dashboard
+        "watt_draw": energy_watts or 0.0,       # kept for LiveStatusBar in Dashboard
         "energy_watts": energy_watts,          # live power reading (Watts)
-        "energy_kwh": energy_kwh,              # cumulative kWh reading
+        "energy_kwh_total": energy_kwh,        # cumulative kWh meter reading
         "session_kwh": runtime.get("session_kwh"),
         "session_id": runtime["session_id"],
         "session_start": runtime["session_start_time"],
@@ -214,6 +215,64 @@ async def list_entities(filter: Optional[str] = None, domain: Optional[str] = No
             "state": e.get("state"),
         })
     result.sort(key=lambda x: x["entity_id"])
+    return result
+
+
+# ── HA DEVICE REGISTRY ────────────────────────────────────────────────────────
+
+@app.get("/api/devices")
+async def get_devices():
+    """
+    Returns all HA devices from the device registry, sorted by name.
+    Used by Settings Energy section so user can pick their circuit breaker / plug.
+    """
+    devices = await ha_client.get_device_registry()
+    result = [
+        {
+            "device_id":    d.get("id", ""),
+            "name":         d.get("name_by_user") or d.get("name") or "",
+            "manufacturer": d.get("manufacturer") or "",
+            "model":        d.get("model") or "",
+        }
+        for d in devices
+        if d.get("id")
+    ]
+    result.sort(key=lambda d: d["name"].lower())
+    return result
+
+
+@app.get("/api/devices/{device_id}/entities")
+async def get_device_entities(device_id: str):
+    """
+    Returns all sensor entities that belong to a specific HA device.
+    Queries the entity registry for device_id match, then enriches with live state.
+    """
+    # Get entity registry to find which entities belong to this device
+    registry = await ha_client.get_entity_registry()
+    device_entity_ids = {
+        r["entity_id"]
+        for r in registry
+        if r.get("device_id") == device_id
+    }
+
+    if not device_entity_ids:
+        return []
+
+    # Enrich with live states
+    all_states = await ha_client.get_all_entities()
+    state_map = {e.get("entity_id"): e for e in all_states}
+
+    result = []
+    for eid in sorted(device_entity_ids):
+        state_obj = state_map.get(eid, {})
+        attrs = state_obj.get("attributes", {})
+        result.append({
+            "entity_id":     eid,
+            "friendly_name": attrs.get("friendly_name", eid),
+            "domain":        eid.split(".")[0] if "." in eid else "",
+            "unit":          attrs.get("unit_of_measurement", ""),
+            "state":         state_obj.get("state"),
+        })
     return result
 
 

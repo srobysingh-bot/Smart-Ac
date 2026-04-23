@@ -15,6 +15,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "energy_power_entity": "",   # live watts sensor  (e.g. sensor.study_sensor_power)
     "energy_kwh_entity": "",     # cumulative kWh sensor (e.g. sensor.study_sensor_power_usage)
     "broadlink_entity": "",
+    "ir_device_name": "",  # device name typed when learning commands in HA (e.g. "studyac")
     "ir_command_on": "",   # exact name of the Broadlink learned command for AC power on
     "ir_command_off": "",  # exact name of the Broadlink learned command for AC power off
     "ac_brand": "",

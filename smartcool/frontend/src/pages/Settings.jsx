@@ -190,9 +190,12 @@ export default function Settings() {
   const [energyKwhSearch,   setEnergyKwhSearch]   = useState('')
   const [broadlinkSearch,   setBroadlinkSearch]   = useState('')
 
-  // Energy auto-detect
-  const [deviceNameInput,  setDeviceNameInput]  = useState('')
-  const [autoDetectResult, setAutoDetectResult] = useState(null)  // null | { power, kwh, notFound }
+  // Energy device registry selector
+  const [allDevices,      setAllDevices]      = useState([])
+  const [deviceSearch,    setDeviceSearch]    = useState('')
+  const [selectedDevice,  setSelectedDevice]  = useState(null)   // { device_id, name, ... }
+  const [deviceEntities,  setDeviceEntities]  = useState([])     // entities from selected device
+  const [loadingEntities, setLoadingEntities] = useState(false)
 
   useEffect(() => {
     Promise.all([getConfig(), getEntities()])
@@ -204,6 +207,12 @@ export default function Settings() {
       })
       .catch(console.error)
       .finally(() => setLoading(false))
+
+    // Load HA device registry for energy device selector
+    fetch('/api/devices')
+      .then(r => r.json())
+      .then(setAllDevices)
+      .catch(() => {})
   }, [])
 
   const patch = useCallback((key, val) => {
@@ -262,34 +271,41 @@ export default function Settings() {
     )
   })
 
-  const findEntities = () => {
-    const keyword = deviceNameInput.toLowerCase().trim()
-    if (!keyword) return
+  const onDeviceSelect = async (device) => {
+    setSelectedDevice(device)
+    setDeviceEntities([])
+    if (!device) return
 
-    const matching = entities.filter(
-      e => e.entity_id.startsWith('sensor.') && e.entity_id.toLowerCase().includes(keyword)
-    )
+    setLoadingEntities(true)
+    try {
+      const res = await fetch(`/api/devices/${device.device_id}/entities`)
+      const devEnts = await res.json()
+      setDeviceEntities(devEnts)
 
-    const powerEntity = matching.find(e => {
-      const id = e.entity_id.toLowerCase()
-      return (id.includes('power') || id.includes('watt')) &&
-             !id.includes('usage') && !id.includes('total') && !id.includes('kwh')
-    })
+      // Auto-detect power (watts) entity
+      const powerEnt = devEnts.find(e => {
+        const id   = e.entity_id.toLowerCase()
+        const unit = (e.unit || '').toLowerCase()
+        return unit === 'w' || unit === 'watt' || unit === 'watts' ||
+               (id.includes('power') && !id.includes('usage') &&
+                !id.includes('total') && !id.includes('kwh'))
+      })
 
-    const kwhEntity = matching.find(e => {
-      const id = e.entity_id.toLowerCase()
-      return id.includes('power_usage') || id.includes('energy') ||
-             id.includes('kwh') || (id.includes('total') && !id.includes('voltage'))
-    })
+      // Auto-detect kWh entity
+      const kwhEnt = devEnts.find(e => {
+        const id   = e.entity_id.toLowerCase()
+        const unit = (e.unit || '').toLowerCase()
+        return unit === 'kwh' || id.includes('kwh') || id.includes('power_usage') ||
+               id.includes('energy') ||
+               (id.includes('total') && !id.includes('voltage') && !id.includes('current'))
+      })
 
-    if (powerEntity) patch('energy_power_entity', powerEntity.entity_id)
-    if (kwhEntity)   patch('energy_kwh_entity',   kwhEntity.entity_id)
-
-    setAutoDetectResult(
-      (powerEntity || kwhEntity)
-        ? { power: powerEntity || null, kwh: kwhEntity || null, notFound: false }
-        : { power: null, kwh: null, notFound: true }
-    )
+      if (powerEnt) patch('energy_power_entity', powerEnt.entity_id)
+      if (kwhEnt)   patch('energy_kwh_entity',   kwhEnt.entity_id)
+    } catch (err) {
+      console.error('[HawaAI] Failed to load device entities:', err)
+    }
+    setLoadingEntities(false)
   }
 
   if (loading) {
@@ -356,56 +372,73 @@ export default function Settings() {
         <div className="border border-gray-800 rounded-xl p-4 space-y-4">
           <p className="text-xs font-semibold uppercase tracking-widest text-gray-400">Energy Monitoring</p>
 
-          {/* Auto-detect row */}
+          {/* Step 1 — pick device from registry */}
           <div>
-            <Label>Circuit Breaker / Smart Plug Device Name</Label>
-            <div className="flex gap-2">
-              <input
-                type="text"
-                placeholder='e.g. study, energy, breaker'
-                value={deviceNameInput}
-                onChange={e => { setDeviceNameInput(e.target.value); setAutoDetectResult(null) }}
-                className="flex-1 bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm text-gray-100 focus:outline-none focus:border-blue-500"
-              />
-              <button
-                type="button"
-                onClick={findEntities}
-                className="px-4 py-2 bg-blue-700 hover:bg-blue-600 rounded-lg text-sm font-medium text-white transition-colors whitespace-nowrap"
-              >
-                Find Entities
-              </button>
-            </div>
+            <Label>Select Energy Device</Label>
+            <input
+              type="text"
+              placeholder="Type to search devices…"
+              value={deviceSearch}
+              onChange={e => setDeviceSearch(e.target.value)}
+              className="w-full mb-2 bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm text-gray-100 focus:outline-none focus:border-blue-500"
+            />
+            <select
+              className="w-full bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm text-gray-100 focus:outline-none focus:border-blue-500"
+              value={selectedDevice?.device_id || ''}
+              onChange={e => {
+                const dev = allDevices.find(d => d.device_id === e.target.value) || null
+                setDeviceSearch('')
+                onDeviceSelect(dev)
+              }}
+            >
+              <option value="">— Select your circuit breaker / smart plug —</option>
+              {allDevices
+                .filter(d => {
+                  if (!deviceSearch) return true
+                  const q = deviceSearch.toLowerCase()
+                  return d.name.toLowerCase().includes(q) ||
+                         d.manufacturer.toLowerCase().includes(q) ||
+                         d.model.toLowerCase().includes(q)
+                })
+                .map(d => (
+                  <option key={d.device_id} value={d.device_id}>
+                    {d.name}{d.manufacturer ? ` · ${d.manufacturer}` : ''}{d.model ? ` ${d.model}` : ''}
+                  </option>
+                ))
+              }
+            </select>
             <p className="text-xs text-gray-500 mt-1">
-              Type part of your device name and click Find — we&apos;ll auto-select the power and kWh sensors.
+              Select your energy monitoring device — entities are auto-detected from it.
             </p>
           </div>
 
-          {/* Auto-detect result */}
-          {autoDetectResult && !autoDetectResult.notFound && (
-            <div className="px-3 py-2 bg-green-900/30 border border-green-700 rounded-lg text-xs text-green-300 space-y-1">
-              <div className="font-semibold">Found:</div>
-              {autoDetectResult.power && (
-                <div>Power: <span className="font-mono">{autoDetectResult.power.entity_id}</span> (Live watts)</div>
-              )}
-              {autoDetectResult.kwh && (
-                <div>Usage: <span className="font-mono">{autoDetectResult.kwh.entity_id}</span> (kWh total)</div>
-              )}
-              {!autoDetectResult.power && (
-                <div className="text-yellow-300">Power sensor not found — select manually below</div>
-              )}
-              {!autoDetectResult.kwh && (
-                <div className="text-yellow-300">kWh sensor not found — select manually below</div>
-              )}
+          {/* Step 2 — show entities from selected device */}
+          {loadingEntities && (
+            <p className="text-xs text-gray-400">Loading entities from device…</p>
+          )}
+
+          {selectedDevice && !loadingEntities && deviceEntities.length > 0 && (
+            <div className="px-3 py-3 bg-green-900/20 border border-green-800 rounded-lg text-xs space-y-2">
+              <div className="text-green-300 font-semibold">
+                Found {deviceEntities.length} entities from &quot;{selectedDevice.name}&quot;:
+              </div>
+              {deviceEntities.map(e => (
+                <div key={e.entity_id} className="flex justify-between text-gray-300">
+                  <span className="font-mono">{e.entity_id}</span>
+                  <span className="text-gray-500">{e.state} {e.unit}</span>
+                </div>
+              ))}
             </div>
           )}
-          {autoDetectResult?.notFound && (
+
+          {selectedDevice && !loadingEntities && deviceEntities.length === 0 && (
             <div className="px-3 py-2 bg-orange-900/30 border border-orange-700 rounded-lg text-xs text-orange-300">
-              No matching entities found for &quot;{deviceNameInput}&quot; — select manually below.
+              No entities found for this device — select manually below.
             </div>
           )}
 
           {/* Divider */}
-          <p className="text-xs text-gray-600 text-center">— or manually select —</p>
+          <p className="text-xs text-gray-600 text-center">— confirm or manually override —</p>
 
           {/* Live Power (Watts) */}
           <div>
@@ -462,22 +495,41 @@ export default function Settings() {
       <div className="card space-y-4">
         <SectionHeader>IR Command Mapping</SectionHeader>
         <p className="text-xs text-gray-500 -mt-2">
-          Enter the exact command names you saved when teaching the Broadlink remote.
-          To find them: HA → Developer Tools → States → find your remote entity → look at <code className="bg-gray-800 px-1 rounded">command_list</code> attribute.
+          These must exactly match what you entered when learning commands in
+          HA → Developer Tools → Actions → <code className="bg-gray-800 px-1 rounded">remote.learn_command</code>.
         </p>
+
+        <Input
+          label="Broadlink Device Name"
+          value={cfg.ir_device_name}
+          onChange={v => patch('ir_device_name', v)}
+          placeholder='e.g. studyac'
+        />
+        <p className="text-xs text-gray-500 -mt-3">
+          The device name you entered when learning commands (e.g. <code className="bg-gray-800 px-1 rounded">studyac</code>).
+          Without this, HA returns HTTP 500. Leave blank only if you learned commands at root level.
+        </p>
+
         <Input
           label="Power ON command name"
           value={cfg.ir_command_on}
           onChange={v => patch('ir_command_on', v)}
-          placeholder='e.g. power  or  ac_on  or  cool_24'
+          placeholder='e.g. turn_on'
         />
         <Input
           label="Power OFF command name"
           value={cfg.ir_command_off}
           onChange={v => patch('ir_command_off', v)}
-          placeholder='e.g. power  or  ac_off'
+          placeholder='e.g. turn_off'
         />
-        {(!cfg.ir_command_on || !cfg.ir_command_off) && (
+
+        {!cfg.ir_device_name && (
+          <div className="flex items-start gap-2 px-3 py-2 bg-yellow-900/30 border border-yellow-700 rounded-lg text-xs text-yellow-300">
+            <span className="shrink-0">⚠</span>
+            <span>Broadlink device name is empty — commands will fail with HTTP 500 if they were learned under a device name.</span>
+          </div>
+        )}
+        {cfg.ir_device_name && (!cfg.ir_command_on || !cfg.ir_command_off) && (
           <div className="flex items-start gap-2 px-3 py-2 bg-yellow-900/30 border border-yellow-700 rounded-lg text-xs text-yellow-300">
             <span className="shrink-0">⚠</span>
             <span>IR command names are empty — AC will not turn on/off automatically until these are filled in.</span>

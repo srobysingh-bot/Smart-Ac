@@ -184,7 +184,8 @@ async def _turn_ac_on(cfg: dict, indoor_temp: float) -> None:
     global _ac_is_on, _session_start_time, _session_start_temp, _session_start_kwh
 
     broadlink_entity = (cfg.get("broadlink_entity") or "").strip()
-    cmd_on = (cfg.get("ir_command_on") or "").strip()
+    cmd_on           = (cfg.get("ir_command_on") or "").strip()
+    ir_device_name   = (cfg.get("ir_device_name") or "").strip()
 
     if not broadlink_entity:
         logger.error("[HawaAI] No Broadlink entity configured — cannot turn AC ON")
@@ -198,7 +199,7 @@ async def _turn_ac_on(cfg: dict, indoor_temp: float) -> None:
         return  # do NOT mark ON
 
     # Send command — only proceed if it succeeds
-    success = await ha_client.send_broadlink_command(broadlink_entity, cmd_on)
+    success = await ha_client.send_broadlink_command(broadlink_entity, cmd_on, ir_device_name)
     if not success:
         logger.error("[HawaAI] AC ON command failed — NOT marking as ON, will retry next tick")
         return  # do NOT mark ON, do NOT start session
@@ -243,10 +244,11 @@ async def _turn_ac_off(cfg: dict, indoor_temp: float, reason: str) -> None:
     global _ac_is_on, _session_start_time, _session_start_temp, _session_start_kwh
 
     broadlink_entity = (cfg.get("broadlink_entity") or "").strip()
-    cmd_off = (cfg.get("ir_command_off") or "").strip()
+    cmd_off          = (cfg.get("ir_command_off") or "").strip()
+    ir_device_name   = (cfg.get("ir_device_name") or "").strip()
 
     if broadlink_entity and cmd_off:
-        ir_ok = await ha_client.send_broadlink_command(broadlink_entity, cmd_off)
+        ir_ok = await ha_client.send_broadlink_command(broadlink_entity, cmd_off, ir_device_name)
         if not ir_ok:
             logger.error(
                 "[HawaAI] AC OFF IR command '%s' failed — marking OFF anyway to avoid retry loop",
