@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useState } from 'react'
-import { getConfig, getEntities, patchConfig } from '../api/smartcool.js'
+import { getConfig, getEntities, getDevices, getDeviceEntities, patchConfig } from '../api/smartcool.js'
 import { Save, RefreshCw, AlertCircle, CheckCircle2, Eye, EyeOff } from 'lucide-react'
 
 // ── Reusable field components ─────────────────────────────────────────────────
@@ -192,9 +192,11 @@ export default function Settings() {
 
   // Energy device registry selector
   const [allDevices,      setAllDevices]      = useState([])
+  const [devicesError,    setDevicesError]    = useState(null)   // string | null
   const [deviceSearch,    setDeviceSearch]    = useState('')
   const [selectedDevice,  setSelectedDevice]  = useState(null)   // { device_id, name, ... }
   const [deviceEntities,  setDeviceEntities]  = useState([])     // entities from selected device
+  const [entitiesError,   setEntitiesError]   = useState(null)   // string | null
   const [loadingEntities, setLoadingEntities] = useState(false)
 
   useEffect(() => {
@@ -209,10 +211,9 @@ export default function Settings() {
       .finally(() => setLoading(false))
 
     // Load HA device registry for energy device selector
-    fetch('/api/devices')
-      .then(r => r.json())
+    getDevices()
       .then(setAllDevices)
-      .catch(() => {})
+      .catch(err => setDevicesError(String(err)))
   }, [])
 
   const patch = useCallback((key, val) => {
@@ -274,15 +275,15 @@ export default function Settings() {
   const onDeviceSelect = async (device) => {
     setSelectedDevice(device)
     setDeviceEntities([])
+    setEntitiesError(null)
     if (!device) return
 
     setLoadingEntities(true)
     try {
-      const res = await fetch(`/api/devices/${device.device_id}/entities`)
-      const devEnts = await res.json()
+      const devEnts = await getDeviceEntities(device.device_id)
       setDeviceEntities(devEnts)
 
-      // Auto-detect power (watts) entity
+      // Auto-detect power (watts) entity — match by unit first, then by entity_id pattern
       const powerEnt = devEnts.find(e => {
         const id   = e.entity_id.toLowerCase()
         const unit = (e.unit || '').toLowerCase()
@@ -291,7 +292,7 @@ export default function Settings() {
                 !id.includes('total') && !id.includes('kwh'))
       })
 
-      // Auto-detect kWh entity
+      // Auto-detect kWh entity — match by unit first, then by entity_id pattern
       const kwhEnt = devEnts.find(e => {
         const id   = e.entity_id.toLowerCase()
         const unit = (e.unit || '').toLowerCase()
@@ -303,7 +304,7 @@ export default function Settings() {
       if (powerEnt) patch('energy_power_entity', powerEnt.entity_id)
       if (kwhEnt)   patch('energy_kwh_entity',   kwhEnt.entity_id)
     } catch (err) {
-      console.error('[HawaAI] Failed to load device entities:', err)
+      setEntitiesError(`Failed to load device entities: ${err.message || err}`)
     }
     setLoadingEntities(false)
   }
@@ -382,31 +383,42 @@ export default function Settings() {
               onChange={e => setDeviceSearch(e.target.value)}
               className="w-full mb-2 bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm text-gray-100 focus:outline-none focus:border-blue-500"
             />
-            <select
-              className="w-full bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm text-gray-100 focus:outline-none focus:border-blue-500"
-              value={selectedDevice?.device_id || ''}
-              onChange={e => {
-                const dev = allDevices.find(d => d.device_id === e.target.value) || null
-                setDeviceSearch('')
-                onDeviceSelect(dev)
-              }}
-            >
-              <option value="">— Select your circuit breaker / smart plug —</option>
-              {allDevices
-                .filter(d => {
-                  if (!deviceSearch) return true
-                  const q = deviceSearch.toLowerCase()
-                  return d.name.toLowerCase().includes(q) ||
-                         d.manufacturer.toLowerCase().includes(q) ||
-                         d.model.toLowerCase().includes(q)
-                })
-                .map(d => (
-                  <option key={d.device_id} value={d.device_id}>
-                    {d.name}{d.manufacturer ? ` · ${d.manufacturer}` : ''}{d.model ? ` ${d.model}` : ''}
-                  </option>
-                ))
-              }
-            </select>
+            {devicesError ? (
+              <div className="flex items-start gap-2 px-3 py-2 bg-red-900/30 border border-red-700 rounded-lg text-xs text-red-300">
+                <AlertCircle size={13} className="shrink-0 mt-0.5" />
+                <span>Could not load HA devices: {devicesError}</span>
+              </div>
+            ) : (
+              <select
+                className="w-full bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm text-gray-100 focus:outline-none focus:border-blue-500"
+                value={selectedDevice?.device_id || ''}
+                onChange={e => {
+                  const dev = allDevices.find(d => d.device_id === e.target.value) || null
+                  setDeviceSearch('')
+                  onDeviceSelect(dev)
+                }}
+              >
+                <option value="">
+                  {allDevices.length === 0
+                    ? '— Loading devices… —'
+                    : '— Select your circuit breaker / smart plug —'}
+                </option>
+                {allDevices
+                  .filter(d => {
+                    if (!deviceSearch) return true
+                    const q = deviceSearch.toLowerCase()
+                    return d.name.toLowerCase().includes(q) ||
+                           d.manufacturer.toLowerCase().includes(q) ||
+                           d.model.toLowerCase().includes(q)
+                  })
+                  .map(d => (
+                    <option key={d.device_id} value={d.device_id}>
+                      {d.name}{d.manufacturer ? ` · ${d.manufacturer}` : ''}{d.model ? ` ${d.model}` : ''}
+                    </option>
+                  ))
+                }
+              </select>
+            )}
             <p className="text-xs text-gray-500 mt-1">
               Select your energy monitoring device — entities are auto-detected from it.
             </p>
@@ -414,10 +426,17 @@ export default function Settings() {
 
           {/* Step 2 — show entities from selected device */}
           {loadingEntities && (
-            <p className="text-xs text-gray-400">Loading entities from device…</p>
+            <p className="text-xs text-gray-400 animate-pulse">Loading entities from device…</p>
           )}
 
-          {selectedDevice && !loadingEntities && deviceEntities.length > 0 && (
+          {entitiesError && (
+            <div className="flex items-start gap-2 px-3 py-2 bg-red-900/30 border border-red-700 rounded-lg text-xs text-red-300">
+              <AlertCircle size={13} className="shrink-0 mt-0.5" />
+              <span>{entitiesError}</span>
+            </div>
+          )}
+
+          {selectedDevice && !loadingEntities && !entitiesError && deviceEntities.length > 0 && (
             <div className="px-3 py-3 bg-green-900/20 border border-green-800 rounded-lg text-xs space-y-2">
               <div className="text-green-300 font-semibold">
                 Found {deviceEntities.length} entities from &quot;{selectedDevice.name}&quot;:
@@ -425,13 +444,13 @@ export default function Settings() {
               {deviceEntities.map(e => (
                 <div key={e.entity_id} className="flex justify-between text-gray-300">
                   <span className="font-mono">{e.entity_id}</span>
-                  <span className="text-gray-500">{e.state} {e.unit}</span>
+                  <span className="text-gray-500">{e.state}{e.unit ? ` ${e.unit}` : ''}</span>
                 </div>
               ))}
             </div>
           )}
 
-          {selectedDevice && !loadingEntities && deviceEntities.length === 0 && (
+          {selectedDevice && !loadingEntities && !entitiesError && deviceEntities.length === 0 && (
             <div className="px-3 py-2 bg-orange-900/30 border border-orange-700 rounded-lg text-xs text-orange-300">
               No entities found for this device — select manually below.
             </div>

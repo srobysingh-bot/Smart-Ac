@@ -58,6 +58,10 @@ export const getEntities = (domain) => {
   return request(`/entities${q}`)
 }
 
+// ── HA Device Registry ───────────────────────────────────────────────────────
+export const getDevices = () => request('/devices')
+export const getDeviceEntities = (deviceId) => request(`/devices/${encodeURIComponent(deviceId)}/entities`)
+
 // ── Export ───────────────────────────────────────────────────────────────────
 export async function downloadExport(format = 'csv') {
   const res = await fetch(`${BASE}/export/${format}`)
