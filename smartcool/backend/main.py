@@ -55,7 +55,7 @@ async def lifespan(app: FastAPI):
     logger.info("[HawaAI] Add-on stopped")
 
 
-app = FastAPI(title="HawaAI API", version="1.1.9", lifespan=lifespan)
+app = FastAPI(title="HawaAI API", version="1.1.10", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -137,23 +137,11 @@ async def get_status():
     if climate_entity:
         climate_data = await ha_client.get_climate_state(climate_entity)
 
-    # Determine ac_on from best available source
+    # Determine ac_on from best available source.
+    # Climate entity is always the source of truth when configured —
+    # power sensor is used ONLY for energy/cost calculations, not for state.
     if climate_entity:
-        climate_says_on = climate_data.get("is_on", False)
-
-        # Cross-check: if climate reports ON but the energy sensor reads near 0W,
-        # the AC is almost certainly physically off and the HA entity is just stale.
-        # (Only applied when an energy sensor is configured — 5W threshold because
-        #  the breaker reads the whole room; near-zero means the breaker is off.)
-        if climate_says_on and energy_watts is not None and energy_watts < 5.0:
-            logger.info(
-                "[HawaAI] Climate entity says ON but power is %.0fW — "
-                "treating AC as OFF (energy reading takes precedence)",
-                energy_watts,
-            )
-            ac_on = False
-        else:
-            ac_on = climate_says_on
+        ac_on = climate_data.get("is_on", False)
     else:
         ac_from_power = energy_watts is not None and energy_watts > 50.0
         ac_on = runtime["ac_is_on"] or ac_from_power
