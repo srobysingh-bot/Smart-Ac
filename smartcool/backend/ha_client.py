@@ -85,6 +85,51 @@ async def get_entity_state_full(entity_id: str) -> Optional[Dict[str, Any]]:
         return None
 
 
+async def get_climate_state(entity_id: str) -> Dict[str, Any]:
+    """
+    Fetch live state of a HA climate entity, returning a flat dict ready for
+    the logic engine and API status response.
+
+    Returns {} (empty dict) on error so callers can safely call .get() on it.
+    """
+    full = await get_entity_state_full(entity_id)
+    if not full:
+        return {}
+    attrs  = full.get("attributes", {})
+    state  = full.get("state") or "off"
+    is_on  = state not in ("off", "unavailable", "unknown")
+    return {
+        "state":        state,
+        "current_temp": attrs.get("current_temperature"),
+        "target_temp":  attrs.get("temperature"),
+        "mode":         state,                  # for climate entities state == hvac_mode
+        "fan_mode":     attrs.get("fan_mode"),
+        "swing_mode":   attrs.get("swing_mode"),
+        "is_on":        is_on,
+    }
+
+
+async def set_climate_temperature(
+    entity_id: str, temperature: float, mode: str = "cool"
+) -> bool:
+    """Set AC target temperature via HA climate.set_temperature service."""
+    return await call_service("climate", "set_temperature", {
+        "entity_id":  entity_id,
+        "temperature": temperature,
+        "hvac_mode":   mode,
+    })
+
+
+async def set_climate_mode(entity_id: str, mode: str) -> bool:
+    """Turn AC on/off or switch HVAC mode via HA climate services."""
+    if mode == "off":
+        return await call_service("climate", "turn_off", {"entity_id": entity_id})
+    return await call_service("climate", "set_hvac_mode", {
+        "entity_id": entity_id,
+        "hvac_mode": mode,
+    })
+
+
 async def get_all_entities() -> List[Dict[str, Any]]:
     """Returns all HA entity states — used to populate Settings dropdowns."""
     url = f"{HA_BASE_URL}/api/states"

@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useState } from 'react'
-import { getConfig, getEntities, getDevices, getDeviceEntities, patchConfig } from '../api/smartcool.js'
+import { getConfig, getEntities, getDevices, getDeviceEntities, patchConfig, getStatus } from '../api/smartcool.js'
 import { Save, RefreshCw, AlertCircle, CheckCircle2, Eye, EyeOff } from 'lucide-react'
 
 // ── Reusable field components ─────────────────────────────────────────────────
@@ -182,6 +182,7 @@ export default function Settings() {
   const [saveStatus, setSaveStatus] = useState(null)
   const [saveMsg,    setSaveMsg]    = useState('')
   const [loading,    setLoading]    = useState(true)
+  const [outdoorTemp, setOutdoorTemp] = useState(null)
 
   // Per-dropdown search state (each search is independent)
   const [presenceSearch,    setPresenceSearch]    = useState('')
@@ -215,6 +216,11 @@ export default function Settings() {
     getDevices()
       .then(setAllDevices)
       .catch(err => setDevicesError(String(err)))
+
+    // Fetch outdoor temp for Smart Adjustment preview
+    getStatus()
+      .then(s => setOutdoorTemp(s.outdoor_temp ?? null))
+      .catch(() => {})
   }, [])
 
   const patch = useCallback((key, val) => {
@@ -606,25 +612,51 @@ export default function Settings() {
       {/* Logic Settings */}
       <div className="card space-y-5">
         <SectionHeader>Logic Settings</SectionHeader>
+
         <Slider
           label="Target Temperature"
           value={cfg.target_temp ?? 24}
           onChange={v => patch('target_temp', v)}
           min={16} max={30} step={1} unit="°C"
         />
+        <p className="text-xs text-gray-500 -mt-3">
+          AC turns ON above target + hysteresis, OFF below target − hysteresis.
+        </p>
+
         <Slider
           label="Hysteresis Band"
           value={cfg.hysteresis ?? 1.5}
           onChange={v => patch('hysteresis', v)}
           min={0.5} max={3.0} step={0.5} unit="°C"
         />
+        <p className="text-xs text-gray-500 -mt-3">
+          Larger band = fewer AC cycles. E.g. target 24°C + 1.5° band: ON at 25.5°C, OFF at 22.5°C.
+        </p>
+
         <Slider
           label="Vacancy Timeout"
           value={cfg.vacancy_timeout_minutes ?? 5}
           onChange={v => patch('vacancy_timeout_minutes', v)}
           min={1} max={60} step={1} unit=" min"
         />
-        <div className="space-y-3 pt-2">
+        <p className="text-xs text-gray-500 -mt-3">
+          Minutes room must be empty before AC turns off automatically.
+        </p>
+
+        <Slider
+          label="Logic Check Interval"
+          value={cfg.logic_interval_seconds ?? 60}
+          onChange={v => patch('logic_interval_seconds', v)}
+          min={30} max={300} step={10} unit=" sec"
+        />
+        <p className="text-xs text-gray-500 -mt-3">
+          How often HawaAI checks temperature and presence. Lower = more responsive, higher = lower CPU.
+        </p>
+
+        {/* ── Automation toggles ─────────────────────────────────────────── */}
+        <div className="border-t border-gray-800 pt-4 space-y-3">
+          <p className="text-xs font-semibold uppercase tracking-widest text-gray-400">Automation Toggles</p>
+
           <Toggle
             label="Use Presence Detection"
             description="Turn AC off when room is vacant for the timeout period"
@@ -633,9 +665,15 @@ export default function Settings() {
           />
           <Toggle
             label="Use Outside Temperature Logic"
-            description="Skips cooling when outdoor temp is already comfortable"
+            description="Skips cooling when outdoor temperature is already comfortable"
             checked={cfg.use_outdoor_temp ?? true}
             onChange={v => patch('use_outdoor_temp', v)}
+          />
+          <Toggle
+            label="Smart Temperature Adjustment"
+            description="Raise / lower effective target based on outdoor conditions to save electricity"
+            checked={cfg.smart_temp_adjustment ?? false}
+            onChange={v => patch('smart_temp_adjustment', v)}
           />
           <Toggle
             label="Manual Override"
@@ -645,6 +683,61 @@ export default function Settings() {
             danger
           />
         </div>
+
+        {/* ── Smart Adjustment Preview ───────────────────────────────────── */}
+        {cfg.smart_temp_adjustment && (() => {
+          const t = cfg.target_temp ?? 24
+          const outdoor = outdoorTemp
+          let adj = 0
+          if (outdoor !== null) {
+            if (outdoor < 30) adj = +1
+            else if (outdoor < 35) adj = +0.5
+            else if (outdoor <= 40) adj = 0
+            else adj = -1
+          }
+          const eff = t + adj
+          return (
+            <div className="rounded-xl border border-blue-800 bg-blue-900/20 p-4 space-y-3">
+              <p className="text-xs font-semibold text-blue-300 uppercase tracking-wide">
+                Smart Adjustment Preview
+              </p>
+
+              {outdoor !== null ? (
+                <div className="grid grid-cols-2 gap-y-1 text-xs">
+                  <span className="text-gray-400">Current outdoor</span>
+                  <span className="font-semibold text-gray-200">{outdoor.toFixed(1)}°C</span>
+                  <span className="text-gray-400">Your target</span>
+                  <span className="font-semibold text-gray-200">{t}°C</span>
+                  <span className="text-gray-400">Adjustment</span>
+                  <span className={`font-semibold ${adj > 0 ? 'text-green-400' : adj < 0 ? 'text-orange-400' : 'text-gray-400'}`}>
+                    {adj > 0 ? `+${adj}` : adj}°C
+                    {adj > 0 ? ' (comfortable outside — saving energy)' : adj < 0 ? ' (very hot — cooling harder)' : ' (no change)'}
+                  </span>
+                  <span className="text-gray-400">Effective target</span>
+                  <span className="font-bold text-blue-400 text-sm">{eff}°C</span>
+                </div>
+              ) : (
+                <p className="text-xs text-gray-500">Configure Weather API to see live outdoor temperature.</p>
+              )}
+
+              <table className="w-full text-xs border-collapse">
+                <thead>
+                  <tr className="text-gray-500">
+                    <th className="text-left py-1 font-normal">Outdoor</th>
+                    <th className="text-left py-1 font-normal">Adjustment</th>
+                    <th className="text-left py-1 font-normal">Reason</th>
+                  </tr>
+                </thead>
+                <tbody className="text-gray-300 divide-y divide-gray-800">
+                  <tr><td className="py-1">{'< 30°C'}</td><td className="text-green-400">+1°C</td><td className="text-gray-500">Comfortable outside — save energy</td></tr>
+                  <tr><td className="py-1">30–35°C</td><td className="text-green-400">+0.5°C</td><td className="text-gray-500">Warm — slight relaxation</td></tr>
+                  <tr><td className="py-1">35–40°C</td><td className="text-gray-400">0°C</td><td className="text-gray-500">Hot — no change</td></tr>
+                  <tr><td className="py-1">{'> 40°C'}</td><td className="text-orange-400">−1°C</td><td className="text-gray-500">Very hot — cool more aggressively</td></tr>
+                </tbody>
+              </table>
+            </div>
+          )
+        })()}
       </div>
 
       {/* Weather API */}
@@ -705,23 +798,6 @@ export default function Settings() {
         </div>
       </div>
 
-      {/* Advanced */}
-      <div className="card space-y-4">
-        <SectionHeader>Advanced</SectionHeader>
-        <Input
-          label="Logic Interval (seconds)"
-          value={cfg.logic_interval_seconds ?? 60}
-          onChange={v => patch('logic_interval_seconds', v)}
-          type="number"
-          min={10}
-          max={300}
-          step={10}
-          placeholder="60"
-        />
-        <p className="text-xs text-gray-500">
-          How often the decision engine checks sensors. Lower = more responsive, higher = lower CPU.
-        </p>
-      </div>
     </div>
   )
 }

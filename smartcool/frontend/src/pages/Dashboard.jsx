@@ -342,6 +342,12 @@ export default function Dashboard() {
             sessionStart={status?.session_start}
             wattDraw={status?.watt_draw}
             sessionKwh={status?.session_kwh}
+            hasClimateEntity={!!status?.climate_entity}
+            acCurrentTemp={status?.ac_current_temp}
+            acTargetTemp={status?.ac_target_temp}
+            acMode={status?.ac_mode}
+            acFanMode={status?.ac_fan_mode}
+            acSwingMode={status?.ac_swing_mode}
           />
           <div className="card flex flex-col gap-3">
             <p className="text-xs text-gray-500 uppercase tracking-wide">Energy Now</p>

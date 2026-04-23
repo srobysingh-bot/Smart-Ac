@@ -27,6 +27,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "vacancy_timeout_minutes": 5,
     "use_presence": True,
     "use_outdoor_temp": True,
+    "smart_temp_adjustment": False,  # raise/lower effective target based on outdoor temp
     "manual_override": False,
     "weather_api_key": "",
     "weather_city": "",

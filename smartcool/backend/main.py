@@ -55,7 +55,7 @@ async def lifespan(app: FastAPI):
     logger.info("[HawaAI] Add-on stopped")
 
 
-app = FastAPI(title="HawaAI API", version="1.1.6", lifespan=lifespan)
+app = FastAPI(title="HawaAI API", version="1.1.7", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -103,19 +103,24 @@ async def reload_config():
 
 @app.get("/api/status")
 async def get_status():
-    """Called by Dashboard every 10 seconds. Reads LIVE data from HA."""
-    cfg = config_manager.load_config()
+    """
+    Called by Dashboard every 10 seconds. Reads LIVE data from HA.
+
+    AC state truth priority:
+      1. HA climate entity (if configured)
+      2. Live power sensor > 50 W
+      3. Logic engine internal flag
+    """
+    cfg     = config_manager.load_config()
     runtime = logic_engine.get_runtime_state()
 
-    indoor_temp_raw   = await ha_client.get_state(cfg.get("indoor_temp_entity", ""))
-    presence_raw      = await ha_client.get_state(cfg.get("presence_entity", ""))
-    energy_power_raw  = await ha_client.get_state(cfg.get("energy_power_entity", ""))
-    energy_kwh_raw    = await ha_client.get_state(cfg.get("energy_kwh_entity", ""))
+    indoor_temp_raw  = await ha_client.get_state(cfg.get("indoor_temp_entity", ""))
+    presence_raw     = await ha_client.get_state(cfg.get("presence_entity", ""))
+    energy_power_raw = await ha_client.get_state(cfg.get("energy_power_entity", ""))
+    energy_kwh_raw   = await ha_client.get_state(cfg.get("energy_kwh_entity", ""))
 
-    # BUG 1 FIX — robust presence parsing (handles FP2, mmWave, device tracker, etc.)
     is_occupied = parse_presence(presence_raw)
-
-    weather = await weather_api.get_cached()
+    weather     = await weather_api.get_cached()
 
     def safe_float(val):
         try:
@@ -126,31 +131,48 @@ async def get_status():
     energy_watts = safe_float(energy_power_raw)
     energy_kwh   = safe_float(energy_kwh_raw)
 
-    # BUG 2 FIX — real AC state = logic engine OR power draw > 50 W
-    # (catches AC turned on by physical remote without going through HawaAI)
-    _POWER_THRESHOLD = 50.0
-    ac_from_power = energy_watts is not None and energy_watts > _POWER_THRESHOLD
-    ac_on = runtime["ac_is_on"] or ac_from_power
+    # Read live climate entity data (the real AC state source of truth)
+    climate_entity = cfg.get("climate_entity", "")
+    climate_data: dict = {}
+    if climate_entity:
+        climate_data = await ha_client.get_climate_state(climate_entity)
+
+    # Determine ac_on from best available source
+    if climate_entity:
+        ac_on = climate_data.get("is_on", runtime["ac_is_on"])
+    else:
+        ac_from_power = energy_watts is not None and energy_watts > 50.0
+        ac_on = runtime["ac_is_on"] or ac_from_power
 
     return {
-        "ac_on": ac_on,
-        "indoor_temp": safe_float(indoor_temp_raw),
-        "outdoor_temp": weather.get("temp") if weather else None,
+        # ── Core state ───────────────────────────────────────────────────────
+        "ac_on":          ac_on,
+        "indoor_temp":    safe_float(indoor_temp_raw),
+        "outdoor_temp":   weather.get("temp")      if weather else None,
         "outdoor_humidity": weather.get("humidity") if weather else None,
-        "presence": is_occupied,
-        "watt_draw": energy_watts or 0.0,       # kept for LiveStatusBar in Dashboard
-        "energy_watts": energy_watts,          # live power reading (Watts)
-        "energy_kwh_total": energy_kwh,        # cumulative kWh meter reading
-        "session_kwh": runtime.get("session_kwh"),
-        "session_id": runtime["session_id"],
-        "session_start": runtime["session_start_time"],
-        "last_action": "none",
+        "presence":       is_occupied,
+        # ── Energy ───────────────────────────────────────────────────────────
+        "watt_draw":      energy_watts or 0.0,
+        "energy_watts":   energy_watts,
+        "energy_kwh_total": energy_kwh,
+        # ── Session ──────────────────────────────────────────────────────────
+        "session_kwh":    runtime.get("session_start_kwh"),   # kWh at session start
+        "session_id":     runtime["session_id"],
+        "session_start":  runtime["session_start_time"],
+        # ── Config ───────────────────────────────────────────────────────────
+        "last_action":    "none",
         "manual_override": cfg.get("manual_override", False),
         "config_complete": bool(
             cfg.get("presence_entity") and cfg.get("indoor_temp_entity")
         ),
-        "target_temp": cfg.get("target_temp", 24),
-        "climate_entity": cfg.get("climate_entity", ""),
+        "target_temp":    cfg.get("target_temp", 24),
+        "climate_entity": climate_entity,
+        # ── Live AC climate data (real state from climate entity) ─────────────
+        "ac_current_temp": climate_data.get("current_temp"),
+        "ac_target_temp":  climate_data.get("target_temp"),
+        "ac_mode":         climate_data.get("mode"),
+        "ac_fan_mode":     climate_data.get("fan_mode"),
+        "ac_swing_mode":   climate_data.get("swing_mode"),
     }
 
 
