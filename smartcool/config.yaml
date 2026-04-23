@@ -1,5 +1,5 @@
 name: HawaAI AC Optimizer
-version: 1.0.9
+version: 1.1.0
 slug: hawaai
 description: AI-powered AC optimization using presence, temperature, and energy data
 url: https://github.com/srobysingh-bot/Smart-Ac
@@ -31,6 +31,8 @@ options:
   indoor_temp_entity: ""
   energy_sensor_entity: ""
   broadlink_entity: ""
+  ir_command_on: ""
+  ir_command_off: ""
   ac_brand: ""
   ac_model: ""
   room_name: "Living Room"
@@ -51,6 +53,8 @@ schema:
   indoor_temp_entity: str?
   energy_sensor_entity: str?
   broadlink_entity: str?
+  ir_command_on: str?
+  ir_command_off: str?
   ac_brand: str?
   ac_model: str?
   room_name: str

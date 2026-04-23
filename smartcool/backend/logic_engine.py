@@ -11,6 +11,7 @@ from datetime import datetime, timezone
 from typing import Optional
 
 from . import config_manager, ha_client, session_logger, weather_api
+from .utils import parse_presence
 
 logger = logging.getLogger(__name__)
 
@@ -63,8 +64,13 @@ async def tick() -> None:
 
     presence_raw = await ha_client.get_state(presence_entity)
 
-    # STEP 4 — parse presence
-    is_occupied = presence_raw in ("on", "occupied", "home", "detected")
+    # STEP 4 — parse presence (BUG 1 FIX — robust check for all HA presence sensor formats)
+    is_occupied = parse_presence(presence_raw)
+    # Always log raw value so addon logs show exactly what HA is returning
+    logger.info(
+        "[HawaAI] Presence raw value from HA: %r → occupied=%s",
+        presence_raw, is_occupied,
+    )
 
     # STEP 5 — manual override
     if cfg.get("manual_override", False):
@@ -86,6 +92,34 @@ async def tick() -> None:
 
     now = datetime.now(timezone.utc)
 
+    # BUG 2 FIX — power-based AC state sync
+    # Detects AC turned on/off by physical remote (outside HawaAI's control)
+    energy_entity = cfg.get("energy_sensor_entity", "")
+    energy_watts = 0.0
+    if energy_entity:
+        energy_raw = await ha_client.get_state(energy_entity)
+        try:
+            energy_watts = float(energy_raw) if energy_raw else 0.0
+        except (ValueError, TypeError):
+            energy_watts = 0.0
+
+        if energy_watts > 50.0 and not _ac_is_on:
+            logger.info(
+                "[HawaAI] AC detected ON via power (%.0fW) but engine thought OFF — syncing state",
+                energy_watts,
+            )
+            _ac_is_on = True
+            if _session_start_time is None:
+                _session_start_time = datetime.now(timezone.utc)
+                _session_start_temp = indoor_temp
+
+        elif energy_watts < 10.0 and _ac_is_on:
+            logger.info(
+                "[HawaAI] AC power dropped to %.0fW but engine thought ON — syncing OFF",
+                energy_watts,
+            )
+            await _turn_ac_off(cfg, indoor_temp, reason="manual_off")
+
     # Write snapshot every tick for chart
     weather = await weather_api.get_cached()
     await session_logger.add_snapshot(
@@ -95,7 +129,7 @@ async def tick() -> None:
             "indoor_temp": indoor_temp,
             "outdoor_temp": weather.get("temp") if weather else None,
             "ac_state": _ac_is_on,
-            "watt_draw": 0.0,
+            "watt_draw": energy_watts,
             "presence": is_occupied,
         },
     )
@@ -145,16 +179,22 @@ async def _turn_ac_on(cfg: dict, indoor_temp: float) -> None:
     global _ac_is_on, _session_start_time, _session_start_temp
 
     broadlink_entity = cfg.get("broadlink_entity", "")
+    # BUG 3C FIX — use user-configured IR command name (must match learned Broadlink command exactly)
+    cmd_on = (cfg.get("ir_command_on") or "").strip()
 
-    if broadlink_entity:
-        target = int(cfg.get("target_temp", 24))
-        ok = await ha_client.send_broadlink_command(
-            broadlink_entity, f"cool_{target}", device="ac"
-        )
-        if not ok:
-            logger.error("[HawaAI] Broadlink command failed for %s — setting ac=ON anyway", broadlink_entity)
-    else:
+    if not broadlink_entity:
         logger.warning("[HawaAI] No broadlink_entity configured — marking ac=ON without IR command")
+    elif not cmd_on:
+        logger.error(
+            "[HawaAI] IR Power ON command is empty! "
+            "Go to Settings → IR Command Mapping and enter the exact Broadlink command name."
+        )
+    else:
+        ok = await ha_client.send_broadlink_command(broadlink_entity, cmd_on)
+        if ok:
+            logger.info("[HawaAI] AC ON — IR sent: '%s' to %s", cmd_on, broadlink_entity)
+        else:
+            logger.error("[HawaAI] Broadlink command '%s' failed for %s", cmd_on, broadlink_entity)
 
     # Always flip the state and start a session so the logic doesn't cycle
     _ac_is_on = True
@@ -180,15 +220,21 @@ async def _turn_ac_off(cfg: dict, indoor_temp: float, reason: str) -> None:
     global _ac_is_on, _session_start_time, _session_start_temp
 
     broadlink_entity = cfg.get("broadlink_entity", "")
+    cmd_off = (cfg.get("ir_command_off") or "").strip()
 
-    if broadlink_entity:
-        ok = await ha_client.send_broadlink_command(
-            broadlink_entity, "power_off", device="ac"
-        )
-        if not ok:
-            logger.error("[HawaAI] Broadlink power_off failed for %s", broadlink_entity)
-    else:
+    if not broadlink_entity:
         logger.warning("[HawaAI] No broadlink_entity configured — marking ac=OFF without IR command")
+    elif not cmd_off:
+        logger.error(
+            "[HawaAI] IR Power OFF command is empty! "
+            "Go to Settings → IR Command Mapping and enter the exact Broadlink command name."
+        )
+    else:
+        ok = await ha_client.send_broadlink_command(broadlink_entity, cmd_off)
+        if ok:
+            logger.info("[HawaAI] AC OFF — IR sent: '%s' to %s | reason: %s", cmd_off, broadlink_entity, reason)
+        else:
+            logger.error("[HawaAI] Broadlink command '%s' failed for %s", cmd_off, broadlink_entity)
 
     _ac_is_on = False
 

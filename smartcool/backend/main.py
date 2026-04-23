@@ -31,6 +31,7 @@ from fastapi.responses import FileResponse, HTMLResponse, Response
 from . import config_manager, database, logic_engine, scheduler, session_logger, weather_api
 from . import ha_client
 from .ac_controller import get_brands
+from .utils import parse_presence
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
@@ -49,7 +50,7 @@ async def lifespan(app: FastAPI):
     logger.info("[HawaAI] Add-on stopped")
 
 
-app = FastAPI(title="HawaAI API", version="1.0.9", lifespan=lifespan)
+app = FastAPI(title="HawaAI API", version="1.1.0", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -102,10 +103,12 @@ async def get_status():
     runtime = logic_engine.get_runtime_state()
 
     indoor_temp_raw = await ha_client.get_state(cfg.get("indoor_temp_entity", ""))
-    presence_raw = await ha_client.get_state(cfg.get("presence_entity", ""))
-    energy_raw = await ha_client.get_state(cfg.get("energy_sensor_entity", ""))
+    presence_raw    = await ha_client.get_state(cfg.get("presence_entity", ""))
+    energy_raw      = await ha_client.get_state(cfg.get("energy_sensor_entity", ""))
 
-    is_occupied = presence_raw in ("on", "occupied", "home", "detected")
+    # BUG 1 FIX — robust presence parsing (handles FP2, mmWave, device tracker, etc.)
+    is_occupied = parse_presence(presence_raw)
+
     weather = await weather_api.get_cached()
 
     def safe_float(val):
@@ -114,13 +117,21 @@ async def get_status():
         except (ValueError, TypeError):
             return None
 
+    energy_watts = safe_float(energy_raw)
+
+    # BUG 2 FIX — real AC state = logic engine OR power draw > 50 W
+    # (catches AC turned on by physical remote without going through HawaAI)
+    _POWER_THRESHOLD = 50.0
+    ac_from_power = energy_watts is not None and energy_watts > _POWER_THRESHOLD
+    ac_on = runtime["ac_is_on"] or ac_from_power
+
     return {
-        "ac_on": runtime["ac_is_on"],  # single source of truth: logic engine memory
+        "ac_on": ac_on,
         "indoor_temp": safe_float(indoor_temp_raw),
         "outdoor_temp": weather.get("temp") if weather else None,
         "outdoor_humidity": weather.get("humidity") if weather else None,
         "presence": is_occupied,
-        "watt_draw": safe_float(energy_raw) or 0.0,
+        "watt_draw": energy_watts or 0.0,
         "session_kwh": 0.0,
         "session_id": runtime["session_id"],
         "session_start": runtime["session_start_time"],

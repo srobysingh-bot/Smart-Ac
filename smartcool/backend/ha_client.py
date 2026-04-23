@@ -102,11 +102,22 @@ async def turn_off_ac(switch_entity: str) -> bool:
     return await call_service(domain, "turn_off", {"entity_id": switch_entity})
 
 
-async def send_broadlink_command(remote_entity: str, command: str, device: str = "ac") -> bool:
+async def send_broadlink_command(remote_entity: str, command: str) -> bool:
+    """
+    Send a learned IR command via Broadlink RM device.
+
+    CRITICAL: HA's remote.send_command requires 'command' as a LIST.
+    A plain string is silently ignored by HA and nothing fires.
+    """
     return await call_service(
         "remote",
         "send_command",
-        {"entity_id": remote_entity, "command": command, "device": device},
+        {
+            "entity_id": remote_entity,
+            "command": [command],   # must be a list
+            "num_repeats": 1,
+            "delay_secs": 0.4,
+        },
     )
 
 

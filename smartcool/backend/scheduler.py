@@ -17,6 +17,24 @@ async def start() -> None:
     logger.info("[HawaAI] Scheduler started")
     weather_accumulator = 0
 
+    # BUG 3B FIX — print startup config so addon logs confirm what is configured
+    try:
+        cfg = config_manager.load_config()
+        logger.info("[HawaAI] --- Startup configuration ---")
+        logger.info("[HawaAI]   presence_entity   : %s", cfg.get("presence_entity") or "(not set)")
+        logger.info("[HawaAI]   indoor_temp_entity: %s", cfg.get("indoor_temp_entity") or "(not set)")
+        logger.info("[HawaAI]   energy_entity     : %s", cfg.get("energy_sensor_entity") or "(not set)")
+        logger.info("[HawaAI]   broadlink_entity  : %s", cfg.get("broadlink_entity") or "(not set)")
+        logger.info("[HawaAI]   ir_command_on     : '%s'", cfg.get("ir_command_on") or "(EMPTY — AC will not turn ON)")
+        logger.info("[HawaAI]   ir_command_off    : '%s'", cfg.get("ir_command_off") or "(EMPTY — AC will not turn OFF)")
+        logger.info("[HawaAI]   target_temp       : %s°C", cfg.get("target_temp", 24))
+        logger.info("[HawaAI]   hysteresis        : ±%s°C", cfg.get("hysteresis", 1.5))
+        logger.info("[HawaAI]   vacancy_timeout   : %s min", cfg.get("vacancy_timeout_minutes", 5))
+        logger.info("[HawaAI]   logic_interval    : %s sec", cfg.get("logic_interval_seconds", 60))
+        logger.info("[HawaAI] ---------------------------------")
+    except Exception as e:
+        logger.error("[HawaAI] Could not log startup config: %s", e)
+
     # Initial weather fetch
     try:
         cfg = config_manager.load_config()

@@ -14,6 +14,8 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "indoor_temp_entity": "",
     "energy_sensor_entity": "",
     "broadlink_entity": "",
+    "ir_command_on": "",   # exact name of the Broadlink learned command for AC power on
+    "ir_command_off": "",  # exact name of the Broadlink learned command for AC power off
     "ac_brand": "",
     "ac_model": "",
     "room_name": "Living Room",

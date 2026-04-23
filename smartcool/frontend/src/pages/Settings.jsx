@@ -354,6 +354,33 @@ export default function Settings() {
         />
       </div>
 
+      {/* IR Command Mapping */}
+      <div className="card space-y-4">
+        <SectionHeader>IR Command Mapping</SectionHeader>
+        <p className="text-xs text-gray-500 -mt-2">
+          Enter the exact command names you saved when teaching the Broadlink remote.
+          To find them: HA → Developer Tools → States → find your remote entity → look at <code className="bg-gray-800 px-1 rounded">command_list</code> attribute.
+        </p>
+        <Input
+          label="Power ON command name"
+          value={cfg.ir_command_on}
+          onChange={v => patch('ir_command_on', v)}
+          placeholder='e.g. power  or  ac_on  or  cool_24'
+        />
+        <Input
+          label="Power OFF command name"
+          value={cfg.ir_command_off}
+          onChange={v => patch('ir_command_off', v)}
+          placeholder='e.g. power  or  ac_off'
+        />
+        {(!cfg.ir_command_on || !cfg.ir_command_off) && (
+          <div className="flex items-start gap-2 px-3 py-2 bg-yellow-900/30 border border-yellow-700 rounded-lg text-xs text-yellow-300">
+            <span className="shrink-0">⚠</span>
+            <span>IR command names are empty — AC will not turn on/off automatically until these are filled in.</span>
+          </div>
+        )}
+      </div>
+
       {/* AC Configuration */}
       <div className="card space-y-4">
         <SectionHeader>AC Configuration</SectionHeader>
