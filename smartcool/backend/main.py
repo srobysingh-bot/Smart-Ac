@@ -55,7 +55,7 @@ async def lifespan(app: FastAPI):
     logger.info("[HawaAI] Add-on stopped")
 
 
-app = FastAPI(title="HawaAI API", version="1.1.14", lifespan=lifespan)
+app = FastAPI(title="HawaAI API", version="1.1.15", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -206,6 +206,21 @@ async def get_stats():
 async def get_today_stats():
     """Today stats only."""
     return await database.get_today_stats()
+
+
+# ── INSIGHTS ──────────────────────────────────────────────────────────────────
+
+@app.get("/api/insights")
+async def get_insights():
+    """
+    Read-only analytics derived from completed sessions.
+    Does not affect any control logic.
+
+    Returns cooling_rate, efficiency, best target temperature, cooling type
+    distribution, and a recent performance trend.
+    Requires at least one session longer than 5 minutes to return useful data.
+    """
+    return await database.get_insights()
 
 
 # ── SNAPSHOTS ─────────────────────────────────────────────────────────────────

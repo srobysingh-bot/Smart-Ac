@@ -15,12 +15,13 @@ logger = logging.getLogger(__name__)
 # Runtime state (in-memory, not persisted)
 _current_session_id: Optional[str] = None
 _session_start_time: Optional[datetime] = None
+_session_start_temp: Optional[float] = None   # for cooling_rate / efficiency calculation
 _cooled_at: Optional[datetime] = None
 
 
 async def start_session(data: Dict[str, Any]) -> str:
     """Insert a session start record. Returns the new session_id (UUID)."""
-    global _current_session_id, _session_start_time, _cooled_at
+    global _current_session_id, _session_start_time, _session_start_temp, _cooled_at
 
     session_id = str(uuid.uuid4())
     now = datetime.now(timezone.utc)
@@ -46,6 +47,7 @@ async def start_session(data: Dict[str, Any]) -> str:
 
     _current_session_id = session_id
     _session_start_time = now
+    _session_start_temp = data.get("indoor_temp_start")
     _cooled_at = None
 
     logger.info(
@@ -57,8 +59,23 @@ async def start_session(data: Dict[str, Any]) -> str:
 
 
 async def end_session(data: Dict[str, Any]) -> None:
-    """Update the current open session with end data."""
-    global _current_session_id, _session_start_time, _cooled_at
+    """
+    Update the current open session with end data and compute analytics.
+
+    Analytics rules (read-only, never affect control logic):
+      - cooling_rate = (start_temp − end_temp) / duration_minutes
+        → only computed when duration > ANALYTICS_WARMUP_MINUTES (5 min)
+        → must be > 0 (room actually cooled)
+      - cooling_type = fast (>0.5°C/min) / normal (0.2–0.5) / slow (<0.2)
+      - efficiency   = delta_temp / energy_kwh
+        → only computed when energy_consumed_kwh > 0
+    """
+    global _current_session_id, _session_start_time, _session_start_temp, _cooled_at
+
+    # Minimum session duration before computing cooling analytics.
+    # The first 5 minutes are ignored because the AC needs time to reach
+    # stable operation after the IR command is processed.
+    ANALYTICS_WARMUP_MINUTES = 5.0
 
     if not _current_session_id:
         logger.warning("[HawaAI] end_session called but no active session")
@@ -68,17 +85,65 @@ async def end_session(data: Dict[str, Any]) -> None:
     if _cooled_at and _session_start_time:
         cool_minutes = (_cooled_at - _session_start_time).total_seconds() / 60.0
 
+    end_time     = data.get("end_time", datetime.now(timezone.utc).isoformat())
+    indoor_start = _session_start_temp   # set by start_session via _store_start_temp
+    indoor_end   = data.get("indoor_temp_end")
+    duration_min = data.get("time_to_cool_minutes") or (
+        round(cool_minutes, 1) if cool_minutes else None
+    )
+    energy_kwh   = data.get("energy_kwh")
+
+    # ── Compute cooling analytics ─────────────────────────────────────────────
+    cooling_rate: Optional[float] = None
+    cooling_type: Optional[str]   = None
+    efficiency:   Optional[float] = None
+
+    if (
+        indoor_start is not None
+        and indoor_end  is not None
+        and duration_min is not None
+        and duration_min > ANALYTICS_WARMUP_MINUTES     # skip first 5 min
+    ):
+        delta = indoor_start - indoor_end
+        if delta > 0:                                    # room actually got cooler
+            cooling_rate = round(delta / duration_min, 4)
+            if cooling_rate > 0.5:
+                cooling_type = "fast"
+            elif cooling_rate >= 0.2:
+                cooling_type = "normal"
+            else:
+                cooling_type = "slow"
+
+    if (
+        indoor_start is not None
+        and indoor_end  is not None
+        and energy_kwh  is not None
+        and energy_kwh  > 0
+    ):
+        delta = indoor_start - indoor_end
+        if delta > 0:
+            efficiency = round(delta / energy_kwh, 2)
+
+    if cooling_rate is not None:
+        logger.info(
+            "[HawaAI] Analytics — cooling_rate=%.4f°C/min (%s) | efficiency=%s°C/kWh",
+            cooling_rate, cooling_type,
+            f"{efficiency:.2f}" if efficiency is not None else "N/A",
+        )
+
     end_data = {
-        "end_time": data.get("end_time", datetime.now(timezone.utc).isoformat()),
-        "indoor_temp_end": data.get("indoor_temp_end"),
-        "time_to_cool_minutes": data.get("time_to_cool_minutes") or (
-            round(cool_minutes, 1) if cool_minutes else None
-        ),
-        "energy_consumed_kwh": data.get("energy_kwh"),
-        "cost_estimate": data.get("cost"),
-        "reason_stopped": data.get("reason_stopped"),
-        "peak_watt_draw": data.get("peak_watts"),
-        "avg_watt_draw": data.get("avg_watts"),
+        "end_time":             end_time,
+        "indoor_temp_end":      indoor_end,
+        "time_to_cool_minutes": duration_min,
+        "energy_consumed_kwh":  energy_kwh,
+        "cost_estimate":        data.get("cost"),
+        "reason_stopped":       data.get("reason_stopped"),
+        "peak_watt_draw":       data.get("peak_watts"),
+        "avg_watt_draw":        data.get("avg_watts"),
+        # Analytics (None if session too short or data missing)
+        "cooling_rate":         cooling_rate,
+        "cooling_type":         cooling_type,
+        "efficiency":           efficiency,
     }
 
     await database.update_session_end(_current_session_id, end_data)
@@ -90,6 +155,7 @@ async def end_session(data: Dict[str, Any]) -> None:
 
     _current_session_id = None
     _session_start_time = None
+    _session_start_temp = None
     _cooled_at = None
 
 

@@ -6,6 +6,7 @@ import TempGauge     from '../components/TempGauge.jsx'
 import EnergyChart   from '../components/EnergyChart.jsx'
 import PresenceBadge from '../components/PresenceBadge.jsx'
 import SessionTable  from '../components/SessionTable.jsx'
+import InsightsCard  from '../components/InsightsCard.jsx'
 import { Thermometer, Wind, Zap, Cloud, AlertTriangle, Minus, Plus, Loader } from 'lucide-react'
 
 // ── Config warning banner ─────────────────────────────────────────────────────
@@ -414,6 +415,9 @@ export default function Dashboard() {
         {status?.climate_entity && (
           <ClimateCard entityId={status.climate_entity} />
         )}
+
+        {/* Insights — read-only analytics from completed sessions */}
+        <InsightsCard />
 
         {/* Real-time chart */}
         <div className="card">

@@ -90,6 +90,9 @@ export const setSwingMode = (entityId, swing_mode) =>
 export const getDevices = () => request('/devices')
 export const getDeviceEntities = (deviceId) => request(`/devices/${encodeURIComponent(deviceId)}/entities`)
 
+// ── Insights ─────────────────────────────────────────────────────────────────
+export const getInsights = () => request('/insights')
+
 // ── Export ───────────────────────────────────────────────────────────────────
 export async function downloadExport(format = 'csv') {
   const res = await fetch(`${BASE}/export/${format}`)
