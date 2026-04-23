@@ -1,11 +1,17 @@
 """
-Home Assistant REST client for HawaAI.
+Home Assistant REST + WebSocket client for HawaAI.
 
 Inside the HA addon container:
-  - HA Core is reachable at http://supervisor/core
-  - The auth token is injected by HA Supervisor as SUPERVISOR_TOKEN env var
+  - HA Core REST API:  http://supervisor/core/api/...
+  - HA Core WebSocket: ws://supervisor/core/api/websocket
+  - Auth token injected by HA Supervisor as SUPERVISOR_TOKEN env var
+
+The device registry and entity registry are ONLY accessible via WebSocket
+(config/device_registry/list, config/entity_registry/list).
+They do NOT have REST equivalents — any REST call to those paths returns 404.
 """
 
+import asyncio
 import os
 import logging
 from typing import Any, Dict, List, Optional
@@ -140,38 +146,98 @@ async def send_broadlink_command(remote_entity: str, command: str, device_name: 
     return success
 
 
-async def get_device_registry() -> List[Dict[str, Any]]:
-    """Returns all HA devices from the device registry."""
-    url = f"{HA_BASE_URL}/api/config/device_registry/list"
+_WS_URL = "ws://supervisor/core/api/websocket"
+
+
+async def _ws_command(command_type: str) -> Optional[Any]:
+    """
+    Execute a single command against the HA Core WebSocket API and return
+    the result payload, or None on failure.
+
+    Protocol:
+      1. Connect to ws://supervisor/core/api/websocket
+      2. Receive {"type": "auth_required"}
+      3. Send    {"type": "auth", "access_token": TOKEN}
+      4. Receive {"type": "auth_ok"}
+      5. Send    {"id": 1, "type": command_type}
+      6. Receive {"id": 1, "type": "result", "success": true, "result": [...]}
+    """
     try:
         async with aiohttp.ClientSession() as session:
-            async with session.get(
-                url, headers=_headers(), timeout=aiohttp.ClientTimeout(total=10)
-            ) as resp:
-                if resp.status == 200:
-                    return await resp.json()
-                logger.error("[HawaAI] get_device_registry HTTP %s", resp.status)
-                return []
+            async with session.ws_connect(
+                _WS_URL,
+                timeout=aiohttp.ClientTimeout(total=15),
+            ) as ws:
+                # 1 — auth_required
+                msg = await asyncio.wait_for(ws.receive_json(), timeout=10)
+                if msg.get("type") != "auth_required":
+                    logger.error("[HawaAI] WS: expected auth_required, got %r", msg.get("type"))
+                    return None
+
+                # 2 — authenticate
+                await ws.send_json({"type": "auth", "access_token": _TOKEN})
+                msg = await asyncio.wait_for(ws.receive_json(), timeout=10)
+                if msg.get("type") != "auth_ok":
+                    logger.error("[HawaAI] WS: auth failed — %s", msg.get("message", msg))
+                    return None
+
+                # 3 — send command
+                await ws.send_json({"id": 1, "type": command_type})
+
+                # 4 — receive result
+                msg = await asyncio.wait_for(ws.receive_json(), timeout=10)
+                if not msg.get("success"):
+                    err = msg.get("error", {})
+                    logger.error(
+                        "[HawaAI] WS %s failed: %s %s",
+                        command_type, err.get("code"), err.get("message"),
+                    )
+                    return None
+
+                return msg.get("result")
+
+    except asyncio.TimeoutError:
+        logger.error("[HawaAI] WS command %s timed out", command_type)
+        return None
     except Exception as e:
-        logger.error("[HawaAI] get_device_registry exception: %s", e)
+        logger.error("[HawaAI] WS command %s exception: %s", command_type, e)
+        return None
+
+
+async def get_device_registry() -> List[Dict[str, Any]]:
+    """
+    Returns all HA devices from the device registry via WebSocket.
+
+    REST /api/config/device_registry/list does NOT exist — this MUST go
+    through the Core WebSocket API (config/device_registry/list).
+    """
+    result = await _ws_command("config/device_registry/list")
+    if result is None:
         return []
+    # HA returns the list directly as result
+    if isinstance(result, list):
+        return result
+    # Some HA versions wrap it in {"devices": [...]}
+    if isinstance(result, dict):
+        return result.get("devices", [])
+    return []
 
 
 async def get_entity_registry() -> List[Dict[str, Any]]:
-    """Returns all HA entity registry entries (includes device_id per entity)."""
-    url = f"{HA_BASE_URL}/api/config/entity_registry/list"
-    try:
-        async with aiohttp.ClientSession() as session:
-            async with session.get(
-                url, headers=_headers(), timeout=aiohttp.ClientTimeout(total=10)
-            ) as resp:
-                if resp.status == 200:
-                    return await resp.json()
-                logger.error("[HawaAI] get_entity_registry HTTP %s", resp.status)
-                return []
-    except Exception as e:
-        logger.error("[HawaAI] get_entity_registry exception: %s", e)
+    """
+    Returns all HA entity registry entries (includes device_id) via WebSocket.
+
+    REST /api/config/entity_registry/list does NOT exist — this MUST go
+    through the Core WebSocket API (config/entity_registry/list).
+    """
+    result = await _ws_command("config/entity_registry/list")
+    if result is None:
         return []
+    if isinstance(result, list):
+        return result
+    if isinstance(result, dict):
+        return result.get("entities", [])
+    return []
 
 
 async def publish_sensor_state(
