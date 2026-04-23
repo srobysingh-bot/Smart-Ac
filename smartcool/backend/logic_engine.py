@@ -28,6 +28,13 @@ _session_start_time: Optional[datetime] = None
 _session_start_temp: Optional[float] = None
 _session_start_kwh: Optional[float] = None
 
+# Command-ignore window — after HawaAI sends an ON command, HA takes several seconds
+# to update the climate entity state. Ignore "off" readings from HA during this window
+# to prevent a false manual_off that would close the session immediately.
+_last_command_time: Optional[datetime] = None   # when HawaAI last sent ON or OFF
+_last_command: str = ""                          # "on" or "off"
+_HA_STATE_DELAY_SECS: int = 30                   # seconds to ignore HA state after ON command
+
 
 async def tick() -> None:
     """
@@ -44,7 +51,7 @@ async def tick() -> None:
     STEP 8  Vacancy logic
     STEP 9  Temperature logic (smart-adjustment aware)
     """
-    global _ac_is_on, _vacant_since, _session_start_time, _session_start_temp, _session_start_kwh
+    global _ac_is_on, _vacant_since, _session_start_time, _session_start_temp, _session_start_kwh, _last_command_time, _last_command
 
     # STEP 1 — fresh config every tick
     cfg = config_manager.load_config()
@@ -202,19 +209,45 @@ async def tick() -> None:
 
     # STEP 6B — Sync internal flag & session bookkeeping
     #
-    # When AC was turned ON by physical remote / HA automation outside HawaAI's control,
-    # we detect the mismatch here and open a session so session timer and kWh tracking work.
+    # ── Command-ignore window ─────────────────────────────────────────────────
+    # HA climate entity state can lag 5–30s after a command is sent.
+    # If HawaAI just sent an ON command and HA still shows "off", we must NOT
+    # treat it as a manual-off — that would close the session immediately.
+    # During the window, trust our own internal flag; after the window, trust HA.
+    now = datetime.now(timezone.utc)
+    secs_since_cmd = (
+        (now - _last_command_time).total_seconds()
+        if _last_command_time is not None
+        else float("inf")
+    )
+    in_on_window = _last_command == "on" and secs_since_cmd < _HA_STATE_DELAY_SECS
+
     if ac_actually_on and not _ac_is_on:
+        # HA shows ON, engine thought OFF → external turn-on (physical remote / app)
         logger.info("[HawaAI] AC turned ON externally — syncing engine state & opening session")
         _ac_is_on = True
         if _session_start_time is None:
-            _session_start_time = datetime.now(timezone.utc)
+            _session_start_time = now
             _session_start_temp = float(climate_data.get("current_temp") or indoor_temp)
 
     elif not ac_actually_on and _ac_is_on:
-        logger.info("[HawaAI] AC turned OFF externally — syncing engine state & closing session")
-        await _turn_ac_off(cfg, indoor_temp, reason="manual_off")
-        ac_actually_on = False     # stays False for the rest of this tick
+        if in_on_window:
+            # HA state hasn't caught up yet — keep engine as ON until window expires
+            logger.info(
+                "[HawaAI] HA shows OFF but %.0fs within %ds ignore window after ON command "
+                "— holding AC=ON until HA state catches up",
+                secs_since_cmd, _HA_STATE_DELAY_SECS,
+            )
+            ac_actually_on = True   # override: keep ON for the rest of this tick
+        else:
+            # Outside ignore window → genuine external turn-off
+            logger.info(
+                "[HawaAI] AC turned OFF externally (HA state settled after %.0fs) "
+                "— syncing engine state & closing session",
+                secs_since_cmd,
+            )
+            await _turn_ac_off(cfg, indoor_temp, reason="manual_off")
+            ac_actually_on = False
 
     # STEP 7 — Write monitoring snapshot
     await session_logger.add_snapshot(
@@ -281,8 +314,9 @@ async def _turn_ac_on(cfg: dict, indoor_temp: float) -> None:
       2. Broadlink IR blast (ir_command_on) — fallback for dumb AC units
 
     Only marks ac=ON and starts a session after confirmed success.
+    Sets _last_command = "on" so the ignore window protects the next tick.
     """
-    global _ac_is_on, _session_start_time, _session_start_temp, _session_start_kwh
+    global _ac_is_on, _session_start_time, _session_start_temp, _session_start_kwh, _last_command_time, _last_command
 
     climate_entity = (cfg.get("climate_entity") or "").strip()
     target_temp    = float(cfg.get("target_temp", 24))
@@ -339,6 +373,9 @@ async def _turn_ac_on(cfg: dict, indoor_temp: float) -> None:
     _ac_is_on           = True
     _session_start_time = datetime.now(timezone.utc)
     _session_start_temp = indoor_temp
+    # Start ignore window — HA entity state won't update for several seconds
+    _last_command_time  = _session_start_time
+    _last_command       = "on"
 
     weather = await weather_api.get_cached()
     await session_logger.start_session({
@@ -370,8 +407,9 @@ async def _turn_ac_off(cfg: dict, indoor_temp: float, reason: str) -> None:
 
     Always marks ac=OFF in the engine regardless of command outcome.
     If no open session exists, resets cleanly without logging session data.
+    Records _last_command = "off" so a following ON command starts a clean window.
     """
-    global _ac_is_on, _session_start_time, _session_start_temp, _session_start_kwh
+    global _ac_is_on, _session_start_time, _session_start_temp, _session_start_kwh, _last_command_time, _last_command
 
     climate_entity = (cfg.get("climate_entity") or "").strip()
 
@@ -407,7 +445,9 @@ async def _turn_ac_off(cfg: dict, indoor_temp: float, reason: str) -> None:
             )
 
     # Always flip internal flag regardless of command outcome
-    _ac_is_on = False
+    _ac_is_on          = False
+    _last_command_time = datetime.now(timezone.utc)
+    _last_command      = "off"
 
     # No open session — just reset and return cleanly
     if _session_start_time is None:
@@ -460,11 +500,22 @@ async def _turn_ac_off(cfg: dict, indoor_temp: float, reason: str) -> None:
 
 def get_runtime_state() -> dict:
     """Returns current in-memory runtime state for the /api/status endpoint."""
+    from datetime import datetime, timezone as _tz
+    now = datetime.now(_tz.utc)
+    secs = (now - _last_command_time).total_seconds() if _last_command_time else None
+    in_window = (
+        _last_command == "on"
+        and secs is not None
+        and secs < _HA_STATE_DELAY_SECS
+    )
     return {
-        "ac_is_on":         _ac_is_on,
-        "session_id":       session_logger.current_session_id(),
+        "ac_is_on":           _ac_is_on,
+        "session_id":         session_logger.current_session_id(),
         "session_start_time": (
             _session_start_time.isoformat() if _session_start_time else None
         ),
-        "session_start_kwh": _session_start_kwh,
+        "session_start_kwh":  _session_start_kwh,
+        # Diagnostic: tells Dashboard whether we're in the ignore window
+        "ha_state_settling":  in_window,
+        "last_command":       _last_command or None,
     }
