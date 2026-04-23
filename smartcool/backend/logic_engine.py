@@ -44,7 +44,7 @@ async def tick() -> None:
     STEP 8  Vacancy logic
     STEP 9  Temperature logic (smart-adjustment aware)
     """
-    global _ac_is_on, _vacant_since, _session_start_kwh
+    global _ac_is_on, _vacant_since, _session_start_time, _session_start_temp, _session_start_kwh
 
     # STEP 1 — fresh config every tick
     cfg = config_manager.load_config()
@@ -170,7 +170,6 @@ async def tick() -> None:
         logger.info("[HawaAI] AC turned ON externally — syncing engine state & opening session")
         _ac_is_on = True
         if _session_start_time is None:
-            global _session_start_time, _session_start_temp
             _session_start_time = datetime.now(timezone.utc)
             _session_start_temp = float(climate_data.get("current_temp") or indoor_temp)
 
