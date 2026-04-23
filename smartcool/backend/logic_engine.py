@@ -31,9 +31,12 @@ _session_start_kwh: Optional[float] = None
 # Command-ignore window — after HawaAI sends an ON command, HA takes several seconds
 # to update the climate entity state. Ignore "off" readings from HA during this window
 # to prevent a false manual_off that would close the session immediately.
+#
+# CRITICAL: window must be > logic_interval_seconds, otherwise it expires before the
+# next tick runs and offers zero protection. We compute it dynamically each tick as
+# max(150, tick_interval * 2 + 30) so it always spans at least 2 full ticks.
 _last_command_time: Optional[datetime] = None   # when HawaAI last sent ON or OFF
 _last_command: str = ""                          # "on" or "off"
-_HA_STATE_DELAY_SECS: int = 30                   # seconds to ignore HA state after ON command
 
 
 async def tick() -> None:
@@ -210,20 +213,25 @@ async def tick() -> None:
     # STEP 6B — Sync internal flag & session bookkeeping
     #
     # ── Command-ignore window ─────────────────────────────────────────────────
-    # HA climate entity state can lag 5–30s after a command is sent.
+    # HA climate entity state lags 5–30 s after a service call is sent.
     # If HawaAI just sent an ON command and HA still shows "off", we must NOT
-    # treat it as a manual-off — that would close the session immediately.
-    # During the window, trust our own internal flag; after the window, trust HA.
+    # treat it as a manual-off — that would close the session right away and then
+    # re-send ON the next tick, creating an infinite ON/OFF loop.
+    #
+    # Window size is computed dynamically to guarantee it spans at least 2 full
+    # tick cycles.  For a 60 s tick: max(150, 60*2+30) = 150 s = 2.5 ticks.
     now = datetime.now(timezone.utc)
+    tick_secs   = int(cfg.get("logic_interval_seconds", 60))
+    settle_secs = max(150, tick_secs * 2 + 30)
     secs_since_cmd = (
         (now - _last_command_time).total_seconds()
         if _last_command_time is not None
         else float("inf")
     )
-    in_on_window = _last_command == "on" and secs_since_cmd < _HA_STATE_DELAY_SECS
+    in_on_window = _last_command == "on" and secs_since_cmd < settle_secs
 
     if ac_actually_on and not _ac_is_on:
-        # HA shows ON, engine thought OFF → external turn-on (physical remote / app)
+        # HA shows ON but engine thought OFF → external turn-on (remote / app / automation)
         logger.info("[HawaAI] AC turned ON externally — syncing engine state & opening session")
         _ac_is_on = True
         if _session_start_time is None:
@@ -232,21 +240,26 @@ async def tick() -> None:
 
     elif not ac_actually_on and _ac_is_on:
         if in_on_window:
-            # HA state hasn't caught up yet — keep engine as ON until window expires
+            # HA hasn't reflected the ON command yet — hold engine state as ON.
+            # This is the most common case: HA lags by several seconds after set_temperature.
             logger.info(
-                "[HawaAI] HA shows OFF but %.0fs within %ds ignore window after ON command "
-                "— holding AC=ON until HA state catches up",
-                secs_since_cmd, _HA_STATE_DELAY_SECS,
+                "[HawaAI] HA shows OFF but %.0fs/%.0fs into settle window — "
+                "holding AC=ON (HA state not yet updated)",
+                secs_since_cmd, settle_secs,
             )
-            ac_actually_on = True   # override: keep ON for the rest of this tick
+            ac_actually_on = True   # override for the rest of this tick
         else:
-            # Outside ignore window → genuine external turn-off
+            # Outside the settle window → HA has had enough time to update.
+            # This is a GENUINE external turn-off (user turned AC off via remote/app).
+            # IMPORTANT: Do NOT send climate.turn_off here — the AC is already off per HA.
+            # Sending another off command would interfere with any concurrent ON attempt.
+            # Just close the session and update internal state.
             logger.info(
-                "[HawaAI] AC turned OFF externally (HA state settled after %.0fs) "
-                "— syncing engine state & closing session",
-                secs_since_cmd,
+                "[HawaAI] AC turned OFF externally (%.0fs since last cmd, window=%.0fs) "
+                "— closing session without resending OFF command",
+                secs_since_cmd, settle_secs,
             )
-            await _turn_ac_off(cfg, indoor_temp, reason="manual_off")
+            await _turn_ac_off(cfg, indoor_temp, reason="manual_off", send_command=False)
             ac_actually_on = False
 
     # STEP 7 — Write monitoring snapshot
@@ -397,13 +410,19 @@ async def _turn_ac_on(cfg: dict, indoor_temp: float) -> None:
 
 # ── Turn AC OFF ───────────────────────────────────────────────────────────────
 
-async def _turn_ac_off(cfg: dict, indoor_temp: float, reason: str) -> None:
+async def _turn_ac_off(
+    cfg: dict, indoor_temp: float, reason: str, send_command: bool = True
+) -> None:
     """
-    Turn the AC off.
+    Turn the AC off (or just close the session if send_command=False).
 
-    Priority:
+    Priority when send_command=True:
       1. HA climate entity turn_off
       2. Broadlink IR blast (ir_command_off)
+
+    send_command=False is used when HA already reports the AC as OFF (external turn-off
+    detected in the sync block). Sending another off command in that case would
+    interfere with any concurrent ON command.
 
     Always marks ac=OFF in the engine regardless of command outcome.
     If no open session exists, resets cleanly without logging session data.
@@ -411,38 +430,43 @@ async def _turn_ac_off(cfg: dict, indoor_temp: float, reason: str) -> None:
     """
     global _ac_is_on, _session_start_time, _session_start_temp, _session_start_kwh, _last_command_time, _last_command
 
-    climate_entity = (cfg.get("climate_entity") or "").strip()
+    if send_command:
+        climate_entity = (cfg.get("climate_entity") or "").strip()
 
-    if climate_entity:
-        ok = await ha_client.set_climate_mode(climate_entity, "off")
-        if ok:
-            logger.info("[HawaAI] AC OFF via climate entity %s", climate_entity)
-        else:
-            logger.error(
-                "[HawaAI] AC OFF via climate entity FAILED — marking OFF anyway"
-            )
-    else:
-        broadlink_entity = (cfg.get("broadlink_entity") or "").strip()
-        cmd_off          = (cfg.get("ir_command_off") or "").strip()
-        ir_device_name   = (cfg.get("ir_device_name") or "").strip()
-
-        if broadlink_entity and cmd_off:
-            ir_ok = await ha_client.send_broadlink_command(
-                broadlink_entity, cmd_off, ir_device_name
-            )
-            if not ir_ok:
+        if climate_entity:
+            ok = await ha_client.set_climate_mode(climate_entity, "off")
+            if ok:
+                logger.info("[HawaAI] AC OFF via climate entity %s", climate_entity)
+            else:
                 logger.error(
-                    "[HawaAI] AC OFF IR command '%s' FAILED — marking OFF anyway to stop retry loop",
-                    cmd_off,
+                    "[HawaAI] AC OFF via climate entity FAILED — marking OFF anyway"
                 )
-        elif not broadlink_entity:
-            logger.warning(
-                "[HawaAI] No Broadlink configured — marking ac=OFF without IR command"
-            )
         else:
-            logger.error(
-                "[HawaAI] IR Power OFF command is empty — set it in Settings → IR Command Mapping"
-            )
+            broadlink_entity = (cfg.get("broadlink_entity") or "").strip()
+            cmd_off          = (cfg.get("ir_command_off") or "").strip()
+            ir_device_name   = (cfg.get("ir_device_name") or "").strip()
+
+            if broadlink_entity and cmd_off:
+                ir_ok = await ha_client.send_broadlink_command(
+                    broadlink_entity, cmd_off, ir_device_name
+                )
+                if not ir_ok:
+                    logger.error(
+                        "[HawaAI] AC OFF IR command '%s' FAILED — marking OFF anyway to stop retry loop",
+                        cmd_off,
+                    )
+            elif not broadlink_entity:
+                logger.warning(
+                    "[HawaAI] No Broadlink configured — marking ac=OFF without IR command"
+                )
+            else:
+                logger.error(
+                    "[HawaAI] IR Power OFF command is empty — set it in Settings → IR Command Mapping"
+                )
+    else:
+        logger.info(
+            "[HawaAI] AC OFF (%s) — skipping command (AC already off per HA)", reason
+        )
 
     # Always flip internal flag regardless of command outcome
     _ac_is_on          = False
@@ -501,12 +525,15 @@ async def _turn_ac_off(cfg: dict, indoor_temp: float, reason: str) -> None:
 def get_runtime_state() -> dict:
     """Returns current in-memory runtime state for the /api/status endpoint."""
     from datetime import datetime, timezone as _tz
-    now = datetime.now(_tz.utc)
-    secs = (now - _last_command_time).total_seconds() if _last_command_time else None
+    from . import config_manager as _cm
+    now       = datetime.now(_tz.utc)
+    secs      = (now - _last_command_time).total_seconds() if _last_command_time else None
+    tick_s    = int(_cm.load_config().get("logic_interval_seconds", 60))
+    settle_s  = max(150, tick_s * 2 + 30)
     in_window = (
         _last_command == "on"
         and secs is not None
-        and secs < _HA_STATE_DELAY_SECS
+        and secs < settle_s
     )
     return {
         "ac_is_on":           _ac_is_on,
@@ -515,7 +542,7 @@ def get_runtime_state() -> dict:
             _session_start_time.isoformat() if _session_start_time else None
         ),
         "session_start_kwh":  _session_start_kwh,
-        # Diagnostic: tells Dashboard whether we're in the ignore window
-        "ha_state_settling":  in_window,
+        "ha_state_settling":  in_window,           # True while ignoring HA OFF reads
         "last_command":       _last_command or None,
+        "settle_window_secs": settle_s,
     }
