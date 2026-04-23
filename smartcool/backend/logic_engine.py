@@ -20,6 +20,7 @@ _ac_is_on: bool = False
 _vacant_since: Optional[datetime] = None
 _session_start_time: Optional[datetime] = None
 _session_start_temp: Optional[float] = None
+_session_start_kwh: Optional[float] = None   # kWh meter reading when session started
 
 
 async def tick() -> None:
@@ -34,7 +35,7 @@ async def tick() -> None:
     STEP 6  Vacancy logic
     STEP 7  Temperature logic
     """
-    global _ac_is_on, _vacant_since
+    global _ac_is_on, _vacant_since, _session_start_kwh
 
     # STEP 1 — fresh config every tick
     cfg = config_manager.load_config()
@@ -92,12 +93,12 @@ async def tick() -> None:
 
     now = datetime.now(timezone.utc)
 
-    # BUG 2 FIX — power-based AC state sync
+    # BUG 2 FIX — power-based AC state sync using LIVE WATTS entity
     # Detects AC turned on/off by physical remote (outside HawaAI's control)
-    energy_entity = cfg.get("energy_sensor_entity", "")
+    energy_power_entity = cfg.get("energy_power_entity", "")
     energy_watts = 0.0
-    if energy_entity:
-        energy_raw = await ha_client.get_state(energy_entity)
+    if energy_power_entity:
+        energy_raw = await ha_client.get_state(energy_power_entity)
         try:
             energy_watts = float(energy_raw) if energy_raw else 0.0
         except (ValueError, TypeError):
@@ -176,7 +177,7 @@ async def tick() -> None:
 
 async def _turn_ac_on(cfg: dict, indoor_temp: float) -> None:
     """Send Broadlink IR 'on' command and start a session."""
-    global _ac_is_on, _session_start_time, _session_start_temp
+    global _ac_is_on, _session_start_time, _session_start_temp, _session_start_kwh
 
     broadlink_entity = cfg.get("broadlink_entity", "")
     # BUG 3C FIX — use user-configured IR command name (must match learned Broadlink command exactly)
@@ -196,6 +197,17 @@ async def _turn_ac_on(cfg: dict, indoor_temp: float) -> None:
         else:
             logger.error("[HawaAI] Broadlink command '%s' failed for %s", cmd_on, broadlink_entity)
 
+    # Record kWh meter reading at session start for consumed-kWh calculation
+    kwh_entity = cfg.get("energy_kwh_entity", "")
+    start_kwh = None
+    if kwh_entity:
+        raw = await ha_client.get_state(kwh_entity)
+        try:
+            start_kwh = float(raw) if raw else None
+        except (ValueError, TypeError):
+            start_kwh = None
+    _session_start_kwh = start_kwh
+
     # Always flip the state and start a session so the logic doesn't cycle
     _ac_is_on = True
     _session_start_time = datetime.now(timezone.utc)
@@ -211,13 +223,14 @@ async def _turn_ac_on(cfg: dict, indoor_temp: float) -> None:
         "ac_brand": cfg.get("ac_brand"),
         "ac_model": cfg.get("ac_model"),
         "room_name": cfg.get("room_name"),
+        "energy_kwh_start": start_kwh,
     })
-    logger.info("[HawaAI] AC ON via Broadlink — session started")
+    logger.info("[HawaAI] AC ON via Broadlink — session started (kWh meter: %s)", start_kwh)
 
 
 async def _turn_ac_off(cfg: dict, indoor_temp: float, reason: str) -> None:
     """Send Broadlink IR 'off' command and end the session."""
-    global _ac_is_on, _session_start_time, _session_start_temp
+    global _ac_is_on, _session_start_time, _session_start_temp, _session_start_kwh
 
     broadlink_entity = cfg.get("broadlink_entity", "")
     cmd_off = (cfg.get("ir_command_off") or "").strip()
@@ -238,6 +251,26 @@ async def _turn_ac_off(cfg: dict, indoor_temp: float, reason: str) -> None:
 
     _ac_is_on = False
 
+    # Calculate kWh consumed during this session
+    kwh_consumed = None
+    cost = None
+    kwh_entity = cfg.get("energy_kwh_entity", "")
+    if kwh_entity and _session_start_kwh is not None:
+        raw = await ha_client.get_state(kwh_entity)
+        try:
+            end_kwh = float(raw) if raw else None
+            if end_kwh is not None:
+                kwh_consumed = round(end_kwh - _session_start_kwh, 4)
+                tariff = float(cfg.get("energy_tariff_per_kwh", 8.0))
+                cost = round(kwh_consumed * tariff, 2)
+                logger.info(
+                    "[HawaAI] Session energy: %.4f kWh consumed, cost %.2f (tariff %.2f/kWh)",
+                    kwh_consumed, cost, tariff,
+                )
+        except (ValueError, TypeError):
+            pass
+    _session_start_kwh = None
+
     if _session_start_time is not None:
         now = datetime.now(timezone.utc)
         cool_minutes = (now - _session_start_time).total_seconds() / 60.0
@@ -246,6 +279,8 @@ async def _turn_ac_off(cfg: dict, indoor_temp: float, reason: str) -> None:
             "indoor_temp_end": indoor_temp,
             "time_to_cool_minutes": round(cool_minutes, 1),
             "reason_stopped": reason,
+            "energy_kwh": kwh_consumed,
+            "cost": cost,
         })
         _session_start_time = None
         _session_start_temp = None
@@ -261,4 +296,5 @@ def get_runtime_state() -> dict:
         "session_start_time": (
             _session_start_time.isoformat() if _session_start_time else None
         ),
+        "session_start_kwh": _session_start_kwh,
     }

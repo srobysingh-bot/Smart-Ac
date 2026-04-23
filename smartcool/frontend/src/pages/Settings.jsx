@@ -183,14 +183,12 @@ export default function Settings() {
   const [saveMsg,    setSaveMsg]    = useState('')
   const [loading,    setLoading]    = useState(true)
 
-  // Per-dropdown search state (FIX 3 — each search is independent)
-  const [presenceSearch, setPresenceSearch]   = useState('')
-  const [tempSearch,     setTempSearch]       = useState('')
-  const [energySearch,   setEnergySearch]     = useState('')
-  const [broadlinkSearch, setBroadlinkSearch] = useState('')
-
-  // Energy fallback: show ALL sensors when the smart filter misses a device
-  const [energyShowAll, setEnergyShowAll] = useState(false)
+  // Per-dropdown search state (each search is independent)
+  const [presenceSearch,    setPresenceSearch]    = useState('')
+  const [tempSearch,        setTempSearch]        = useState('')
+  const [energyPowerSearch, setEnergyPowerSearch] = useState('')
+  const [energyKwhSearch,   setEnergyKwhSearch]   = useState('')
+  const [broadlinkSearch,   setBroadlinkSearch]   = useState('')
 
   useEffect(() => {
     Promise.all([getConfig(), getEntities()])
@@ -232,25 +230,33 @@ export default function Settings() {
 
   const allSensors = entities.filter(e => e.entity_id.startsWith('sensor.'))
 
-  // FIX 2 — broad energy filter catches breakers, Tuya circuits, etc.
-  const smartEnergySensors = entities.filter(e => {
-    if (e.domain !== 'sensor' && !e.entity_id.startsWith('sensor.')) return false
+  // Live power sensors — watts / current / breaker / circuit
+  const powerSensors = allSensors.filter(e => {
     const id   = e.entity_id.toLowerCase()
     const name = (e.friendly_name || '').toLowerCase()
     return (
-      id.includes('power')   || id.includes('energy')  ||
-      id.includes('watt')    || id.includes('current')  ||
-      id.includes('voltage') || id.includes('breaker')  ||
-      id.includes('circuit') || id.includes('kwh')      ||
-      name.includes('power') || name.includes('energy') ||
-      name.includes('watt')  || name.includes('breaker')||
-      name.includes('circuit')|| name.includes('30a')   ||
-      name.includes('amp')
+      id.includes('power')   || id.includes('watt')    ||
+      id.includes('current') || id.includes('breaker') ||
+      id.includes('circuit') || id.includes('30a')     ||
+      name.includes('power') || name.includes('watt')  ||
+      name.includes('current')|| name.includes('breaker')||
+      name.includes('circuit')|| name.includes('30a')
     )
   })
 
-  // Use smart filter unless user switched to "show all"
-  const energyEntities = energyShowAll ? allSensors : smartEnergySensors
+  // Cumulative kWh sensors — energy / usage / total / consumption
+  const kwhSensors = allSensors.filter(e => {
+    const id   = e.entity_id.toLowerCase()
+    const name = (e.friendly_name || '').toLowerCase()
+    return (
+      id.includes('kwh')         || id.includes('energy')      ||
+      id.includes('usage')       || id.includes('total')       ||
+      id.includes('consumption') ||
+      name.includes('kwh')       || name.includes('energy')    ||
+      name.includes('usage')     || name.includes('total')     ||
+      name.includes('consumption')
+    )
+  })
 
   if (loading) {
     return (
@@ -312,35 +318,43 @@ export default function Settings() {
           onSearchChange={setTempSearch}
         />
 
-        {/* Energy / Power sensor — FIX 2: broader filter + show-all fallback */}
+        {/* Live Power (Watts) */}
         <div>
           <EntityDropdown
-            label="Energy / Power Sensor"
-            value={cfg.energy_sensor_entity}
-            onChange={v => {
-              if (v === '__all__') {
-                setEnergyShowAll(true)
-              } else {
-                patch('energy_sensor_entity', v)
-                setEnergyShowAll(false)
-              }
-            }}
-            entities={energyEntities}
-            search={energySearch}
-            onSearchChange={setEnergySearch}
+            label="Live Power Sensor (Watts)"
+            value={cfg.energy_power_entity}
+            onChange={v => patch('energy_power_entity', v)}
+            entities={powerSensors.length > 0 ? powerSensors : allSensors}
+            search={energyPowerSearch}
+            onSearchChange={setEnergyPowerSearch}
           />
-          {/* Fallback toggle */}
-          <div className="flex items-center gap-2 mt-1">
-            <button
-              type="button"
-              onClick={() => setEnergyShowAll(v => !v)}
-              className="text-xs text-blue-400 hover:text-blue-300 underline"
-            >
-              {energyShowAll
-                ? `Smart filter (${smartEnergySensors.length} sensors)`
-                : `Not seeing your device? Show all ${allSensors.length} sensors`}
-            </button>
-          </div>
+          <p className="text-xs text-gray-500 mt-1">
+            Select entity showing current watts — e.g. &quot;power&quot; from your breaker
+          </p>
+        </div>
+
+        {/* Energy Usage (kWh) */}
+        <div>
+          <EntityDropdown
+            label="Energy Usage Sensor (kWh)"
+            value={cfg.energy_kwh_entity}
+            onChange={v => patch('energy_kwh_entity', v)}
+            entities={kwhSensors.length > 0 ? kwhSensors : allSensors}
+            search={energyKwhSearch}
+            onSearchChange={setEnergyKwhSearch}
+          />
+          <p className="text-xs text-gray-500 mt-1">
+            Select entity showing kWh consumed — e.g. &quot;Power Usage&quot; or &quot;Total&quot;
+          </p>
+        </div>
+
+        {/* Breaker info */}
+        <div className="flex items-start gap-2 px-3 py-2 bg-blue-900/20 border border-blue-800 rounded-lg text-xs text-blue-300">
+          <span className="shrink-0">ℹ</span>
+          <span>
+            This is a whole-room breaker — energy figures include all devices (PC, lights, AC).
+            For AC-only accuracy, use a dedicated smart plug on the AC unit.
+          </span>
         </div>
 
         {/* Broadlink remote */}

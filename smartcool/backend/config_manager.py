@@ -12,7 +12,8 @@ CONFIG_PATH = "/data/hawaai_config.json"
 DEFAULT_CONFIG: Dict[str, Any] = {
     "presence_entity": "",
     "indoor_temp_entity": "",
-    "energy_sensor_entity": "",
+    "energy_power_entity": "",   # live watts sensor  (e.g. sensor.study_sensor_power)
+    "energy_kwh_entity": "",     # cumulative kWh sensor (e.g. sensor.study_sensor_power_usage)
     "broadlink_entity": "",
     "ir_command_on": "",   # exact name of the Broadlink learned command for AC power on
     "ir_command_off": "",  # exact name of the Broadlink learned command for AC power off
@@ -57,6 +58,14 @@ def load_config() -> Dict[str, Any]:
 
     # Merge: defaults < supervisor options < persisted UI config
     merged = {**DEFAULT_CONFIG, **options, **saved}
+
+    # Migration: rename legacy energy_sensor_entity → energy_power_entity
+    if "energy_sensor_entity" in merged and "energy_power_entity" not in merged:
+        merged["energy_power_entity"] = merged.pop("energy_sensor_entity")
+        merged.setdefault("energy_kwh_entity", "")
+    elif "energy_sensor_entity" in merged:
+        merged.pop("energy_sensor_entity", None)
+
     return merged
 
 

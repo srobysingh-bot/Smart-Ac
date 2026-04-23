@@ -158,24 +158,25 @@ export default function Dashboard() {
           <div className="card flex flex-col gap-3">
             <p className="text-xs text-gray-500 uppercase tracking-wide">Energy Now</p>
             <div className="flex-1 flex flex-col justify-center items-center gap-1">
-              {status?.watt_draw != null && status.watt_draw > 0 ? (
+              {status?.energy_watts != null ? (
                 <>
                   <span className="text-4xl font-bold text-yellow-400">
-                    {status.watt_draw.toFixed(0)} W
+                    {status.energy_watts.toFixed(0)} W
                   </span>
-                  <span className="text-sm text-gray-400">
-                    {status.session_kwh
-                      ? `${status.session_kwh.toFixed(3)} kWh this session`
-                      : 'No active session'}
-                  </span>
+                  <span className="text-xs text-gray-500">Room total consumption</span>
+                  {status.session_start && status.energy_kwh != null && (
+                    <span className="text-sm text-gray-400 mt-1">
+                      Session: tracking kWh…
+                    </span>
+                  )}
                 </>
               ) : (
-                <span className="text-2xl font-bold text-gray-600">— W</span>
-              )}
-              {status && !status.energy_sensor_entity_configured && (
-                <span className="text-xs text-gray-600 text-center">
-                  Configure energy sensor in Settings
-                </span>
+                <>
+                  <span className="text-2xl font-bold text-gray-600">— W</span>
+                  <span className="text-xs text-gray-600 text-center">
+                    Configure Live Power Sensor in Settings
+                  </span>
+                </>
               )}
             </div>
           </div>
