@@ -58,6 +58,34 @@ export const getEntities = (domain) => {
   return request(`/entities${q}`)
 }
 
+// ── Climate entity ────────────────────────────────────────────────────────────
+export const getClimateState = (entityId) =>
+  request(`/climate/${encodeURIComponent(entityId)}`)
+
+export const setClimateTemperature = (entityId, temperature) =>
+  request(`/climate/${encodeURIComponent(entityId)}/set_temperature`, {
+    method: 'POST',
+    body: JSON.stringify({ temperature }),
+  })
+
+export const setHvacMode = (entityId, hvac_mode) =>
+  request(`/climate/${encodeURIComponent(entityId)}/set_hvac_mode`, {
+    method: 'POST',
+    body: JSON.stringify({ hvac_mode }),
+  })
+
+export const setFanMode = (entityId, fan_mode) =>
+  request(`/climate/${encodeURIComponent(entityId)}/set_fan_mode`, {
+    method: 'POST',
+    body: JSON.stringify({ fan_mode }),
+  })
+
+export const setSwingMode = (entityId, swing_mode) =>
+  request(`/climate/${encodeURIComponent(entityId)}/set_swing_mode`, {
+    method: 'POST',
+    body: JSON.stringify({ swing_mode }),
+  })
+
 // ── HA Device Registry ───────────────────────────────────────────────────────
 export const getDevices = () => request('/devices')
 export const getDeviceEntities = (deviceId) => request(`/devices/${encodeURIComponent(deviceId)}/entities`)

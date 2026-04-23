@@ -57,6 +57,34 @@ async def get_state(entity_id: str) -> Optional[str]:
         return None
 
 
+async def get_entity_state_full(entity_id: str) -> Optional[Dict[str, Any]]:
+    """
+    Fetch the full HA state object for an entity, including all attributes.
+    Returns {"state": "...", "attributes": {...}} or None on error.
+    Needed for climate entities where attributes carry temperature, modes, etc.
+    """
+    if not entity_id:
+        return None
+    url = f"{HA_BASE_URL}/api/states/{entity_id}"
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(
+                url, headers=_headers(), timeout=aiohttp.ClientTimeout(total=5)
+            ) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    return {
+                        "state":      data.get("state"),
+                        "attributes": data.get("attributes", {}),
+                    }
+                body = await resp.text()
+                logger.error("[HawaAI] get_entity_state_full(%s) HTTP %s: %s", entity_id, resp.status, body)
+                return None
+    except Exception as e:
+        logger.error("[HawaAI] get_entity_state_full(%s) exception: %s", entity_id, e)
+        return None
+
+
 async def get_all_entities() -> List[Dict[str, Any]]:
     """Returns all HA entity states — used to populate Settings dropdowns."""
     url = f"{HA_BASE_URL}/api/states"

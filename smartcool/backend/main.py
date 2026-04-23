@@ -10,6 +10,10 @@ Routes:
   GET  /api/config          Current add-on config
   POST /api/config          Save config to /data/hawaai_config.json
   GET  /api/entities        HA entity list for Settings dropdowns
+  GET  /api/climate/{id}   Live climate entity state + attributes
+  POST /api/climate/{id}/set_temperature
+  POST /api/climate/{id}/set_hvac_mode
+  POST /api/climate/{id}/set_fan_mode
   GET  /api/brands          AC brand+model library
   GET  /api/daily           Daily stats for last N days
   GET  /api/export/csv      Download session CSV
@@ -25,7 +29,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import aiohttp
-from fastapi import Body, FastAPI, HTTPException, Query, Request, WebSocket, WebSocketDisconnect
+from fastapi import Body, FastAPI, Query, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, HTMLResponse, Response
 
@@ -51,7 +55,7 @@ async def lifespan(app: FastAPI):
     logger.info("[HawaAI] Add-on stopped")
 
 
-app = FastAPI(title="HawaAI API", version="1.1.5", lifespan=lifespan)
+app = FastAPI(title="HawaAI API", version="1.1.6", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -146,6 +150,7 @@ async def get_status():
             cfg.get("presence_entity") and cfg.get("indoor_temp_entity")
         ),
         "target_temp": cfg.get("target_temp", 24),
+        "climate_entity": cfg.get("climate_entity", ""),
     }
 
 
@@ -189,6 +194,96 @@ async def get_snapshots(minutes: int = Query(120, ge=5, le=1440)):
 @app.get("/api/daily")
 async def get_daily(days: int = Query(7, ge=1, le=90)):
     return await database.get_daily_stats(days)
+
+
+# ── CLIMATE ENTITY ────────────────────────────────────────────────────────────
+
+@app.get("/api/climate/{entity_id:path}")
+async def get_climate_state(entity_id: str):
+    """
+    Fetch live state of a HA climate entity.
+    Returns hvac_mode, current_temperature, temperature (setpoint),
+    fan_mode, swing_mode, and all available mode lists.
+    """
+    full = await ha_client.get_entity_state_full(entity_id)
+    if full is None:
+        return {"error": f"Entity {entity_id!r} not found or unavailable"}
+
+    attrs = full.get("attributes", {})
+
+    def _safe_float(v):
+        try:
+            return float(v) if v is not None else None
+        except (ValueError, TypeError):
+            return None
+
+    return {
+        "entity_id":          entity_id,
+        "hvac_mode":          full.get("state"),               # "cool" / "heat" / "off" / "fan_only" / "dry" / "auto"
+        "current_temperature": _safe_float(attrs.get("current_temperature")),
+        "temperature":         _safe_float(attrs.get("temperature")),   # setpoint
+        "fan_mode":           attrs.get("fan_mode"),
+        "swing_mode":         attrs.get("swing_mode"),
+        "hvac_modes":         attrs.get("hvac_modes", []),
+        "fan_modes":          attrs.get("fan_modes", []),
+        "swing_modes":        attrs.get("swing_modes", []),
+        "min_temp":           _safe_float(attrs.get("min_temp")),
+        "max_temp":           _safe_float(attrs.get("max_temp")),
+        "target_temp_step":   _safe_float(attrs.get("target_temp_step")) or 1.0,
+        "friendly_name":      attrs.get("friendly_name", entity_id),
+    }
+
+
+@app.post("/api/climate/{entity_id:path}/set_temperature")
+async def climate_set_temperature(entity_id: str, data: Dict[str, Any] = Body(...)):
+    """Set climate setpoint. Body: {"temperature": 24}"""
+    temperature = data.get("temperature")
+    if temperature is None:
+        return {"success": False, "error": "temperature field required"}
+    ok = await ha_client.call_service("climate", "set_temperature", {
+        "entity_id":   entity_id,
+        "temperature": float(temperature),
+    })
+    return {"success": ok}
+
+
+@app.post("/api/climate/{entity_id:path}/set_hvac_mode")
+async def climate_set_hvac_mode(entity_id: str, data: Dict[str, Any] = Body(...)):
+    """Set HVAC mode. Body: {"hvac_mode": "cool"}"""
+    hvac_mode = data.get("hvac_mode")
+    if not hvac_mode:
+        return {"success": False, "error": "hvac_mode field required"}
+    ok = await ha_client.call_service("climate", "set_hvac_mode", {
+        "entity_id": entity_id,
+        "hvac_mode": hvac_mode,
+    })
+    return {"success": ok}
+
+
+@app.post("/api/climate/{entity_id:path}/set_fan_mode")
+async def climate_set_fan_mode(entity_id: str, data: Dict[str, Any] = Body(...)):
+    """Set fan mode. Body: {"fan_mode": "auto"}"""
+    fan_mode = data.get("fan_mode")
+    if not fan_mode:
+        return {"success": False, "error": "fan_mode field required"}
+    ok = await ha_client.call_service("climate", "set_fan_mode", {
+        "entity_id": entity_id,
+        "fan_mode":  fan_mode,
+    })
+    return {"success": ok}
+
+
+@app.post("/api/climate/{entity_id:path}/set_swing_mode")
+async def climate_set_swing_mode(entity_id: str, data: Dict[str, Any] = Body(...)):
+    """Set swing mode. Body: {"swing_mode": "auto"}"""
+    swing_mode = data.get("swing_mode")
+    if not swing_mode:
+        return {"success": False, "error": "swing_mode field required"}
+    ok = await ha_client.call_service("climate", "set_swing_mode", {
+        "entity_id":  entity_id,
+        "swing_mode": swing_mode,
+    })
+    return {"success": ok}
 
 
 # ── HA ENTITIES (for Settings dropdowns) ─────────────────────────────────────

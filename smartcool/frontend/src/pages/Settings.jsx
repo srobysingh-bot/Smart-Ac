@@ -186,6 +186,7 @@ export default function Settings() {
   // Per-dropdown search state (each search is independent)
   const [presenceSearch,    setPresenceSearch]    = useState('')
   const [tempSearch,        setTempSearch]        = useState('')
+  const [climateSearch,     setClimateSearch]     = useState('')
   const [energyPowerSearch, setEnergyPowerSearch] = useState('')
   const [energyKwhSearch,   setEnergyKwhSearch]   = useState('')
   const [broadlinkSearch,   setBroadlinkSearch]   = useState('')
@@ -368,6 +369,22 @@ export default function Settings() {
           search={tempSearch}
           onSearchChange={setTempSearch}
         />
+
+        {/* Climate entity */}
+        <div>
+          <EntityDropdown
+            label="Climate Entity (climate.*) — optional"
+            value={cfg.climate_entity}
+            onChange={v => patch('climate_entity', v)}
+            entities={byDomain('climate')}
+            search={climateSearch}
+            onSearchChange={setClimateSearch}
+          />
+          <p className="text-xs text-gray-500 mt-1">
+            If your AC is integrated as a HA climate entity, select it here to see live
+            temperature, mode, and fan data — and control it from the Dashboard.
+          </p>
+        </div>
 
         {/* ── Energy Monitoring ─────────────────────────────────────────────── */}
         <div className="border border-gray-800 rounded-xl p-4 space-y-4">

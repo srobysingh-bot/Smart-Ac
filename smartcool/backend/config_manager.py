@@ -12,6 +12,7 @@ CONFIG_PATH = "/data/hawaai_config.json"
 DEFAULT_CONFIG: Dict[str, Any] = {
     "presence_entity": "",
     "indoor_temp_entity": "",
+    "climate_entity": "",      # optional HA climate entity for live AC data + control
     "energy_power_entity": "",   # live watts sensor  (e.g. sensor.study_sensor_power)
     "energy_kwh_entity": "",     # cumulative kWh sensor (e.g. sensor.study_sensor_power_usage)
     "broadlink_entity": "",

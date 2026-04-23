@@ -1,12 +1,12 @@
-import { useEffect, useRef, useState } from 'react'
+import { useEffect, useRef, useState, useCallback } from 'react'
 import { useNavigate } from 'react-router-dom'
-import { getStatus, getSessionStats, getSnapshots } from '../api/smartcool.js'
+import { getStatus, getSessionStats, getSnapshots, getClimateState, setClimateTemperature, setHvacMode, setFanMode, setSwingMode } from '../api/smartcool.js'
 import ACStatusCard  from '../components/ACStatusCard.jsx'
 import TempGauge     from '../components/TempGauge.jsx'
 import EnergyChart   from '../components/EnergyChart.jsx'
 import PresenceBadge from '../components/PresenceBadge.jsx'
 import SessionTable  from '../components/SessionTable.jsx'
-import { Thermometer, Wind, Zap, Cloud, AlertTriangle } from 'lucide-react'
+import { Thermometer, Wind, Zap, Cloud, AlertTriangle, Minus, Plus, Loader } from 'lucide-react'
 
 // ── Config warning banner ─────────────────────────────────────────────────────
 function ConfigWarning() {
@@ -102,6 +102,194 @@ function formatMinutes(mins) {
   return h > 0 ? `${h}h ${m}m` : `${m}m`
 }
 
+// ── Climate card ──────────────────────────────────────────────────────────────
+const HVAC_MODE_COLORS = {
+  cool:     'bg-blue-600 text-white',
+  heat:     'bg-orange-600 text-white',
+  auto:     'bg-purple-600 text-white',
+  dry:      'bg-yellow-600 text-white',
+  fan_only: 'bg-teal-600 text-white',
+  off:      'bg-gray-700 text-gray-300',
+}
+const HVAC_MODE_LABELS = {
+  cool: 'Cool', heat: 'Heat', auto: 'Auto',
+  dry: 'Dry', fan_only: 'Fan', off: 'Off',
+}
+
+function ClimateCard({ entityId }) {
+  const [climate,  setClimate]  = useState(null)
+  const [error,    setError]    = useState(null)
+  const [busy,     setBusy]     = useState(false)   // pending control command
+
+  const fetchClimate = useCallback(() => {
+    getClimateState(entityId)
+      .then(d => { setClimate(d); setError(null) })
+      .catch(e => setError(e.message || String(e)))
+  }, [entityId])
+
+  // Initial fetch + 8-second polling
+  useEffect(() => {
+    fetchClimate()
+    const id = setInterval(fetchClimate, 8_000)
+    return () => clearInterval(id)
+  }, [fetchClimate])
+
+  const sendCommand = async (fn) => {
+    setBusy(true)
+    try {
+      await fn()
+      // Short delay then re-fetch so UI reflects confirmed state
+      setTimeout(fetchClimate, 800)
+    } catch (e) {
+      setError(e.message || String(e))
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  const adjustTemp = (delta) => {
+    if (!climate) return
+    const step = climate.target_temp_step || 1
+    const next = Math.round(((climate.temperature ?? 24) + delta) / step) * step
+    const clamped = Math.max(climate.min_temp ?? 16, Math.min(climate.max_temp ?? 30, next))
+    sendCommand(() => setClimateTemperature(entityId, clamped))
+  }
+
+  if (error) {
+    return (
+      <div className="card">
+        <p className="text-xs text-gray-500 uppercase tracking-wide mb-3">AC Climate</p>
+        <div className="flex items-center gap-2 text-xs text-red-400">
+          <AlertTriangle size={13} /> {error}
+        </div>
+        <p className="text-xs text-gray-600 mt-1">entity: {entityId}</p>
+      </div>
+    )
+  }
+
+  if (!climate) {
+    return (
+      <div className="card flex items-center gap-2 text-xs text-gray-500">
+        <Loader size={13} className="animate-spin" /> Loading climate data…
+      </div>
+    )
+  }
+
+  const { hvac_mode, current_temperature, temperature, fan_mode, swing_mode,
+          hvac_modes, fan_modes, swing_modes, friendly_name } = climate
+
+  return (
+    <div className="card space-y-4">
+      {/* Header */}
+      <div className="flex items-center justify-between">
+        <div>
+          <p className="text-xs text-gray-500 uppercase tracking-wide">AC Climate</p>
+          <p className="text-sm text-gray-300 mt-0.5">{friendly_name}</p>
+        </div>
+        <span className={`px-3 py-1 rounded-full text-xs font-semibold ${HVAC_MODE_COLORS[hvac_mode] ?? 'bg-gray-700 text-gray-300'}`}>
+          {HVAC_MODE_LABELS[hvac_mode] ?? hvac_mode ?? '—'}
+        </span>
+      </div>
+
+      {/* Temperature row */}
+      <div className="flex items-center justify-between">
+        {/* Current temp */}
+        <div className="text-center">
+          <p className="text-3xl font-bold text-blue-400">
+            {current_temperature != null ? `${current_temperature.toFixed(1)}°` : '—'}
+          </p>
+          <p className="text-xs text-gray-500 mt-0.5">Current</p>
+        </div>
+
+        {/* Setpoint with ±controls */}
+        <div className="flex flex-col items-center gap-1">
+          <p className="text-xs text-gray-500">Setpoint</p>
+          <div className="flex items-center gap-2">
+            <button
+              disabled={busy || hvac_mode === 'off'}
+              onClick={() => adjustTemp(-1)}
+              className="w-8 h-8 rounded-lg bg-gray-700 hover:bg-gray-600 disabled:opacity-40 flex items-center justify-center transition-colors"
+            >
+              <Minus size={14} />
+            </button>
+            <span className="text-2xl font-bold w-14 text-center">
+              {temperature != null ? `${temperature}°` : '—'}
+            </span>
+            <button
+              disabled={busy || hvac_mode === 'off'}
+              onClick={() => adjustTemp(+1)}
+              className="w-8 h-8 rounded-lg bg-gray-700 hover:bg-gray-600 disabled:opacity-40 flex items-center justify-center transition-colors"
+            >
+              <Plus size={14} />
+            </button>
+          </div>
+        </div>
+
+        {/* Fan mode */}
+        <div className="text-center">
+          <p className="text-xs text-gray-500 mb-1">Fan</p>
+          {fan_modes && fan_modes.length > 0 ? (
+            <select
+              disabled={busy || hvac_mode === 'off'}
+              value={fan_mode ?? ''}
+              onChange={e => sendCommand(() => setFanMode(entityId, e.target.value))}
+              className="bg-gray-700 border border-gray-600 rounded-lg px-2 py-1 text-xs text-gray-100 focus:outline-none focus:border-blue-500 disabled:opacity-40"
+            >
+              {fan_modes.map(m => <option key={m} value={m}>{m}</option>)}
+            </select>
+          ) : (
+            <span className="text-sm font-semibold">{fan_mode ?? '—'}</span>
+          )}
+        </div>
+      </div>
+
+      {/* HVAC mode buttons */}
+      {hvac_modes && hvac_modes.length > 0 && (
+        <div>
+          <p className="text-xs text-gray-500 mb-2">Mode</p>
+          <div className="flex flex-wrap gap-2">
+            {hvac_modes.map(mode => (
+              <button
+                key={mode}
+                disabled={busy}
+                onClick={() => sendCommand(() => setHvacMode(entityId, mode))}
+                className={`px-3 py-1 rounded-lg text-xs font-medium transition-colors disabled:opacity-40 ${
+                  mode === hvac_mode
+                    ? HVAC_MODE_COLORS[mode] ?? 'bg-blue-600 text-white'
+                    : 'bg-gray-700 text-gray-300 hover:bg-gray-600'
+                }`}
+              >
+                {HVAC_MODE_LABELS[mode] ?? mode}
+              </button>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {/* Swing mode (if supported) */}
+      {swing_modes && swing_modes.length > 1 && (
+        <div className="flex items-center justify-between">
+          <p className="text-xs text-gray-500">Swing</p>
+          <select
+            disabled={busy || hvac_mode === 'off'}
+            value={swing_mode ?? ''}
+            onChange={e => sendCommand(() => setSwingMode(entityId, e.target.value))}
+            className="bg-gray-700 border border-gray-600 rounded-lg px-2 py-1 text-xs text-gray-100 focus:outline-none disabled:opacity-40"
+          >
+            {swing_modes.map(m => <option key={m} value={m}>{m}</option>)}
+          </select>
+        </div>
+      )}
+
+      {busy && (
+        <div className="flex items-center gap-1.5 text-xs text-gray-400">
+          <Loader size={11} className="animate-spin" /> Sending command…
+        </div>
+      )}
+    </div>
+  )
+}
+
 // ── Page ──────────────────────────────────────────────────────────────────────
 export default function Dashboard() {
   const [status,    setStatus]    = useState(null)
@@ -185,6 +373,11 @@ export default function Dashboard() {
             </div>
           </div>
         </div>
+
+        {/* Climate card — only shown when a climate entity is configured */}
+        {status?.climate_entity && (
+          <ClimateCard entityId={status.climate_entity} />
+        )}
 
         {/* Real-time chart */}
         <div className="card">
