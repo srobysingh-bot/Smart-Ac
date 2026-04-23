@@ -84,7 +84,7 @@ async def tick() -> None:
     use_presence    = cfg.get("use_presence", True)
 
     logger.info(
-        "[HawaAI] TICK | indoor=%.1f°C | presence=%s | ac=%s | target=%.1f°C",
+        "[HawaAI] TICK | indoor=%.1f°C | presence=%s | ac(internal)=%s | target=%.1f°C",
         indoor_temp,
         "occupied" if is_occupied else "vacant",
         "ON" if _ac_is_on else "OFF",
@@ -93,8 +93,7 @@ async def tick() -> None:
 
     now = datetime.now(timezone.utc)
 
-    # BUG 2 FIX — power-based AC state sync using LIVE WATTS entity
-    # Detects AC turned on/off by physical remote (outside HawaAI's control)
+    # ── Read live energy/power from HA ────────────────────────────────────────
     energy_power_entity = cfg.get("energy_power_entity", "")
     energy_watts = 0.0
     if energy_power_entity:
@@ -104,22 +103,50 @@ async def tick() -> None:
         except (ValueError, TypeError):
             energy_watts = 0.0
 
-        if energy_watts > 50.0 and not _ac_is_on:
-            logger.info(
-                "[HawaAI] AC detected ON via power (%.0fW) but engine thought OFF — syncing state",
-                energy_watts,
-            )
-            _ac_is_on = True
-            if _session_start_time is None:
-                _session_start_time = datetime.now(timezone.utc)
-                _session_start_temp = indoor_temp
+    # ── STEP 6A: Determine authoritative AC state from HA (never trust only
+    #            the internal flag — physical remote use makes it stale) ───────
+    #
+    # Priority:
+    #   1. Live power sensor (watts) — most reliable
+    #   2. Climate entity HVAC mode  — if no power sensor
+    #   3. Internal _ac_is_on flag   — last resort / fallback
+    #
+    ac_actually_on: bool
+    if energy_power_entity:
+        if energy_watts > 50.0:
+            ac_actually_on = True
+        elif energy_watts < 10.0:
+            ac_actually_on = False
+        else:
+            # Watts in the 10-50W grey-zone: trust the internal flag
+            ac_actually_on = _ac_is_on
+    else:
+        climate_entity = cfg.get("climate_entity", "")
+        if climate_entity:
+            climate_raw = await ha_client.get_state(climate_entity)
+            ac_actually_on = climate_raw not in (None, "off", "unavailable", "unknown")
+        else:
+            ac_actually_on = _ac_is_on  # no external sensor; trust internal state
 
-        elif energy_watts < 10.0 and _ac_is_on:
-            logger.info(
-                "[HawaAI] AC power dropped to %.0fW but engine thought ON — syncing OFF",
-                energy_watts,
-            )
-            await _turn_ac_off(cfg, indoor_temp, reason="manual_off")
+    # ── Sync internal flag & manage sessions for physical-remote changes ──────
+    if ac_actually_on and not _ac_is_on:
+        logger.info(
+            "[HawaAI] AC detected ON by HA (%.0fW) but engine thought OFF — syncing",
+            energy_watts,
+        )
+        _ac_is_on = True
+        if _session_start_time is None:
+            _session_start_time = now
+            _session_start_temp = indoor_temp
+
+    elif not ac_actually_on and _ac_is_on:
+        logger.info(
+            "[HawaAI] AC detected OFF by HA (%.0fW) but engine thought ON — syncing",
+            energy_watts,
+        )
+        await _turn_ac_off(cfg, indoor_temp, reason="manual_off")
+        # _ac_is_on is now False inside _turn_ac_off; re-read for the rest of this tick
+        ac_actually_on = False
 
     # Write snapshot every tick for chart
     weather = await weather_api.get_cached()
@@ -129,40 +156,52 @@ async def tick() -> None:
             "timestamp": now.isoformat(),
             "indoor_temp": indoor_temp,
             "outdoor_temp": weather.get("temp") if weather else None,
-            "ac_state": _ac_is_on,
+            "ac_state": ac_actually_on,
             "watt_draw": energy_watts,
             "presence": is_occupied,
         },
     )
 
-    # STEP 6 — VACANCY LOGIC
+    # STEP 6B — VACANCY LOGIC ─────────────────────────────────────────────────
     if use_presence and not is_occupied:
+        # Record the moment presence transitioned True → False (first vacant tick only)
         if _vacant_since is None:
             _vacant_since = now
-            logger.info("[HawaAI] Room just became vacant — starting vacancy timer")
+            logger.info("[HawaAI] Room became vacant — vacancy timer started")
 
-        elapsed = (now - _vacant_since).total_seconds()
+        vacancy_duration = (now - _vacant_since).total_seconds()
+        logger.info(
+            "[HawaAI] Vacant %.0fs / timeout %ds | AC=%s (HA-read)",
+            vacancy_duration, vacancy_timeout, "ON" if ac_actually_on else "OFF",
+        )
 
-        if _ac_is_on and elapsed >= vacancy_timeout:
-            logger.info("[HawaAI] Room vacant for %.0fs — turning AC OFF", elapsed)
+        # Turn AC OFF as soon as vacancy_duration reaches the timeout,
+        # using ac_actually_on (HA source of truth) — not the internal flag
+        if ac_actually_on and vacancy_duration >= vacancy_timeout:
+            logger.info(
+                "[HawaAI] Vacancy timeout reached (%.0fs) — turning AC OFF",
+                vacancy_duration,
+            )
             await _turn_ac_off(cfg, indoor_temp, reason="vacant")
-        return  # always return early when vacant, regardless of AC state
+
+        # Always skip temperature logic while vacant
+        return
 
     # Room is occupied (or presence disabled) — reset vacancy timer
     _vacant_since = None
 
-    # STEP 7 — TEMPERATURE LOGIC
+    # STEP 7 — TEMPERATURE LOGIC ──────────────────────────────────────────────
     upper_threshold = target_temp + hysteresis   # e.g. 24 + 1.5 = 25.5°C
     lower_threshold = target_temp - hysteresis   # e.g. 24 - 1.5 = 22.5°C
 
-    if indoor_temp > upper_threshold and not _ac_is_on:
+    if indoor_temp > upper_threshold and not ac_actually_on:
         logger.info(
             "[HawaAI] Too warm (%.1f°C > %.1f°C) — turning AC ON",
             indoor_temp, upper_threshold,
         )
         await _turn_ac_on(cfg, indoor_temp)
 
-    elif indoor_temp <= lower_threshold and _ac_is_on:
+    elif indoor_temp <= lower_threshold and ac_actually_on:
         logger.info(
             "[HawaAI] Room cooled (%.1f°C ≤ %.1f°C) — turning AC OFF",
             indoor_temp, lower_threshold,
@@ -170,8 +209,8 @@ async def tick() -> None:
         session_logger.mark_cooled()
         await _turn_ac_off(cfg, indoor_temp, reason="cooled")
 
-    elif indoor_temp <= target_temp and _ac_is_on:
-        # Between thresholds and cooling: just record milestone
+    elif indoor_temp <= target_temp and ac_actually_on:
+        # Between thresholds and cooling: record milestone only
         session_logger.mark_cooled()
 
 
