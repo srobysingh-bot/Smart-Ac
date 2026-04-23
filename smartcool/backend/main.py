@@ -50,7 +50,7 @@ async def lifespan(app: FastAPI):
     logger.info("[HawaAI] Add-on stopped")
 
 
-app = FastAPI(title="HawaAI API", version="1.1.1", lifespan=lifespan)
+app = FastAPI(title="HawaAI API", version="1.1.2", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,

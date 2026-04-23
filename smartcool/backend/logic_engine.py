@@ -176,27 +176,34 @@ async def tick() -> None:
 
 
 async def _turn_ac_on(cfg: dict, indoor_temp: float) -> None:
-    """Send Broadlink IR 'on' command and start a session."""
+    """Send Broadlink IR 'on' command and start a session.
+
+    Only marks ac=ON and starts a session if the IR command succeeded.
+    Exits early on missing config or command failure.
+    """
     global _ac_is_on, _session_start_time, _session_start_temp, _session_start_kwh
 
-    broadlink_entity = cfg.get("broadlink_entity", "")
-    # BUG 3C FIX — use user-configured IR command name (must match learned Broadlink command exactly)
+    broadlink_entity = (cfg.get("broadlink_entity") or "").strip()
     cmd_on = (cfg.get("ir_command_on") or "").strip()
 
     if not broadlink_entity:
-        logger.warning("[HawaAI] No broadlink_entity configured — marking ac=ON without IR command")
-    elif not cmd_on:
-        logger.error(
-            "[HawaAI] IR Power ON command is empty! "
-            "Go to Settings → IR Command Mapping and enter the exact Broadlink command name."
-        )
-    else:
-        ok = await ha_client.send_broadlink_command(broadlink_entity, cmd_on)
-        if ok:
-            logger.info("[HawaAI] AC ON — IR sent: '%s' to %s", cmd_on, broadlink_entity)
-        else:
-            logger.error("[HawaAI] Broadlink command '%s' failed for %s", cmd_on, broadlink_entity)
+        logger.error("[HawaAI] No Broadlink entity configured — cannot turn AC ON")
+        return  # do NOT mark ON
 
+    if not cmd_on:
+        logger.error(
+            "[HawaAI] IR Power ON command is empty — "
+            "go to Settings → IR Command Mapping and enter the exact Broadlink command name"
+        )
+        return  # do NOT mark ON
+
+    # Send command — only proceed if it succeeds
+    success = await ha_client.send_broadlink_command(broadlink_entity, cmd_on)
+    if not success:
+        logger.error("[HawaAI] AC ON command failed — NOT marking as ON, will retry next tick")
+        return  # do NOT mark ON, do NOT start session
+
+    # ── IR command confirmed sent ───────────────────────────────────────────
     # Record kWh meter reading at session start for consumed-kWh calculation
     kwh_entity = cfg.get("energy_kwh_entity", "")
     start_kwh = None
@@ -208,7 +215,6 @@ async def _turn_ac_on(cfg: dict, indoor_temp: float) -> None:
             start_kwh = None
     _session_start_kwh = start_kwh
 
-    # Always flip the state and start a session so the logic doesn't cycle
     _ac_is_on = True
     _session_start_time = datetime.now(timezone.utc)
     _session_start_temp = indoor_temp
@@ -225,31 +231,46 @@ async def _turn_ac_on(cfg: dict, indoor_temp: float) -> None:
         "room_name": cfg.get("room_name"),
         "energy_kwh_start": start_kwh,
     })
-    logger.info("[HawaAI] AC ON via Broadlink — session started (kWh meter: %s)", start_kwh)
+    logger.info("[HawaAI] AC ON — session started (indoor=%.1f°C, kWh meter: %s)", indoor_temp, start_kwh)
 
 
 async def _turn_ac_off(cfg: dict, indoor_temp: float, reason: str) -> None:
-    """Send Broadlink IR 'off' command and end the session."""
+    """Send Broadlink IR 'off' command and end the session.
+
+    Always marks ac=OFF in the engine (we attempted the command).
+    If no open session exists, skips the session-end logic safely.
+    """
     global _ac_is_on, _session_start_time, _session_start_temp, _session_start_kwh
 
-    broadlink_entity = cfg.get("broadlink_entity", "")
+    broadlink_entity = (cfg.get("broadlink_entity") or "").strip()
     cmd_off = (cfg.get("ir_command_off") or "").strip()
 
-    if not broadlink_entity:
-        logger.warning("[HawaAI] No broadlink_entity configured — marking ac=OFF without IR command")
-    elif not cmd_off:
-        logger.error(
-            "[HawaAI] IR Power OFF command is empty! "
-            "Go to Settings → IR Command Mapping and enter the exact Broadlink command name."
-        )
+    if broadlink_entity and cmd_off:
+        ir_ok = await ha_client.send_broadlink_command(broadlink_entity, cmd_off)
+        if not ir_ok:
+            logger.error(
+                "[HawaAI] AC OFF IR command '%s' failed — marking OFF anyway to avoid retry loop",
+                cmd_off,
+            )
+    elif not broadlink_entity:
+        logger.warning("[HawaAI] No Broadlink entity configured — marking ac=OFF without IR command")
     else:
-        ok = await ha_client.send_broadlink_command(broadlink_entity, cmd_off)
-        if ok:
-            logger.info("[HawaAI] AC OFF — IR sent: '%s' to %s | reason: %s", cmd_off, broadlink_entity, reason)
-        else:
-            logger.error("[HawaAI] Broadlink command '%s' failed for %s", cmd_off, broadlink_entity)
+        logger.error(
+            "[HawaAI] IR Power OFF command is empty — "
+            "go to Settings → IR Command Mapping and enter the exact Broadlink command name"
+        )
 
+    # Always flip internal state regardless of IR outcome
     _ac_is_on = False
+
+    # Safety guard — if there's no open session just reset and exit
+    if _session_start_time is None:
+        logger.info("[HawaAI] AC OFF (%s) — no open session to close", reason)
+        _session_start_kwh = None
+        return
+
+    now = datetime.now(timezone.utc)
+    cool_minutes = (now - _session_start_time).total_seconds() / 60.0
 
     # Calculate kWh consumed during this session
     kwh_consumed = None
@@ -264,28 +285,29 @@ async def _turn_ac_off(cfg: dict, indoor_temp: float, reason: str) -> None:
                 tariff = float(cfg.get("energy_tariff_per_kwh", 8.0))
                 cost = round(kwh_consumed * tariff, 2)
                 logger.info(
-                    "[HawaAI] Session energy: %.4f kWh consumed, cost %.2f (tariff %.2f/kWh)",
+                    "[HawaAI] Session energy: %.4f kWh, cost %.2f (tariff %.2f/kWh)",
                     kwh_consumed, cost, tariff,
                 )
         except (ValueError, TypeError):
             pass
+
+    await session_logger.end_session({
+        "end_time": now.isoformat(),
+        "indoor_temp_end": indoor_temp,
+        "time_to_cool_minutes": round(cool_minutes, 1),
+        "reason_stopped": reason,
+        "energy_kwh": kwh_consumed,
+        "cost": cost,
+    })
+
+    logger.info(
+        "[HawaAI] AC OFF — reason=%s | cool=%.1fmin | kWh=%s",
+        reason, cool_minutes, kwh_consumed,
+    )
+
+    _session_start_time = None
+    _session_start_temp = None
     _session_start_kwh = None
-
-    if _session_start_time is not None:
-        now = datetime.now(timezone.utc)
-        cool_minutes = (now - _session_start_time).total_seconds() / 60.0
-        await session_logger.end_session({
-            "end_time": now.isoformat(),
-            "indoor_temp_end": indoor_temp,
-            "time_to_cool_minutes": round(cool_minutes, 1),
-            "reason_stopped": reason,
-            "energy_kwh": kwh_consumed,
-            "cost": cost,
-        })
-        _session_start_time = None
-        _session_start_temp = None
-
-    logger.info("[HawaAI] AC OFF via Broadlink — reason: %s", reason)
 
 
 def get_runtime_state() -> dict:

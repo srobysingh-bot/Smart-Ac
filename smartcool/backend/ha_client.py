@@ -106,19 +106,28 @@ async def send_broadlink_command(remote_entity: str, command: str) -> bool:
     """
     Send a learned IR command via Broadlink RM device.
 
-    CRITICAL: HA's remote.send_command requires 'command' as a LIST.
-    A plain string is silently ignored by HA and nothing fires.
+    CRITICAL:
+      - 'command' must be a LIST — plain string is silently ignored by HA.
+      - Do NOT include a 'device' field — Broadlink RM rejects it with HTTP 500.
     """
-    return await call_service(
-        "remote",
-        "send_command",
-        {
-            "entity_id": remote_entity,
-            "command": [command],   # must be a list
-            "num_repeats": 1,
-            "delay_secs": 0.4,
-        },
-    )
+    if not remote_entity or not command:
+        logger.error("[HawaAI] send_broadlink_command: missing entity=%r or command=%r", remote_entity, command)
+        return False
+
+    payload = {
+        "entity_id": remote_entity,
+        "command": [command],   # must be a list — DO NOT add "device" key
+        "num_repeats": 1,
+        "delay_secs": 0.4,
+    }
+
+    logger.info("[HawaAI] Sending IR: entity=%s command=%s", remote_entity, command)
+    success = await call_service("remote", "send_command", payload)
+    if success:
+        logger.info("[HawaAI] IR command '%s' sent successfully", command)
+    else:
+        logger.error("[HawaAI] IR command '%s' FAILED — check HA logs for details", command)
+    return success
 
 
 async def publish_sensor_state(

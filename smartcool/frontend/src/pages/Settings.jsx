@@ -190,6 +190,10 @@ export default function Settings() {
   const [energyKwhSearch,   setEnergyKwhSearch]   = useState('')
   const [broadlinkSearch,   setBroadlinkSearch]   = useState('')
 
+  // Energy auto-detect
+  const [deviceNameInput,  setDeviceNameInput]  = useState('')
+  const [autoDetectResult, setAutoDetectResult] = useState(null)  // null | { power, kwh, notFound }
+
   useEffect(() => {
     Promise.all([getConfig(), getEntities()])
       .then(([c, e]) => {
@@ -258,6 +262,36 @@ export default function Settings() {
     )
   })
 
+  const findEntities = () => {
+    const keyword = deviceNameInput.toLowerCase().trim()
+    if (!keyword) return
+
+    const matching = entities.filter(
+      e => e.entity_id.startsWith('sensor.') && e.entity_id.toLowerCase().includes(keyword)
+    )
+
+    const powerEntity = matching.find(e => {
+      const id = e.entity_id.toLowerCase()
+      return (id.includes('power') || id.includes('watt')) &&
+             !id.includes('usage') && !id.includes('total') && !id.includes('kwh')
+    })
+
+    const kwhEntity = matching.find(e => {
+      const id = e.entity_id.toLowerCase()
+      return id.includes('power_usage') || id.includes('energy') ||
+             id.includes('kwh') || (id.includes('total') && !id.includes('voltage'))
+    })
+
+    if (powerEntity) patch('energy_power_entity', powerEntity.entity_id)
+    if (kwhEntity)   patch('energy_kwh_entity',   kwhEntity.entity_id)
+
+    setAutoDetectResult(
+      (powerEntity || kwhEntity)
+        ? { power: powerEntity || null, kwh: kwhEntity || null, notFound: false }
+        : { power: null, kwh: null, notFound: true }
+    )
+  }
+
   if (loading) {
     return (
       <div className="flex items-center justify-center h-full text-gray-500">
@@ -318,43 +352,99 @@ export default function Settings() {
           onSearchChange={setTempSearch}
         />
 
-        {/* Live Power (Watts) */}
-        <div>
-          <EntityDropdown
-            label="Live Power Sensor (Watts)"
-            value={cfg.energy_power_entity}
-            onChange={v => patch('energy_power_entity', v)}
-            entities={powerSensors.length > 0 ? powerSensors : allSensors}
-            search={energyPowerSearch}
-            onSearchChange={setEnergyPowerSearch}
-          />
-          <p className="text-xs text-gray-500 mt-1">
-            Select entity showing current watts — e.g. &quot;power&quot; from your breaker
-          </p>
-        </div>
+        {/* ── Energy Monitoring ─────────────────────────────────────────────── */}
+        <div className="border border-gray-800 rounded-xl p-4 space-y-4">
+          <p className="text-xs font-semibold uppercase tracking-widest text-gray-400">Energy Monitoring</p>
 
-        {/* Energy Usage (kWh) */}
-        <div>
-          <EntityDropdown
-            label="Energy Usage Sensor (kWh)"
-            value={cfg.energy_kwh_entity}
-            onChange={v => patch('energy_kwh_entity', v)}
-            entities={kwhSensors.length > 0 ? kwhSensors : allSensors}
-            search={energyKwhSearch}
-            onSearchChange={setEnergyKwhSearch}
-          />
-          <p className="text-xs text-gray-500 mt-1">
-            Select entity showing kWh consumed — e.g. &quot;Power Usage&quot; or &quot;Total&quot;
-          </p>
-        </div>
+          {/* Auto-detect row */}
+          <div>
+            <Label>Circuit Breaker / Smart Plug Device Name</Label>
+            <div className="flex gap-2">
+              <input
+                type="text"
+                placeholder='e.g. study, energy, breaker'
+                value={deviceNameInput}
+                onChange={e => { setDeviceNameInput(e.target.value); setAutoDetectResult(null) }}
+                className="flex-1 bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm text-gray-100 focus:outline-none focus:border-blue-500"
+              />
+              <button
+                type="button"
+                onClick={findEntities}
+                className="px-4 py-2 bg-blue-700 hover:bg-blue-600 rounded-lg text-sm font-medium text-white transition-colors whitespace-nowrap"
+              >
+                Find Entities
+              </button>
+            </div>
+            <p className="text-xs text-gray-500 mt-1">
+              Type part of your device name and click Find — we&apos;ll auto-select the power and kWh sensors.
+            </p>
+          </div>
 
-        {/* Breaker info */}
-        <div className="flex items-start gap-2 px-3 py-2 bg-blue-900/20 border border-blue-800 rounded-lg text-xs text-blue-300">
-          <span className="shrink-0">ℹ</span>
-          <span>
-            This is a whole-room breaker — energy figures include all devices (PC, lights, AC).
-            For AC-only accuracy, use a dedicated smart plug on the AC unit.
-          </span>
+          {/* Auto-detect result */}
+          {autoDetectResult && !autoDetectResult.notFound && (
+            <div className="px-3 py-2 bg-green-900/30 border border-green-700 rounded-lg text-xs text-green-300 space-y-1">
+              <div className="font-semibold">Found:</div>
+              {autoDetectResult.power && (
+                <div>Power: <span className="font-mono">{autoDetectResult.power.entity_id}</span> (Live watts)</div>
+              )}
+              {autoDetectResult.kwh && (
+                <div>Usage: <span className="font-mono">{autoDetectResult.kwh.entity_id}</span> (kWh total)</div>
+              )}
+              {!autoDetectResult.power && (
+                <div className="text-yellow-300">Power sensor not found — select manually below</div>
+              )}
+              {!autoDetectResult.kwh && (
+                <div className="text-yellow-300">kWh sensor not found — select manually below</div>
+              )}
+            </div>
+          )}
+          {autoDetectResult?.notFound && (
+            <div className="px-3 py-2 bg-orange-900/30 border border-orange-700 rounded-lg text-xs text-orange-300">
+              No matching entities found for &quot;{deviceNameInput}&quot; — select manually below.
+            </div>
+          )}
+
+          {/* Divider */}
+          <p className="text-xs text-gray-600 text-center">— or manually select —</p>
+
+          {/* Live Power (Watts) */}
+          <div>
+            <EntityDropdown
+              label="Live Power Sensor (Watts)"
+              value={cfg.energy_power_entity}
+              onChange={v => patch('energy_power_entity', v)}
+              entities={powerSensors.length > 0 ? powerSensors : allSensors}
+              search={energyPowerSearch}
+              onSearchChange={setEnergyPowerSearch}
+            />
+            <p className="text-xs text-gray-500 mt-1">
+              Entity showing current watts — e.g. &quot;power&quot; from your breaker
+            </p>
+          </div>
+
+          {/* Energy Usage (kWh) */}
+          <div>
+            <EntityDropdown
+              label="Energy Usage Sensor (kWh)"
+              value={cfg.energy_kwh_entity}
+              onChange={v => patch('energy_kwh_entity', v)}
+              entities={kwhSensors.length > 0 ? kwhSensors : allSensors}
+              search={energyKwhSearch}
+              onSearchChange={setEnergyKwhSearch}
+            />
+            <p className="text-xs text-gray-500 mt-1">
+              Entity showing kWh consumed — e.g. &quot;Power Usage&quot; or &quot;Total&quot;
+            </p>
+          </div>
+
+          {/* Breaker info */}
+          <div className="flex items-start gap-2 px-3 py-2 bg-blue-900/20 border border-blue-800 rounded-lg text-xs text-blue-300">
+            <span className="shrink-0">ℹ</span>
+            <span>
+              This is a whole-room breaker — energy figures include all devices (PC, lights, AC).
+              For AC-only accuracy, use a dedicated smart plug on the AC unit.
+            </span>
+          </div>
         </div>
 
         {/* Broadlink remote */}
