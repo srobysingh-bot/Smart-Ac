@@ -55,7 +55,7 @@ async def lifespan(app: FastAPI):
     logger.info("[HawaAI] Add-on stopped")
 
 
-app = FastAPI(title="HawaAI API", version="1.1.15", lifespan=lifespan)
+app = FastAPI(title="HawaAI API", version="1.1.16", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -218,9 +218,22 @@ async def get_insights():
 
     Returns cooling_rate, efficiency, best target temperature, cooling type
     distribution, and a recent performance trend.
-    Requires at least one session longer than 5 minutes to return useful data.
+    Always returns valid JSON — never a 500 error.
     """
-    return await database.get_insights()
+    try:
+        return await database.get_insights()
+    except Exception as exc:
+        logger.error("[HawaAI] /api/insights error: %s", exc, exc_info=True)
+        return {
+            "sessions_analyzed":   0,
+            "avg_cooling_rate":    0.0,
+            "avg_efficiency":      0.0,
+            "best_target_temp":    None,
+            "best_outdoor_range":  None,
+            "cooling_type_counts": {"fast": 0, "normal": 0, "slow": 0},
+            "trend":               None,
+            "error":               str(exc),
+        }
 
 
 # ── SNAPSHOTS ─────────────────────────────────────────────────────────────────

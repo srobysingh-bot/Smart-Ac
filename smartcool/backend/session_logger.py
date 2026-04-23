@@ -93,43 +93,51 @@ async def end_session(data: Dict[str, Any]) -> None:
     )
     energy_kwh   = data.get("energy_kwh")
 
-    # ── Compute cooling analytics ─────────────────────────────────────────────
+    # ── Compute cooling analytics (never raises — errors logged and skipped) ───
     cooling_rate: Optional[float] = None
     cooling_type: Optional[str]   = None
     efficiency:   Optional[float] = None
 
-    if (
-        indoor_start is not None
-        and indoor_end  is not None
-        and duration_min is not None
-        and duration_min > ANALYTICS_WARMUP_MINUTES     # skip first 5 min
-    ):
-        delta = indoor_start - indoor_end
-        if delta > 0:                                    # room actually got cooler
-            cooling_rate = round(delta / duration_min, 4)
-            if cooling_rate > 0.5:
-                cooling_type = "fast"
-            elif cooling_rate >= 0.2:
-                cooling_type = "normal"
-            else:
-                cooling_type = "slow"
+    try:
+        # Safe coercion — treat None/non-numeric as 0 for guard comparisons only
+        _start  = float(indoor_start) if indoor_start is not None else None
+        _end    = float(indoor_end)   if indoor_end   is not None else None
+        _dur    = float(duration_min) if duration_min is not None else 0.0
+        _energy = float(energy_kwh)   if energy_kwh   is not None else 0.0
 
-    if (
-        indoor_start is not None
-        and indoor_end  is not None
-        and energy_kwh  is not None
-        and energy_kwh  > 0
-    ):
-        delta = indoor_start - indoor_end
-        if delta > 0:
-            efficiency = round(delta / energy_kwh, 2)
+        if (
+            _start is not None
+            and _end    is not None
+            and _dur    > ANALYTICS_WARMUP_MINUTES      # skip first 5 min
+        ):
+            delta = _start - _end
+            if delta > 0 and _dur > 0:                  # room cooled + no div/0
+                cooling_rate = round(delta / _dur, 4)
+                if cooling_rate > 0.5:
+                    cooling_type = "fast"
+                elif cooling_rate >= 0.2:
+                    cooling_type = "normal"
+                else:
+                    cooling_type = "slow"
 
-    if cooling_rate is not None:
-        logger.info(
-            "[HawaAI] Analytics — cooling_rate=%.4f°C/min (%s) | efficiency=%s°C/kWh",
-            cooling_rate, cooling_type,
-            f"{efficiency:.2f}" if efficiency is not None else "N/A",
-        )
+        if (
+            _start  is not None
+            and _end    is not None
+            and _energy > 0                             # guard against div/0
+        ):
+            delta = _start - _end
+            if delta > 0:
+                efficiency = round(delta / _energy, 2)
+
+        if cooling_rate is not None:
+            logger.info(
+                "[HawaAI] Analytics — cooling_rate=%.4f°C/min (%s) | efficiency=%s°C/kWh",
+                cooling_rate, cooling_type,
+                f"{efficiency:.2f}" if efficiency is not None else "N/A",
+            )
+    except Exception as exc:
+        logger.warning("[HawaAI] Analytics calculation skipped: %s", exc)
+        cooling_rate = cooling_type = efficiency = None
 
     end_data = {
         "end_time":             end_time,
