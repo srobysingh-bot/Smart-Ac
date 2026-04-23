@@ -62,14 +62,40 @@ async def tick() -> None:
 
     # STEP 3 — read live sensor states from HA
     indoor_temp_raw = await ha_client.get_state(indoor_temp_entity)
-    if indoor_temp_raw is None:
-        logger.warning("[HawaAI] Cannot read indoor temp from %s", indoor_temp_entity)
-        return
+    indoor_temp: Optional[float] = None
 
-    try:
-        indoor_temp = float(indoor_temp_raw)
-    except (ValueError, TypeError):
-        logger.error("[HawaAI] Invalid temp value: %r from %s", indoor_temp_raw, indoor_temp_entity)
+    if indoor_temp_raw not in (None, "unavailable", "unknown"):
+        try:
+            indoor_temp = float(indoor_temp_raw)
+        except (ValueError, TypeError):
+            logger.warning(
+                "[HawaAI] Cannot parse temp %r from %s",
+                indoor_temp_raw, indoor_temp_entity,
+            )
+
+    # Fallback: use climate entity's built-in thermistor when WiFi sensor is offline
+    if indoor_temp is None:
+        climate_entity_tmp = cfg.get("climate_entity", "").strip()
+        if climate_entity_tmp:
+            climate_tmp = await ha_client.get_climate_state(climate_entity_tmp)
+            fallback = climate_tmp.get("current_temp")
+            if fallback is not None:
+                try:
+                    indoor_temp = float(fallback)
+                    logger.info(
+                        "[HawaAI] Indoor sensor unavailable (%r) — using climate entity "
+                        "current_temp fallback: %.1f°C",
+                        indoor_temp_raw, indoor_temp,
+                    )
+                except (ValueError, TypeError):
+                    pass
+
+    if indoor_temp is None:
+        logger.warning(
+            "[HawaAI] Cannot read indoor temp from %s (returned %r) "
+            "and no climate entity fallback available — skipping tick",
+            indoor_temp_entity, indoor_temp_raw,
+        )
         return
 
     presence_raw = await ha_client.get_state(presence_entity)
@@ -138,9 +164,21 @@ async def tick() -> None:
     if climate_entity:
         climate_data   = await ha_client.get_climate_state(climate_entity)
         ac_actually_on = climate_data.get("is_on", False)
+
+        if ac_actually_on and climate_data.get("current_temp") is None:
+            logger.warning(
+                "[HawaAI] Climate entity says ON but current_temp is None — "
+                "entity may be stale. Trusting reported state: %s",
+                climate_data.get("state"),
+            )
+
         logger.debug(
-            "[HawaAI] Climate entity %s state=%r is_on=%s",
-            climate_entity, climate_data.get("state"), ac_actually_on,
+            "[HawaAI] Climate %s state=%r current=%s target=%s is_on=%s",
+            climate_entity,
+            climate_data.get("state"),
+            f"{climate_data['current_temp']:.1f}°" if climate_data.get("current_temp") is not None else "—",
+            f"{climate_data['target_temp']:.1f}°" if climate_data.get("target_temp") is not None else "—",
+            ac_actually_on,
         )
     elif energy_power_entity:
         if energy_watts > 50.0:

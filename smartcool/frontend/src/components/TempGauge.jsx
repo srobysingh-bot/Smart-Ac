@@ -18,7 +18,7 @@ function Arc({ pct, color, r = 60, strokeWidth = 10 }) {
   )
 }
 
-export default function TempGauge({ indoor, outdoor, target }) {
+export default function TempGauge({ indoor, outdoor, target, indoorFromAC = false }) {
   const MIN_T = 16; const MAX_T = 40
   const indoorPct  = indoor  != null ? (indoor  - MIN_T) / (MAX_T - MIN_T) : 0
   const outdoorPct = outdoor != null ? (outdoor - MIN_T) / (MAX_T - MIN_T) : 0
@@ -58,7 +58,9 @@ export default function TempGauge({ indoor, outdoor, target }) {
           <span className="text-2xl font-bold" style={{ color: tempColor(indoor) }}>
             {indoor != null ? `${indoor.toFixed(1)}°` : '—'}
           </span>
-          <span className="text-xs text-gray-500">indoor</span>
+          <span className="text-xs text-gray-500">
+            {indoor == null ? 'sensor offline' : indoorFromAC ? 'from AC unit' : 'indoor'}
+          </span>
         </div>
       </div>
 

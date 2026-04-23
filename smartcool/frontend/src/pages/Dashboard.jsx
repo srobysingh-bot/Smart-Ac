@@ -29,13 +29,25 @@ function ConfigWarning() {
 
 // ── Live status bar ───────────────────────────────────────────────────────────
 function LiveStatusBar({ status }) {
-  const { indoor_temp, outdoor_temp, presence, ac_on, watt_draw } = status || {}
+  const { indoor_temp, outdoor_temp, presence, ac_on, watt_draw, ac_current_temp } = status || {}
+
+  // When WiFi switch sensor is offline, fall back to AC unit's own thermistor
+  const displayTemp   = indoor_temp ?? ac_current_temp
+  const tempFromAC    = indoor_temp == null && ac_current_temp != null
+
   return (
     <div className="flex flex-wrap items-center gap-3 px-6 py-3 bg-gray-900 border-b border-gray-800 text-sm">
       <span className="flex items-center gap-1.5">
-        <Thermometer size={15} className="text-orange-400" />
+        <Thermometer size={15} className={tempFromAC ? 'text-blue-400' : 'text-orange-400'} />
         Indoor:{' '}
-        <strong>{indoor_temp != null ? `${indoor_temp.toFixed(1)}°C` : '—'}</strong>
+        <strong>
+          {displayTemp != null ? `${displayTemp.toFixed(1)}°C` : '—'}
+        </strong>
+        {tempFromAC && (
+          <span className="text-xs text-blue-400 ml-0.5" title="Reading from AC unit (WiFi sensor offline)">
+            ⁽ᴬᶜ⁾
+          </span>
+        )}
       </span>
       <span className="text-gray-700">|</span>
       <span className="flex items-center gap-1.5">
@@ -333,9 +345,10 @@ export default function Dashboard() {
         {/* Top cards row */}
         <div className="grid grid-cols-3 gap-4">
           <TempGauge
-            indoor={status?.indoor_temp}
+            indoor={status?.indoor_temp ?? status?.ac_current_temp}
             outdoor={status?.outdoor_temp}
             target={status?.target_temp}
+            indoorFromAC={status?.indoor_temp == null && status?.ac_current_temp != null}
           />
           <ACStatusCard
             acOn={status?.ac_on}
