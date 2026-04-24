@@ -244,6 +244,15 @@ async def tick() -> None:
                     "— syncing internal flag", energy_watts, _WATTS_FAN_ONLY,
                 )
                 _ac_is_on = False
+                # ── CRITICAL: close any open session ─────────────────────────
+                # The AC was turned off externally (physical remote, power cut,
+                # HA automation, etc.). _turn_ac_off() was never called for this
+                # path, so the session would remain open forever without this.
+                if _session_start_time is not None:
+                    logger.info(
+                        "[HawaAI] External power-off detected — finalizing open session"
+                    )
+                    await _close_session(cfg, indoor_temp, reason="power_off")
         power_source = "watts"
     else:
         # No valid power reading or inside cooldown — trust internal flag.
@@ -455,6 +464,91 @@ async def _turn_ac_on(cfg: dict, indoor_temp: float) -> None:
     )
 
 
+# ── Session finalization (shared by _turn_ac_off and external power-off) ──────
+
+async def _close_session(cfg: dict, indoor_temp: float, reason: str) -> None:
+    """
+    Finalize the open session: compute energy/cost, write to DB, clear state.
+
+    Called from every path that ends a session:
+      - _turn_ac_off()        (temperature / vacancy logic)
+      - STEP 6B power-off     (watts dropped < 50 W externally)
+
+    RULES:
+      ✓ Returns immediately if no session is open  (double-close safe)
+      ✗ Does NOT send IR commands     (caller handles that)
+      ✗ Does NOT touch _ac_is_on      (caller handles that)
+      ✗ Does NOT set _last_command_time (caller handles that)
+
+    Energy policy:
+      - Power sensor samples available AND avg ≥ 100 W  → compute kWh + cost
+      - No samples (no power sensor configured)          → store None / None
+        (distinguishes "not measured" from "measured zero")
+    """
+    global _session_start_time, _session_start_temp, _session_start_kwh, _watts_samples
+
+    # ── Guard: no session open ─────────────────────────────────────────────────
+    if _session_start_time is None:
+        logger.debug("[HawaAI] _close_session(%s) — no open session, skipping", reason)
+        return
+
+    now           = datetime.now(timezone.utc)
+    duration_secs = (now - _session_start_time).total_seconds()
+    cool_minutes  = duration_secs / 60.0
+
+    logger.info(
+        "[HawaAI] [SESSION END] reason=%s | duration=%.0fs (%.1f min)",
+        reason, duration_secs, cool_minutes,
+    )
+
+    # ── Energy calculation (avg watts × duration) ─────────────────────────────
+    if _watts_samples:
+        avg_watts = sum(_watts_samples) / len(_watts_samples)
+    else:
+        avg_watts = 0.0
+
+    logger.info("[HawaAI] Avg watts: %.0f W (%d samples)", avg_watts, len(_watts_samples))
+    logger.info("[HawaAI] Duration: %.0f sec (%.1f min)", duration_secs, cool_minutes)
+
+    if _watts_samples and avg_watts >= 100.0 and duration_secs > 0:
+        kwh_consumed: Optional[float] = max(0.0, (avg_watts * duration_secs) / 3_600_000.0)
+        kwh_consumed = round(kwh_consumed, 4)
+        tariff = float(cfg.get("energy_tariff_per_kwh", 8.0))
+        cost: Optional[float] = round(kwh_consumed * tariff, 2)
+        logger.info("[HawaAI] Energy: %.4f kWh | Cost: ₹%.2f", kwh_consumed, cost)
+    else:
+        # No power sensor, or avg below noise floor — store NULL so the DB can
+        # distinguish "not measured" from "measured as zero".
+        kwh_consumed = None
+        cost         = None
+        logger.info("[HawaAI] Energy: N/A (no power sensor data) | Cost: N/A")
+
+    await session_logger.end_session({
+        "end_time":              now.isoformat(),
+        "indoor_temp_end":       indoor_temp,
+        "time_to_cool_minutes":  round(cool_minutes, 1),
+        "reason_stopped":        reason,
+        "energy_kwh":            kwh_consumed,
+        "cost":                  cost,
+        "avg_watts":             round(avg_watts, 1) if avg_watts else None,
+    })
+
+    logger.info(
+        "[HawaAI] Session closed — reason=%s | %.1f min | "
+        "energy=%s | cost=%s",
+        reason, cool_minutes,
+        f"{kwh_consumed:.4f} kWh" if kwh_consumed is not None else "N/A",
+        f"₹{cost:.2f}"            if cost          is not None else "N/A",
+    )
+
+    # ── Clear session state ────────────────────────────────────────────────────
+    _session_start_time = None
+    _session_start_temp = None
+    _session_start_kwh  = None
+    _watts_samples      = []
+    smart_cooling.reset()   # clear fan-mode state so next session starts fresh
+
+
 # ── Turn AC OFF ───────────────────────────────────────────────────────────────
 
 async def _turn_ac_off(cfg: dict, indoor_temp: float, reason: str) -> None:
@@ -464,11 +558,10 @@ async def _turn_ac_off(cfg: dict, indoor_temp: float, reason: str) -> None:
     The climate entity is NOT used for ON/OFF control — it is display-only.
     Internal flag _ac_is_on is set False regardless of IR outcome so we don't
     get stuck in an ON state if the IR fails.
-    Closes the open session and calculates energy consumed.
+    Delegates session bookkeeping to _close_session().
     Sets _last_command="off" to activate the 60 s cooldown on the next tick.
     """
-    global _ac_is_on, _session_start_time, _session_start_temp, \
-           _session_start_kwh, _last_command_time, _last_command, _watts_samples
+    global _ac_is_on, _last_command_time, _last_command
 
     broadlink_entity = (cfg.get("broadlink_entity") or "").strip()
     cmd_off          = (cfg.get("ir_command_off")   or "").strip()
@@ -495,77 +588,13 @@ async def _turn_ac_off(cfg: dict, indoor_temp: float, reason: str) -> None:
             "[HawaAI] IR OFF command is empty — set it in Settings → IR Command Mapping"
         )
 
-    # Always flip internal flag regardless of IR outcome
+    # Always flip internal flag and set cooldown regardless of IR outcome
     _ac_is_on          = False
     _last_command_time = datetime.now(timezone.utc)
     _last_command      = "off"
 
-    # No open session — reset cleanly
-    if _session_start_time is None:
-        logger.info("[HawaAI] AC OFF (%s) — no open session to close", reason)
-        _session_start_kwh = None
-        return
-
-    now              = datetime.now(timezone.utc)
-    duration_secs    = (now - _session_start_time).total_seconds()
-    cool_minutes     = duration_secs / 60.0
-
-    # ── Energy calculation — avg watts × duration (safe; immune to kWh meter issues) ──
-    #
-    # We use the watts samples collected each tick rather than the kWh meter delta.
-    # The kWh meter approach is fragile: a misconfigured entity, meter reset, or
-    # entity pointing to the wrong sensor can produce wildly wrong values (e.g. ₹264
-    # for 19 min because the meter reading itself is "33 kWh").
-    #
-    # Safety rules (as specified):
-    #   1. avg_watts < 100 W  → treat session as zero-energy (noise / very short)
-    #   2. energy_kwh < 0     → clamp to 0
-    #   3. energy_kwh == 0    → cost MUST be 0
-    #   4. No samples (no power sensor) → energy = 0, cost = 0
-
-    if _watts_samples:
-        avg_watts = sum(_watts_samples) / len(_watts_samples)
-    else:
-        avg_watts = 0.0
-
-    logger.info("[HawaAI] Avg watts: %.0f W (%d samples)", avg_watts, len(_watts_samples))
-    logger.info("[HawaAI] Duration: %.0f sec (%.1f min)", duration_secs, cool_minutes)
-
-    if avg_watts >= 100.0 and duration_secs > 0:
-        kwh_consumed = max(0.0, (avg_watts * duration_secs) / 3_600_000.0)
-        kwh_consumed = round(kwh_consumed, 4)
-    else:
-        kwh_consumed = 0.0
-
-    if kwh_consumed > 0:
-        tariff = float(cfg.get("energy_tariff_per_kwh", 8.0))
-        cost   = round(kwh_consumed * tariff, 2)
-    else:
-        cost = 0.0
-
-    logger.info("[HawaAI] Energy: %.4f kWh", kwh_consumed)
-    logger.info("[HawaAI] Cost: ₹%.2f", cost)
-
-    await session_logger.end_session({
-        "end_time":              now.isoformat(),
-        "indoor_temp_end":       indoor_temp,
-        "time_to_cool_minutes":  round(cool_minutes, 1),
-        "reason_stopped":        reason,
-        "energy_kwh":            kwh_consumed,
-        "cost":                  cost,
-        "avg_watts":             round(avg_watts, 1),
-    })
-
-    logger.info(
-        "[HawaAI] AC OFF — reason=%s | %.1fmin | %.4f kWh | ₹%.2f",
-        reason, cool_minutes, kwh_consumed, cost,
-    )
-
-    _session_start_time = None
-    _session_start_temp = None
-    _session_start_kwh  = None
-    _watts_samples      = []
-    smart_cooling.reset()   # clear fan-mode state so next session starts fresh
+    # Finalize session (handles double-close guard and energy calc internally)
+    await _close_session(cfg, indoor_temp, reason)
 
 
 # ── Runtime state for /api/status ────────────────────────────────────────────
