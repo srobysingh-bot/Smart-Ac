@@ -1,13 +1,16 @@
 /**
  * ACStatusCard — displays current AC state and session info.
  *
- * IMPORTANT: `acOn` must come exclusively from /api/status → ac_on
- * (which reflects the backend _ac_is_on internal flag, set only by
- * Broadlink IR commands). Never derive it from climate entity state.
+ * State source (v1.1.17+):
+ *   acOn   → /api/status.ac_on   (watts > 500 W when power sensor available)
+ *   acIdle → /api/status.ac_idle (watts 50–500 W: fan running, compressor off)
  *
- * "Running" is shown only when acOn === true (backend truth).
- * Watt draw is shown as supplementary info when available, but does NOT
- * gate the Running status — power sensors have their own read delays.
+ * Three possible states:
+ *   ON   (green)  — compressor running, watts > 500 W
+ *   IDLE (amber)  — fan only, compressor resting, watts 50–500 W
+ *   OFF  (gray)   — < 50 W or IR off command sent
+ *
+ * Climate entity is used ONLY for display (temp, mode, fan, swing).
  */
 import { useEffect, useState } from 'react'
 import { Wind, Timer, Zap, Thermometer } from 'lucide-react'
@@ -34,13 +37,35 @@ const MODE_LABELS = {
   dry: 'Dry', fan_only: 'Fan', off: 'Off',
 }
 
+function StateChip({ acOn, acIdle }) {
+  if (acOn && !acIdle) {
+    return (
+      <span className="chip bg-green-900/50 text-green-300">
+        <Wind size={12} /> Running
+      </span>
+    )
+  }
+  if (acIdle) {
+    return (
+      <span className="chip bg-yellow-900/50 text-yellow-300">
+        <Wind size={12} /> Idle
+      </span>
+    )
+  }
+  return (
+    <span className="chip bg-gray-800 text-gray-500">
+      <Wind size={12} /> Off
+    </span>
+  )
+}
+
 export default function ACStatusCard({
-  // ac_on comes from /api/status.ac_on → backend _ac_is_on flag only
   acOn,
+  acIdle = false,
   sessionStart,
   wattDraw,
   sessionKwh,
-  // Climate entity display data (read-only, not used for acOn)
+  // Climate entity display data (read-only, never used for state)
   acCurrentTemp,
   acTargetTemp,
   acMode,
@@ -50,31 +75,27 @@ export default function ACStatusCard({
 }) {
   const [timer, setTimer] = useState(null)
 
+  // Timer runs while AC is ON or IDLE (session is active)
+  const sessionActive = acOn || acIdle
+
   useEffect(() => {
-    if (!acOn || !sessionStart) { setTimer(null); return }
+    if (!sessionActive || !sessionStart) { setTimer(null); return }
     const id = setInterval(() => setTimer(elapsed(sessionStart)), 1000)
     setTimer(elapsed(sessionStart))
     return () => clearInterval(id)
-  }, [acOn, sessionStart])
-
-  // "Running" is shown ONLY when backend confirms AC is ON.
-  // Do not show Running based on watt reading or climate entity state.
-  const isRunning = acOn === true
+  }, [sessionActive, sessionStart])
 
   return (
     <div className="card flex flex-col gap-3">
       {/* Header row */}
       <div className="flex items-center justify-between">
         <p className="text-xs text-gray-500 uppercase tracking-wide">AC Status</p>
-        <span className={`chip ${isRunning ? 'bg-green-900/50 text-green-300' : 'bg-gray-800 text-gray-500'}`}>
-          <Wind size={12} />
-          {isRunning ? 'Running' : 'Off'}
-        </span>
+        <StateChip acOn={acOn} acIdle={acIdle} />
       </div>
 
-      {/* Timer / idle message */}
+      {/* Timer / idle message / off message */}
       <div className="flex flex-col gap-2">
-        {isRunning && timer ? (
+        {acOn && !acIdle && timer ? (
           <>
             <div className="flex items-center gap-2 text-sm text-gray-400">
               <Timer size={14} className="text-blue-400" />
@@ -82,20 +103,40 @@ export default function ACStatusCard({
             </div>
             <span className="text-3xl font-mono font-bold text-blue-400">{timer}</span>
           </>
+        ) : acIdle && timer ? (
+          <>
+            <div className="flex items-center gap-2 text-sm text-gray-400">
+              <Timer size={14} className="text-yellow-400" />
+              <span>Idle for</span>
+            </div>
+            <span className="text-3xl font-mono font-bold text-yellow-400">{timer}</span>
+            <span className="text-xs text-gray-500">
+              Compressor resting · fan running
+              {wattDraw > 0 ? ` · ${Number(wattDraw).toFixed(0)} W` : ''}
+            </span>
+          </>
         ) : (
           <span className="text-gray-600 text-sm">Not running</span>
         )}
 
-        {isRunning && sessionKwh > 0 && (
+        {acOn && !acIdle && sessionKwh > 0 && (
           <div className="flex items-center gap-1.5 text-sm text-yellow-400">
             <Zap size={13} />
-            {sessionKwh.toFixed(3)} kWh this session
+            {Number(sessionKwh).toFixed(3)} kWh this session
+          </div>
+        )}
+
+        {/* Live watt reading when compressor is running */}
+        {acOn && !acIdle && wattDraw > 0 && (
+          <div className="flex items-center gap-1.5 text-xs text-gray-400">
+            <Zap size={11} className="text-yellow-400" />
+            {Number(wattDraw).toFixed(0)} W
           </div>
         )}
       </div>
 
-      {/* Live climate entity data — display only, shown when available */}
-      {hasClimateEntity && isRunning && (
+      {/* Climate entity display data — shown when configured and AC active */}
+      {hasClimateEntity && (acOn || acIdle) && (
         <div className="border-t border-gray-800 pt-3 grid grid-cols-2 gap-y-1.5 text-xs">
           {acCurrentTemp != null && (
             <>
@@ -133,14 +174,6 @@ export default function ACStatusCard({
               <span className="font-semibold text-gray-200">{acSwingMode}</span>
             </>
           )}
-        </div>
-      )}
-
-      {/* Watt draw — supplementary info only when no climate entity */}
-      {isRunning && !hasClimateEntity && wattDraw > 0 && (
-        <div className="flex items-center gap-1.5 text-xs text-gray-400">
-          <Zap size={11} className="text-yellow-400" />
-          {Number(wattDraw).toFixed(0)} W
         </div>
       )}
     </div>

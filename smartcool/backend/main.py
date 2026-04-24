@@ -55,7 +55,7 @@ async def lifespan(app: FastAPI):
     logger.info("[HawaAI] Add-on stopped")
 
 
-app = FastAPI(title="HawaAI API", version="1.1.16", lifespan=lifespan)
+app = FastAPI(title="HawaAI API", version="1.1.17", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -106,9 +106,12 @@ async def get_status():
     """
     Called by Dashboard every 5 seconds. Single source of truth for all UI state.
 
-    AC state rule (v1.1.13+):
-      ac_on = logic_engine._ac_is_on (internal flag, set only by Broadlink IR commands)
-      Climate entity is NEVER used to determine ac_on — display only.
+    AC state priority (v1.1.17+):
+      1. Power sensor (watts) — physical ground truth — after cooldown expires
+         > 500 W → ON  |  50–500 W → IDLE  |  < 50 W → OFF
+      2. Internal _ac_is_on flag — used during 60 s post-command cooldown or
+         when no power sensor is configured
+      Climate entity is NEVER used to determine ac_on / ac_idle — display only.
     """
     cfg     = config_manager.load_config()
     runtime = logic_engine.get_runtime_state()
@@ -130,9 +133,38 @@ async def get_status():
     energy_watts = safe_float(energy_power_raw)
     energy_kwh   = safe_float(energy_kwh_raw)
 
-    # AC state = internal flag ONLY. Never override with climate entity or power.
-    # This mirrors the logic_engine architecture: Broadlink IR commands set the flag.
-    ac_on = runtime["ac_is_on"]
+    # ── Determine ac_on + ac_idle from power sensor (mirrors logic_engine) ────
+    cooldown_active = runtime.get("cooldown_active", False)
+    watts_on_thr    = runtime.get("watts_on_threshold",   500.0)
+    watts_idle_thr  = runtime.get("watts_idle_threshold",  50.0)
+
+    ac_idle: bool = False
+    power_source: str
+
+    if energy_watts is not None and not cooldown_active:
+        # Power sensor available and cooldown expired — use watts as truth
+        if energy_watts > watts_on_thr:
+            ac_on        = True
+            ac_idle      = False
+            power_source = "watts"
+        elif energy_watts >= watts_idle_thr:
+            ac_on        = runtime["ac_is_on"]   # keep engine intent in IDLE zone
+            ac_idle      = True
+            power_source = "watts_idle"
+        else:
+            ac_on        = False
+            ac_idle      = False
+            power_source = "watts"
+    elif cooldown_active:
+        # Just sent a command — trust internal flag until AC responds
+        ac_on        = runtime["ac_is_on"]
+        ac_idle      = False
+        power_source = "cooldown"
+    else:
+        # No power sensor configured
+        ac_on        = runtime["ac_is_on"]
+        ac_idle      = False
+        power_source = "internal"
 
     # Climate entity — display data only (temp, mode, fan, swing for ClimateCard)
     climate_entity = cfg.get("climate_entity", "")
@@ -146,13 +178,15 @@ async def get_status():
         indoor_temp = climate_data.get("current_temp")
 
     return {
-        # ── Core state (always from internal engine flag) ─────────────────────
+        # ── Core state ────────────────────────────────────────────────────────
         "ac_on":            ac_on,
+        "ac_idle":          ac_idle,       # fan running, compressor off (50–500 W)
+        "power_source":     power_source,  # "watts" | "watts_idle" | "cooldown" | "internal"
         "indoor_temp":      indoor_temp,
         "outdoor_temp":     weather.get("temp")      if weather else None,
         "outdoor_humidity": weather.get("humidity")  if weather else None,
         "presence":         is_occupied,
-        # ── Energy (from power sensor — display only, not used for ac_on) ──────
+        # ── Energy ────────────────────────────────────────────────────────────
         "watt_draw":        energy_watts or 0.0,
         "energy_watts":     energy_watts,
         "energy_kwh_total": energy_kwh,
@@ -161,7 +195,7 @@ async def get_status():
         "session_id":       runtime["session_id"],
         "session_start":    runtime["session_start_time"],
         # ── Engine diagnostics ────────────────────────────────────────────────
-        "cooldown_active":  runtime.get("cooldown_active", False),
+        "cooldown_active":  cooldown_active,
         "last_command":     runtime.get("last_command"),
         "secs_since_cmd":   runtime.get("secs_since_cmd"),
         # ── Config ────────────────────────────────────────────────────────────
@@ -171,7 +205,7 @@ async def get_status():
         ),
         "target_temp":      cfg.get("target_temp", 24),
         "climate_entity":   climate_entity,
-        # ── Climate display data (read-only, not used for ac_on) ──────────────
+        # ── Climate display data (read-only, NEVER used for ac_on) ─────────────
         "ac_current_temp":  climate_data.get("current_temp"),
         "ac_target_temp":   climate_data.get("target_temp"),
         "ac_mode":          climate_data.get("mode"),

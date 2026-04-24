@@ -31,14 +31,20 @@ function ConfigWarning() {
 // ── Live status bar ───────────────────────────────────────────────────────────
 function LiveStatusBar({ status }) {
   const {
-    indoor_temp, outdoor_temp, presence, ac_on, watt_draw,
-    ac_current_temp, cooldown_active, last_command, secs_since_cmd,
+    indoor_temp, outdoor_temp, presence, ac_on, ac_idle, watt_draw,
+    ac_current_temp, cooldown_active, last_command, secs_since_cmd, power_source,
   } = status || {}
 
-  // indoor_temp from /api/status already has the fallback applied server-side.
-  // ac_current_temp is kept for the ⁽ᴬᶜ⁾ indicator only.
   const displayTemp = indoor_temp
   const tempFromAC  = status != null && indoor_temp == null && ac_current_temp != null
+
+  // State display: ON (green) / IDLE (amber) / OFF (gray)
+  const acColor  = ac_on && !ac_idle ? 'text-green-400'
+                 : ac_idle           ? 'text-yellow-400'
+                 :                    'text-gray-500'
+  const acLabel  = ac_on && !ac_idle ? 'ON'
+                 : ac_idle           ? 'IDLE'
+                 :                    'OFF'
 
   return (
     <div className="flex flex-wrap items-center gap-3 px-6 py-3 bg-gray-900 border-b border-gray-800 text-sm">
@@ -63,22 +69,26 @@ function LiveStatusBar({ status }) {
       <span className="text-gray-700">|</span>
       <PresenceBadge present={presence} />
       <span className="text-gray-700">|</span>
-      {/* AC state comes from backend _ac_is_on flag — never from climate entity */}
+      {/* AC state — from power sensor (watts) or internal flag */}
       <span className="flex items-center gap-1.5">
-        <Zap size={15} className={ac_on ? 'text-green-400' : 'text-gray-500'} />
+        <Zap size={15} className={acColor} />
         AC:{' '}
-        <strong className={ac_on ? 'text-green-400' : 'text-gray-500'}>
-          {ac_on ? 'ON' : 'OFF'}
-        </strong>
-        {ac_on && watt_draw > 0 && (
-          <span className="text-gray-400">· {watt_draw.toFixed(0)} W</span>
+        <strong className={acColor}>{acLabel}</strong>
+        {watt_draw > 0 && (
+          <span className="text-gray-400">· {Number(watt_draw).toFixed(0)} W</span>
+        )}
+        {power_source === 'internal' && (
+          <span className="text-xs text-gray-600 ml-1" title="No power sensor — state from IR command flag">
+            (flag)
+          </span>
         )}
       </span>
       {/* Cooldown indicator — shows briefly after every IR command */}
       {cooldown_active && (
         <>
           <span className="text-gray-700">|</span>
-          <span className="text-xs text-yellow-400 flex items-center gap-1" title={`${secs_since_cmd?.toFixed(0)}s since ${last_command} command`}>
+          <span className="text-xs text-yellow-400 flex items-center gap-1"
+                title={`${secs_since_cmd?.toFixed(0)}s since ${last_command} command`}>
             <Loader size={11} className="animate-spin" />
             Cooldown {secs_since_cmd != null ? `${Math.round(secs_since_cmd)}s` : ''}
           </span>
@@ -370,6 +380,7 @@ export default function Dashboard() {
           />
           <ACStatusCard
             acOn={status?.ac_on}
+            acIdle={status?.ac_idle ?? false}
             sessionStart={status?.session_start}
             wattDraw={status?.watt_draw}
             sessionKwh={status?.session_kwh}

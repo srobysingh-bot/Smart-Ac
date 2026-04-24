@@ -3,21 +3,29 @@ HawaAI core decision engine — THE BRAIN.
 
 Called every `logic_interval_seconds` by the scheduler.
 
-AC control architecture (v1.1.13):
-  ┌─────────────────────────────────────────────────────────────────┐
-  │  CONTROL  →  Broadlink IR ONLY  (ir_command_on / ir_command_off)│
-  │  STATE    →  Internal _ac_is_on flag is the SOLE source of truth │
-  │  DISPLAY  →  Climate entity read-only (temp, mode, fan, swing)   │
-  └─────────────────────────────────────────────────────────────────┘
+AC control architecture (v1.1.17):
+  ┌──────────────────────────────────────────────────────────────────────┐
+  │  CONTROL  →  Broadlink IR ONLY  (ir_command_on / ir_command_off)    │
+  │  STATE    →  Power sensor (watts) — primary ground truth             │
+  │             Internal _ac_is_on flag — used during 60 s cooldown      │
+  │  DISPLAY  →  Climate entity read-only (temp, mode, fan, swing)       │
+  └──────────────────────────────────────────────────────────────────────┘
 
-Why:
-  - Climate entity state lags 5–60 s after a command → unreliable for control
-  - Reading HA state to derive "ac is on" creates an unstable feedback loop
-  - Broadlink IR + internal flag = deterministic, no HA round-trip needed
+Power-based state bands (watts):
+  > 500 W   →  ON   (compressor running)
+  50–500 W  →  IDLE (fan-only; compressor resting between cycles)
+  < 50 W    →  OFF
 
-Command cooldown (60 s):
-  After any IR command, temperature and vacancy logic are skipped for 60 s.
-  This prevents immediate re-evaluation before the AC responds to the IR signal.
+Why power, not climate entity:
+  - Climate entity is a cloud-integration state that can lag or be stale
+  - Real physical behavior is always reflected by wall-socket power draw
+  - 500 W threshold cleanly separates compressor-on from fan-only
+
+Cooldown (60 s after any IR command):
+  Immediately after the IR signal, the AC needs time to respond and the
+  power draw starts from 0. During this window we trust the internal flag
+  to avoid false "OFF" detection and a premature re-send of the ON command.
+  After 60 s the power sensor takes over as the authoritative source.
 """
 
 import logging
@@ -41,6 +49,10 @@ _session_start_kwh: Optional[float] = None
 _COOLDOWN_SECS: int = 60
 _last_command_time: Optional[datetime] = None   # when the last IR command was sent
 _last_command: str = ""                          # "on" or "off"
+
+# Power-based state thresholds
+_WATTS_COMPRESSOR: float = 500.0   # watts above this → compressor running (AC ON)
+_WATTS_FAN_ONLY:   float = 50.0    # watts between FAN_ONLY and COMPRESSOR → IDLE (fan only)
 
 
 async def tick() -> None:
@@ -160,37 +172,24 @@ async def tick() -> None:
 
     # ── Read live energy/power from HA ────────────────────────────────────────
     energy_power_entity = cfg.get("energy_power_entity", "")
-    energy_watts = 0.0
+    energy_watts: float = 0.0
+    energy_watts_valid: bool = False     # True only when sensor returned a real number
+
     if energy_power_entity:
         energy_raw = await ha_client.get_state(energy_power_entity)
-        try:
-            energy_watts = float(energy_raw) if energy_raw else 0.0
-        except (ValueError, TypeError):
-            energy_watts = 0.0
+        if energy_raw not in (None, "unavailable", "unknown", ""):
+            try:
+                energy_watts       = float(energy_raw)
+                energy_watts_valid = True
+            except (ValueError, TypeError):
+                energy_watts = 0.0
 
-    # STEP 6 — AC state is the internal flag — no HA round-trip, no reconciliation
+    # STEP 6A — Cooldown gate timer
     #
-    # _ac_is_on is set True only when HawaAI successfully sends IR ON.
-    # _ac_is_on is set False only when HawaAI successfully sends IR OFF.
-    # We never override it based on climate entity state or power readings.
-    # This eliminates the ON/OFF feedback loop entirely.
-    ac_on = _ac_is_on
-
-    logger.info(
-        "[HawaAI] TICK | indoor=%.1f°C | outdoor=%s | presence=%s | ac=%s | "
-        "target=%.1f°C (eff=%.1f°C) | watts=%.0f",
-        indoor_temp,
-        f"{outdoor_temp:.1f}°C" if outdoor_temp is not None else "—",
-        "occupied" if is_occupied else "vacant",
-        "ON" if ac_on else "OFF",
-        target_temp, effective_target, energy_watts,
-    )
-
-    # STEP 7 — Cooldown gate
-    #
-    # After any IR command (ON or OFF), skip all control logic for _COOLDOWN_SECS.
-    # This gives the physical AC time to respond to the IR signal before we
-    # re-evaluate the temperature / vacancy conditions.
+    # Compute this FIRST so it can guard the power-based state decision below.
+    # The cooldown begins when an IR command is sent and lasts 60 s. During
+    # this window the power draw is still rising from 0, so we must not let
+    # the power sensor report "OFF" and trigger another ON command.
     now = datetime.now(timezone.utc)
     secs_since_cmd = (
         (now - _last_command_time).total_seconds()
@@ -199,6 +198,68 @@ async def tick() -> None:
     )
     in_cooldown = secs_since_cmd < _COOLDOWN_SECS
 
+    # STEP 6B — Determine authoritative AC state
+    #
+    # Priority order:
+    #   1. Power sensor (after cooldown expires) — physical ground truth
+    #      > 500 W → compressor running    → ON
+    #      50–500 W → fan-only / resting   → IDLE  (keep current engine state)
+    #      < 50 W  → completely off        → OFF
+    #   2. Internal _ac_is_on flag (during cooldown or when no power sensor)
+    #
+    # Climate entity is NEVER used for ON/OFF decisions.
+    ac_idle: bool = False    # True when fan is running but compressor is off
+
+    if energy_watts_valid and not in_cooldown:
+        # Power sensor is the authoritative source outside the cooldown window.
+        if energy_watts > _WATTS_COMPRESSOR:
+            ac_on   = True
+            ac_idle = False
+            # Sync internal flag if AC was externally turned on (e.g. via physical remote)
+            if not _ac_is_on:
+                logger.info(
+                    "[HawaAI] AC confirmed ON by power sensor (%.0f W > %.0f W threshold) "
+                    "— syncing internal flag", energy_watts, _WATTS_COMPRESSOR,
+                )
+                _ac_is_on = True
+        elif energy_watts >= _WATTS_FAN_ONLY:
+            # IDLE zone: compressor is resting between cycles. Keep current state
+            # so we don't oscillate. The engine already knows its intent.
+            ac_on   = _ac_is_on
+            ac_idle = True
+        else:
+            # < 50 W → AC is genuinely off (compressor and fan both stopped)
+            ac_on   = False
+            ac_idle = False
+            if _ac_is_on:
+                logger.info(
+                    "[HawaAI] AC confirmed OFF by power sensor (%.0f W < %.0f W threshold) "
+                    "— syncing internal flag", energy_watts, _WATTS_FAN_ONLY,
+                )
+                _ac_is_on = False
+        power_source = "watts"
+    else:
+        # No valid power reading or inside cooldown — trust internal flag.
+        ac_on        = _ac_is_on
+        ac_idle      = False
+        power_source = "cooldown" if in_cooldown else "internal"
+
+    ac_state_label = (
+        f"IDLE({energy_watts:.0f}W)" if ac_idle
+        else f"ON({energy_watts:.0f}W)"  if ac_on
+        else "OFF"
+    )
+    logger.info(
+        "[HawaAI] TICK | indoor=%.1f°C | outdoor=%s | presence=%s | ac=%s "
+        "[src=%s] | target=%.1f°C (eff=%.1f°C)",
+        indoor_temp,
+        f"{outdoor_temp:.1f}°C" if outdoor_temp is not None else "—",
+        "occupied" if is_occupied else "vacant",
+        ac_state_label, power_source,
+        target_temp, effective_target,
+    )
+
+    # STEP 7 — Cooldown gate
     if in_cooldown:
         logger.info(
             "[HawaAI] Cooldown active — %.0fs / %ds since '%s' command — "
@@ -445,14 +506,16 @@ def get_runtime_state() -> dict:
         and secs_since_cmd < _COOLDOWN_SECS
     )
     return {
-        "ac_is_on":           _ac_is_on,
-        "session_id":         session_logger.current_session_id(),
-        "session_start_time": (
+        "ac_is_on":              _ac_is_on,
+        "session_id":            session_logger.current_session_id(),
+        "session_start_time":    (
             _session_start_time.isoformat() if _session_start_time else None
         ),
-        "session_start_kwh":  _session_start_kwh,
+        "session_start_kwh":     _session_start_kwh,
         # Diagnostics
-        "cooldown_active":    in_cooldown,
-        "last_command":       _last_command or None,
-        "secs_since_cmd":     round(secs_since_cmd, 1) if secs_since_cmd is not None else None,
+        "cooldown_active":       in_cooldown,
+        "last_command":          _last_command or None,
+        "secs_since_cmd":        round(secs_since_cmd, 1) if secs_since_cmd is not None else None,
+        "watts_on_threshold":    _WATTS_COMPRESSOR,
+        "watts_idle_threshold":  _WATTS_FAN_ONLY,
     }
