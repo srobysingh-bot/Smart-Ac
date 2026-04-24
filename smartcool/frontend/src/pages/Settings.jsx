@@ -190,7 +190,6 @@ export default function Settings() {
   const [climateSearch,     setClimateSearch]     = useState('')
   const [energyPowerSearch, setEnergyPowerSearch] = useState('')
   const [energyKwhSearch,   setEnergyKwhSearch]   = useState('')
-  const [broadlinkSearch,   setBroadlinkSearch]   = useState('')
 
   // Energy device registry selector
   const [allDevices,      setAllDevices]      = useState([])
@@ -352,6 +351,52 @@ export default function Settings() {
         </div>
       </div>
 
+      {/* AC Control — single pipeline */}
+      <div className="card space-y-4">
+        <SectionHeader>AC Control</SectionHeader>
+        <p className="text-xs text-gray-500 -mt-2">
+          HawaAI sends all commands through your climate entity.
+          Home Assistant (Aerostate) handles the Broadlink IR transport automatically.
+        </p>
+
+        <div className="space-y-2">
+          <EntityDropdown
+            label="Climate Entity (climate.*)"
+            value={cfg.climate_entity}
+            onChange={v => patch('climate_entity', v)}
+            entities={byDomain('climate')}
+            search={climateSearch}
+            onSearchChange={setClimateSearch}
+          />
+          <p className="text-xs text-gray-500">
+            Pipeline: <span className="text-blue-400 font-medium">HawaAI</span>
+            {' → '}
+            <span className="text-blue-400 font-medium">Aerostate</span>
+            {' → '}
+            <span className="text-gray-400">Broadlink</span>
+            {' → '}
+            <span className="text-gray-400">AC</span>
+          </p>
+
+          {/* Connection status badge */}
+          {cfg.climate_entity ? (
+            <div className="flex items-center gap-2 px-3 py-2 bg-green-900/20 border border-green-800 rounded-lg">
+              <span className="w-2 h-2 rounded-full bg-green-400 shrink-0" />
+              <span className="text-xs text-green-300">
+                Connected — <code className="font-mono">{cfg.climate_entity}</code>
+              </span>
+            </div>
+          ) : (
+            <div className="flex items-center gap-2 px-3 py-2 bg-red-900/20 border border-red-800 rounded-lg">
+              <span className="w-2 h-2 rounded-full bg-red-400 shrink-0" />
+              <span className="text-xs text-red-300">
+                Not configured — AC control is disabled until a climate entity is selected
+              </span>
+            </div>
+          )}
+        </div>
+      </div>
+
       {/* Sensors & Devices */}
       <div className="card space-y-4">
         <SectionHeader>Sensors &amp; Devices</SectionHeader>
@@ -375,22 +420,6 @@ export default function Settings() {
           search={tempSearch}
           onSearchChange={setTempSearch}
         />
-
-        {/* Climate entity */}
-        <div>
-          <EntityDropdown
-            label="Climate Entity (climate.*) — optional"
-            value={cfg.climate_entity}
-            onChange={v => patch('climate_entity', v)}
-            entities={byDomain('climate')}
-            search={climateSearch}
-            onSearchChange={setClimateSearch}
-          />
-          <p className="text-xs text-gray-500 mt-1">
-            If your AC is integrated as a HA climate entity, select it here to see live
-            temperature, mode, and fan data — and control it from the Dashboard.
-          </p>
-        </div>
 
         {/* ── Energy Monitoring ─────────────────────────────────────────────── */}
         <div className="border border-gray-800 rounded-xl p-4 space-y-4">
@@ -522,61 +551,6 @@ export default function Settings() {
           </div>
         </div>
 
-        {/* Broadlink remote */}
-        <EntityDropdown
-          label="Broadlink Remote Entity (remote.*)"
-          value={cfg.broadlink_entity}
-          onChange={v => patch('broadlink_entity', v)}
-          entities={byDomain('remote')}
-          search={broadlinkSearch}
-          onSearchChange={setBroadlinkSearch}
-        />
-      </div>
-
-      {/* IR Command Mapping */}
-      <div className="card space-y-4">
-        <SectionHeader>IR Command Mapping</SectionHeader>
-        <p className="text-xs text-gray-500 -mt-2">
-          These must exactly match what you entered when learning commands in
-          HA → Developer Tools → Actions → <code className="bg-gray-800 px-1 rounded">remote.learn_command</code>.
-        </p>
-
-        <Input
-          label="Broadlink Device Name"
-          value={cfg.ir_device_name}
-          onChange={v => patch('ir_device_name', v)}
-          placeholder='e.g. studyac'
-        />
-        <p className="text-xs text-gray-500 -mt-3">
-          The device name you entered when learning commands (e.g. <code className="bg-gray-800 px-1 rounded">studyac</code>).
-          Without this, HA returns HTTP 500. Leave blank only if you learned commands at root level.
-        </p>
-
-        <Input
-          label="Power ON command name"
-          value={cfg.ir_command_on}
-          onChange={v => patch('ir_command_on', v)}
-          placeholder='e.g. turn_on'
-        />
-        <Input
-          label="Power OFF command name"
-          value={cfg.ir_command_off}
-          onChange={v => patch('ir_command_off', v)}
-          placeholder='e.g. turn_off'
-        />
-
-        {!cfg.ir_device_name && (
-          <div className="flex items-start gap-2 px-3 py-2 bg-yellow-900/30 border border-yellow-700 rounded-lg text-xs text-yellow-300">
-            <span className="shrink-0">⚠</span>
-            <span>Broadlink device name is empty — commands will fail with HTTP 500 if they were learned under a device name.</span>
-          </div>
-        )}
-        {cfg.ir_device_name && (!cfg.ir_command_on || !cfg.ir_command_off) && (
-          <div className="flex items-start gap-2 px-3 py-2 bg-yellow-900/30 border border-yellow-700 rounded-lg text-xs text-yellow-300">
-            <span className="shrink-0">⚠</span>
-            <span>IR command names are empty — AC will not turn on/off automatically until these are filled in.</span>
-          </div>
-        )}
       </div>
 
       {/* AC Configuration */}
