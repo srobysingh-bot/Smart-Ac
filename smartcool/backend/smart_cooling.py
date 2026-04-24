@@ -42,9 +42,16 @@ FAN_BOOST  = "high"
 FAN_NORMAL = "auto"
 
 # ── Module-level state (in-memory, never persisted) ───────────────────────────
-_current_mode:        str               = "hold"
+
+# Fan-mode optimizer state
+_current_mode:         str               = "hold"
 _last_adjustment_time: Optional[datetime] = None
-_last_fan_mode:        Optional[str]     = None
+_last_fan_mode:        Optional[str]      = None
+
+# Effective-target dispatcher state
+_APPLY_TARGET_COOLDOWN = 180          # seconds between temperature commands
+_last_apply_target_time: Optional[datetime] = None
+_last_applied_target:    Optional[float]    = None
 
 
 # ── Public accessors ──────────────────────────────────────────────────────────
@@ -52,17 +59,21 @@ _last_fan_mode:        Optional[str]     = None
 def get_state() -> Dict[str, Any]:
     """Returns current smart cooling state for /api/status and /api/runtime."""
     return {
-        "smart_mode":     _current_mode,
-        "smart_fan_mode": _last_fan_mode,
+        "smart_mode":          _current_mode,
+        "smart_fan_mode":      _last_fan_mode,
+        "last_applied_target": _last_applied_target,
     }
 
 
 def reset() -> None:
-    """Reset state when a session ends or AC is turned off."""
-    global _current_mode, _last_adjustment_time, _last_fan_mode
-    _current_mode         = "hold"
-    _last_adjustment_time = None
-    _last_fan_mode        = None
+    """Reset all smart cooling state when a session ends or AC turns off."""
+    global _current_mode, _last_adjustment_time, _last_fan_mode, \
+           _last_apply_target_time, _last_applied_target
+    _current_mode           = "hold"
+    _last_adjustment_time   = None
+    _last_fan_mode          = None
+    _last_apply_target_time = None
+    _last_applied_target    = None
 
 
 # ── Core function ─────────────────────────────────────────────────────────────
@@ -212,3 +223,94 @@ async def apply_smart_cooling(
         )
 
     return result
+
+
+# ── Effective target dispatcher ───────────────────────────────────────────────
+
+async def apply_effective_target(
+    climate_entity:   str,
+    effective_target: float,
+    current_target:   Optional[float],
+    ac_on:            bool,
+    manual_override:  bool,
+) -> str:
+    """
+    Safely push the smart-adjusted effective target temperature to the
+    climate entity.
+
+    This is the bridge between the logic engine's decision (effective_target)
+    and the actual AC setpoint — without touching ON/OFF control.
+
+    RULES (hard — never violate):
+      - Only runs when AC is ON (compressor confirmed running)
+      - Skips if manual_override is True
+      - Minimum 180 s between consecutive commands (prevents spam)
+      - Dead-band of 0.5°C — ignores tiny/noisy adjustments
+      - No climate entity → no-op, returns diagnostic string
+      - Never raises — all errors are logged and swallowed
+
+    Returns a short diagnostic string (action label).
+
+    Example log sequence when active:
+      [HawaAI] Smart adj: outdoor=41.0°C → effective target 23.0°C (config=24.0°C)
+      [HawaAI] Applied smart temp → 23.0°C
+    """
+    global _last_apply_target_time, _last_applied_target
+
+    # ── Guards ────────────────────────────────────────────────────────────────
+
+    if not climate_entity:
+        return "no_climate_entity"
+
+    if manual_override:
+        return "manual_override"
+
+    if not ac_on:
+        return "ac_off"
+
+    if current_target is None:
+        return "no_current_target"
+
+    try:
+        current_f  = float(current_target)
+        effective_f = round(float(effective_target), 1)
+    except (TypeError, ValueError):
+        return "parse_error"
+
+    # Dead-band: skip if delta < 0.5°C to avoid hunting / noise
+    if abs(current_f - effective_f) < 0.5:
+        return "within_deadband"
+
+    # Rate limiter: minimum 180 s between commands
+    now = datetime.now(timezone.utc)
+    if _last_apply_target_time is not None:
+        secs = (now - _last_apply_target_time).total_seconds()
+        if secs < _APPLY_TARGET_COOLDOWN:
+            logger.debug(
+                "[HawaAI] apply_effective_target: cooldown %.0fs / %ds",
+                secs, _APPLY_TARGET_COOLDOWN,
+            )
+            return f"cooldown_{int(secs)}s"
+
+    # ── Send command via HA climate service ───────────────────────────────────
+    try:
+        ok = await ha_client.set_climate_temperature(climate_entity, effective_f)
+        if ok:
+            _last_apply_target_time = now
+            _last_applied_target    = effective_f
+            logger.info(
+                "[HawaAI] Applied smart temp → %.1f°C  "
+                "(was %.1f°C on %s)",
+                effective_f, current_f, climate_entity,
+            )
+            return "applied"
+        else:
+            logger.error(
+                "[HawaAI] apply_effective_target failed for %s "
+                "(%.1f°C → %.1f°C)",
+                climate_entity, current_f, effective_f,
+            )
+            return "failed"
+    except Exception as exc:
+        logger.error("[HawaAI] apply_effective_target exception: %s", exc)
+        return "error"

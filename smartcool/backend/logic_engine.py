@@ -74,6 +74,7 @@ async def tick() -> None:
     STEP 8  Write monitoring snapshot
     STEP 9  Vacancy logic
     STEP 10 Temperature logic (smart-adjustment aware)
+    STEP 10.5 Apply effective target to climate entity (smart temp dispatcher)
     STEP 11 Smart cooling optimizer — fan-only, never touches ON/OFF
     """
     global _ac_is_on, _vacant_since, _session_start_time, _session_start_temp, \
@@ -334,6 +335,27 @@ async def tick() -> None:
     elif indoor_temp <= effective_target and ac_on:
         session_logger.mark_cooled()
 
+    # STEP 10.5 — Apply effective target to climate entity
+    #
+    # When smart_temp_adjustment has produced an effective_target that differs
+    # from the AC's current setpoint, push the new value to the climate entity
+    # so the physical AC unit tracks the computed optimal temperature.
+    #
+    # Safety contract (all enforced inside apply_effective_target):
+    #   - Only fires when AC is ON (compressor confirmed running)
+    #   - 0.5°C dead-band — ignores tiny adjustments
+    #   - 180 s minimum between consecutive commands (no spam)
+    #   - manual_override → skip (already returned at STEP 5, but double-checked)
+    #   - No climate entity configured → silent no-op
+    if smart_adj and climate_entity and ac_on:
+        await smart_cooling.apply_effective_target(
+            climate_entity   = climate_entity,
+            effective_target = effective_target,
+            current_target   = climate_data.get("target_temp"),
+            ac_on            = ac_on,
+            manual_override  = False,   # guaranteed: STEP 5 returns early on override
+        )
+
     # STEP 11 — Smart cooling optimizer
     #
     # Called AFTER the ON/OFF decision (STEP 10) to ensure we only run when
@@ -574,4 +596,5 @@ def get_runtime_state() -> dict:
         # Smart cooling state
         "smart_mode":            sc["smart_mode"],
         "smart_fan_mode":        sc["smart_fan_mode"],
+        "last_applied_target":   sc.get("last_applied_target"),
     }

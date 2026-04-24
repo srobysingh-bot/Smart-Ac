@@ -55,7 +55,7 @@ async def lifespan(app: FastAPI):
     logger.info("[HawaAI] Add-on stopped")
 
 
-app = FastAPI(title="HawaAI API", version="1.1.21", lifespan=lifespan)
+app = FastAPI(title="HawaAI API", version="1.1.22", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -213,12 +213,14 @@ async def get_status():
         "ac_swing_mode":    climate_data.get("swing_mode"),
         # ── Smart cooling (read-only, NEVER changes AC ON/OFF) ─────────────────
         "smart_cooling_enabled": cfg.get("smart_cooling_enabled", False),
+        "smart_temp_adjustment": cfg.get("smart_temp_adjustment", False),
         "smart_mode":            runtime.get("smart_mode"),
         "smart_fan_mode":        runtime.get("smart_fan_mode"),
         "smart_delta": (
             round(indoor_temp - float(cfg.get("target_temp", 24)), 2)
             if indoor_temp is not None else None
         ),
+        "last_applied_target":   runtime.get("last_applied_target"),
     }
 
 
