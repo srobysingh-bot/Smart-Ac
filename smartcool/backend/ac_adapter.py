@@ -21,8 +21,9 @@ from . import ha_client
 
 logger = logging.getLogger(__name__)
 
-# Minimum temperature delta to warrant a set_temperature call.
-_TEMP_DEAD_BAND: float = 0.5
+# Minimum temperature delta to warrant a set_temperature call (°C).
+# Wider band avoids duplicate ON / setpoint spam when Aerostate already matches.
+_TEMP_DEAD_BAND: float = 1.0
 
 
 async def turn_on(
@@ -55,6 +56,17 @@ async def turn_on(
     current_mode = state.get("state", "off")
     current_temp = state.get("target_temp")   # setpoint, not measured temp
     current_fan  = state.get("fan_mode")
+
+    # Strong guard: already in desired mode and setpoint within deadband → no HA calls
+    if current_mode == hvac_mode:
+        if current_temp is not None and abs(current_temp - temperature) < _TEMP_DEAD_BAND:
+            fan_ok_early = (current_fan == fan_mode) if fan_mode else True
+            if fan_ok_early:
+                logger.info(
+                    "[HawaAI] Aerostate skip — mode=%s setpoint within %.1f°C (no command)",
+                    hvac_mode, _TEMP_DEAD_BAND,
+                )
+                return True
 
     already_on = current_mode not in ("off", "unavailable", "unknown", "")
     temp_ok    = (

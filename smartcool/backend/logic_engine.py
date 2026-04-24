@@ -40,6 +40,7 @@ logger = logging.getLogger(__name__)
 
 # ── In-memory runtime state (not persisted across restarts) ───────────────────
 _ac_is_on: bool = False                         # SOLE source of truth for AC state
+_startup_sync_done: bool = False                # first-tick climate sync (no command spam)
 _vacant_since: Optional[datetime] = None
 _session_start_time: Optional[datetime] = None
 _session_start_temp: Optional[float] = None
@@ -61,6 +62,40 @@ _WATTS_COMPRESSOR: float = 500.0   # watts above this → compressor running (AC
 _WATTS_FAN_ONLY:   float = 50.0    # watts between FAN_ONLY and COMPRESSOR → IDLE (fan only)
 
 
+def smart_temp_adjustment_enabled(cfg: dict) -> bool:
+    """
+    Smart outdoor-based target adjustment.
+
+    Prefer explicit ``smart_enabled`` (bool) when present in merged config;
+    otherwise ``smart_temp_adjustment``. If the latter is missing, default True
+    for backward compatibility with older installs that only had the key in UI.
+    """
+    se = cfg.get("smart_enabled")
+    if isinstance(se, bool):
+        return se
+    v = cfg.get("smart_temp_adjustment")
+    if v is None:
+        return True
+    return bool(v)
+
+
+def compute_effective_target(
+    target_temp: float,
+    outdoor_temp: Optional[float],
+    smart_enabled: bool,
+) -> float:
+    """Outdoor-aware setpoint (same formula as historical HawaAI smart adj)."""
+    if not smart_enabled or outdoor_temp is None:
+        return target_temp
+    if outdoor_temp < 30:
+        return target_temp + 1.0
+    if outdoor_temp < 35:
+        return target_temp + 0.5
+    if outdoor_temp <= 40:
+        return target_temp
+    return target_temp - 1.0
+
+
 async def tick() -> None:
     """
     Single decision-loop iteration.
@@ -79,7 +114,8 @@ async def tick() -> None:
     STEP 11 Smart cooling optimizer — fan-only, never touches ON/OFF
     """
     global _ac_is_on, _vacant_since, _session_start_time, _session_start_temp, \
-           _session_start_kwh, _last_command_time, _last_command, _watts_samples
+           _session_start_kwh, _last_command_time, _last_command, _watts_samples, \
+           _startup_sync_done
 
     # STEP 1 — fresh config every tick
     cfg = config_manager.load_config()
@@ -94,6 +130,38 @@ async def tick() -> None:
             bool(presence_entity), bool(indoor_temp_entity),
         )
         return
+
+    # STEP 2.5 — startup sync: align internal AC flag with Aerostate, skip one tick
+    #
+    # After add-on restart, _ac_is_on starts False. If the AC is already cooling,
+    # the next temperature check would send a duplicate ON. Read climate once,
+    # sync the flag, and return without running control logic this cycle.
+    if not _startup_sync_done:
+        ce = (cfg.get("climate_entity") or "").strip()
+        if ce:
+            cd = await ha_client.get_climate_state(ce)
+            st_raw = (cd.get("state") or "off").lower()
+            if st_raw == "cool":
+                _ac_is_on = True
+                logger.info(
+                    "[HawaAI] Startup sync → AC already ON (cool), skipping first command cycle",
+                )
+            elif st_raw in ("off", "unavailable", "unknown", ""):
+                _ac_is_on = False
+                logger.info(
+                    "[HawaAI] Startup sync → AC OFF (%s), skipping first command cycle",
+                    st_raw or "off",
+                )
+            else:
+                # fan_only, dry, auto, etc. — treat as already running
+                _ac_is_on = True
+                logger.info(
+                    "[HawaAI] Startup sync → AC already ON (mode=%s), skipping first command cycle",
+                    st_raw,
+                )
+            _startup_sync_done = True
+            return
+        _startup_sync_done = True
 
     # STEP 3 — read live indoor temperature
     indoor_temp_raw = await ha_client.get_state(indoor_temp_entity)
@@ -154,28 +222,29 @@ async def tick() -> None:
     hysteresis      = float(cfg.get("hysteresis", 1.5))
     vacancy_timeout = int(cfg.get("vacancy_timeout_minutes", 5)) * 60
     use_presence    = cfg.get("use_presence", True)
-    smart_adj       = cfg.get("smart_temp_adjustment", False)
+    smart_adj       = smart_temp_adjustment_enabled(cfg)
 
     # Weather — needed for smart adjustment and snapshot
     weather      = await weather_api.get_cached()
     outdoor_temp = weather.get("temp") if weather else None
 
     # ── Smart Temperature Adjustment ─────────────────────────────────────────
-    effective_target = target_temp
-    if smart_adj and outdoor_temp is not None:
-        if outdoor_temp < 30:
-            effective_target = target_temp + 1.0
-        elif outdoor_temp < 35:
-            effective_target = target_temp + 0.5
-        elif outdoor_temp <= 40:
-            effective_target = target_temp          # no change
-        else:                                       # > 40°C
-            effective_target = target_temp - 1.0
-
-        if effective_target != target_temp:
+    effective_target = compute_effective_target(target_temp, outdoor_temp, smart_adj)
+    if smart_adj:
+        if outdoor_temp is None:
             logger.info(
-                "[HawaAI] Smart adj: outdoor=%.1f°C → effective target %.1f°C (config=%.1f°C)",
+                "[HawaAI] Smart adj: enabled — no outdoor temp yet → effective=%.1f°C (config)",
+                effective_target,
+            )
+        elif effective_target != target_temp:
+            logger.info(
+                "[HawaAI] Smart adj: outdoor=%.1f°C → effective %.1f°C (config=%.1f°C)",
                 outdoor_temp, effective_target, target_temp,
+            )
+        else:
+            logger.info(
+                "[HawaAI] Smart adj: outdoor=%.1f°C → effective unchanged at %.1f°C",
+                outdoor_temp, effective_target,
             )
 
     # ── Read live energy/power from HA ────────────────────────────────────────

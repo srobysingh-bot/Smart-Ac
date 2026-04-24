@@ -587,6 +587,20 @@ export default function Settings() {
       <div className="card space-y-5">
         <SectionHeader>Logic Settings</SectionHeader>
 
+        {/* Timer first — easy to find */}
+        <div className="border border-gray-800 rounded-xl p-4 space-y-4">
+          <p className="text-xs font-semibold uppercase tracking-widest text-gray-400">Automation timer</p>
+          <Slider
+            label="Logic Check Interval"
+            value={cfg.logic_interval_seconds ?? 60}
+            onChange={v => patch('logic_interval_seconds', v)}
+            min={30} max={300} step={10} unit=" sec"
+          />
+          <p className="text-xs text-gray-500 -mt-3">
+            How often HawaAI runs the decision loop (temperature, presence, AC control). Lower = more responsive.
+          </p>
+        </div>
+
         <Slider
           label="Target Temperature"
           value={cfg.target_temp ?? 24}
@@ -617,16 +631,6 @@ export default function Settings() {
           Minutes room must be empty before AC turns off automatically.
         </p>
 
-        <Slider
-          label="Logic Check Interval"
-          value={cfg.logic_interval_seconds ?? 60}
-          onChange={v => patch('logic_interval_seconds', v)}
-          min={30} max={300} step={10} unit=" sec"
-        />
-        <p className="text-xs text-gray-500 -mt-3">
-          How often HawaAI checks temperature and presence. Lower = more responsive, higher = lower CPU.
-        </p>
-
         {/* ── Automation toggles ─────────────────────────────────────────── */}
         <div className="border-t border-gray-800 pt-4 space-y-3">
           <p className="text-xs font-semibold uppercase tracking-widest text-gray-400">Automation Toggles</p>
@@ -646,8 +650,14 @@ export default function Settings() {
           <Toggle
             label="Smart Temperature Adjustment"
             description="Raise / lower effective target based on outdoor conditions to save electricity"
-            checked={cfg.smart_temp_adjustment ?? false}
+            checked={cfg.smart_temp_adjustment !== false}
             onChange={v => patch('smart_temp_adjustment', v)}
+          />
+          <Toggle
+            label="Smart Cooling (fan optimizer)"
+            description="Boost fan when room is far from target; backs off near setpoint (uses climate entity only)"
+            checked={cfg.smart_cooling_enabled ?? false}
+            onChange={v => patch('smart_cooling_enabled', v)}
           />
           <Toggle
             label="Manual Override"
@@ -659,7 +669,7 @@ export default function Settings() {
         </div>
 
         {/* ── Smart Adjustment Preview ───────────────────────────────────── */}
-        {cfg.smart_temp_adjustment && (() => {
+        {cfg.smart_temp_adjustment !== false && (() => {
           const t = cfg.target_temp ?? 24
           const outdoor = outdoorTemp
           let adj = 0

@@ -55,7 +55,7 @@ async def lifespan(app: FastAPI):
     logger.info("[HawaAI] Add-on stopped")
 
 
-app = FastAPI(title="HawaAI API", version="1.1.25", lifespan=lifespan)
+app = FastAPI(title="HawaAI API", version="1.1.26", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -178,18 +178,13 @@ async def get_status():
     if indoor_temp is None and climate_data:
         indoor_temp = climate_data.get("current_temp")
 
-    # Effective target (with smart-temp adjustment applied, if enabled)
-    smart_adj        = cfg.get("smart_temp_adjustment", False)
+    # Effective target — same formula as logic_engine (single source of truth)
+    smart_adj        = logic_engine.smart_temp_adjustment_enabled(cfg)
     base_target      = float(cfg.get("target_temp", 24))
     outdoor_temp_val = weather.get("temp") if weather else None
-    effective_target = base_target
-    if smart_adj and outdoor_temp_val is not None:
-        if outdoor_temp_val < 30:
-            effective_target = base_target + 1.0
-        elif outdoor_temp_val < 35:
-            effective_target = base_target + 0.5
-        elif outdoor_temp_val > 40:
-            effective_target = base_target - 1.0
+    effective_target = logic_engine.compute_effective_target(
+        base_target, outdoor_temp_val, smart_adj,
+    )
 
     return {
         # ── Core state ────────────────────────────────────────────────────────
