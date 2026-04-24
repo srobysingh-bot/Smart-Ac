@@ -2,13 +2,20 @@
  * InsightsCard — displays cooling analytics derived from completed sessions.
  *
  * Data comes from GET /api/insights (read-only, never affects control logic).
- * Requires at least one session > 5 min to show meaningful numbers.
+ * Handles both the new structured response (has_data / metrics) and the old
+ * flat format for backward compatibility.
+ *
+ * Shows data after the first 3-minute completed session.
+ * If no strict-valid sessions exist, shows a fallback notice.
  */
 import { useEffect, useState } from 'react'
 import { getInsights } from '../api/smartcool.js'
-import { TrendingUp, TrendingDown, Minus, Zap, Thermometer, BarChart2, Loader, AlertTriangle } from 'lucide-react'
+import {
+  TrendingUp, TrendingDown, Minus, Zap, Thermometer,
+  BarChart2, Loader, AlertTriangle, Info,
+} from 'lucide-react'
 
-// ── Helpers ────────────────────────────────────────────────────────────────
+// ── Helpers ───────────────────────────────────────────────────────────────────
 
 function Stat({ label, value, unit, color = 'text-white', small = false }) {
   return (
@@ -33,9 +40,9 @@ function TypeBar({ fast = 0, normal = 0, slow = 0 }) {
   return (
     <div className="space-y-1.5">
       {[
-        { label: 'Fast',   count: fast,   pct: pct(fast),   color: 'bg-green-500' },
-        { label: 'Normal', count: normal, pct: pct(normal), color: 'bg-blue-500'  },
-        { label: 'Slow',   count: slow,   pct: pct(slow),   color: 'bg-orange-500'},
+        { label: 'Fast',   count: fast,   pct: pct(fast),   color: 'bg-green-500'  },
+        { label: 'Normal', count: normal, pct: pct(normal), color: 'bg-blue-500'   },
+        { label: 'Slow',   count: slow,   pct: pct(slow),   color: 'bg-orange-500' },
       ].map(({ label, count, pct: p, color }) => (
         <div key={label} className="flex items-center gap-2 text-xs">
           <span className="w-12 text-gray-400 text-right">{label}</span>
@@ -65,6 +72,13 @@ function TrendBadge({ trend }) {
   )
 }
 
+const REASON_LABELS = {
+  no_sessions:       'No completed sessions yet',
+  insufficient_data: 'Sessions too short or incomplete',
+  no_usable_data:    'No sessions with positive cooling',
+  error:             'Calculation error (check logs)',
+}
+
 // ── Card ──────────────────────────────────────────────────────────────────────
 
 export default function InsightsCard() {
@@ -76,12 +90,11 @@ export default function InsightsCard() {
     let alive = true
     const load = () => {
       getInsights()
-        .then(d => { if (alive) { setData(d); setLoading(false) } })
+        .then(d  => { if (alive) { setData(d);           setLoading(false) } })
         .catch(e => { if (alive) { setError(e.message); setLoading(false) } })
     }
     load()
-    // Refresh every 5 minutes — insights don't change often
-    const id = setInterval(load, 5 * 60 * 1000)
+    const id = setInterval(load, 5 * 60 * 1000)   // refresh every 5 min
     return () => { alive = false; clearInterval(id) }
   }, [])
 
@@ -101,10 +114,21 @@ export default function InsightsCard() {
     )
   }
 
-  const { sessions_analyzed, avg_cooling_rate, avg_efficiency,
-          best_target_temp, best_outdoor_range, cooling_type_counts, trend } = data || {}
-  const counts = cooling_type_counts || { fast: 0, normal: 0, slow: 0 }
-  const hasData = sessions_analyzed > 0
+  // Support both new structured response and old flat response
+  const hasData       = data?.has_data ?? (data?.sessions_analyzed > 0)
+  const reason        = data?.reason
+  const fallbackUsed  = data?.fallback_used ?? false
+  const n             = data?.sessions_analyzed ?? 0
+
+  // Prefer metrics block; fall back to flat keys for backward compat
+  const m = data?.metrics ?? data ?? {}
+  const avgRate    = m.avg_cooling_rate  ?? 0
+  const avgEff     = m.avg_efficiency    ?? 0
+  const avgCoolMin = m.avg_cool_time_min ?? null
+  const bestTemp   = m.best_target_temp  ?? null
+  const bestRange  = m.best_outdoor_range ?? null
+  const counts     = m.cooling_type_counts ?? { fast: 0, normal: 0, slow: 0 }
+  const trend      = m.trend ?? null
 
   return (
     <div className="card space-y-5">
@@ -113,15 +137,27 @@ export default function InsightsCard() {
         <div>
           <p className="text-xs text-gray-500 uppercase tracking-wide">AC Insights</p>
           <p className="text-xs text-gray-600 mt-0.5">
-            Based on {sessions_analyzed ?? 0} analyzed session{sessions_analyzed !== 1 ? 's' : ''}
-            {!hasData && ' — run the AC for >5 min to generate data'}
+            {hasData
+              ? `Based on ${n} session${n !== 1 ? 's' : ''}`
+              : (REASON_LABELS[reason] ?? 'Run AC for ≥3 min to generate insights')}
           </p>
         </div>
         <div className="flex items-center gap-2">
           <BarChart2 size={16} className="text-purple-400" />
-          <TrendBadge trend={trend} />
+          {hasData && <TrendBadge trend={trend} />}
         </div>
       </div>
+
+      {/* Fallback notice */}
+      {hasData && fallbackUsed && (
+        <div className="flex items-start gap-2 px-3 py-2 bg-yellow-900/20 border border-yellow-800/40 rounded-lg text-xs text-yellow-300">
+          <Info size={12} className="mt-0.5 shrink-0" />
+          <span>
+            Using approximate data — sessions are short or missing temperature readings.
+            Insights will improve with longer cooling sessions.
+          </span>
+        </div>
+      )}
 
       {hasData ? (
         <>
@@ -129,47 +165,53 @@ export default function InsightsCard() {
           <div className="grid grid-cols-3 gap-4">
             <Stat
               label="Avg Cooling Rate"
-              value={avg_cooling_rate != null ? avg_cooling_rate.toFixed(3) : null}
+              value={avgRate > 0 ? avgRate.toFixed(3) : null}
               unit="°C/min"
               color="text-blue-400"
             />
             <Stat
-              label="Avg Efficiency"
-              value={avg_efficiency != null ? avg_efficiency.toFixed(1) : null}
-              unit="°C/kWh"
+              label="Energy / °C"
+              value={avgEff > 0 ? avgEff.toFixed(4) : null}
+              unit="kWh/°C"
               color="text-yellow-400"
             />
             <Stat
-              label="Best Target Temp"
-              value={best_target_temp != null ? `${best_target_temp}°` : null}
+              label="Best Target"
+              value={bestTemp != null ? `${bestTemp}°` : null}
               color="text-green-400"
             />
           </div>
 
-          {/* Secondary row */}
+          {/* Avg cool time if available */}
+          {avgCoolMin != null && avgCoolMin > 0 && (
+            <div className="flex items-center gap-2 text-xs text-gray-500">
+              <Thermometer size={12} className="text-orange-400" />
+              Avg time to cool: <span className="font-semibold text-gray-300">{avgCoolMin.toFixed(1)} min</span>
+            </div>
+          )}
+
+          {/* Bottom row */}
           <div className="grid grid-cols-2 gap-4">
             {/* Cooling type distribution */}
             <div className="space-y-2">
-              <p className="text-xs text-gray-500 uppercase tracking-wide">Cooling Speed Distribution</p>
+              <p className="text-xs text-gray-500 uppercase tracking-wide">Cooling Speed</p>
               <TypeBar fast={counts.fast} normal={counts.normal} slow={counts.slow} />
             </div>
 
             {/* Best conditions */}
             <div className="space-y-2">
               <p className="text-xs text-gray-500 uppercase tracking-wide">Best Conditions</p>
-              <div className="space-y-1.5 text-sm">
+              <div className="space-y-1.5 text-xs">
                 <div className="flex items-center gap-2">
-                  <Thermometer size={13} className="text-orange-400 shrink-0" />
-                  <span className="text-gray-400 text-xs">Outdoor range:</span>
-                  <span className="text-xs font-semibold text-gray-200">
-                    {best_outdoor_range ?? '—'}
-                  </span>
+                  <Thermometer size={12} className="text-orange-400 shrink-0" />
+                  <span className="text-gray-400">Outdoor:</span>
+                  <span className="font-semibold text-gray-200">{bestRange ?? '—'}</span>
                 </div>
                 <div className="flex items-center gap-2">
-                  <Zap size={13} className="text-yellow-400 shrink-0" />
-                  <span className="text-gray-400 text-xs">Target temp:</span>
-                  <span className="text-xs font-semibold text-green-300">
-                    {best_target_temp != null ? `${best_target_temp}°C` : '—'}
+                  <Zap size={12} className="text-yellow-400 shrink-0" />
+                  <span className="text-gray-400">Target:</span>
+                  <span className="font-semibold text-green-300">
+                    {bestTemp != null ? `${bestTemp}°C` : '—'}
                   </span>
                 </div>
               </div>
@@ -177,19 +219,22 @@ export default function InsightsCard() {
           </div>
 
           {/* Speed legend */}
-          <div className="flex gap-4 text-xs text-gray-600 border-t border-gray-800 pt-3">
+          <div className="flex flex-wrap gap-4 text-xs text-gray-600 border-t border-gray-800 pt-3">
             <span><span className="text-green-400 font-semibold">Fast</span> &gt;0.5°C/min</span>
             <span><span className="text-blue-400 font-semibold">Normal</span> 0.2–0.5°C/min</span>
             <span><span className="text-orange-400 font-semibold">Slow</span> &lt;0.2°C/min</span>
-            <span className="ml-auto text-gray-700">First 5 min excluded from analysis</span>
+            <span className="ml-auto text-gray-700">Min 3 min session · Δtemp ≥ 0.3°C</span>
           </div>
         </>
       ) : (
         <div className="py-6 text-center space-y-2">
           <BarChart2 size={32} className="text-gray-700 mx-auto" />
-          <p className="text-sm text-gray-500">No cooling data yet</p>
+          <p className="text-sm text-gray-500">
+            {REASON_LABELS[reason] ?? 'No cooling data yet'}
+          </p>
           <p className="text-xs text-gray-600">
-            Insights appear after the AC runs for at least 5 minutes and a session completes.
+            Insights appear after the AC runs for at least 3 minutes and the room
+            temperature drops by at least 0.3 °C.
           </p>
         </div>
       )}

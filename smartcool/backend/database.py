@@ -2,6 +2,7 @@
 
 import aiosqlite
 import logging
+from collections import defaultdict
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -98,6 +99,96 @@ async def init_db() -> None:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Session enrichment  (API-layer only — never writes to the database)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _enrich_session(row: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Add computed fields to a session dict at API-response time.
+
+    RULES (strictly followed):
+    - Never modifies the database
+    - Never changes session start/stop triggers
+    - Only normalises values and adds derived read-only fields
+    - All operations are safe — no crashes on missing / None values
+
+    Added fields:
+      duration_minutes  float | None   — wall-clock session length
+      delta_temp        float | None   — indoor_temp_start − indoor_temp_end
+      valid             bool           — session is analytically useful
+        criteria: duration >= 3 min, delta_temp >= 0.3 °C, session completed
+
+    Normalised fields (not modified in DB):
+      energy_consumed_kwh — None→0, negative→0, spikes > 10 kWh → 0
+      cost_estimate       — None→0
+    """
+    s = dict(row)
+
+    # ── Duration ──────────────────────────────────────────────────────────────
+    duration_min: Optional[float] = None
+    try:
+        if s.get("start_time") and s.get("end_time"):
+            def _parse(ts: str) -> datetime:
+                ts = str(ts).replace("Z", "+00:00")
+                try:
+                    return datetime.fromisoformat(ts)
+                except ValueError:
+                    return datetime.strptime(ts[:19], "%Y-%m-%dT%H:%M:%S")
+
+            start = _parse(s["start_time"])
+            end   = _parse(s["end_time"])
+            secs  = (end - start).total_seconds()
+            duration_min = max(0.0, secs / 60.0)
+    except Exception:
+        pass
+    # Fall back to stored time_to_cool_minutes if timestamps unparseable
+    if duration_min is None and s.get("time_to_cool_minutes") is not None:
+        try:
+            duration_min = max(0.0, float(s["time_to_cool_minutes"]))
+        except (TypeError, ValueError):
+            pass
+
+    s["duration_minutes"] = round(duration_min, 2) if duration_min is not None else None
+
+    # ── Delta temperature ─────────────────────────────────────────────────────
+    try:
+        t_start = float(s["indoor_temp_start"]) if s.get("indoor_temp_start") is not None else None
+        t_end   = float(s["indoor_temp_end"])   if s.get("indoor_temp_end")   is not None else None
+        s["delta_temp"] = round(t_start - t_end, 2) if (t_start is not None and t_end is not None) else None
+    except (TypeError, ValueError):
+        s["delta_temp"] = None
+
+    # ── Energy normalisation (API layer only) ─────────────────────────────────
+    try:
+        e = float(s["energy_consumed_kwh"]) if s.get("energy_consumed_kwh") is not None else 0.0
+        e = max(0.0, e)
+        if e > 10.0:            # unrealistic spike — treat as missing data
+            logger.debug("Session %s: energy spike %.2f kWh clamped to 0", s.get("session_id"), e)
+            e = 0.0
+        s["energy_consumed_kwh"] = round(e, 4)
+    except (TypeError, ValueError):
+        s["energy_consumed_kwh"] = 0.0
+
+    # ── Cost normalisation ────────────────────────────────────────────────────
+    try:
+        s["cost_estimate"] = round(float(s["cost_estimate"]), 2) if s.get("cost_estimate") is not None else 0.0
+    except (TypeError, ValueError):
+        s["cost_estimate"] = 0.0
+
+    # ── Validity flag ─────────────────────────────────────────────────────────
+    s["valid"] = bool(
+        s.get("end_time") is not None          # session completed
+        and duration_min is not None
+        and duration_min >= 3.0                # at least 3 minutes
+        and s["delta_temp"] is not None
+        and s["delta_temp"] >= 0.3             # room cooled by at least 0.3 °C
+        and s["energy_consumed_kwh"] >= 0      # no negative energy
+    )
+
+    return s
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Sessions
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -188,7 +279,8 @@ async def get_sessions(
         params.extend([limit, offset])
         async with db.execute(query, params) as cursor:
             rows = await cursor.fetchall()
-            return [dict(r) for r in rows]
+            # Enrich at API layer — adds valid, delta_temp, duration_minutes
+            return [_enrich_session(dict(r)) for r in rows]
 
 
 async def get_session_count(
@@ -216,7 +308,7 @@ async def get_all_sessions_for_export() -> List[Dict]:
             "SELECT * FROM sessions ORDER BY start_time DESC"
         ) as cursor:
             rows = await cursor.fetchall()
-            return [dict(r) for r in rows]
+            return [_enrich_session(dict(r)) for r in rows]
 
 
 async def archive_old_sessions(days: int = 90) -> int:
@@ -334,17 +426,6 @@ async def get_daily_stats(days: int = 7) -> List[Dict]:
             ]
 
 
-_INSIGHTS_EMPTY: Dict[str, Any] = {
-    "sessions_analyzed":   0,
-    "avg_cooling_rate":    0.0,
-    "avg_efficiency":      0.0,
-    "best_target_temp":    None,
-    "best_outdoor_range":  None,
-    "cooling_type_counts": {"fast": 0, "normal": 0, "slow": 0},
-    "trend":               None,
-}
-
-
 def _safe_round(val, digits: int) -> Optional[float]:
     """round() that returns None instead of raising when val is None."""
     try:
@@ -353,138 +434,211 @@ def _safe_round(val, digits: int) -> Optional[float]:
         return None
 
 
+def _safe_div(numerator: float, denominator: float, default: float = 0.0) -> float:
+    """Division that returns default instead of raising ZeroDivisionError."""
+    try:
+        if denominator == 0:
+            return default
+        return numerator / denominator
+    except (TypeError, ValueError, ZeroDivisionError):
+        return default
+
+
+def _build_empty_insights(reason: str) -> Dict[str, Any]:
+    return {
+        "has_data":           False,
+        "reason":             reason,
+        "sessions_analyzed":  0,
+        "fallback_used":      False,
+        # Flat keys (backward-compatible with old InsightsCard / callers)
+        "avg_cooling_rate":   0.0,
+        "avg_efficiency":     0.0,
+        "best_target_temp":   None,
+        "best_outdoor_range": None,
+        "cooling_type_counts": {"fast": 0, "normal": 0, "slow": 0},
+        "trend":              None,
+        # New structured metrics block
+        "metrics": {
+            "avg_cooling_rate":    0.0,
+            "avg_efficiency":      0.0,
+            "avg_cool_time_min":   0.0,
+            "best_target_temp":    None,
+            "best_outdoor_range":  None,
+            "cooling_type_counts": {"fast": 0, "normal": 0, "slow": 0},
+            "trend":               None,
+        },
+    }
+
+
 async def get_insights() -> Dict[str, Any]:
     """
-    Compute analytics insights from completed sessions.
+    Compute analytics insights at the API layer from enriched completed sessions.
 
-    Only sessions with a valid cooling_rate are used (session duration > 5 min
-    and room actually cooled down). Returns safe empty defaults when there is
-    not enough data or when any query/calculation fails — NEVER raises.
+    All computation is done in Python — no reliance on stored cooling_rate column.
+    This means insights work even for sessions logged before v1.1.15.
+
+    Selection logic:
+      1. Prefer "valid" sessions: duration >= 3 min, delta_temp >= 0.3 °C
+      2. If none exist, fall back to sessions with duration >= 2 min + delta_temp > 0
+         (at most last 5) — flagged with fallback_used=True
+      3. If still none, return has_data=False with a human-readable reason
+
+    Never raises. Always returns valid JSON.
     """
     try:
+        # ── Fetch recent completed sessions ───────────────────────────────────
         async with aiosqlite.connect(DB_PATH) as db:
-
-            # ── Aggregate stats ───────────────────────────────────────────────
+            db.row_factory = aiosqlite.Row
             async with db.execute(
                 """
-                SELECT
-                    COUNT(*)             AS n,
-                    AVG(cooling_rate)    AS avg_cooling_rate,
-                    AVG(efficiency)      AS avg_efficiency,
-                    COUNT(CASE WHEN cooling_type = 'fast'   THEN 1 END) AS fast_count,
-                    COUNT(CASE WHEN cooling_type = 'normal' THEN 1 END) AS normal_count,
-                    COUNT(CASE WHEN cooling_type = 'slow'   THEN 1 END) AS slow_count
-                FROM sessions
-                WHERE cooling_rate IS NOT NULL
+                SELECT * FROM sessions
+                WHERE end_time IS NOT NULL
                   AND is_archived = 0
+                ORDER BY start_time DESC
+                LIMIT 200
                 """
             ) as cur:
-                row = await cur.fetchone()
+                rows = await cur.fetchall()
 
-            if not row or row[0] == 0:
-                return dict(_INSIGHTS_EMPTY)  # no qualifying sessions yet
+        if not rows:
+            return _build_empty_insights("no_sessions")
 
-            n              = int(row[0] or 0)
-            avg_rate       = _safe_round(row[1], 4) or 0.0
-            avg_efficiency = _safe_round(row[2], 2) or 0.0
-            fast_count     = int(row[3] or 0)
-            normal_count   = int(row[4] or 0)
-            slow_count     = int(row[5] or 0)
+        sessions = [_enrich_session(dict(r)) for r in rows]
 
-            # ── Best target temperature ───────────────────────────────────────
-            best_temp: Optional[float] = None
-            try:
-                async with db.execute(
-                    """
-                    SELECT target_temp
-                    FROM sessions
-                    WHERE cooling_rate IS NOT NULL
-                      AND target_temp   IS NOT NULL
-                      AND is_archived   = 0
-                    GROUP BY target_temp
-                    ORDER BY AVG(cooling_rate) DESC
-                    LIMIT 1
-                    """
-                ) as cur:
-                    row2 = await cur.fetchone()
-                    if row2 and row2[0] is not None:
-                        best_temp = float(row2[0])
-            except Exception:
-                pass  # non-critical — leave None
+        # ── Select analysis pool ──────────────────────────────────────────────
+        valid_pool = [s for s in sessions if s.get("valid")]
+        fallback_used = False
 
-            # ── Best outdoor temp range ───────────────────────────────────────
-            best_outdoor_range: Optional[str] = None
-            try:
-                async with db.execute(
-                    """
-                    SELECT
-                        CASE
-                            WHEN outdoor_temp_start < 30 THEN 'Below 30°C'
-                            WHEN outdoor_temp_start < 35 THEN '30-35°C'
-                            WHEN outdoor_temp_start < 40 THEN '35-40°C'
-                            ELSE 'Above 40°C'
-                        END AS range_label
-                    FROM sessions
-                    WHERE cooling_rate IS NOT NULL
-                      AND outdoor_temp_start IS NOT NULL
-                      AND is_archived = 0
-                    GROUP BY range_label
-                    ORDER BY AVG(cooling_rate) DESC
-                    LIMIT 1
-                    """
-                ) as cur:
-                    row3 = await cur.fetchone()
-                    if row3 and row3[0] is not None:
-                        best_outdoor_range = str(row3[0])
-            except Exception:
-                pass  # non-critical — leave None
+        if not valid_pool:
+            # Relaxed fallback: duration >= 2 min, positive cooling
+            valid_pool = [
+                s for s in sessions
+                if (s.get("duration_minutes") or 0) >= 2.0
+                and (s.get("delta_temp") or 0) > 0.0
+            ][:5]
+            if valid_pool:
+                fallback_used = True
+                logger.info(
+                    "[HawaAI] Insights: no strict-valid sessions; using %d fallback sessions",
+                    len(valid_pool),
+                )
+            else:
+                return _build_empty_insights("insufficient_data")
 
-            # ── Recent trend (last 5 sessions vs all-time avg) ────────────────
-            # Subquery approach — no window functions, works on SQLite 3.x
-            trend: Optional[str] = None
-            try:
-                async with db.execute(
-                    """
-                    SELECT AVG(cooling_rate)
-                    FROM (
-                        SELECT cooling_rate
-                        FROM sessions
-                        WHERE cooling_rate IS NOT NULL AND is_archived = 0
-                        ORDER BY start_time DESC
-                        LIMIT 5
-                    ) recent
-                    """
-                ) as cur:
-                    row4 = await cur.fetchone()
-                    recent_avg = float(row4[0]) if (row4 and row4[0] is not None) else None
+        # ── Compute metrics in Python ─────────────────────────────────────────
+        cooling_rates: List[float] = []
+        efficiencies:  List[float] = []
+        cool_times:    List[float] = []
+        type_counts: Dict[str, int] = {"fast": 0, "normal": 0, "slow": 0}
+        temp_rates:    Dict[float,  List[float]] = defaultdict(list)
+        range_rates:   Dict[str,    List[float]] = defaultdict(list)
 
-                if recent_avg is not None and avg_rate and n >= 5:
-                    if recent_avg > avg_rate * 1.1:
-                        trend = "improving"
-                    elif recent_avg < avg_rate * 0.9:
-                        trend = "declining"
-                    else:
-                        trend = "stable"
-            except Exception:
-                pass  # non-critical — leave None
+        for s in valid_pool:
+            dur = s.get("duration_minutes") or 0.0
+            dt  = s.get("delta_temp")       or 0.0
+            kwh = s.get("energy_consumed_kwh") or 0.0
+
+            if dur <= 0 or dt <= 0:
+                continue
+
+            rate = _safe_div(dt, dur)
+            if rate > 0:
+                cooling_rates.append(rate)
+                if   rate > 0.5:  type_counts["fast"]   += 1
+                elif rate >= 0.2: type_counts["normal"] += 1
+                else:             type_counts["slow"]   += 1
+
+            # Efficiency: kWh per °C cooled (lower = more efficient)
+            if kwh > 0:
+                efficiencies.append(_safe_div(kwh, max(dt, 0.1)))
+
+            cool_times.append(dur)
+
+            # Best target temperature accumulator
+            tgt = s.get("target_temp")
+            if tgt is not None:
+                try:
+                    temp_rates[float(tgt)].append(rate)
+                except (TypeError, ValueError):
+                    pass
+
+            # Best outdoor range accumulator
+            out = s.get("outdoor_temp_start")
+            if out is not None:
+                try:
+                    out_f = float(out)
+                    if   out_f < 30: label = "Below 30°C"
+                    elif out_f < 35: label = "30-35°C"
+                    elif out_f < 40: label = "35-40°C"
+                    else:            label = "Above 40°C"
+                    range_rates[label].append(rate)
+                except (TypeError, ValueError):
+                    pass
+
+        if not cooling_rates:
+            return _build_empty_insights("no_usable_data")
+
+        n            = len(valid_pool)
+        avg_rate     = _safe_div(sum(cooling_rates), len(cooling_rates))
+        avg_eff      = _safe_div(sum(efficiencies),  len(efficiencies)) if efficiencies else 0.0
+        avg_cool_min = _safe_div(sum(cool_times),    len(cool_times))   if cool_times   else 0.0
+
+        # Best target temp: highest average cooling rate
+        best_temp: Optional[float] = None
+        if temp_rates:
+            best_temp = max(
+                temp_rates,
+                key=lambda t: _safe_div(sum(temp_rates[t]), len(temp_rates[t]))
+            )
+
+        # Best outdoor range: highest average cooling rate
+        best_outdoor: Optional[str] = None
+        if range_rates:
+            best_outdoor = max(
+                range_rates,
+                key=lambda l: _safe_div(sum(range_rates[l]), len(range_rates[l]))
+            )
+
+        # Trend: compare last 3 vs rest
+        trend: Optional[str] = None
+        if len(cooling_rates) >= 5:
+            recent_avg = _safe_div(sum(cooling_rates[:3]), 3)
+            older_pool = cooling_rates[3:]
+            older_avg  = _safe_div(sum(older_pool), max(len(older_pool), 1))
+            if older_avg > 0:
+                if   recent_avg > older_avg * 1.1: trend = "improving"
+                elif recent_avg < older_avg * 0.9: trend = "declining"
+                else:                              trend = "stable"
+
+        metrics = {
+            "avg_cooling_rate":    round(avg_rate, 4),
+            "avg_efficiency":      round(avg_eff,  4),
+            "avg_cool_time_min":   round(avg_cool_min, 1),
+            "best_target_temp":    best_temp,
+            "best_outdoor_range":  best_outdoor,
+            "cooling_type_counts": type_counts,
+            "trend":               trend,
+        }
 
         return {
-            "sessions_analyzed":   n,
-            "avg_cooling_rate":    avg_rate,
-            "avg_efficiency":      avg_efficiency,
-            "best_target_temp":    best_temp,
-            "best_outdoor_range":  best_outdoor_range,
-            "cooling_type_counts": {
-                "fast":   fast_count,
-                "normal": normal_count,
-                "slow":   slow_count,
-            },
-            "trend": trend,
+            "has_data":           True,
+            "reason":             None,
+            "sessions_analyzed":  n,
+            "fallback_used":      fallback_used,
+            # Flat backward-compatible keys
+            "avg_cooling_rate":   metrics["avg_cooling_rate"],
+            "avg_efficiency":     metrics["avg_efficiency"],
+            "best_target_temp":   best_temp,
+            "best_outdoor_range": best_outdoor,
+            "cooling_type_counts": type_counts,
+            "trend":              trend,
+            # Structured block for new InsightsCard
+            "metrics":            metrics,
         }
 
     except Exception as exc:
         logger.error("[HawaAI] get_insights() failed: %s", exc, exc_info=True)
-        return dict(_INSIGHTS_EMPTY)
+        return _build_empty_insights("error")
 
 
 async def get_ml_stats() -> Dict[str, Any]:
