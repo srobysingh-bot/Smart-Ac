@@ -55,7 +55,7 @@ async def lifespan(app: FastAPI):
     logger.info("[HawaAI] Add-on stopped")
 
 
-app = FastAPI(title="HawaAI API", version="1.1.23", lifespan=lifespan)
+app = FastAPI(title="HawaAI API", version="1.1.24", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -166,7 +166,8 @@ async def get_status():
         ac_idle      = False
         power_source = "internal"
 
-    # Climate entity — display data only (temp, mode, fan, swing for ClimateCard)
+    # Aerostate — single source of truth for displayed AC state.
+    # HawaAI now commands via Aerostate; this reads live state back.
     climate_entity = cfg.get("climate_entity", "")
     climate_data: dict = {}
     if climate_entity:
@@ -177,14 +178,27 @@ async def get_status():
     if indoor_temp is None and climate_data:
         indoor_temp = climate_data.get("current_temp")
 
+    # Effective target (with smart-temp adjustment applied, if enabled)
+    smart_adj        = cfg.get("smart_temp_adjustment", False)
+    base_target      = float(cfg.get("target_temp", 24))
+    outdoor_temp_val = weather.get("temp") if weather else None
+    effective_target = base_target
+    if smart_adj and outdoor_temp_val is not None:
+        if outdoor_temp_val < 30:
+            effective_target = base_target + 1.0
+        elif outdoor_temp_val < 35:
+            effective_target = base_target + 0.5
+        elif outdoor_temp_val > 40:
+            effective_target = base_target - 1.0
+
     return {
         # ── Core state ────────────────────────────────────────────────────────
         "ac_on":            ac_on,
         "ac_idle":          ac_idle,       # fan running, compressor off (50–500 W)
         "power_source":     power_source,  # "watts" | "watts_idle" | "cooldown" | "internal"
         "indoor_temp":      indoor_temp,
-        "outdoor_temp":     weather.get("temp")      if weather else None,
-        "outdoor_humidity": weather.get("humidity")  if weather else None,
+        "outdoor_temp":     outdoor_temp_val,
+        "outdoor_humidity": weather.get("humidity") if weather else None,
         "presence":         is_occupied,
         # ── Energy ────────────────────────────────────────────────────────────
         "watt_draw":        energy_watts or 0.0,
@@ -203,9 +217,21 @@ async def get_status():
         "config_complete":  bool(
             cfg.get("presence_entity") and cfg.get("indoor_temp_entity")
         ),
-        "target_temp":      cfg.get("target_temp", 24),
+        "target_temp":      base_target,
+        "effective_target": effective_target,
         "climate_entity":   climate_entity,
-        # ── Climate display data (read-only, NEVER used for ac_on) ─────────────
+        # ── Aerostate — live state read back from the climate entity ───────────
+        # This is the single UI truth for what the AC is currently doing.
+        "aerostate": {
+            "entity_id":    climate_entity,
+            "mode":         climate_data.get("mode"),         # hvac_mode
+            "current_temp": climate_data.get("current_temp"), # measured room temp
+            "target_temp":  climate_data.get("target_temp"),  # setpoint
+            "fan_mode":     climate_data.get("fan_mode"),
+            "swing_mode":   climate_data.get("swing_mode"),
+            "is_on":        climate_data.get("is_on", False),
+        },
+        # Flattened aliases kept for backward compat with existing frontend components
         "ac_current_temp":  climate_data.get("current_temp"),
         "ac_target_temp":   climate_data.get("target_temp"),
         "ac_mode":          climate_data.get("mode"),
@@ -213,11 +239,11 @@ async def get_status():
         "ac_swing_mode":    climate_data.get("swing_mode"),
         # ── Smart cooling (read-only, NEVER changes AC ON/OFF) ─────────────────
         "smart_cooling_enabled": cfg.get("smart_cooling_enabled", False),
-        "smart_temp_adjustment": cfg.get("smart_temp_adjustment", False),
+        "smart_temp_adjustment": smart_adj,
         "smart_mode":            runtime.get("smart_mode"),
         "smart_fan_mode":        runtime.get("smart_fan_mode"),
         "smart_delta": (
-            round(indoor_temp - float(cfg.get("target_temp", 24)), 2)
+            round(indoor_temp - base_target, 2)
             if indoor_temp is not None else None
         ),
         "last_applied_target":   runtime.get("last_applied_target"),

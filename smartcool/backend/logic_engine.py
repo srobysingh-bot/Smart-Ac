@@ -3,26 +3,27 @@ HawaAI core decision engine — THE BRAIN.
 
 Called every `logic_interval_seconds` by the scheduler.
 
-AC control architecture (v1.1.17):
-  ┌──────────────────────────────────────────────────────────────────────┐
-  │  CONTROL  →  Broadlink IR ONLY  (ir_command_on / ir_command_off)    │
-  │  STATE    →  Power sensor (watts) — primary ground truth             │
-  │             Internal _ac_is_on flag — used during 60 s cooldown      │
-  │  DISPLAY  →  Climate entity read-only (temp, mode, fan, swing)       │
-  └──────────────────────────────────────────────────────────────────────┘
+AC control architecture (v1.1.24):
+  ┌───────────────────────────────────────────────────────────────────────┐
+  │  CONTROL  →  Aerostate (climate entity) via ac_adapter               │
+  │               ac_adapter → HA climate services → Broadlink → AC      │
+  │  STATE    →  Power sensor (watts) — primary ground truth              │
+  │               Internal _ac_is_on flag — used during 60 s cooldown     │
+  │  DISPLAY  →  Climate entity read-only (temp, mode, fan, swing)        │
+  └───────────────────────────────────────────────────────────────────────┘
 
 Power-based state bands (watts):
   > 500 W   →  ON   (compressor running)
   50–500 W  →  IDLE (fan-only; compressor resting between cycles)
   < 50 W    →  OFF
 
-Why power, not climate entity:
+Why power sensor for STATE detection (not climate entity):
   - Climate entity is a cloud-integration state that can lag or be stale
   - Real physical behavior is always reflected by wall-socket power draw
   - 500 W threshold cleanly separates compressor-on from fan-only
 
-Cooldown (60 s after any IR command):
-  Immediately after the IR signal, the AC needs time to respond and the
+Cooldown (60 s after any climate command):
+  Immediately after the command, the AC needs time to respond and the
   power draw starts from 0. During this window we trust the internal flag
   to avoid false "OFF" detection and a premature re-send of the ON command.
   After 60 s the power sensor takes over as the authoritative source.
@@ -32,7 +33,7 @@ import logging
 from datetime import datetime, timezone
 from typing import List, Optional
 
-from . import config_manager, ha_client, session_logger, smart_cooling, weather_api
+from . import ac_adapter, config_manager, ha_client, session_logger, smart_cooling, weather_api
 from .utils import parse_presence
 
 logger = logging.getLogger(__name__)
@@ -334,7 +335,7 @@ async def tick() -> None:
 
     if indoor_temp > upper and not ac_on:
         logger.info("[HawaAI] Too warm (%.1f°C > %.1f°C) — turning AC ON", indoor_temp, upper)
-        await _turn_ac_on(cfg, indoor_temp)
+        await _turn_ac_on(cfg, indoor_temp, effective_target)
 
     elif indoor_temp <= lower and ac_on:
         logger.info("[HawaAI] Room cooled (%.1f°C ≤ %.1f°C) — turning AC OFF", indoor_temp, lower)
@@ -386,46 +387,45 @@ async def tick() -> None:
 
 # ── Turn AC ON ────────────────────────────────────────────────────────────────
 
-async def _turn_ac_on(cfg: dict, indoor_temp: float) -> None:
+async def _turn_ac_on(
+    cfg: dict,
+    indoor_temp: float,
+    effective_target: Optional[float] = None,
+) -> None:
     """
-    Send AC ON command via Broadlink IR (the ONLY control method).
+    Turn AC ON via Aerostate (climate entity) using ac_adapter.
 
-    The climate entity is NOT used for ON/OFF control — it is display-only.
-    Internal flag _ac_is_on is set True only on confirmed IR success.
+    Pipeline: HawaAI → ac_adapter → climate entity → Broadlink → AC
+    Internal flag _ac_is_on is set True only when the adapter call succeeds.
     Starts a session and records the kWh meter baseline.
     Sets _last_command="on" to activate the 60 s cooldown on the next tick.
     """
     global _ac_is_on, _session_start_time, _session_start_temp, \
            _session_start_kwh, _last_command_time, _last_command, _watts_samples
 
-    broadlink_entity = (cfg.get("broadlink_entity") or "").strip()
-    cmd_on           = (cfg.get("ir_command_on")    or "").strip()
-    ir_device_name   = (cfg.get("ir_device_name")   or "").strip()
-
-    if not broadlink_entity:
+    climate_entity = (cfg.get("climate_entity") or "").strip()
+    if not climate_entity:
         logger.error(
-            "[HawaAI] AC ON FAILED — no Broadlink entity configured. "
-            "Set 'broadlink_entity' in Settings → IR Command Mapping."
-        )
-        return
-    if not cmd_on:
-        logger.error(
-            "[HawaAI] AC ON FAILED — IR ON command is empty. "
-            "Set 'ir_command_on' in Settings → IR Command Mapping."
+            "[HawaAI] AC ON FAILED — no climate entity configured. "
+            "Set 'climate_entity' in Settings."
         )
         return
 
-    success = await ha_client.send_broadlink_command(
-        broadlink_entity, cmd_on, ir_device_name
+    # Use effective_target (with smart adjustment) when available,
+    # otherwise fall back to the raw config target_temp.
+    target = effective_target if effective_target is not None else float(cfg.get("target_temp", 24))
+
+    success = await ac_adapter.turn_on(
+        entity_id   = climate_entity,
+        temperature = target,
+        fan_mode    = "auto",
+        hvac_mode   = "cool",
     )
     if not success:
         logger.error(
-            "[HawaAI] AC ON IR command '%s' FAILED — not marking as ON, will retry next tick",
-            cmd_on,
+            "[HawaAI] AC ON via Aerostate FAILED — not marking as ON, will retry next tick"
         )
         return
-
-    logger.info("[HawaAI] AC ON via Broadlink IR → command='%s'", cmd_on)
 
     # Record kWh meter baseline for this session
     kwh_entity = cfg.get("energy_kwh_entity", "")
@@ -553,42 +553,23 @@ async def _close_session(cfg: dict, indoor_temp: float, reason: str) -> None:
 
 async def _turn_ac_off(cfg: dict, indoor_temp: float, reason: str) -> None:
     """
-    Send AC OFF command via Broadlink IR (the ONLY control method).
+    Turn AC OFF via Aerostate (climate entity) using ac_adapter.
 
-    The climate entity is NOT used for ON/OFF control — it is display-only.
-    Internal flag _ac_is_on is set False regardless of IR outcome so we don't
-    get stuck in an ON state if the IR fails.
+    Pipeline: HawaAI → ac_adapter → climate entity → Broadlink → AC
+    Internal flag _ac_is_on is set False regardless of adapter outcome so we
+    never get stuck in an ON state if the service call fails.
     Delegates session bookkeeping to _close_session().
     Sets _last_command="off" to activate the 60 s cooldown on the next tick.
     """
     global _ac_is_on, _last_command_time, _last_command
 
-    broadlink_entity = (cfg.get("broadlink_entity") or "").strip()
-    cmd_off          = (cfg.get("ir_command_off")   or "").strip()
-    ir_device_name   = (cfg.get("ir_device_name")   or "").strip()
+    climate_entity = (cfg.get("climate_entity") or "").strip()
 
-    if broadlink_entity and cmd_off:
-        ir_ok = await ha_client.send_broadlink_command(
-            broadlink_entity, cmd_off, ir_device_name
-        )
-        if ir_ok:
-            logger.info("[HawaAI] AC OFF via Broadlink IR → command='%s'", cmd_off)
-        else:
-            logger.error(
-                "[HawaAI] AC OFF IR command '%s' FAILED — "
-                "marking OFF anyway to prevent stuck-ON state",
-                cmd_off,
-            )
-    elif not broadlink_entity:
-        logger.warning(
-            "[HawaAI] No Broadlink configured — marking ac=OFF without sending IR command"
-        )
-    else:
-        logger.error(
-            "[HawaAI] IR OFF command is empty — set it in Settings → IR Command Mapping"
-        )
+    # Send OFF command via Aerostate. Even on failure we flip the internal flag
+    # (below) to avoid a stuck-ON state — same policy as the old Broadlink path.
+    await ac_adapter.turn_off(climate_entity)
 
-    # Always flip internal flag and set cooldown regardless of IR outcome
+    # Always flip internal flag and set cooldown regardless of adapter outcome
     _ac_is_on          = False
     _last_command_time = datetime.now(timezone.utc)
     _last_command      = "off"
