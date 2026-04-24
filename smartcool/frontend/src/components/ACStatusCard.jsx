@@ -87,6 +87,7 @@ export default function ACStatusCard({
   acOn,
   acIdle = false,
   sessionStart,
+  runtime,
   wattDraw,
   sessionKwh,
   // Smart cooling (read-only display)
@@ -140,6 +141,9 @@ export default function ACStatusCard({
               <span>Running for</span>
             </div>
             <span className="text-3xl font-mono font-bold text-blue-400">{timer}</span>
+            {runtime?.active && runtime?.formatted && (
+              <span className="text-xs text-gray-500">~{runtime.formatted} session</span>
+            )}
           </>
         ) : acIdle && timer ? (
           <>
@@ -148,10 +152,22 @@ export default function ACStatusCard({
               <span>Idle for</span>
             </div>
             <span className="text-3xl font-mono font-bold text-yellow-400">{timer}</span>
+            {runtime?.active && runtime?.formatted && (
+              <span className="text-xs text-gray-500">~{runtime.formatted} session</span>
+            )}
             <span className="text-xs text-gray-500">
               Compressor resting · fan running
               {wattDraw > 0 ? ` · ${Number(wattDraw).toFixed(0)} W` : ''}
             </span>
+          </>
+        ) : (acOn || acIdle) && runtime?.active && runtime?.formatted && runtime.formatted !== '—' ? (
+          <>
+            <div className="flex items-center gap-2 text-sm text-gray-400">
+              <Timer size={14} className="text-blue-400" />
+              <span>Session</span>
+            </div>
+            <span className="text-2xl font-mono font-bold text-blue-400">{runtime.formatted}</span>
+            <span className="text-xs text-gray-500">Live timer syncs when session start is available</span>
           </>
         ) : (
           <span className="text-gray-600 text-sm">Not running</span>

@@ -9,16 +9,19 @@ logger = logging.getLogger(__name__)
 
 CONFIG_PATH = "/data/hawaai_config.json"
 
+# Legacy keys from pre–climate-only installs — stripped from merged config (ignored safely).
+_LEGACY_IR_KEYS = frozenset({
+    "broadlink_entity", "ir_device_name", "ir_command_on", "ir_command_off",
+})
+
 DEFAULT_CONFIG: Dict[str, Any] = {
     "presence_entity": "",
     "indoor_temp_entity": "",
-    "climate_entity": "",      # optional HA climate entity for live AC data + control
+    # Primary AC entity (Aerostate). Synced to climate_entity for engine/API compatibility.
+    "ac_entity": "",
+    "climate_entity": "",
     "energy_power_entity": "",   # live watts sensor  (e.g. sensor.study_sensor_power)
     "energy_kwh_entity": "",     # cumulative kWh sensor (e.g. sensor.study_sensor_power_usage)
-    "broadlink_entity": "",
-    "ir_device_name": "",  # device name typed when learning commands in HA (e.g. "studyac")
-    "ir_command_on": "",   # exact name of the Broadlink learned command for AC power on
-    "ir_command_off": "",  # exact name of the Broadlink learned command for AC power off
     "ac_brand": "",
     "ac_model": "",
     "room_name": "Living Room",
@@ -63,6 +66,15 @@ def load_config() -> Dict[str, Any]:
     # Merge: defaults < supervisor options < persisted UI config
     merged = {**DEFAULT_CONFIG, **options, **saved}
 
+    # Drop legacy Broadlink / IR keys — old JSON may still contain them; never used.
+    for _k in _LEGACY_IR_KEYS:
+        merged.pop(_k, None)
+
+    # Single AC entity: ac_entity wins, else climate_entity (supervisor / old saves).
+    _ace = (merged.get("ac_entity") or merged.get("climate_entity") or "").strip()
+    merged["ac_entity"] = _ace
+    merged["climate_entity"] = _ace
+
     # Migration: rename legacy energy_sensor_entity → energy_power_entity
     if "energy_sensor_entity" in merged and "energy_power_entity" not in merged:
         merged["energy_power_entity"] = merged.pop("energy_sensor_entity")
@@ -76,8 +88,12 @@ def load_config() -> Dict[str, Any]:
 def save_config(data: Dict[str, Any]) -> bool:
     """Write config to /data/ which persists across HA addon restarts."""
     try:
+        data = {k: v for k, v in data.items() if k not in _LEGACY_IR_KEYS}
         current = load_config()
         current.update(data)
+        _ace = (current.get("ac_entity") or current.get("climate_entity") or "").strip()
+        current["ac_entity"] = _ace
+        current["climate_entity"] = _ace
         os.makedirs(os.path.dirname(CONFIG_PATH), exist_ok=True)
         with open(CONFIG_PATH, "w", encoding="utf-8") as f:
             json.dump(current, f, indent=2, ensure_ascii=False)

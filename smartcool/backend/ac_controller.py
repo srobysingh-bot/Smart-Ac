@@ -1,8 +1,8 @@
 """
-AC controller — dispatches IR commands via Broadlink remote entity in HA.
+AC brand/model library + legacy ACController stub.
 
-Looks up the correct IR command from the brand/model profile in
-ac_library/brands.json and sends it through the HA remote service.
+HawaAI control is climate-only (ac_adapter → Aerostate). IR/Broadlink is no
+longer used from this add-on. The library remains for reference / future use.
 """
 
 import json
@@ -11,7 +11,6 @@ from pathlib import Path
 from typing import Any, Dict, Optional
 
 from . import config_manager
-from . import ha_client
 
 logger = logging.getLogger(__name__)
 
@@ -49,21 +48,15 @@ def get_model(brand_id: str, model_id: str) -> Optional[Dict[str, Any]]:
 
 
 class ACController:
-    """Send IR commands to the AC via Broadlink remote entity (legacy class)."""
+    """Legacy stub — IR/Broadlink disabled; configure Aerostate in Settings."""
 
     async def turn_on(self, mode: str = "cool", temp: int = 24, fan: str = "auto") -> bool:
         command = self._build_command("on", mode=mode, temp=temp, fan=fan)
-        success = await self._send(command)
-        if success:
-            logger.info("AC turned ON — mode=%s temp=%d fan=%s", mode, temp, fan)
-        return success
+        return await self._send(command)
 
     async def turn_off(self) -> bool:
         command = self._build_command("off")
-        success = await self._send(command)
-        if success:
-            logger.info("AC turned OFF via IR")
-        return success
+        return await self._send(command)
 
     async def set_temperature(self, temp: int) -> bool:
         command = self._build_command("set_temp", temp=temp)
@@ -119,23 +112,9 @@ class ACController:
         return f"{mode}_{temp}_{fan}"
 
     async def _send(self, command: str) -> bool:
-        entity = config_manager.get("broadlink_entity", "")
-        ac_entity = config_manager.get("ac_switch_entity", "")
-
-        if entity:
-            brand_id = config_manager.get("ac_brand", "")
-            model_id = config_manager.get("ac_model", "")
-            device_name = f"{brand_id}_{model_id}" if brand_id else "ac"
-            ok = await ha_client.send_broadlink_command(entity, command, device_name)
-            if ok:
-                return True
-            logger.warning("IR send failed, falling back to switch control")
-
-        if ac_entity:
-            if command == "off":
-                return await ha_client.turn_off_ac(ac_entity)
-            else:
-                return await ha_client.turn_on_ac(ac_entity)
-
-        logger.error("No Broadlink entity or AC switch entity configured")
+        logger.warning(
+            "[HawaAI] ACController IR path disabled — use Climate entity (Aerostate). "
+            "Ignored command key/payload (len=%s).",
+            len(command) if command else 0,
+        )
         return False

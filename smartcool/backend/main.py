@@ -25,6 +25,7 @@ import asyncio
 import json
 import logging
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -47,7 +48,11 @@ _ws_clients: List[WebSocket] = []
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     await database.init_db()
-    config_manager.load_config()
+    cfg = config_manager.load_config()
+    ac_ent = (cfg.get("ac_entity") or cfg.get("climate_entity") or "").strip() or "(not set)"
+    smart_on = logic_engine.smart_temp_adjustment_enabled(cfg)
+    logger.info("[HawaAI] Startup configuration: AC entity=%s | Control=climate_adapter | Target=%s°C | Smart=%s",
+                ac_ent, cfg.get("target_temp", 24), "enabled" if smart_on else "disabled")
     asyncio.create_task(scheduler.start())
     asyncio.create_task(_broadcast_loop())
     logger.info("[HawaAI] Add-on started")
@@ -55,7 +60,7 @@ async def lifespan(app: FastAPI):
     logger.info("[HawaAI] Add-on stopped")
 
 
-app = FastAPI(title="HawaAI API", version="1.1.26", lifespan=lifespan)
+app = FastAPI(title="HawaAI API", version="1.1.27", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -100,6 +105,49 @@ async def reload_config():
 
 
 # ── LIVE STATUS ───────────────────────────────────────────────────────────────
+
+def _runtime_block(runtime: Dict[str, Any]) -> Dict[str, Any]:
+    """Session runtime for UI timer (minutes + formatted)."""
+    now = datetime.now(timezone.utc)
+    start_iso = runtime.get("session_start_time")
+    sid = runtime.get("session_id")
+    active = bool(sid and start_iso)
+    minutes = 0
+    if active and start_iso:
+        try:
+            iso = start_iso.replace("Z", "+00:00")
+            st = datetime.fromisoformat(iso)
+            minutes = max(0, int((now - st).total_seconds() // 60))
+        except (TypeError, ValueError):
+            minutes = 0
+    return {
+        "active":      active,
+        "minutes":     minutes,
+        "formatted":   f"{minutes} min" if active else "—",
+        "session_start": start_iso,
+    }
+
+
+def _smart_adjustment_reason(
+    enabled: bool,
+    outdoor: Optional[float],
+    base_t: float,
+    eff_t: float,
+) -> str:
+    if not enabled:
+        return "Smart target adjustment is off in Settings."
+    if outdoor is None:
+        return "Waiting for outdoor temperature from the weather API."
+    if eff_t > base_t:
+        if outdoor < 30:
+            return "Cooler outside — relaxed setpoint (+1 °C)."
+        if outdoor < 35:
+            return "Warm outside — slight relaxation (+0.5 °C)."
+        return "Outdoor conditions raised the effective target."
+    if eff_t < base_t:
+        return "Very hot outside — stronger cooling (−1 °C)."
+    return "Effective target matches config (outdoor in 30–40 °C band)."
+
 
 @app.get("/api/status")
 async def get_status():
@@ -168,7 +216,7 @@ async def get_status():
 
     # Aerostate — single source of truth for displayed AC state.
     # HawaAI now commands via Aerostate; this reads live state back.
-    climate_entity = cfg.get("climate_entity", "")
+    climate_entity = (cfg.get("ac_entity") or cfg.get("climate_entity") or "").strip()
     climate_data: dict = {}
     if climate_entity:
         climate_data = await ha_client.get_climate_state(climate_entity)
@@ -184,6 +232,11 @@ async def get_status():
     outdoor_temp_val = weather.get("temp") if weather else None
     effective_target = logic_engine.compute_effective_target(
         base_target, outdoor_temp_val, smart_adj,
+    )
+
+    rt = _runtime_block(runtime)
+    reason = _smart_adjustment_reason(
+        smart_adj, outdoor_temp_val, base_target, effective_target,
     )
 
     return {
@@ -203,6 +256,7 @@ async def get_status():
         "session_kwh":      runtime.get("session_start_kwh"),
         "session_id":       runtime["session_id"],
         "session_start":    runtime["session_start_time"],
+        "runtime":          rt,
         # ── Engine diagnostics ────────────────────────────────────────────────
         "cooldown_active":  cooldown_active,
         "last_command":     runtime.get("last_command"),
@@ -215,6 +269,9 @@ async def get_status():
         "target_temp":      base_target,
         "effective_target": effective_target,
         "climate_entity":   climate_entity,
+        "ac_entity":        climate_entity,
+        "smart_adjustment":           smart_adj,
+        "smart_adjustment_reason":    reason,
         # ── Aerostate — live state read back from the climate entity ───────────
         # This is the single UI truth for what the AC is currently doing.
         "aerostate": {
@@ -234,11 +291,11 @@ async def get_status():
         "ac_swing_mode":    climate_data.get("swing_mode"),
         # ── Smart cooling (read-only, NEVER changes AC ON/OFF) ─────────────────
         "smart_cooling_enabled": cfg.get("smart_cooling_enabled", False),
-        "smart_temp_adjustment": smart_adj,
+        "smart_temp_adjustment": smart_adj,  # alias of smart_adjustment
         "smart_mode":            runtime.get("smart_mode"),
         "smart_fan_mode":        runtime.get("smart_fan_mode"),
         "smart_delta": (
-            round(indoor_temp - base_target, 2)
+            round(indoor_temp - effective_target, 2)
             if indoor_temp is not None else None
         ),
         "last_applied_target":   runtime.get("last_applied_target"),

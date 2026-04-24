@@ -355,35 +355,33 @@ export default function Settings() {
       <div className="card space-y-4">
         <SectionHeader>AC Control</SectionHeader>
         <p className="text-xs text-gray-500 -mt-2">
-          HawaAI sends all commands through your climate entity.
-          Home Assistant (Aerostate) handles the Broadlink IR transport automatically.
+          Single control path: HawaAI calls your Home Assistant climate entity (e.g. Aerostate).
+          Your integration handles the physical AC.
         </p>
 
         <div className="space-y-2">
           <EntityDropdown
-            label="Climate Entity (climate.*)"
-            value={cfg.climate_entity}
-            onChange={v => patch('climate_entity', v)}
+            label="AC entity (climate.*)"
+            value={cfg.ac_entity || cfg.climate_entity || ''}
+            onChange={v => patch('ac_entity', v)}
             entities={byDomain('climate')}
             search={climateSearch}
             onSearchChange={setClimateSearch}
           />
           <p className="text-xs text-gray-500">
-            Pipeline: <span className="text-blue-400 font-medium">HawaAI</span>
+            <span className="text-blue-400 font-medium">HawaAI</span>
             {' → '}
-            <span className="text-blue-400 font-medium">Aerostate</span>
-            {' → '}
-            <span className="text-gray-400">Broadlink</span>
+            <span className="text-blue-400 font-medium">Climate entity</span>
             {' → '}
             <span className="text-gray-400">AC</span>
           </p>
 
           {/* Connection status badge */}
-          {cfg.climate_entity ? (
+          {(cfg.ac_entity || cfg.climate_entity) ? (
             <div className="flex items-center gap-2 px-3 py-2 bg-green-900/20 border border-green-800 rounded-lg">
               <span className="w-2 h-2 rounded-full bg-green-400 shrink-0" />
               <span className="text-xs text-green-300">
-                Connected — <code className="font-mono">{cfg.climate_entity}</code>
+                Connected — <code className="font-mono">{cfg.ac_entity || cfg.climate_entity}</code>
               </span>
             </div>
           ) : (

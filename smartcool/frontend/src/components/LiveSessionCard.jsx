@@ -58,17 +58,23 @@ function Tile({ icon: Icon, label, value, sub, color = 'text-white' }) {
 export default function LiveSessionCard({ status }) {
   const {
     session_start,
+    runtime,
     indoor_temp,
     session_start_temp,   // may be null if backend doesn't expose it
     target_temp,
+    effective_target,
     watt_draw,
     session_kwh,
     ac_on,
     ac_idle,
   } = status || {}
 
-  const elapsed = useElapsed(session_start)
-  const isActive = !!(session_start && (ac_on || ac_idle))
+  const startIso = session_start || runtime?.session_start
+  const elapsed = useElapsed(startIso)
+  const isActive = !!(
+    (startIso || runtime?.active)
+    && (ac_on || ac_idle)
+  )
 
   if (!isActive) return null
 
@@ -85,8 +91,9 @@ export default function LiveSessionCard({ status }) {
     : null
 
   // Temp gap from target
-  const tempGap = indoor_temp != null && target_temp != null
-    ? indoor_temp - target_temp
+  const effT = effective_target != null ? effective_target : target_temp
+  const tempGap = indoor_temp != null && effT != null
+    ? indoor_temp - effT
     : null
 
   return (
@@ -101,7 +108,7 @@ export default function LiveSessionCard({ status }) {
       </div>
 
       <p className="text-xs text-gray-500 uppercase tracking-wide mb-4">
-        Active Session · Started {fmtTime(session_start)}
+        Active Session · Started {fmtTime(startIso)}
       </p>
 
       <div className="grid grid-cols-2 sm:grid-cols-4 gap-4">

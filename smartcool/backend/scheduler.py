@@ -17,17 +17,19 @@ async def start() -> None:
     logger.info("[HawaAI] Scheduler started")
     weather_accumulator = 0
 
-    # BUG 3B FIX — print startup config so addon logs confirm what is configured
+    # Startup configuration — climate-only control path (Aerostate / ac_adapter)
     try:
         cfg = config_manager.load_config()
+        ac_ent = (cfg.get("ac_entity") or cfg.get("climate_entity") or "").strip() or "(not set)"
+        smart_on = logic_engine.smart_temp_adjustment_enabled(cfg)
         logger.info("[HawaAI] --- Startup configuration ---")
+        logger.info("[HawaAI]   AC entity         : %s", ac_ent)
+        logger.info("[HawaAI]   Control mode      : climate_adapter (Aerostate)")
         logger.info("[HawaAI]   presence_entity   : %s", cfg.get("presence_entity") or "(not set)")
         logger.info("[HawaAI]   indoor_temp_entity: %s", cfg.get("indoor_temp_entity") or "(not set)")
-        logger.info("[HawaAI]   energy_entity     : %s", cfg.get("energy_sensor_entity") or "(not set)")
-        logger.info("[HawaAI]   broadlink_entity  : %s", cfg.get("broadlink_entity") or "(not set)")
-        logger.info("[HawaAI]   ir_command_on     : '%s'", cfg.get("ir_command_on") or "(EMPTY — AC will not turn ON)")
-        logger.info("[HawaAI]   ir_command_off    : '%s'", cfg.get("ir_command_off") or "(EMPTY — AC will not turn OFF)")
+        logger.info("[HawaAI]   energy_power      : %s", cfg.get("energy_power_entity") or "(not set)")
         logger.info("[HawaAI]   target_temp       : %s°C", cfg.get("target_temp", 24))
+        logger.info("[HawaAI]   Smart mode        : %s", "enabled" if smart_on else "disabled")
         logger.info("[HawaAI]   hysteresis        : ±%s°C", cfg.get("hysteresis", 1.5))
         logger.info("[HawaAI]   vacancy_timeout   : %s min", cfg.get("vacancy_timeout_minutes", 5))
         logger.info("[HawaAI]   logic_interval    : %s sec", cfg.get("logic_interval_seconds", 60))

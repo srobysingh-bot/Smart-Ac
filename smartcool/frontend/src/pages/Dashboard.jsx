@@ -8,6 +8,7 @@ import PresenceBadge   from '../components/PresenceBadge.jsx'
 import SessionTable    from '../components/SessionTable.jsx'
 import InsightsCard    from '../components/InsightsCard.jsx'
 import LiveSessionCard from '../components/LiveSessionCard.jsx'
+import SmartAdjustmentCard from '../components/SmartAdjustmentCard.jsx'
 import { Thermometer, Wind, Zap, Cloud, AlertTriangle, Minus, Plus, Loader } from 'lucide-react'
 
 // ── Config warning banner ─────────────────────────────────────────────────────
@@ -372,20 +373,21 @@ export default function Dashboard() {
 
       <div className="flex-1 overflow-y-auto p-6 space-y-6">
         {/* Top cards row */}
-        <div className="grid grid-cols-3 gap-4">
+        <div className="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-4 gap-4">
           <TempGauge
             indoor={status?.indoor_temp ?? status?.ac_current_temp}
             outdoor={status?.outdoor_temp}
-            target={status?.target_temp}
+            target={status?.effective_target ?? status?.target_temp}
             indoorFromAC={status?.indoor_temp == null && status?.ac_current_temp != null}
           />
           <ACStatusCard
             acOn={status?.ac_on}
             acIdle={status?.ac_idle ?? false}
-            sessionStart={status?.session_start}
+            sessionStart={status?.session_start || status?.runtime?.session_start}
+            runtime={status?.runtime}
             wattDraw={status?.watt_draw}
             sessionKwh={status?.session_kwh}
-            hasClimateEntity={!!status?.climate_entity}
+            hasClimateEntity={!!(status?.climate_entity || status?.ac_entity)}
             acCurrentTemp={status?.ac_current_temp}
             acTargetTemp={status?.ac_target_temp}
             acMode={status?.ac_mode}
@@ -395,6 +397,12 @@ export default function Dashboard() {
             smartMode={status?.smart_mode}
             smartFanMode={status?.smart_fan_mode}
             smartDelta={status?.smart_delta}
+          />
+          <SmartAdjustmentCard
+            smartAdjustment={status?.smart_adjustment ?? status?.smart_temp_adjustment}
+            targetTemp={status?.target_temp}
+            effectiveTarget={status?.effective_target}
+            reason={status?.smart_adjustment_reason}
           />
           <div className="card flex flex-col gap-3">
             <p className="text-xs text-gray-500 uppercase tracking-wide">Energy Now</p>
@@ -428,8 +436,8 @@ export default function Dashboard() {
         </div>
 
         {/* Climate card — only shown when a climate entity is configured */}
-        {status?.climate_entity && (
-          <ClimateCard entityId={status.climate_entity} />
+        {(status?.climate_entity || status?.ac_entity) && (
+          <ClimateCard entityId={status.climate_entity || status.ac_entity} />
         )}
 
         {/* Live session card — visible only when a session is active */}
