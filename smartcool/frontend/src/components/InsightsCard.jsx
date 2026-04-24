@@ -1,18 +1,15 @@
 /**
- * InsightsCard — displays cooling analytics derived from completed sessions.
+ * InsightsCard — displays cooling analytics + smart recommendations.
  *
  * Data comes from GET /api/insights (read-only, never affects control logic).
  * Handles both the new structured response (has_data / metrics) and the old
  * flat format for backward compatibility.
- *
- * Shows data after the first 3-minute completed session.
- * If no strict-valid sessions exist, shows a fallback notice.
  */
 import { useEffect, useState } from 'react'
 import { getInsights } from '../api/smartcool.js'
 import {
   TrendingUp, TrendingDown, Minus, Zap, Thermometer,
-  BarChart2, Loader, AlertTriangle, Info,
+  BarChart2, Loader, AlertTriangle, Info, Lightbulb,
 } from 'lucide-react'
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -79,6 +76,81 @@ const REASON_LABELS = {
   error:             'Calculation error (check logs)',
 }
 
+// ── Recommendations engine (pure JS, read-only) ───────────────────────────────
+
+function buildRecommendations({ avgRate, avgEff, bestTemp, bestRange, counts, trend }) {
+  const tips = []
+
+  // Cooling speed advice
+  const total = (counts.fast || 0) + (counts.normal || 0) + (counts.slow || 0)
+  const slowFraction = total > 0 ? (counts.slow || 0) / total : 0
+  if (avgRate > 0 && avgRate < 0.2) {
+    tips.push({
+      icon: '🐢',
+      text: `Cooling is slow (${avgRate.toFixed(3)} °C/min). Check if doors/windows are open or if AC filter needs cleaning.`,
+    })
+  } else if (avgRate >= 0.5) {
+    tips.push({
+      icon: '⚡',
+      text: `Great cooling speed (${avgRate.toFixed(3)} °C/min). Your setup is performing well.`,
+    })
+  }
+
+  // Best target temp highlight
+  if (bestTemp != null) {
+    tips.push({
+      icon: '🎯',
+      text: `Your AC is most effective at ${bestTemp}°C target. Setting it higher wastes energy; lower rarely cools faster.`,
+      highlight: true,
+    })
+  }
+
+  // Efficiency advice
+  if (avgEff > 0) {
+    if (avgEff < 0.01) {
+      tips.push({
+        icon: '✅',
+        text: `Efficient cooling: ${avgEff.toFixed(4)} kWh per °C cooled. Keep it up!`,
+      })
+    } else if (avgEff > 0.05) {
+      tips.push({
+        icon: '⚠️',
+        text: `High energy per °C (${avgEff.toFixed(4)} kWh/°C). Consider a shorter on-time or better insulation.`,
+      })
+    }
+  }
+
+  // Trend advice
+  if (trend === 'declining') {
+    tips.push({
+      icon: '📉',
+      text: 'Cooling efficiency is declining. Servicing the AC or improving room insulation may help.',
+    })
+  } else if (trend === 'improving') {
+    tips.push({
+      icon: '📈',
+      text: 'Cooling efficiency is improving — recent sessions are performing better.',
+    })
+  }
+
+  // Slow sessions proportion
+  if (slowFraction >= 0.5 && total >= 3) {
+    tips.push({
+      icon: '🌡️',
+      text: `${Math.round(slowFraction * 100)}% of sessions are slow. Try pre-cooling before peak heat hours.`,
+    })
+  }
+
+  if (tips.length === 0) {
+    tips.push({
+      icon: '📊',
+      text: 'Collect more sessions to unlock personalised recommendations.',
+    })
+  }
+
+  return tips
+}
+
 // ── Card ──────────────────────────────────────────────────────────────────────
 
 export default function InsightsCard() {
@@ -114,21 +186,23 @@ export default function InsightsCard() {
     )
   }
 
-  // Support both new structured response and old flat response
-  const hasData       = data?.has_data ?? (data?.sessions_analyzed > 0)
-  const reason        = data?.reason
-  const fallbackUsed  = data?.fallback_used ?? false
-  const n             = data?.sessions_analyzed ?? 0
+  const hasData      = data?.has_data ?? (data?.sessions_analyzed > 0)
+  const reason       = data?.reason
+  const fallbackUsed = data?.fallback_used ?? false
+  const n            = data?.sessions_analyzed ?? 0
 
-  // Prefer metrics block; fall back to flat keys for backward compat
   const m = data?.metrics ?? data ?? {}
-  const avgRate    = m.avg_cooling_rate  ?? 0
-  const avgEff     = m.avg_efficiency    ?? 0
-  const avgCoolMin = m.avg_cool_time_min ?? null
-  const bestTemp   = m.best_target_temp  ?? null
+  const avgRate    = m.avg_cooling_rate   ?? 0
+  const avgEff     = m.avg_efficiency     ?? 0
+  const avgCoolMin = m.avg_cool_time_min  ?? null
+  const bestTemp   = m.best_target_temp   ?? null
   const bestRange  = m.best_outdoor_range ?? null
   const counts     = m.cooling_type_counts ?? { fast: 0, normal: 0, slow: 0 }
   const trend      = m.trend ?? null
+
+  const tips = hasData
+    ? buildRecommendations({ avgRate, avgEff, bestTemp, bestRange, counts, trend })
+    : []
 
   return (
     <div className="card space-y-5">
@@ -175,30 +249,37 @@ export default function InsightsCard() {
               unit="kWh/°C"
               color="text-yellow-400"
             />
-            <Stat
-              label="Best Target"
-              value={bestTemp != null ? `${bestTemp}°` : null}
-              color="text-green-400"
-            />
+            {/* Best target highlighted */}
+            <div className="flex flex-col gap-0.5">
+              <span className="text-xs text-gray-500 uppercase tracking-wide">Best Target</span>
+              {bestTemp != null ? (
+                <span className="font-bold text-2xl text-green-400">
+                  {bestTemp}°
+                  <span className="ml-2 text-xs font-normal text-green-600 bg-green-900/30 px-1.5 py-0.5 rounded">
+                    Recommended
+                  </span>
+                </span>
+              ) : (
+                <span className="text-sm text-gray-600">—</span>
+              )}
+            </div>
           </div>
 
-          {/* Avg cool time if available */}
+          {/* Avg cool time */}
           {avgCoolMin != null && avgCoolMin > 0 && (
             <div className="flex items-center gap-2 text-xs text-gray-500">
               <Thermometer size={12} className="text-orange-400" />
-              Avg time to cool: <span className="font-semibold text-gray-300">{avgCoolMin.toFixed(1)} min</span>
+              Avg time to cool:{' '}
+              <span className="font-semibold text-gray-300">{avgCoolMin.toFixed(1)} min</span>
             </div>
           )}
 
-          {/* Bottom row */}
+          {/* Bottom row: cooling speed + best conditions */}
           <div className="grid grid-cols-2 gap-4">
-            {/* Cooling type distribution */}
             <div className="space-y-2">
               <p className="text-xs text-gray-500 uppercase tracking-wide">Cooling Speed</p>
               <TypeBar fast={counts.fast} normal={counts.normal} slow={counts.slow} />
             </div>
-
-            {/* Best conditions */}
             <div className="space-y-2">
               <p className="text-xs text-gray-500 uppercase tracking-wide">Best Conditions</p>
               <div className="space-y-1.5 text-xs">
@@ -218,7 +299,30 @@ export default function InsightsCard() {
             </div>
           </div>
 
-          {/* Speed legend */}
+          {/* Recommendations */}
+          <div className="border-t border-gray-800 pt-4 space-y-2">
+            <div className="flex items-center gap-1.5 text-xs text-gray-500 uppercase tracking-wide mb-1">
+              <Lightbulb size={12} className="text-yellow-400" />
+              Recommendations
+            </div>
+            <div className="space-y-2">
+              {tips.map((tip, i) => (
+                <div
+                  key={i}
+                  className={`flex items-start gap-2.5 px-3 py-2 rounded-lg text-xs ${
+                    tip.highlight
+                      ? 'bg-green-900/20 border border-green-800/40 text-green-200'
+                      : 'bg-gray-800/50 text-gray-300'
+                  }`}
+                >
+                  <span className="shrink-0 mt-0.5">{tip.icon}</span>
+                  <span>{tip.text}</span>
+                </div>
+              ))}
+            </div>
+          </div>
+
+          {/* Footer legend */}
           <div className="flex flex-wrap gap-4 text-xs text-gray-600 border-t border-gray-800 pt-3">
             <span><span className="text-green-400 font-semibold">Fast</span> &gt;0.5°C/min</span>
             <span><span className="text-blue-400 font-semibold">Normal</span> 0.2–0.5°C/min</span>

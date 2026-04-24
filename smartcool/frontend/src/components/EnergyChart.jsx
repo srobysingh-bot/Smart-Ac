@@ -1,6 +1,6 @@
 import {
   ComposedChart, Line, Bar, XAxis, YAxis, CartesianGrid,
-  Tooltip, ResponsiveContainer, ReferenceLine,
+  Tooltip, ResponsiveContainer, ReferenceLine, Label,
 } from 'recharts'
 
 function formatTime(iso) {
@@ -22,7 +22,7 @@ function CustomTooltip({ active, payload, label }) {
   )
 }
 
-export default function EnergyChart({ snapshots = [] }) {
+export default function EnergyChart({ snapshots = [], targetTemp = null }) {
   const data = snapshots.map(s => ({
     time:     formatTime(s.timestamp),
     indoor:   s.indoor_temp,
@@ -88,6 +88,24 @@ export default function EnergyChart({ snapshots = [] }) {
           dot={false}
           isAnimationActive={false}
         />
+
+        {/* Target temp reference line */}
+        {targetTemp != null && (
+          <ReferenceLine
+            yAxisId="temp"
+            y={targetTemp}
+            stroke="#60a5fa"
+            strokeDasharray="6 3"
+            strokeWidth={1.5}
+          >
+            <Label
+              value={`Target ${targetTemp}°`}
+              position="insideTopRight"
+              fill="#60a5fa"
+              fontSize={10}
+            />
+          </ReferenceLine>
+        )}
 
         {/* Indoor temp line */}
         <Line

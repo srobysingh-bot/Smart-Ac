@@ -1,12 +1,13 @@
 import { useEffect, useRef, useState, useCallback } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { getStatus, getSessionStats, getSnapshots, getClimateState, setClimateTemperature, setHvacMode, setFanMode, setSwingMode } from '../api/smartcool.js'
-import ACStatusCard  from '../components/ACStatusCard.jsx'
-import TempGauge     from '../components/TempGauge.jsx'
-import EnergyChart   from '../components/EnergyChart.jsx'
-import PresenceBadge from '../components/PresenceBadge.jsx'
-import SessionTable  from '../components/SessionTable.jsx'
-import InsightsCard  from '../components/InsightsCard.jsx'
+import ACStatusCard    from '../components/ACStatusCard.jsx'
+import TempGauge       from '../components/TempGauge.jsx'
+import EnergyChart     from '../components/EnergyChart.jsx'
+import PresenceBadge   from '../components/PresenceBadge.jsx'
+import SessionTable    from '../components/SessionTable.jsx'
+import InsightsCard    from '../components/InsightsCard.jsx'
+import LiveSessionCard from '../components/LiveSessionCard.jsx'
 import { Thermometer, Wind, Zap, Cloud, AlertTriangle, Minus, Plus, Loader } from 'lucide-react'
 
 // ── Config warning banner ─────────────────────────────────────────────────────
@@ -427,6 +428,9 @@ export default function Dashboard() {
           <ClimateCard entityId={status.climate_entity} />
         )}
 
+        {/* Live session card — visible only when a session is active */}
+        <LiveSessionCard status={status} />
+
         {/* Insights — read-only analytics from completed sessions */}
         <InsightsCard />
 
@@ -440,7 +444,7 @@ export default function Dashboard() {
               Waiting for first session to start
             </p>
           ) : (
-            <EnergyChart snapshots={snapshots} />
+            <EnergyChart snapshots={snapshots} targetTemp={status?.target_temp} />
           )}
         </div>
 
