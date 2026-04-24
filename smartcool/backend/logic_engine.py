@@ -32,7 +32,7 @@ import logging
 from datetime import datetime, timezone
 from typing import List, Optional
 
-from . import config_manager, ha_client, session_logger, weather_api
+from . import config_manager, ha_client, session_logger, smart_cooling, weather_api
 from .utils import parse_presence
 
 logger = logging.getLogger(__name__)
@@ -74,6 +74,7 @@ async def tick() -> None:
     STEP 8  Write monitoring snapshot
     STEP 9  Vacancy logic
     STEP 10 Temperature logic (smart-adjustment aware)
+    STEP 11 Smart cooling optimizer — fan-only, never touches ON/OFF
     """
     global _ac_is_on, _vacant_since, _session_start_time, _session_start_temp, \
            _session_start_kwh, _last_command_time, _last_command, _watts_samples
@@ -333,6 +334,24 @@ async def tick() -> None:
     elif indoor_temp <= effective_target and ac_on:
         session_logger.mark_cooled()
 
+    # STEP 11 — Smart cooling optimizer
+    #
+    # Called AFTER the ON/OFF decision (STEP 10) to ensure we only run when
+    # the AC is confirmed to be actively cooling.  This step NEVER changes
+    # the _ac_is_on flag or sends Broadlink commands.  It only adjusts the
+    # climate-entity fan mode to maximise airflow when the room is far from
+    # target, and backs off when the room is comfortable.
+    await smart_cooling.apply_smart_cooling(
+        indoor_temp     = indoor_temp,
+        target_temp     = effective_target,
+        ac_on           = ac_on,
+        ac_idle         = ac_idle,
+        is_occupied     = is_occupied,
+        manual_override = cfg.get("manual_override", False),
+        climate_entity  = climate_entity,
+        enabled         = cfg.get("smart_cooling_enabled", False),
+    )
+
 
 # ── Turn AC ON ────────────────────────────────────────────────────────────────
 
@@ -524,6 +543,7 @@ async def _turn_ac_off(cfg: dict, indoor_temp: float, reason: str) -> None:
     _session_start_temp = None
     _session_start_kwh  = None
     _watts_samples      = []
+    smart_cooling.reset()   # clear fan-mode state so next session starts fresh
 
 
 # ── Runtime state for /api/status ────────────────────────────────────────────
@@ -537,6 +557,7 @@ def get_runtime_state() -> dict:
         secs_since_cmd is not None
         and secs_since_cmd < _COOLDOWN_SECS
     )
+    sc = smart_cooling.get_state()
     return {
         "ac_is_on":              _ac_is_on,
         "session_id":            session_logger.current_session_id(),
@@ -550,4 +571,7 @@ def get_runtime_state() -> dict:
         "secs_since_cmd":        round(secs_since_cmd, 1) if secs_since_cmd is not None else None,
         "watts_on_threshold":    _WATTS_COMPRESSOR,
         "watts_idle_threshold":  _WATTS_FAN_ONLY,
+        # Smart cooling state
+        "smart_mode":            sc["smart_mode"],
+        "smart_fan_mode":        sc["smart_fan_mode"],
     }

@@ -13,7 +13,7 @@
  * Climate entity is used ONLY for display (temp, mode, fan, swing).
  */
 import { useEffect, useState } from 'react'
-import { Wind, Timer, Zap, Thermometer } from 'lucide-react'
+import { Wind, Timer, Zap, Thermometer, Gauge } from 'lucide-react'
 
 function elapsed(startIso) {
   if (!startIso) return null
@@ -35,6 +35,30 @@ const MODE_COLORS = {
 const MODE_LABELS = {
   cool: 'Cool', heat: 'Heat', auto: 'Auto',
   dry: 'Dry', fan_only: 'Fan', off: 'Off',
+}
+
+// ── Smart mode badge ──────────────────────────────────────────────────────────
+
+const SMART_MODE_CFG = {
+  boost:  { label: 'Boost',  bg: 'bg-orange-900/50', text: 'text-orange-300', desc: 'Max airflow' },
+  normal: { label: 'Normal', bg: 'bg-blue-900/40',   text: 'text-blue-300',   desc: 'Balanced'   },
+  hold:   { label: 'Hold',   bg: 'bg-gray-800',      text: 'text-gray-400',   desc: 'Comfortable'},
+}
+
+function SmartModeBadge({ mode, fanMode, delta }) {
+  const cfg = SMART_MODE_CFG[mode] || SMART_MODE_CFG.hold
+  return (
+    <div className={`flex items-center gap-1.5 px-2 py-1 rounded-lg text-xs ${cfg.bg}`}>
+      <Gauge size={11} className={cfg.text} />
+      <span className={`font-semibold ${cfg.text}`}>{cfg.label}</span>
+      {delta != null && (
+        <span className="text-gray-500">Δ{delta > 0 ? '+' : ''}{delta.toFixed(1)}°</span>
+      )}
+      {fanMode && mode !== 'hold' && (
+        <span className="text-gray-500">· fan:{fanMode}</span>
+      )}
+    </div>
+  )
 }
 
 function StateChip({ acOn, acIdle }) {
@@ -65,6 +89,11 @@ export default function ACStatusCard({
   sessionStart,
   wattDraw,
   sessionKwh,
+  // Smart cooling (read-only display)
+  smartCoolingEnabled = false,
+  smartMode,
+  smartFanMode,
+  smartDelta,
   // Climate entity display data (read-only, never used for state)
   acCurrentTemp,
   acTargetTemp,
@@ -92,6 +121,15 @@ export default function ACStatusCard({
         <p className="text-xs text-gray-500 uppercase tracking-wide">AC Status</p>
         <StateChip acOn={acOn} acIdle={acIdle} />
       </div>
+
+      {/* Smart cooling mode badge — shown only when feature is enabled and AC is active */}
+      {smartCoolingEnabled && (acOn || acIdle) && (
+        <SmartModeBadge
+          mode={smartMode || 'hold'}
+          fanMode={smartFanMode}
+          delta={smartDelta}
+        />
+      )}
 
       {/* Timer / idle message / off message */}
       <div className="flex flex-col gap-2">

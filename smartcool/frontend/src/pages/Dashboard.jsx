@@ -391,6 +391,10 @@ export default function Dashboard() {
             acMode={status?.ac_mode}
             acFanMode={status?.ac_fan_mode}
             acSwingMode={status?.ac_swing_mode}
+            smartCoolingEnabled={status?.smart_cooling_enabled ?? false}
+            smartMode={status?.smart_mode}
+            smartFanMode={status?.smart_fan_mode}
+            smartDelta={status?.smart_delta}
           />
           <div className="card flex flex-col gap-3">
             <p className="text-xs text-gray-500 uppercase tracking-wide">Energy Now</p>
