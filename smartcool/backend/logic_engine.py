@@ -30,7 +30,7 @@ Cooldown (60 s after any IR command):
 
 import logging
 from datetime import datetime, timezone
-from typing import Optional
+from typing import List, Optional
 
 from . import config_manager, ha_client, session_logger, weather_api
 from .utils import parse_presence
@@ -43,6 +43,11 @@ _vacant_since: Optional[datetime] = None
 _session_start_time: Optional[datetime] = None
 _session_start_temp: Optional[float] = None
 _session_start_kwh: Optional[float] = None
+
+# Watts samples — one reading per tick while a session is active.
+# Used at session end to compute energy via avg_watts × duration, which is
+# safer than a kWh-meter delta (immune to meter resets / misconfigured entities).
+_watts_samples: List[float] = []
 
 # Command cooldown — after any IR command, skip control logic for this many
 # seconds to let the AC respond to the IR signal before re-evaluating.
@@ -71,7 +76,7 @@ async def tick() -> None:
     STEP 10 Temperature logic (smart-adjustment aware)
     """
     global _ac_is_on, _vacant_since, _session_start_time, _session_start_temp, \
-           _session_start_kwh, _last_command_time, _last_command
+           _session_start_kwh, _last_command_time, _last_command, _watts_samples
 
     # STEP 1 — fresh config every tick
     cfg = config_manager.load_config()
@@ -280,6 +285,12 @@ async def tick() -> None:
         },
     )
 
+    # Collect a watts reading for this tick (used for energy calculation at session end).
+    # Only recorded when a session is active AND the power sensor returned a valid number.
+    # Skipping ticks with no valid reading avoids dragging the average toward 0.
+    if session_logger.current_session_id() and energy_watts_valid:
+        _watts_samples.append(energy_watts)
+
     if in_cooldown:
         return  # skip STEP 9 and STEP 10 during cooldown
 
@@ -335,7 +346,7 @@ async def _turn_ac_on(cfg: dict, indoor_temp: float) -> None:
     Sets _last_command="on" to activate the 60 s cooldown on the next tick.
     """
     global _ac_is_on, _session_start_time, _session_start_temp, \
-           _session_start_kwh, _last_command_time, _last_command
+           _session_start_kwh, _last_command_time, _last_command, _watts_samples
 
     broadlink_entity = (cfg.get("broadlink_entity") or "").strip()
     cmd_on           = (cfg.get("ir_command_on")    or "").strip()
@@ -383,6 +394,7 @@ async def _turn_ac_on(cfg: dict, indoor_temp: float) -> None:
     _session_start_temp = indoor_temp
     _last_command_time  = now
     _last_command       = "on"
+    _watts_samples      = []   # reset for the new session
 
     weather = await weather_api.get_cached()
     await session_logger.start_session({
@@ -415,7 +427,7 @@ async def _turn_ac_off(cfg: dict, indoor_temp: float, reason: str) -> None:
     Sets _last_command="off" to activate the 60 s cooldown on the next tick.
     """
     global _ac_is_on, _session_start_time, _session_start_temp, \
-           _session_start_kwh, _last_command_time, _last_command
+           _session_start_kwh, _last_command_time, _last_command, _watts_samples
 
     broadlink_entity = (cfg.get("broadlink_entity") or "").strip()
     cmd_off          = (cfg.get("ir_command_off")   or "").strip()
@@ -453,27 +465,45 @@ async def _turn_ac_off(cfg: dict, indoor_temp: float, reason: str) -> None:
         _session_start_kwh = None
         return
 
-    now          = datetime.now(timezone.utc)
-    cool_minutes = (now - _session_start_time).total_seconds() / 60.0
+    now              = datetime.now(timezone.utc)
+    duration_secs    = (now - _session_start_time).total_seconds()
+    cool_minutes     = duration_secs / 60.0
 
-    # Calculate session energy consumed
-    kwh_consumed = None
-    cost         = None
-    kwh_entity   = cfg.get("energy_kwh_entity", "")
-    if kwh_entity and _session_start_kwh is not None:
-        raw = await ha_client.get_state(kwh_entity)
-        try:
-            end_kwh = float(raw) if raw else None
-            if end_kwh is not None:
-                kwh_consumed = round(end_kwh - _session_start_kwh, 4)
-                tariff       = float(cfg.get("energy_tariff_per_kwh", 8.0))
-                cost         = round(kwh_consumed * tariff, 2)
-                logger.info(
-                    "[HawaAI] Session energy: %.4f kWh · cost %.2f (tariff %.2f/kWh)",
-                    kwh_consumed, cost, tariff,
-                )
-        except (ValueError, TypeError):
-            pass
+    # ── Energy calculation — avg watts × duration (safe; immune to kWh meter issues) ──
+    #
+    # We use the watts samples collected each tick rather than the kWh meter delta.
+    # The kWh meter approach is fragile: a misconfigured entity, meter reset, or
+    # entity pointing to the wrong sensor can produce wildly wrong values (e.g. ₹264
+    # for 19 min because the meter reading itself is "33 kWh").
+    #
+    # Safety rules (as specified):
+    #   1. avg_watts < 100 W  → treat session as zero-energy (noise / very short)
+    #   2. energy_kwh < 0     → clamp to 0
+    #   3. energy_kwh == 0    → cost MUST be 0
+    #   4. No samples (no power sensor) → energy = 0, cost = 0
+
+    if _watts_samples:
+        avg_watts = sum(_watts_samples) / len(_watts_samples)
+    else:
+        avg_watts = 0.0
+
+    logger.info("[HawaAI] Avg watts: %.0f W (%d samples)", avg_watts, len(_watts_samples))
+    logger.info("[HawaAI] Duration: %.0f sec (%.1f min)", duration_secs, cool_minutes)
+
+    if avg_watts >= 100.0 and duration_secs > 0:
+        kwh_consumed = max(0.0, (avg_watts * duration_secs) / 3_600_000.0)
+        kwh_consumed = round(kwh_consumed, 4)
+    else:
+        kwh_consumed = 0.0
+
+    if kwh_consumed > 0:
+        tariff = float(cfg.get("energy_tariff_per_kwh", 8.0))
+        cost   = round(kwh_consumed * tariff, 2)
+    else:
+        cost = 0.0
+
+    logger.info("[HawaAI] Energy: %.4f kWh", kwh_consumed)
+    logger.info("[HawaAI] Cost: ₹%.2f", cost)
 
     await session_logger.end_session({
         "end_time":              now.isoformat(),
@@ -482,16 +512,18 @@ async def _turn_ac_off(cfg: dict, indoor_temp: float, reason: str) -> None:
         "reason_stopped":        reason,
         "energy_kwh":            kwh_consumed,
         "cost":                  cost,
+        "avg_watts":             round(avg_watts, 1),
     })
 
     logger.info(
-        "[HawaAI] AC OFF — reason=%s | %.1fmin | kWh=%s",
-        reason, cool_minutes, kwh_consumed,
+        "[HawaAI] AC OFF — reason=%s | %.1fmin | %.4f kWh | ₹%.2f",
+        reason, cool_minutes, kwh_consumed, cost,
     )
 
     _session_start_time = None
     _session_start_temp = None
     _session_start_kwh  = None
+    _watts_samples      = []
 
 
 # ── Runtime state for /api/status ────────────────────────────────────────────

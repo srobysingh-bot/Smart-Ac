@@ -13,6 +13,14 @@ function formatTime(iso) {
   return new Date(iso).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
 }
 
+function formatDuration(startIso, endIso) {
+  if (!startIso || !endIso) return null
+  const mins = (new Date(endIso) - new Date(startIso)) / 60000
+  if (mins < 0) return null
+  if (mins < 60) return `${Math.round(mins)}m`
+  return `${Math.floor(mins / 60)}h ${Math.round(mins % 60)}m`
+}
+
 const REASON_COLORS = {
   cooled:   'text-green-400',
   vacant:   'text-yellow-400',
@@ -98,8 +106,9 @@ export default function SessionTable({ limit = 10 }) {
         <thead>
           <tr className="text-left text-xs text-gray-500 uppercase tracking-wide border-b border-gray-800">
             <th className="pb-2 pr-3">Start</th>
+            <th className="pb-2 pr-3">End</th>
+            <th className="pb-2 pr-3">Duration</th>
             <th className="pb-2 pr-3">Δ Temp</th>
-            <th className="pb-2 pr-3">Time to Cool</th>
             <th className="pb-2 pr-3">kWh</th>
             <th className="pb-2 pr-3">Cost</th>
             <th className="pb-2 pr-3">Reason</th>
@@ -113,18 +122,21 @@ export default function SessionTable({ limit = 10 }) {
                 ? s.indoor_temp_start - s.indoor_temp_end
                 : null)
             const isInvalid = s._quality === 'invalid'
+            const duration  = formatDuration(s.start_time, s.end_time) ??
+              (s.time_to_cool_minutes != null ? `${Math.round(s.time_to_cool_minutes)}m` : null)
             return (
               <tr
                 key={s.session_id}
                 className={`hover:bg-gray-800/30 transition-colors ${isInvalid ? 'opacity-40' : ''}`}
               >
                 <td className="py-2 pr-3 text-gray-400">{formatTime(s.start_time)}</td>
+                <td className="py-2 pr-3 text-gray-400">{formatTime(s.end_time)}</td>
+                <td className="py-2 pr-3 text-gray-300">{duration ?? '—'}</td>
                 <td className="py-2 pr-3">
                   {delta != null
                     ? <span className="text-blue-400">−{delta.toFixed(1)}°C</span>
                     : '—'}
                 </td>
-                <td className="py-2 pr-3">{fmt(s.time_to_cool_minutes, 0, ' min')}</td>
                 <td className="py-2 pr-3">{fmt(s.energy_consumed_kwh, 3)}</td>
                 <td className="py-2 pr-3 text-yellow-400">
                   {s.cost_estimate != null ? `₹${s.cost_estimate.toFixed(2)}` : '—'}

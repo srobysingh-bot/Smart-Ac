@@ -170,10 +170,13 @@ def _enrich_session(row: Dict[str, Any]) -> Dict[str, Any]:
         s["energy_consumed_kwh"] = 0.0
 
     # ── Cost normalisation ────────────────────────────────────────────────────
+    # Rule: cost MUST be 0 if energy is 0 (guards against stale DB rows where
+    # the kWh-meter calculation was wrong and produced a high cost with 0 energy).
     try:
-        s["cost_estimate"] = round(float(s["cost_estimate"]), 2) if s.get("cost_estimate") is not None else 0.0
+        cost_raw = round(float(s["cost_estimate"]), 2) if s.get("cost_estimate") is not None else 0.0
     except (TypeError, ValueError):
-        s["cost_estimate"] = 0.0
+        cost_raw = 0.0
+    s["cost_estimate"] = 0.0 if s["energy_consumed_kwh"] == 0.0 else cost_raw
 
     # ── Validity flag ─────────────────────────────────────────────────────────
     s["valid"] = bool(
