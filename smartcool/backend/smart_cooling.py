@@ -27,7 +27,7 @@ Modes:
 
 import logging
 from datetime import datetime, timezone
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from . import ha_client
 
@@ -38,15 +38,69 @@ BOOST_DELTA         = 4.0    # °C: delta ≥ this → boost
 HOLD_DELTA          = 1.5    # °C: delta ≤ this → hold (no change)
 ADJUSTMENT_COOLDOWN = 120    # seconds minimum between fan mode changes
 
+# Logical names used by HawaAI; mapped to entity-specific values at runtime
 FAN_BOOST  = "high"
 FAN_NORMAL = "auto"
+
+# Map generic → Aerostate / Midea-style (and common aliases). Unknown keys pass through.
+FAN_ALIAS_MAP: Dict[str, str] = {
+    "high":   "f5",
+    "medium": "f3",
+    "low":    "f1",
+    "auto":   "auto",
+}
+
+# ── Fan mode resolution (Aerostate / Midea use f1–f5, not "high"/"low") ────────
+
+def _mode_in_supported(mode: str, supported: List[str]) -> Optional[str]:
+    """Return the canonical string from `supported` to use with HA, or None."""
+    if not mode or not supported:
+        return None
+    if mode in supported:
+        return mode
+    m = mode.lower()
+    for s in supported:
+        if s is not None and s.lower() == m:
+            return s
+    return None
+
+
+def _resolve_fan_mode_for_entity(
+    requested_logical: str,
+    supported: List[str],
+) -> Tuple[Optional[str], str, str]:
+    """
+    Map logical fan (high/auto/…) to an HA entity value.
+    Returns (value_for_ha_or_None, log_fragment, reason_code).
+    reason_code: "alias" | "native" | "unsupported" | "empty_supported"
+    """
+    if not supported:
+        return None, requested_logical, "empty_supported"
+
+    mapped = FAN_ALIAS_MAP.get(requested_logical, requested_logical)
+    log_frag = (
+        f"{requested_logical!r}→{mapped!r}"
+        if mapped != requested_logical
+        else f"{requested_logical!r}"
+    )
+
+    hit = _mode_in_supported(mapped, supported)
+    if hit is not None:
+        return hit, log_frag, "alias"
+
+    hit2 = _mode_in_supported(requested_logical, supported)
+    if hit2 is not None:
+        return hit2, f"{requested_logical!r} (no alias)", "native"
+
+    return None, log_frag, "unsupported"
+
 
 # ── Module-level state (in-memory, never persisted) ───────────────────────────
 
 # Fan-mode optimizer state
 _current_mode:         str               = "hold"
 _last_adjustment_time: Optional[datetime] = None
-_last_fan_mode:        Optional[str]      = None
+_last_fan_mode:        Optional[str]      = None  # last value **sent to HA** (entity-native)
 
 # Effective-target dispatcher state
 _APPLY_TARGET_COOLDOWN = 180          # seconds between temperature commands
@@ -159,15 +213,71 @@ async def apply_smart_cooling(
         return result
 
     result["mode"]     = target_mode
-    result["fan_mode"] = target_fan_mode
+    result["fan_mode"] = target_fan_mode  # logical (boost / normal intent)
 
-    # ── Skip-same guard ───────────────────────────────────────────────────────
-    if _last_fan_mode == target_fan_mode:
+    # ── No climate entity — log only, no service call ────────────────────────
+    if not climate_entity:
+        _current_mode    = target_mode
+        result["action"] = "no_climate_entity"
+        logger.info(
+            "[HawaAI] Smart Mode: %s | Delta: %.1f°C | Fan target: %s "
+            "— no climate entity configured, skipping fan command",
+            target_mode, delta, target_fan_mode,
+        )
+        return result
+
+    # ── Runtime: read supported fan_modes, map aliases (high→f5, …) ─────────
+    cstate     = await ha_client.get_climate_state(climate_entity)
+    supported  = cstate.get("fan_modes")
+    if not isinstance(supported, list):
+        supported = []
+    resolved, _log_frag, resolve_reason = _resolve_fan_mode_for_entity(
+        target_fan_mode, supported,
+    )
+    result["fan_mode_ha"] = resolved
+
+    logger.info(
+        "[HawaAI] smart_cooling fan: requested=%r | %s | supported=%s | "
+        "translated_ha=%r | detail=%s",
+        target_fan_mode,
+        _log_frag,
+        supported,
+        resolved,
+        resolve_reason,
+    )
+
+    if resolved is None:
+        _current_mode    = target_mode
+        result["action"]  = "fan_mode_unsupported"
+        logger.warning(
+            "[HawaAI] Fan mode not supported — skipping (logical=%r, %s) "
+            "supported=%s",
+            target_fan_mode, _log_frag, supported,
+        )
+        return result
+
+    cur_fan = cstate.get("fan_mode")
+    cur_norm = str(cur_fan).lower() if cur_fan is not None else ""
+    res_norm = str(resolved).lower()
+
+    # Skip if AC already reports this *entity-native* mode
+    if cur_norm and cur_norm == res_norm:
+        _current_mode    = target_mode
+        result["action"] = "skip_same"
+        _last_fan_mode   = resolved
+        logger.info(
+            "[HawaAI] smart_cooling fan: skipped (AC already at %r, current=%r)",
+            resolved, cur_fan,
+        )
+        return result
+
+    # Compare to last *applied* entity-native value (HA state may lag one tick)
+    if _last_fan_mode is not None and str(_last_fan_mode).lower() == res_norm:
         _current_mode    = target_mode
         result["action"] = "skip_same"
         logger.debug(
-            "[HawaAI] Smart Mode: %s — fan already '%s', no resend",
-            target_mode, target_fan_mode,
+            "[HawaAI] Smart Mode: %s — last fan command was already %r, no resend",
+            target_mode, resolved,
         )
         return result
 
@@ -184,42 +294,38 @@ async def apply_smart_cooling(
             )
             return result
 
-    # ── No climate entity — log only, no service call ────────────────────────
-    if not climate_entity:
-        _current_mode    = target_mode
-        result["action"] = "no_climate_entity"
-        logger.info(
-            "[HawaAI] Smart Mode: %s | Delta: %.1f°C | Fan target: %s "
-            "— no climate entity configured, skipping fan command",
-            target_mode, delta, target_fan_mode,
-        )
-        return result
-
-    # ── Apply fan mode via HA climate service ─────────────────────────────────
+    # ── Apply fan mode (isolated: failure does not touch temperature path) ─────
     logger.info(
-        "[HawaAI] Smart Mode: %s | Delta: %.1f°C | Fan set to: %s | "
-        "Reason: delta %s %.1f°C threshold",
-        target_mode, delta, target_fan_mode,
+        "[HawaAI] Smart Mode: %s | Delta: %.1f°C | "
+        "Reason: delta %s %.1f°C | applying climate.set_fan_mode → %r",
+        target_mode, delta,
         ">=" if target_mode == "boost" else ">",
         BOOST_DELTA if target_mode == "boost" else HOLD_DELTA,
+        resolved,
     )
 
     ok = await ha_client.call_service("climate", "set_fan_mode", {
         "entity_id": climate_entity,
-        "fan_mode":  target_fan_mode,
+        "fan_mode":  resolved,
     })
 
     if ok:
         _current_mode         = target_mode
-        _last_fan_mode        = target_fan_mode
+        _last_fan_mode        = resolved
         _last_adjustment_time = now
         result["action"]      = "set_fan"
-        logger.info("[HawaAI] Fan set to: %s ✓", target_fan_mode)
+        logger.info(
+            "[HawaAI] smart_cooling fan: applied %r (requested logical=%r) ✓",
+            resolved, target_fan_mode,
+        )
     else:
+        _current_mode    = target_mode
         result["action"] = "set_fan_failed"
+        # Do not set _last_fan_mode — will retry; temperature logic unaffected
         logger.error(
-            "[HawaAI] Smart Mode: failed to set fan mode '%s' on %s",
-            target_fan_mode, climate_entity,
+            "[HawaAI] smart_cooling fan: climate.set_fan_mode failed for %r on %s "
+            "(logical was %r)",
+            resolved, climate_entity, target_fan_mode,
         )
 
     return result

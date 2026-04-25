@@ -98,12 +98,19 @@ async def get_climate_state(entity_id: str) -> Dict[str, Any]:
     attrs  = full.get("attributes", {})
     state  = full.get("state") or "off"
     is_on  = state not in ("off", "unavailable", "unknown")
+    raw_fan_modes = attrs.get("fan_modes") or attrs.get("fan_mode_list")
+    if isinstance(raw_fan_modes, (list, tuple)):
+        fan_modes: List[str] = [str(x) for x in raw_fan_modes if x is not None]
+    else:
+        fan_modes = []
+
     return {
         "state":        state,
         "current_temp": attrs.get("current_temperature"),
         "target_temp":  attrs.get("temperature"),
         "mode":         state,                  # for climate entities state == hvac_mode
         "fan_mode":     attrs.get("fan_mode"),
+        "fan_modes":    fan_modes,             # supported fan speeds for smart_cooling mapping
         "swing_mode":   attrs.get("swing_mode"),
         "is_on":        is_on,
     }
