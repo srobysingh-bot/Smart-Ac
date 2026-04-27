@@ -17,7 +17,6 @@ logger = logging.getLogger(__name__)
 
 _DEFAULT_URL = config_manager.DEFAULT_CONFIG["ai_ollama_url"]
 _ollama_url_logged: bool = False
-_DEFAULT_MODEL = "gemma:2b-instruct"
 _GENERATE = "/api/generate"
 _TIMEOUT_S = 20.0
 _FAN_COOLDOWN = 60.0  # minimum seconds between fan_mode service calls
@@ -62,7 +61,7 @@ def _base_url(cfg: Dict[str, Any]) -> str:
 
 def _model(cfg: Dict[str, Any]) -> str:
     m = (cfg.get("ai_ollama_model") or "").strip()
-    return m or _DEFAULT_MODEL
+    return m or config_manager.DEFAULT_OLLAMA_MODEL
 
 
 async def _post_generate(
@@ -128,6 +127,8 @@ async def run_ai_and_cache(
     base   = _base_url(cfg)
     logger.debug("[AI] Ollama base URL: %s", base)
     model  = _model(cfg)
+    ai_cache.invalidate_if_ollama_model_changed(model)
+    logger.debug("[AI DEBUG] Model being used: %s", model)
     system = ai_prompt.build_system_prompt()
     user   = ai_prompt.build_user_prompt(
         indoor_temp, target_temp, base_effective, outdoor_temp, is_occupied,

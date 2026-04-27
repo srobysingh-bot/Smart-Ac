@@ -2,15 +2,19 @@
 
 from __future__ import annotations
 
+import logging
 import random
 import time
 from typing import Any, Dict, Optional
+
+logger = logging.getLogger(__name__)
 
 # Call interval: 10–15 minutes (seconds)
 _MIN_INTERVAL = 600.0
 _MAX_INTERVAL = 900.0
 
 _last_valid: Optional[Dict[str, Any]] = None
+_last_ollama_model: Optional[str] = None
 # Slight post-start delay before first Ollama call (Raspberry Pi safe)
 _next_fetch_at: float = 0.0
 _last_cache_info_log: float = 0.0
@@ -42,6 +46,17 @@ def get_cached() -> Optional[Dict[str, Any]]:
 def set_validated(v: Dict[str, Any]) -> None:
     global _last_valid
     _last_valid = v
+
+
+def invalidate_if_ollama_model_changed(resolved_model: str) -> None:
+    """Clear cached AI output when the configured Ollama model changes (UI vs backend stay aligned)."""
+    global _last_ollama_model, _last_valid, _next_fetch_at
+    r = (resolved_model or "").strip()
+    if _last_ollama_model is not None and r != _last_ollama_model:
+        _last_valid = None
+        _next_fetch_at = 0.0
+        logger.info("[AI] Ollama model changed — cache invalidated")
+    _last_ollama_model = r
 
 
 def throttle_cache_use_log() -> bool:

@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useState } from 'react'
-import { getConfig, getEntities, getDevices, getDeviceEntities, patchConfig, getStatus, setAiEnabled } from '../api/smartcool.js'
+import { getConfig, getEntities, getDevices, getDeviceEntities, patchConfig, getStatus, setAiEnabled, updateAiConfig } from '../api/smartcool.js'
 import { Save, RefreshCw, AlertCircle, CheckCircle2, Eye, EyeOff } from 'lucide-react'
 
 // ── Reusable field components ─────────────────────────────────────────────────
@@ -223,7 +223,15 @@ export default function Settings() {
   }, [])
 
   const patch = useCallback((key, val) => {
-    setCfg(prev => ({ ...prev, [key]: val }))
+    setCfg(prev => {
+      const next = { ...prev, [key]: val }
+      if (key === 'ai_ollama_url' || key === 'ai_ollama_model') {
+        updateAiConfig({ [key]: val }).catch((err) => {
+          console.error('Failed to save Ollama field', key, err)
+        })
+      }
+      return next
+    })
   }, [])
 
   const handleSave = async () => {

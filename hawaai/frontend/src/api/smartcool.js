@@ -52,6 +52,10 @@ export const reloadConfig = () => request('/config/reload', { method: 'POST' })
 export const setAiEnabled = (ai_enabled) =>
   request('/ai', { method: 'POST', body: JSON.stringify({ ai_enabled }) })
 
+/** Merge Ollama URL/model (and/or ai_enabled) to disk; same as Settings Save for these keys. */
+export const updateAiConfig = (data) =>
+  request('/ai', { method: 'POST', body: JSON.stringify(data) })
+
 // ── Brands ───────────────────────────────────────────────────────────────────
 export const getBrands = () => request('/brands')
 

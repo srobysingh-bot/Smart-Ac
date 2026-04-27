@@ -9,8 +9,8 @@ Routes:
   GET  /api/snapshots       Recent monitoring snapshots (last 2h)
   GET  /api/config          Current add-on config
   POST /api/config          Save config to /data/hawaai_config.json
-  GET  /api/ai              { ai_enabled }
-  POST /api/ai              Toggle ai_enabled (instant persist)
+  GET  /api/ai              { ai_enabled, ai_ollama_url, ai_ollama_model, default_ollama_model }
+  POST /api/ai              Set ai_enabled and/or Ollama URL/model (merge persist)
   GET  /api/entities        HA entity list for Settings dropdowns
   GET  /api/climate/{id}   Live climate entity state + attributes
   POST /api/climate/{id}/set_temperature
@@ -32,7 +32,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import aiohttp
-from fastapi import Body, FastAPI, Query, Request, WebSocket, WebSocketDisconnect
+from fastapi import Body, FastAPI, HTTPException, Query, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, HTMLResponse, Response
 
@@ -70,7 +70,7 @@ async def lifespan(app: FastAPI):
     logger.info("[HawaAI] Add-on stopped")
 
 
-app = FastAPI(title="HawaAI API", version="1.2.5", lifespan=lifespan)
+app = FastAPI(title="HawaAI API", version="1.2.6", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -116,20 +116,41 @@ async def reload_config():
 
 @app.get("/api/ai")
 async def get_ai_flag():
-    """Expose whether the optional Ollama AI layer is enabled."""
+    """Expose optional Ollama layer flags and current URL/model (full config in /api/config)."""
     cfg = config_manager.load_config()
-    return {"ai_enabled": bool(cfg.get("ai_enabled", False))}
+    return {
+        "ai_enabled": bool(cfg.get("ai_enabled", False)),
+        "ai_ollama_url": (str(cfg.get("ai_ollama_url") or "")).strip(),
+        "ai_ollama_model": (str(cfg.get("ai_ollama_model") or "")).strip(),
+        "default_ollama_model": config_manager.DEFAULT_OLLAMA_MODEL,
+    }
 
 
 @app.post("/api/ai")
 async def set_ai_flag(data: Dict[str, Any] = Body(...)):
-    """Toggle AI optimization (persists to /data/hawaai_config.json)."""
-    if "ai_enabled" not in data:
-        return {"success": False, "error": "ai_enabled required"}, 400
-    ok = config_manager.save_config({"ai_enabled": bool(data["ai_enabled"])})
-    if ok:
-        return {"ai_enabled": bool(data["ai_enabled"])}
-    return {"success": False}, 500
+    """Update AI-related settings (merges into /data/hawaai_config.json). At least one field required."""
+    patch: Dict[str, Any] = {}
+    if "ai_enabled" in data:
+        patch["ai_enabled"] = bool(data["ai_enabled"])
+    if "ai_ollama_url" in data and data.get("ai_ollama_url") is not None:
+        patch["ai_ollama_url"] = str(data["ai_ollama_url"] or "").strip()
+    if "ai_ollama_model" in data and data.get("ai_ollama_model") is not None:
+        patch["ai_ollama_model"] = str(data["ai_ollama_model"] or "").strip()
+    if not patch:
+        raise HTTPException(
+            status_code=400,
+            detail="At least one of: ai_enabled, ai_ollama_url, ai_ollama_model",
+        )
+    ok = config_manager.save_config(patch)
+    if not ok:
+        raise HTTPException(status_code=500, detail="Failed to save config")
+    out = config_manager.load_config()
+    return {
+        "ai_enabled": bool(out.get("ai_enabled", False)),
+        "ai_ollama_url": (str(out.get("ai_ollama_url") or "")).strip(),
+        "ai_ollama_model": (str(out.get("ai_ollama_model") or "")).strip(),
+        "default_ollama_model": config_manager.DEFAULT_OLLAMA_MODEL,
+    }
 
 
 # ── LIVE STATUS ───────────────────────────────────────────────────────────────
