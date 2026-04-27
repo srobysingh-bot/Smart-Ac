@@ -671,7 +671,7 @@ export default function Settings() {
             }}
           />
           <Input
-            label="Ollama base URL (optional)"
+            label="Ollama base URL (leave empty to use default: 172.30.32.1)"
             value={cfg.ai_ollama_url ?? ''}
             onChange={v => patch('ai_ollama_url', v)}
             placeholder="http://172.30.32.1:11434"

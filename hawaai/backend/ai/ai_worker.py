@@ -11,11 +11,12 @@ from typing import Any, Dict, Optional, Tuple
 import aiohttp
 
 from . import ai_cache, ai_prompt, ai_validator
-from .. import ha_client
+from .. import config_manager, ha_client
 
 logger = logging.getLogger(__name__)
 
-_DEFAULT_URL = "http://172.30.32.1:11434"
+_DEFAULT_URL = config_manager.DEFAULT_CONFIG["ai_ollama_url"]
+_ollama_url_logged: bool = False
 _DEFAULT_MODEL = "gemma:3b-instruct-q4_K_M"
 _GENERATE = "/api/generate"
 _TIMEOUT_S = 5.0
@@ -47,8 +48,16 @@ def last_ai_log_state() -> Dict[str, Any]:
 
 
 def _base_url(cfg: Dict[str, Any]) -> str:
+    global _ollama_url_logged
     u = (cfg.get("ai_ollama_url") or "").strip()
-    return (u.rstrip("/") if u else _DEFAULT_URL)
+    if not u or "ollama_ai" in u.lower():
+        u = _DEFAULT_URL
+    else:
+        u = u.rstrip("/")
+    if not _ollama_url_logged:
+        logger.info("[AI] Using Ollama URL: %s", u)
+        _ollama_url_logged = True
+    return u
 
 
 def _model(cfg: Dict[str, Any]) -> str:

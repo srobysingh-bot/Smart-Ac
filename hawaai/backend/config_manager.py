@@ -77,11 +77,10 @@ def load_config() -> Dict[str, Any]:
     if merged.get("ai_enabled") is None:
         merged["ai_enabled"] = False
 
-    # Default Ollama URL: HA host from add-on network (host_port mapped service).
-    if not (str(merged.get("ai_ollama_url") or "")).strip():
-        merged["ai_ollama_url"] = DEFAULT_CONFIG.get(
-            "ai_ollama_url", "http://172.30.32.1:11434",
-        )
+    # Ollama URL: empty or legacy unresolvable hostname → HA host default.
+    _ou = (str(merged.get("ai_ollama_url") or "")).strip()
+    if not _ou or "ollama_ai" in _ou.lower():
+        merged["ai_ollama_url"] = DEFAULT_CONFIG["ai_ollama_url"]
 
     # Single AC entity: ac_entity wins, else climate_entity (supervisor / old saves).
     _ace = (merged.get("ac_entity") or merged.get("climate_entity") or "").strip()
