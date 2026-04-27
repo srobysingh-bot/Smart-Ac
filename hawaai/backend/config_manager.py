@@ -34,7 +34,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "smart_cooling_enabled": False,  # fan boost/normal via climate entity when enabled
     "manual_override": False,
     "ai_enabled": False,
-    "ai_ollama_url": "http://ollama_ai:11434",
+    "ai_ollama_url": "http://172.30.32.1:11434",
     "ai_ollama_model": "",
     "weather_api_key": "",
     "weather_city": "",
@@ -77,10 +77,10 @@ def load_config() -> Dict[str, Any]:
     if merged.get("ai_enabled") is None:
         merged["ai_enabled"] = False
 
-    # Default Ollama add-on URL (Home Assistant internal DNS) when not overridden.
+    # Default Ollama URL: HA host from add-on network (host_port mapped service).
     if not (str(merged.get("ai_ollama_url") or "")).strip():
         merged["ai_ollama_url"] = DEFAULT_CONFIG.get(
-            "ai_ollama_url", "http://ollama_ai:11434",
+            "ai_ollama_url", "http://172.30.32.1:11434",
         )
 
     # Single AC entity: ac_entity wins, else climate_entity (supervisor / old saves).

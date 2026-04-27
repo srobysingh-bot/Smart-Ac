@@ -659,7 +659,7 @@ export default function Settings() {
           />
           <Toggle
             label="Enable AI Optimization"
-            description="Optional Ollama (Gemma) HTTP layer — soft setpoint and fan hints. Default uses the add-on hostname ollama_ai:11434 on the Home Assistant network."
+            description="Optional Ollama (Gemma) HTTP layer — soft setpoint and fan hints. Default points to the Home Assistant host (172.30.32.1) where Ollama is exposed; override if needed."
             checked={cfg.ai_enabled ?? false}
             onChange={async (v) => {
               patch('ai_enabled', v)
@@ -674,7 +674,7 @@ export default function Settings() {
             label="Ollama base URL (optional)"
             value={cfg.ai_ollama_url ?? ''}
             onChange={v => patch('ai_ollama_url', v)}
-            placeholder="http://ollama_ai:11434"
+            placeholder="http://172.30.32.1:11434"
           />
           <Input
             label="Ollama model name (optional)"

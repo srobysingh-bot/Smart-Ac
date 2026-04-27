@@ -1,5 +1,5 @@
 name: HawaAI AC Optimizer
-version: 1.2.2
+version: 1.2.3
 slug: hawaai
 description: AI-powered AC optimization using presence, temperature, and energy data
 url: https://github.com/srobysingh-bot/Smart-Ac
@@ -42,7 +42,7 @@ options:
   smart_cooling_enabled: false
   manual_override: false
   ai_enabled: false
-  ai_ollama_url: "http://ollama_ai:11434"
+  ai_ollama_url: "http://172.30.32.1:11434"
   ai_ollama_model: ""
 schema:
   weather_api_key: password?

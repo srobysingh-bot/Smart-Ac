@@ -15,7 +15,7 @@ from .. import ha_client
 
 logger = logging.getLogger(__name__)
 
-_DEFAULT_URL = "http://ollama_ai:11434"
+_DEFAULT_URL = "http://172.30.32.1:11434"
 _DEFAULT_MODEL = "gemma:3b-instruct-q4_K_M"
 _GENERATE = "/api/generate"
 _TIMEOUT_S = 5.0
