@@ -18,17 +18,17 @@ logger = logging.getLogger(__name__)
 _DEFAULT_URL = config_manager.DEFAULT_CONFIG["ai_ollama_url"]
 _ollama_url_logged: bool = False
 _GENERATE = "/api/generate"
-_TIMEOUT_S = 25.0
+# Fail fast on hung / chatty runs (target <10s for tiny JSON on Pi)
+_TIMEOUT_S = 15.0
 _RETRY_DELAY_S = 4.0
-# Hard cap: short JSON only (reduces chatty output and CPU on Pi)
 _OLLAMA_GEN_OPTIONS: Dict[str, Any] = {
-    "num_predict":  30,
-    "temperature": 0.1,
+    "num_predict":  20,
+    "temperature": 0.0,
 }
-# Stop chat-style continuations (Ollama /api/generate top-level `stop`)
-_OLLAMA_STOP = ["\n\n", "Explanation:", "Note:"]
-# Reject text blobs before parse (invalid / non-JSON from model)
-_MAX_RESPONSE_TEXT_LEN = 320
+# Ollama /api/generate top-level `stop` (failsafe if model veers off JSON)
+_OLLAMA_STOP = ["\n", "Explanation", "Note", "."]
+# Strict guard: any longer text is never parsed (no cleaning)
+_MAX_RESPONSE_TEXT_LEN = 200
 _FAN_COOLDOWN = 60.0  # minimum seconds between fan_mode service calls
 
 _last_fan_cmd_at: float = 0.0
@@ -126,8 +126,8 @@ def _parse_response_body(resp: Dict[str, Any]) -> Any:
             blob = json.dumps(raw)
         except (TypeError, ValueError):
             return None
-        if len(blob) > _MAX_RESPONSE_TEXT_LEN * 2:
-            logger.debug("[AI] response object too large")
+        if len(blob) > _MAX_RESPONSE_TEXT_LEN:
+            logger.info("[AI] response too long → rejecting (object serializes >%d chars)", _MAX_RESPONSE_TEXT_LEN)
             return None
         return raw
     if isinstance(raw, list):
@@ -138,12 +138,13 @@ def _parse_response_body(resp: Dict[str, Any]) -> Any:
         if not s:
             return None
         if len(s) > _MAX_RESPONSE_TEXT_LEN:
-            logger.debug("[AI] response text too long (%d chars)", len(s))
+            logger.info("[AI] response too long → rejecting (>%d chars)", _MAX_RESPONSE_TEXT_LEN)
             return None
         try:
             return json.loads(s)
         except json.JSONDecodeError:
-            logger.debug("[AI] body not valid JSON")
+            # No extraction / cleaning — must be a single valid JSON value only
+            logger.info("[AI] response not valid JSON → rejecting")
             return None
     return None
 
@@ -167,6 +168,7 @@ async def run_ai_and_cache(
     prompt = ai_prompt.build_hvac_control_prompt(
         indoor_temp, outdoor_temp, is_occupied,
     )
+    logger.info("AI PROMPT SENT: %s", prompt)
     body   = ai_prompt.ollama_payload(model, prompt)
     body["options"] = dict(_OLLAMA_GEN_OPTIONS)
     body["stop"] = list(_OLLAMA_STOP)
