@@ -1,0 +1,514 @@
+{
+  "brands": [
+    {
+      "id": "daikin",
+      "name": "Daikin",
+      "models": [
+        {
+          "id": "daikin_ftkf35",
+          "name": "FTKF35",
+          "series": "F Series",
+          "broadlink_profile": "daikin_ftkf35.json",
+          "supported_modes": ["cool", "heat", "auto", "dry", "fan"],
+          "temp_range": [16, 30],
+          "fan_speeds": ["auto", "low", "medium", "high"]
+        },
+        {
+          "id": "daikin_ftxs50",
+          "name": "FTXS50",
+          "series": "X Series",
+          "broadlink_profile": "daikin_ftxs50.json",
+          "supported_modes": ["cool", "heat", "auto", "dry", "fan"],
+          "temp_range": [16, 30],
+          "fan_speeds": ["auto", "low", "medium", "high", "turbo"]
+        },
+        {
+          "id": "daikin_ftkl35",
+          "name": "FTKL35",
+          "series": "GOODCOOL",
+          "broadlink_profile": "daikin_ftkl35.json",
+          "supported_modes": ["cool", "dry", "fan"],
+          "temp_range": [18, 30],
+          "fan_speeds": ["auto", "low", "medium", "high"]
+        },
+        {
+          "id": "daikin_atxs35",
+          "name": "ATXS35",
+          "series": "Stylish",
+          "broadlink_profile": "daikin_atxs35.json",
+          "supported_modes": ["cool", "heat", "auto", "dry", "fan"],
+          "temp_range": [16, 30],
+          "fan_speeds": ["auto", "low", "medium", "high"]
+        },
+        {
+          "id": "daikin_ftq35",
+          "name": "FTQ35",
+          "series": "Cassette",
+          "broadlink_profile": "daikin_ftq35.json",
+          "supported_modes": ["cool", "heat", "auto", "dry", "fan"],
+          "temp_range": [16, 30],
+          "fan_speeds": ["auto", "low", "medium", "high"]
+        }
+      ]
+    },
+    {
+      "id": "lg",
+      "name": "LG",
+      "models": [
+        {
+          "id": "lg_ls_q18ynza",
+          "name": "LS-Q18YNZA",
+          "series": "Dual Inverter",
+          "broadlink_profile": "lg_dual_inverter.json",
+          "supported_modes": ["cool", "heat", "auto", "dry", "fan"],
+          "temp_range": [16, 30],
+          "fan_speeds": ["auto", "low", "medium", "high"]
+        },
+        {
+          "id": "lg_js_q18cpxd",
+          "name": "JS-Q18CPXD",
+          "series": "Artcool",
+          "broadlink_profile": "lg_artcool.json",
+          "supported_modes": ["cool", "heat", "auto", "dry", "fan"],
+          "temp_range": [16, 30],
+          "fan_speeds": ["auto", "low", "medium", "high", "turbo"]
+        },
+        {
+          "id": "lg_ps_q19bnze",
+          "name": "PS-Q19BNZE",
+          "series": "Window",
+          "broadlink_profile": "lg_window.json",
+          "supported_modes": ["cool", "fan"],
+          "temp_range": [18, 30],
+          "fan_speeds": ["low", "medium", "high"]
+        },
+        {
+          "id": "lg_ls_q13gnxa",
+          "name": "LS-Q13GNXA",
+          "series": "DUALCOOL",
+          "broadlink_profile": "lg_dualcool.json",
+          "supported_modes": ["cool", "heat", "auto", "dry", "fan"],
+          "temp_range": [16, 30],
+          "fan_speeds": ["auto", "low", "medium", "high"]
+        },
+        {
+          "id": "lg_uw48r",
+          "name": "UW48R",
+          "series": "Ceiling Cassette",
+          "broadlink_profile": "lg_cassette.json",
+          "supported_modes": ["cool", "heat", "auto", "dry", "fan"],
+          "temp_range": [16, 30],
+          "fan_speeds": ["auto", "low", "medium", "high"]
+        }
+      ]
+    },
+    {
+      "id": "samsung",
+      "name": "Samsung",
+      "models": [
+        {
+          "id": "samsung_ar18cy",
+          "name": "AR18CY",
+          "series": "WindFree",
+          "broadlink_profile": "samsung_windfree.json",
+          "supported_modes": ["cool", "heat", "auto", "dry", "fan"],
+          "temp_range": [16, 30],
+          "fan_speeds": ["auto", "low", "medium", "high", "turbo"]
+        },
+        {
+          "id": "samsung_ar18bv",
+          "name": "AR18BV",
+          "series": "Boracay",
+          "broadlink_profile": "samsung_boracay.json",
+          "supported_modes": ["cool", "heat", "auto", "dry", "fan"],
+          "temp_range": [16, 30],
+          "fan_speeds": ["auto", "low", "medium", "high"]
+        },
+        {
+          "id": "samsung_ar18av",
+          "name": "AR18AV",
+          "series": "Alize",
+          "broadlink_profile": "samsung_alize.json",
+          "supported_modes": ["cool", "dry", "fan"],
+          "temp_range": [18, 30],
+          "fan_speeds": ["auto", "low", "medium", "high"]
+        },
+        {
+          "id": "samsung_ac120fn4pkh",
+          "name": "AC120FN4PKH",
+          "series": "4-Way Cassette",
+          "broadlink_profile": "samsung_cassette.json",
+          "supported_modes": ["cool", "heat", "auto", "dry", "fan"],
+          "temp_range": [16, 30],
+          "fan_speeds": ["auto", "low", "medium", "high"]
+        },
+        {
+          "id": "samsung_ar09txhqbwkneu",
+          "name": "AR09TXHQBWKNEU",
+          "series": "WindFree Comfort",
+          "broadlink_profile": "samsung_windfree_comfort.json",
+          "supported_modes": ["cool", "heat", "auto", "dry", "fan"],
+          "temp_range": [16, 30],
+          "fan_speeds": ["auto", "low", "medium", "high", "turbo"]
+        }
+      ]
+    },
+    {
+      "id": "voltas",
+      "name": "Voltas",
+      "models": [
+        {
+          "id": "voltas_185v_czp",
+          "name": "185V CZP",
+          "series": "Adjustable Inverter",
+          "broadlink_profile": "voltas_czp.json",
+          "supported_modes": ["cool", "dry", "fan", "auto"],
+          "temp_range": [16, 30],
+          "fan_speeds": ["auto", "low", "medium", "high", "turbo"]
+        },
+        {
+          "id": "voltas_125v_dza",
+          "name": "125V DZA",
+          "series": "Executive",
+          "broadlink_profile": "voltas_dza.json",
+          "supported_modes": ["cool", "dry", "fan"],
+          "temp_range": [18, 30],
+          "fan_speeds": ["auto", "low", "medium", "high"]
+        },
+        {
+          "id": "voltas_185v_jzj",
+          "name": "185V JZJ",
+          "series": "Inverter Split",
+          "broadlink_profile": "voltas_jzj.json",
+          "supported_modes": ["cool", "dry", "fan", "auto"],
+          "temp_range": [16, 30],
+          "fan_speeds": ["auto", "low", "medium", "high"]
+        },
+        {
+          "id": "voltas_155v_ead",
+          "name": "155V EAD",
+          "series": "Window",
+          "broadlink_profile": "voltas_window.json",
+          "supported_modes": ["cool", "fan"],
+          "temp_range": [18, 30],
+          "fan_speeds": ["low", "medium", "high"]
+        },
+        {
+          "id": "voltas_185h_zy4",
+          "name": "185H ZY4",
+          "series": "H Series Inverter",
+          "broadlink_profile": "voltas_zy4.json",
+          "supported_modes": ["cool", "heat", "dry", "fan", "auto"],
+          "temp_range": [16, 30],
+          "fan_speeds": ["auto", "low", "medium", "high"]
+        }
+      ]
+    },
+    {
+      "id": "carrier",
+      "name": "Carrier",
+      "models": [
+        {
+          "id": "carrier_cai18es5r39f0",
+          "name": "CAI18ES5R39F0",
+          "series": "Ester +",
+          "broadlink_profile": "carrier_ester.json",
+          "supported_modes": ["cool", "heat", "dry", "fan", "auto"],
+          "temp_range": [16, 30],
+          "fan_speeds": ["auto", "low", "medium", "high"]
+        },
+        {
+          "id": "carrier_cai12en3r39f0",
+          "name": "CAI12EN3R39F0",
+          "series": "Emperia Edge",
+          "broadlink_profile": "carrier_emperia.json",
+          "supported_modes": ["cool", "heat", "dry", "fan", "auto"],
+          "temp_range": [16, 30],
+          "fan_speeds": ["auto", "low", "medium", "high", "turbo"]
+        },
+        {
+          "id": "carrier_42qhp018n8",
+          "name": "42QHP018N8",
+          "series": "X-Power",
+          "broadlink_profile": "carrier_xpower.json",
+          "supported_modes": ["cool", "heat", "dry", "fan", "auto"],
+          "temp_range": [16, 30],
+          "fan_speeds": ["auto", "low", "medium", "high"]
+        },
+        {
+          "id": "carrier_cai18ek5r39f0",
+          "name": "CAI18EK5R39F0",
+          "series": "Esko +",
+          "broadlink_profile": "carrier_esko.json",
+          "supported_modes": ["cool", "dry", "fan"],
+          "temp_range": [18, 30],
+          "fan_speeds": ["auto", "low", "medium", "high"]
+        },
+        {
+          "id": "carrier_50xcc518_703",
+          "name": "50XCC518-703",
+          "series": "Cassette",
+          "broadlink_profile": "carrier_cassette.json",
+          "supported_modes": ["cool", "heat", "dry", "fan", "auto"],
+          "temp_range": [16, 30],
+          "fan_speeds": ["auto", "low", "medium", "high"]
+        }
+      ]
+    },
+    {
+      "id": "hitachi",
+      "name": "Hitachi",
+      "models": [
+        {
+          "id": "hitachi_rsog518heea",
+          "name": "RSOG518HEEA",
+          "series": "Kashikoi",
+          "broadlink_profile": "hitachi_kashikoi.json",
+          "supported_modes": ["cool", "heat", "auto", "dry", "fan"],
+          "temp_range": [16, 32],
+          "fan_speeds": ["auto", "low", "medium", "high", "turbo"]
+        },
+        {
+          "id": "hitachi_ras_x13ch",
+          "name": "RAS-X13CH",
+          "series": "Frost Wash",
+          "broadlink_profile": "hitachi_frostwash.json",
+          "supported_modes": ["cool", "heat", "auto", "dry", "fan"],
+          "temp_range": [16, 30],
+          "fan_speeds": ["auto", "low", "medium", "high"]
+        },
+        {
+          "id": "hitachi_rpf318hdda",
+          "name": "RPF318HDDA",
+          "series": "Kaze-I",
+          "broadlink_profile": "hitachi_kazei.json",
+          "supported_modes": ["cool", "heat", "dry", "fan"],
+          "temp_range": [16, 30],
+          "fan_speeds": ["auto", "low", "medium", "high"]
+        },
+        {
+          "id": "hitachi_ras_3hfv1",
+          "name": "RAS-3HFV1",
+          "series": "Multi-Split",
+          "broadlink_profile": "hitachi_multisplit.json",
+          "supported_modes": ["cool", "heat", "auto", "dry", "fan"],
+          "temp_range": [16, 30],
+          "fan_speeds": ["auto", "low", "medium", "high"]
+        },
+        {
+          "id": "hitachi_rpid518hfdap",
+          "name": "RPID518HFDAP",
+          "series": "Ceiling Cassette",
+          "broadlink_profile": "hitachi_cassette.json",
+          "supported_modes": ["cool", "heat", "auto", "dry", "fan"],
+          "temp_range": [16, 30],
+          "fan_speeds": ["auto", "low", "medium", "high"]
+        }
+      ]
+    },
+    {
+      "id": "mitsubishi",
+      "name": "Mitsubishi Electric",
+      "models": [
+        {
+          "id": "mitsubishi_msz_ap18vgd",
+          "name": "MSZ-AP18VGD",
+          "series": "AP Series",
+          "broadlink_profile": "mitsubishi_ap.json",
+          "supported_modes": ["cool", "heat", "auto", "dry", "fan"],
+          "temp_range": [16, 31],
+          "fan_speeds": ["auto", "low", "medium", "high", "turbo"]
+        },
+        {
+          "id": "mitsubishi_msz_gl18na",
+          "name": "MSZ-GL18NA",
+          "series": "GL Series",
+          "broadlink_profile": "mitsubishi_gl.json",
+          "supported_modes": ["cool", "heat", "auto", "dry", "fan"],
+          "temp_range": [16, 30],
+          "fan_speeds": ["auto", "low", "medium", "high"]
+        },
+        {
+          "id": "mitsubishi_msz_hr18vf",
+          "name": "MSZ-HR18VF",
+          "series": "Standard Inverter",
+          "broadlink_profile": "mitsubishi_hr.json",
+          "supported_modes": ["cool", "heat", "auto", "dry", "fan"],
+          "temp_range": [16, 30],
+          "fan_speeds": ["auto", "low", "medium", "high"]
+        },
+        {
+          "id": "mitsubishi_mfz_ka25va",
+          "name": "MFZ-KA25VA",
+          "series": "Floor Standing",
+          "broadlink_profile": "mitsubishi_floor.json",
+          "supported_modes": ["cool", "heat", "auto", "dry", "fan"],
+          "temp_range": [16, 30],
+          "fan_speeds": ["auto", "low", "medium", "high"]
+        },
+        {
+          "id": "mitsubishi_slz_m18fa",
+          "name": "SLZ-M18FA",
+          "series": "Mr. Slim Cassette",
+          "broadlink_profile": "mitsubishi_cassette.json",
+          "supported_modes": ["cool", "heat", "auto", "dry", "fan"],
+          "temp_range": [16, 30],
+          "fan_speeds": ["auto", "low", "medium", "high"]
+        }
+      ]
+    },
+    {
+      "id": "panasonic",
+      "name": "Panasonic",
+      "models": [
+        {
+          "id": "panasonic_cs_wu18xkyw",
+          "name": "CS-WU18XKYW",
+          "series": "7-in-1 Inverter",
+          "broadlink_profile": "panasonic_wu.json",
+          "supported_modes": ["cool", "heat", "auto", "dry", "fan"],
+          "temp_range": [16, 30],
+          "fan_speeds": ["auto", "low", "medium", "high", "turbo"]
+        },
+        {
+          "id": "panasonic_cs_cu_pu18xkyw",
+          "name": "CS/CU-PU18XKYW",
+          "series": "Premium Inverter",
+          "broadlink_profile": "panasonic_pu.json",
+          "supported_modes": ["cool", "heat", "auto", "dry", "fan"],
+          "temp_range": [16, 30],
+          "fan_speeds": ["auto", "low", "medium", "high"]
+        },
+        {
+          "id": "panasonic_cs_ku18xkyw",
+          "name": "CS-KU18XKYW",
+          "series": "Wi-Fi Inverter",
+          "broadlink_profile": "panasonic_ku.json",
+          "supported_modes": ["cool", "heat", "auto", "dry", "fan"],
+          "temp_range": [16, 30],
+          "fan_speeds": ["auto", "low", "medium", "high"]
+        },
+        {
+          "id": "panasonic_cs_ync18wkf",
+          "name": "CS-YNC18WKF",
+          "series": "Standard",
+          "broadlink_profile": "panasonic_ync.json",
+          "supported_modes": ["cool", "dry", "fan"],
+          "temp_range": [18, 30],
+          "fan_speeds": ["auto", "low", "medium", "high"]
+        },
+        {
+          "id": "panasonic_cs_z18xkyw",
+          "name": "CS-Z18XKYW",
+          "series": "Aero Series",
+          "broadlink_profile": "panasonic_z.json",
+          "supported_modes": ["cool", "heat", "auto", "dry", "fan"],
+          "temp_range": [16, 30],
+          "fan_speeds": ["auto", "low", "medium", "high", "turbo"]
+        }
+      ]
+    },
+    {
+      "id": "haier",
+      "name": "Haier",
+      "models": [
+        {
+          "id": "haier_hsu18c_tfw3b",
+          "name": "HSU18C-TFW3B",
+          "series": "Clean Cool",
+          "broadlink_profile": "haier_clean_cool.json",
+          "supported_modes": ["cool", "heat", "auto", "dry", "fan"],
+          "temp_range": [16, 30],
+          "fan_speeds": ["auto", "low", "medium", "high", "turbo"]
+        },
+        {
+          "id": "haier_hsu18n_nrs5b",
+          "name": "HSU18N-NRS5B",
+          "series": "Turbo Cool",
+          "broadlink_profile": "haier_turbo.json",
+          "supported_modes": ["cool", "dry", "fan", "auto"],
+          "temp_range": [16, 30],
+          "fan_speeds": ["auto", "low", "medium", "high", "turbo"]
+        },
+        {
+          "id": "haier_hsu18c_tqw3b",
+          "name": "HSU18C-TQW3B",
+          "series": "Self-Cleaning",
+          "broadlink_profile": "haier_selfclean.json",
+          "supported_modes": ["cool", "heat", "auto", "dry", "fan"],
+          "temp_range": [16, 30],
+          "fan_speeds": ["auto", "low", "medium", "high"]
+        },
+        {
+          "id": "haier_hpa_18ctaa",
+          "name": "HPA-18CTAA",
+          "series": "Convertible",
+          "broadlink_profile": "haier_convertible.json",
+          "supported_modes": ["cool", "heat", "dry", "fan"],
+          "temp_range": [16, 30],
+          "fan_speeds": ["auto", "low", "medium", "high"]
+        },
+        {
+          "id": "haier_hw18axc83n8b",
+          "name": "HW18AXC83N8B",
+          "series": "Honu",
+          "broadlink_profile": "haier_honu.json",
+          "supported_modes": ["cool", "heat", "auto", "dry", "fan"],
+          "temp_range": [16, 30],
+          "fan_speeds": ["auto", "low", "medium", "high"]
+        }
+      ]
+    },
+    {
+      "id": "bluestar",
+      "name": "Blue Star",
+      "models": [
+        {
+          "id": "bluestar_ic518ynus",
+          "name": "IC518YNUS",
+          "series": "5-Star Inverter",
+          "broadlink_profile": "bluestar_5star.json",
+          "supported_modes": ["cool", "dry", "fan", "auto"],
+          "temp_range": [16, 30],
+          "fan_speeds": ["auto", "low", "medium", "high", "turbo"]
+        },
+        {
+          "id": "bluestar_ia318ynu",
+          "name": "IA318YNU",
+          "series": "3-Star Inverter",
+          "broadlink_profile": "bluestar_3star.json",
+          "supported_modes": ["cool", "dry", "fan"],
+          "temp_range": [18, 30],
+          "fan_speeds": ["auto", "low", "medium", "high"]
+        },
+        {
+          "id": "bluestar_fa318ynu",
+          "name": "FA318YNU",
+          "series": "Fixed Speed",
+          "broadlink_profile": "bluestar_fixed.json",
+          "supported_modes": ["cool", "dry", "fan"],
+          "temp_range": [18, 30],
+          "fan_speeds": ["low", "medium", "high"]
+        },
+        {
+          "id": "bluestar_5cnhw18pafu",
+          "name": "5CNHW18PAFU",
+          "series": "Cassette",
+          "broadlink_profile": "bluestar_cassette.json",
+          "supported_modes": ["cool", "heat", "dry", "fan", "auto"],
+          "temp_range": [16, 30],
+          "fan_speeds": ["auto", "low", "medium", "high"]
+        },
+        {
+          "id": "bluestar_5hfw18natx",
+          "name": "5HFW18NATX",
+          "series": "Slim Floor Standing",
+          "broadlink_profile": "bluestar_floor.json",
+          "supported_modes": ["cool", "heat", "dry", "fan", "auto"],
+          "temp_range": [16, 30],
+          "fan_speeds": ["auto", "low", "medium", "high"]
+        }
+      ]
+    }
+  ]
+}

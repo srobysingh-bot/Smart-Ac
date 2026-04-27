@@ -16,6 +16,8 @@ env/
 
 # Node / React
 node_modules/
+hawai/frontend/dist/
+hawai/frontend/.cache/
 smartcool/frontend/dist/
 smartcool/frontend/.cache/
 
@@ -26,6 +28,7 @@ smartcool/frontend/.cache/
 data/
 
 # Secrets / options
+hawai/data/
 smartcool/data/
 
 # IDE

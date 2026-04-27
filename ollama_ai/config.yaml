@@ -1,0 +1,16 @@
+name: "Ollama AI (Gemma)"
+version: 1.0.0
+slug: ollama_ai
+description: "Ollama with Gemma 3B (Q4) for the HawaAI optional AI layer. HTTP on port 11434."
+url: https://github.com/srobysingh-bot/Smart-Ac
+arch:
+  - aarch64
+init: false
+startup: application
+boot: auto
+host_network: true
+ports:
+  11434/tcp: 11434
+map: []
+options: {}
+schema: {}
