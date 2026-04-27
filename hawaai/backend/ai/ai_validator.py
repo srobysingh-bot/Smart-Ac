@@ -16,50 +16,47 @@ MIN_CONF = 0.6
 
 def validate_ai_payload(data: Any, is_occupied: bool) -> Optional[Dict[str, Any]]:
     """
-    Reject if:
-      - not a dict / missing fields
-      - target_temp outside [16, 30] (strict)
-      - fan_mode invalid
-      - confidence < 0.6 (strict)
-      - boost or pre_cool when room vacant
+    Accept compact JSON: target_temp, fan_mode, confidence (optional legacy: action).
+    If action is omitted, default "normal" for downstream apply_ai_fan / setpoint.
     """
     if not isinstance(data, dict):
-        logger.info("[AI] Invalid response: not a JSON object")
+        logger.debug("[AI] Invalid response: not a JSON object")
         return None
 
-    action = data.get("action")
-    if not isinstance(action, str) or action not in VALID_ACTIONS:
-        logger.info("[AI] Invalid response: bad action %r", action)
+    action: Optional[str] = data.get("action")
+    if action is not None and (not isinstance(action, str) or action not in VALID_ACTIONS):
+        logger.debug("[AI] Invalid response: bad action %r", action)
         return None
+    if action is None:
+        action = "normal"
 
     try:
         t = float(data.get("target_temp"))
     except (TypeError, ValueError):
-        logger.info("[AI] Invalid response: target_temp not numeric")
+        logger.debug("[AI] Invalid response: target_temp not numeric")
         return None
     if t < MIN_T or t > MAX_T:
-        logger.info("[AI] Invalid response: target_temp %.1f out of range", t)
+        logger.debug("[AI] Invalid response: target_temp %.1f out of range", t)
         return None
 
     fan = data.get("fan_mode")
     if not isinstance(fan, str) or fan not in VALID_FANS:
-        logger.info("[AI] Invalid response: bad fan_mode %r", fan)
+        logger.debug("[AI] Invalid response: bad fan_mode %r", fan)
         return None
 
     try:
         conf = float(data.get("confidence", 0))
     except (TypeError, ValueError):
-        logger.info("[AI] Invalid response: confidence not numeric")
+        logger.debug("[AI] Invalid response: confidence not numeric")
         return None
     if conf < MIN_CONF:
-        logger.info("[AI] Invalid response: confidence %.2f < %.1f", conf, MIN_CONF)
+        logger.debug("[AI] Invalid response: confidence %.2f < %.1f", conf, MIN_CONF)
         return None
 
     if not is_occupied and action in ("boost", "pre_cool"):
-        logger.info("[AI] Invalid response: %s when room empty", action)
+        logger.debug("[AI] Invalid response: %s when room empty", action)
         return None
 
-    # Clamp to bounds (defense in depth; rejects already filtered)
     t = min(MAX_T, max(MIN_T, t))
     return {
         "action":       action,

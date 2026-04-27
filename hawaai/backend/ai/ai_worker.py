@@ -37,7 +37,8 @@ def _log_skipped_not_available() -> None:
     if now - _skip_unavailable_log_at < _SKIP_UNAVAILABLE_THROTTLE:
         return
     _skip_unavailable_log_at = now
-    logger.info("[AI] Skipped (not available)")
+    logger.info("[AI] Skipped")
+    logger.debug("[AI] Skipped reason: Ollama unreachable or bad response (throttled detail)")
 
 
 def last_ai_log_state() -> Dict[str, Any]:
@@ -55,7 +56,7 @@ def _base_url(cfg: Dict[str, Any]) -> str:
     else:
         u = u.rstrip("/")
     if not _ollama_url_logged:
-        logger.info("[AI] Using Ollama URL: %s", u)
+        logger.debug("[AI] Ollama URL: %s", u)
         _ollama_url_logged = True
     return u
 
@@ -76,17 +77,17 @@ async def _post_generate(
             async with session.post(url, json=body) as resp:
                 if resp.status != 200:
                     txt = await resp.text()
-                    logger.info("[AI] Invalid response: HTTP %s %s", resp.status, txt[:200])
+                    logger.debug("[AI] HTTP %s %s", resp.status, txt[:200])
                     return None
                 data = await resp.json()
                 elapsed = time.perf_counter() - t0
-                logger.info("[AI] Response received in %.2f sec", elapsed)
+                logger.debug("[AI] response time %.2fs", elapsed)
                 return data
     except asyncio.TimeoutError:
-        logger.info("[AI] Invalid response: timeout %ss", _TIMEOUT_S)
+        logger.debug("[AI] request timeout %ss", _TIMEOUT_S)
         return None
     except aiohttp.ClientError as e:
-        logger.info("[AI] Invalid response: %s", e)
+        logger.debug("[AI] client error: %s", e)
         return None
 
 
@@ -97,7 +98,7 @@ async def _post_generate_with_one_retry(
     r = await _post_generate(base, body)
     if r is not None:
         return r
-    logger.info("[AI] Retrying request in %.0fs", _RETRY_DELAY_S)
+    logger.debug("[AI] retry in %.0fs", _RETRY_DELAY_S)
     await asyncio.sleep(_RETRY_DELAY_S)
     return await _post_generate(base, body)
 
@@ -120,7 +121,7 @@ def _parse_response_body(resp: Dict[str, Any]) -> Any:
         try:
             return json.loads(s)
         except json.JSONDecodeError:
-            logger.info("[AI] Invalid response: not valid JSON in body")
+            logger.debug("[AI] body not valid JSON")
             return None
     return None
 
@@ -138,16 +139,16 @@ async def run_ai_and_cache(
         return
 
     base   = _base_url(cfg)
-    logger.debug("[AI] Ollama base URL: %s", base)
     model  = _model(cfg)
     ai_cache.invalidate_if_ollama_model_changed(model)
-    logger.debug("[AI DEBUG] Model being used: %s", model)
+    logger.debug("[AI] model=%s", model)
     system = ai_prompt.build_system_prompt()
     user   = ai_prompt.build_user_prompt(
         indoor_temp, target_temp, base_effective, outdoor_temp, is_occupied,
     )
     body   = ai_prompt.ollama_payload(model, system, user)
 
+    logger.info("[AI] Called")
     resp = await _post_generate_with_one_retry(base, body)
     if resp is None:
         _log_skipped_not_available()
@@ -156,16 +157,19 @@ async def run_ai_and_cache(
 
     parsed = _parse_response_body(resp)
     if parsed is None:
-        logger.debug("[AI] Invalid model output (unparseable)")
+        logger.info("[AI] Skipped")
+        logger.debug("[AI] Skipped reason: unparseable output")
         ai_cache.mark_fetch_done()
         return
 
     validated = ai_validator.validate_ai_payload(parsed, is_occupied)
     if not validated:
+        logger.info("[AI] Skipped")
+        logger.debug("[AI] Skipped reason: validation failed")
         ai_cache.mark_fetch_done()
         return
 
-    ai_cache.set_validated(validated)
+    ai_cache.set_validated(validated, indoor_temp)
     ai_cache.mark_fetch_done()
     logger.info("[AI] Applied")
 
@@ -236,7 +240,7 @@ async def apply_ai_fan(
 
     resolved, reason = _map_logical_fan_to_ha(supported, fan_mode)
     if resolved is None:
-        logger.info("[AI] Invalid response: fan %r not on entity (%s)", fan_mode, reason)
+        logger.debug("[AI] fan %r not on entity (%s)", fan_mode, reason)
         return
 
     cur = cstate.get("fan_mode")
@@ -244,7 +248,7 @@ async def apply_ai_fan(
         tnow = time.perf_counter()
         if tnow - _last_same_mode_log_at >= _SAME_MODE_LOG_THROTTLE:
             _last_same_mode_log_at = tnow
-            logger.info("[AI] Fan skipped (same mode)")
+            logger.debug("[AI] Fan skipped (same mode)")
         return
 
     ok = await ha_client.call_service("climate", "set_fan_mode", {

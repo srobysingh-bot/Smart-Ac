@@ -413,13 +413,13 @@ async def tick() -> None:
 
     # AI soft override (non-blocking Ollama fetch; cached setpoint + fan, occupied only)
     if cfg.get("ai_enabled", False) and is_occupied:
-        if should_run_ai(cfg, is_occupied):
+        if should_run_ai(cfg, is_occupied, indoor_temp):
             fetch_ai_in_background(
                 cfg, indoor_temp, target_temp, base_effective, outdoor_temp, is_occupied,
             )
         rec = get_cached()
         if rec and throttle_cache_use_log():
-            logger.info("[AI] Cached used")
+            logger.debug("[AI] Cached used")
         if rec and is_occupied and rec.get("action") and rec.get("action") != "none":
             try:
                 ai_t = float(rec.get("target_temp", effective_target))
@@ -427,7 +427,7 @@ async def tick() -> None:
                     # AI may only lower setpoint (more aggressive cooling), never raise it
                     new_eff = min(effective_target, ai_t)
                     if new_eff < effective_target - 0.01:
-                        logger.info(
+                        logger.debug(
                             "[AI] Target adjusted (safe clamp) %.1f°C → %.1f°C (AI suggested %.1f°C)",
                             effective_target, new_eff, ai_t,
                         )

@@ -18,4 +18,7 @@ ollama pull "${OLLAMA_WARMUP_MODEL}" || echo "Model pull failed"
 echo "Warming up model (loads weights before first Hawaai request)..."
 ollama run "${OLLAMA_WARMUP_MODEL}" "warmup" || echo "Warmup failed"
 
+# Background ping helps keep the model hot between requests (non-blocking for container)
+( ollama run "${OLLAMA_WARMUP_MODEL}" "keep alive" > /dev/null 2>&1 || true ) &
+
 wait
