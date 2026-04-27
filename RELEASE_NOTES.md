@@ -2,6 +2,8 @@
 
 ## 1.2.0
 
+The add-on lives in the repository folder **`hawaai/`** (same name as the add-on `slug` in `config.yaml`). Home Assistant builds from that directory; it must contain `Dockerfile` and `config.yaml`.
+
 **New: Optional AI Optimization (Gemma)**
 
 - AI can improve cooling decisions (soft setpoint / fan hints via optional Ollama HTTP layer).
