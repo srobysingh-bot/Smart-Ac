@@ -1,8 +1,10 @@
 # HawaAI add-on — release notes
 
-## 1.2.0
+## 1.2.1
 
-The add-on lives in the repository folder **`hawaai/`** (same name as the add-on `slug` in `config.yaml`). Home Assistant builds from that directory; it must contain `Dockerfile` and `config.yaml`.
+- Fix: add-on build directory renamed to **`hawaai/`** to match the `slug: hawaai` in `config.yaml` (ensures `Dockerfile` and `config.yaml` are on the build path Home Assistant uses).
+
+## 1.2.0
 
 **New: Optional AI Optimization (Gemma)**
 
