@@ -17,9 +17,9 @@ logger = logging.getLogger(__name__)
 
 _DEFAULT_URL = config_manager.DEFAULT_CONFIG["ai_ollama_url"]
 _ollama_url_logged: bool = False
-_DEFAULT_MODEL = "gemma:3b-instruct-q4_K_M"
+_DEFAULT_MODEL = "gemma:2b-instruct"
 _GENERATE = "/api/generate"
-_TIMEOUT_S = 5.0
+_TIMEOUT_S = 20.0
 _FAN_COOLDOWN = 60.0  # minimum seconds between fan_mode service calls
 
 _last_fan_cmd_at: float = 0.0
@@ -70,6 +70,7 @@ async def _post_generate(
 ) -> Optional[Dict[str, Any]]:
     url = f"{base}{_GENERATE}"
     timeout = aiohttp.ClientTimeout(total=_TIMEOUT_S)
+    t0 = time.perf_counter()
     try:
         async with aiohttp.ClientSession(timeout=timeout) as session:
             async with session.post(url, json=body) as resp:
@@ -77,7 +78,10 @@ async def _post_generate(
                     txt = await resp.text()
                     logger.info("[AI] Invalid response: HTTP %s %s", resp.status, txt[:200])
                     return None
-                return await resp.json()
+                data = await resp.json()
+                elapsed = time.perf_counter() - t0
+                logger.info("[AI] Response received in %.2f sec", elapsed)
+                return data
     except asyncio.TimeoutError:
         logger.info("[AI] Invalid response: timeout %ss", _TIMEOUT_S)
         return None
@@ -130,7 +134,6 @@ async def run_ai_and_cache(
     )
     body   = ai_prompt.ollama_payload(model, system, user)
 
-    t0 = time.perf_counter()
     resp = await _post_generate(base, body)
     if resp is None:
         _log_skipped_not_available()
@@ -151,7 +154,6 @@ async def run_ai_and_cache(
     ai_cache.set_validated(validated)
     ai_cache.mark_fetch_done()
     logger.info("[AI] Applied")
-    logger.debug("[AI] Ollama round-trip %.0f ms", (time.perf_counter() - t0) * 1000)
 
 
 def fetch_ai_in_background(
