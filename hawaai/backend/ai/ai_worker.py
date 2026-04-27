@@ -18,7 +18,8 @@ logger = logging.getLogger(__name__)
 _DEFAULT_URL = config_manager.DEFAULT_CONFIG["ai_ollama_url"]
 _ollama_url_logged: bool = False
 _GENERATE = "/api/generate"
-_TIMEOUT_S = 20.0
+_TIMEOUT_S = 25.0
+_RETRY_DELAY_S = 4.0
 _FAN_COOLDOWN = 60.0  # minimum seconds between fan_mode service calls
 
 _last_fan_cmd_at: float = 0.0
@@ -89,6 +90,18 @@ async def _post_generate(
         return None
 
 
+async def _post_generate_with_one_retry(
+    base: str, body: Dict[str, Any],
+) -> Optional[Dict[str, Any]]:
+    """Single retry after delay (covers transient load / network on Pi; does not block main loop)."""
+    r = await _post_generate(base, body)
+    if r is not None:
+        return r
+    logger.info("[AI] Retrying request in %.0fs", _RETRY_DELAY_S)
+    await asyncio.sleep(_RETRY_DELAY_S)
+    return await _post_generate(base, body)
+
+
 def _parse_response_body(resp: Dict[str, Any]) -> Any:
     """Ollama /api/generate returns { response: string (JSON) } or similar."""
     raw = (resp or {}).get("response")
@@ -135,7 +148,7 @@ async def run_ai_and_cache(
     )
     body   = ai_prompt.ollama_payload(model, system, user)
 
-    resp = await _post_generate(base, body)
+    resp = await _post_generate_with_one_retry(base, body)
     if resp is None:
         _log_skipped_not_available()
         ai_cache.mark_fetch_done()

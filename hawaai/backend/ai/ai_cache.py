@@ -15,11 +15,12 @@ _MAX_INTERVAL = 900.0
 
 _last_valid: Optional[Dict[str, Any]] = None
 _last_ollama_model: Optional[str] = None
-# Slight post-start delay before first Ollama call (Raspberry Pi safe)
+# No AI for first 60s after this process start (Ollama model load / addon settle; Raspberry Pi safe)
 _next_fetch_at: float = 0.0
 _last_cache_info_log: float = 0.0
 _boot = time.monotonic()
-_next_fetch_at = _boot + 90.0
+_STARTUP_BLOCK_S = 60.0
+_next_fetch_at = _boot + _STARTUP_BLOCK_S
 
 _THROTTLE_LOG_SEC = 300.0
 

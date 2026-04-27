@@ -10,7 +10,7 @@ logger = logging.getLogger(__name__)
 CONFIG_PATH = "/data/hawaai_config.json"
 
 # When `ai_ollama_model` is empty in stored config, AI uses this model name (Ollama tag).
-DEFAULT_OLLAMA_MODEL = "gemma:2b-instruct"
+DEFAULT_OLLAMA_MODEL = "tinyllama"
 
 # Legacy keys from pre–climate-only installs — stripped from merged config (ignored safely).
 _LEGACY_IR_KEYS = frozenset({

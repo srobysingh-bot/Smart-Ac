@@ -685,10 +685,10 @@ export default function Settings() {
             placeholder="http://172.30.32.1:11434"
           />
           <Input
-            label="Ollama model (optional; default gemma:2b-instruct — use tinyllama if still slow)"
+            label="Ollama model (optional; default tinyllama — try gemma:2b if you need quality)"
             value={cfg.ai_ollama_model ?? ''}
             onChange={v => patch('ai_ollama_model', v)}
-            placeholder="gemma:2b-instruct"
+            placeholder="tinyllama"
           />
           <Toggle
             label="Manual Override"
