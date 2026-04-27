@@ -40,7 +40,7 @@ def should_run_ai(
     cfg: Dict[str, Any], is_occupied: bool, indoor_temp: float,
 ) -> bool:
     """
-    Gate Ollama calls: time window + need new context (ΔT, vacant→occupied, or no cache).
+    Gate Ollama calls: time window + need new context (ΔT ≥ 1°C, vacant→occupied edge, or no cache).
     Skips fetch if a prior decision still fits a stable room (defers next check).
     """
     global _last_tick_occupied, _next_fetch_at

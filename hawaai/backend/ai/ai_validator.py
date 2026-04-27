@@ -13,14 +13,20 @@ MIN_T = 16.0
 MAX_T = 30.0
 MIN_CONF = 0.6
 
+_REQUIRED = ("target_temp", "fan_mode", "confidence")
+
 
 def validate_ai_payload(data: Any, is_occupied: bool) -> Optional[Dict[str, Any]]:
     """
-    Accept compact JSON: target_temp, fan_mode, confidence (optional legacy: action).
+    Strict JSON: target_temp, fan_mode, confidence (optional legacy: action).
     If action is omitted, default "normal" for downstream apply_ai_fan / setpoint.
     """
     if not isinstance(data, dict):
         logger.debug("[AI] Invalid response: not a JSON object")
+        return None
+
+    if not all(k in data for k in _REQUIRED):
+        logger.debug("[AI] Invalid response: missing required fields %s", _REQUIRED)
         return None
 
     action: Optional[str] = data.get("action")

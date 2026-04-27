@@ -20,6 +20,13 @@ _ollama_url_logged: bool = False
 _GENERATE = "/api/generate"
 _TIMEOUT_S = 25.0
 _RETRY_DELAY_S = 4.0
+# MANDATORY cap — prevents 500s / multi-minute runs on Pi CPU (see Ollama gen options)
+_OLLAMA_GEN_OPTIONS: Dict[str, Any] = {
+    "num_predict":  40,
+    "temperature": 0.2,
+}
+# Reject string responses longer than this (aborts huge generations before JSON parse)
+_MAX_RESPONSE_TEXT_LEN = 512
 _FAN_COOLDOWN = 60.0  # minimum seconds between fan_mode service calls
 
 _last_fan_cmd_at: float = 0.0
@@ -104,7 +111,7 @@ async def _post_generate_with_one_retry(
 
 
 def _parse_response_body(resp: Dict[str, Any]) -> Any:
-    """Ollama /api/generate returns { response: string (JSON) } or similar."""
+    """Ollama /api/generate: extract JSON. Reject too-long or non-JSON text (stability on Pi)."""
     raw = (resp or {}).get("response")
     if not raw and isinstance(resp, dict) and "message" in resp:
         c = (resp.get("message") or {}).get("content")
@@ -112,11 +119,24 @@ def _parse_response_body(resp: Dict[str, Any]) -> Any:
             raw = c
     if raw is None:
         return None
-    if isinstance(raw, (dict, list)):
+    if isinstance(raw, dict):
+        try:
+            blob = json.dumps(raw)
+        except (TypeError, ValueError):
+            return None
+        if len(blob) > _MAX_RESPONSE_TEXT_LEN * 2:
+            logger.debug("[AI] response object too large")
+            return None
         return raw
+    if isinstance(raw, list):
+        logger.debug("[AI] unexpected list response")
+        return None
     if isinstance(raw, str):
         s = raw.strip()
         if not s:
+            return None
+        if len(s) > _MAX_RESPONSE_TEXT_LEN:
+            logger.debug("[AI] response text too long (%d chars)", len(s))
             return None
         try:
             return json.loads(s)
@@ -147,6 +167,7 @@ async def run_ai_and_cache(
         indoor_temp, target_temp, base_effective, outdoor_temp, is_occupied,
     )
     body   = ai_prompt.ollama_payload(model, system, user)
+    body["options"] = dict(_OLLAMA_GEN_OPTIONS)
 
     logger.info("[AI] Called")
     resp = await _post_generate_with_one_retry(base, body)
