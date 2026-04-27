@@ -1,5 +1,5 @@
 name: "Ollama AI (tinyllama)"
-version: 1.0.7
+version: 1.0.8
 slug: ollama_ai
 description: "Ollama with tinyllama (fast CPU) for the HawaAI optional AI layer. HTTP on port 11434. Pulls and warms up on start."
 url: https://github.com/srobysingh-bot/Smart-Ac
