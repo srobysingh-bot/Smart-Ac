@@ -9,9 +9,9 @@ logger = logging.getLogger(__name__)
 
 VALID_ACTIONS = frozenset({"none", "pre_cool", "boost", "normal"})
 VALID_FANS = frozenset({"auto", "f1", "f2", "f3", "f4", "f5"})
-MIN_T = 16.0
-MAX_T = 30.0
-MIN_CONF = 0.6
+# HVAC JSON contract (must match ai_prompt rules)
+AI_MIN_T = 22.0
+AI_MAX_T = 26.0
 
 _REQUIRED = ("target_temp", "fan_mode", "confidence")
 
@@ -41,8 +41,8 @@ def validate_ai_payload(data: Any, is_occupied: bool) -> Optional[Dict[str, Any]
     except (TypeError, ValueError):
         logger.debug("[AI] Invalid response: target_temp not numeric")
         return None
-    if t < MIN_T or t > MAX_T:
-        logger.debug("[AI] Invalid response: target_temp %.1f out of range", t)
+    if t < AI_MIN_T or t > AI_MAX_T:
+        logger.debug("[AI] Invalid response: target_temp %.1f not in [%.0f,%.0f]", t, AI_MIN_T, AI_MAX_T)
         return None
 
     fan = data.get("fan_mode")
@@ -55,15 +55,15 @@ def validate_ai_payload(data: Any, is_occupied: bool) -> Optional[Dict[str, Any]
     except (TypeError, ValueError):
         logger.debug("[AI] Invalid response: confidence not numeric")
         return None
-    if conf < MIN_CONF:
-        logger.debug("[AI] Invalid response: confidence %.2f < %.1f", conf, MIN_CONF)
+    if conf < 0.0 or conf > 1.0:
+        logger.debug("[AI] Invalid response: confidence %.2f not in [0,1]", conf)
         return None
 
     if not is_occupied and action in ("boost", "pre_cool"):
         logger.debug("[AI] Invalid response: %s when room empty", action)
         return None
 
-    t = min(MAX_T, max(MIN_T, t))
+    t = min(AI_MAX_T, max(AI_MIN_T, t))
     return {
         "action":       action,
         "target_temp":  round(t, 1),

@@ -20,13 +20,15 @@ _ollama_url_logged: bool = False
 _GENERATE = "/api/generate"
 _TIMEOUT_S = 25.0
 _RETRY_DELAY_S = 4.0
-# MANDATORY cap — prevents 500s / multi-minute runs on Pi CPU (see Ollama gen options)
+# Hard cap: short JSON only (reduces chatty output and CPU on Pi)
 _OLLAMA_GEN_OPTIONS: Dict[str, Any] = {
-    "num_predict":  40,
-    "temperature": 0.2,
+    "num_predict":  30,
+    "temperature": 0.1,
 }
-# Reject string responses longer than this (aborts huge generations before JSON parse)
-_MAX_RESPONSE_TEXT_LEN = 512
+# Stop chat-style continuations (Ollama /api/generate top-level `stop`)
+_OLLAMA_STOP = ["\n\n", "Explanation:", "Note:"]
+# Reject text blobs before parse (invalid / non-JSON from model)
+_MAX_RESPONSE_TEXT_LEN = 320
 _FAN_COOLDOWN = 60.0  # minimum seconds between fan_mode service calls
 
 _last_fan_cmd_at: float = 0.0
@@ -162,12 +164,12 @@ async def run_ai_and_cache(
     model  = _model(cfg)
     ai_cache.invalidate_if_ollama_model_changed(model)
     logger.debug("[AI] model=%s", model)
-    system = ai_prompt.build_system_prompt()
-    user   = ai_prompt.build_user_prompt(
-        indoor_temp, target_temp, base_effective, outdoor_temp, is_occupied,
+    prompt = ai_prompt.build_hvac_control_prompt(
+        indoor_temp, outdoor_temp, is_occupied,
     )
-    body   = ai_prompt.ollama_payload(model, system, user)
+    body   = ai_prompt.ollama_payload(model, prompt)
     body["options"] = dict(_OLLAMA_GEN_OPTIONS)
+    body["stop"] = list(_OLLAMA_STOP)
 
     logger.info("[AI] Called")
     resp = await _post_generate_with_one_retry(base, body)

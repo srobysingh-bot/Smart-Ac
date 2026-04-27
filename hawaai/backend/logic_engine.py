@@ -41,6 +41,7 @@ from .ai import (
     should_run_ai,
     throttle_cache_use_log,
 )
+from .ai.ai_validator import AI_MAX_T, AI_MIN_T
 from .utils import parse_presence
 
 logger = logging.getLogger(__name__)
@@ -423,7 +424,7 @@ async def tick() -> None:
         if rec and is_occupied and rec.get("action") and rec.get("action") != "none":
             try:
                 ai_t = float(rec.get("target_temp", effective_target))
-                if 16.0 <= ai_t <= 30.0:
+                if AI_MIN_T <= ai_t <= AI_MAX_T:
                     # AI may only lower setpoint (more aggressive cooling), never raise it
                     new_eff = min(effective_target, ai_t)
                     if new_eff < effective_target - 0.01:
