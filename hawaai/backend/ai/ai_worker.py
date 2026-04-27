@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 import time
 from typing import Any, Dict, Optional, Tuple
 
@@ -15,19 +16,19 @@ from .. import config_manager, ha_client
 
 logger = logging.getLogger(__name__)
 
+# Bumped with each AI transport change — look for "AI worker initialized" in add-on logs
+AI_WORKER_VERSION = "1.2.12"
+
 _DEFAULT_URL = config_manager.DEFAULT_CONFIG["ai_ollama_url"]
 _ollama_url_logged: bool = False
 _GENERATE = "/api/generate"
-# Fail fast on hung / chatty runs (target <10s for tiny JSON on Pi)
 _TIMEOUT_S = 15.0
 _RETRY_DELAY_S = 4.0
+# Exact generation options (no extra top-level fields on request)
 _OLLAMA_GEN_OPTIONS: Dict[str, Any] = {
-    "num_predict":  20,
+    "num_predict":  15,
     "temperature": 0.0,
 }
-# Ollama /api/generate top-level `stop` (failsafe if model veers off JSON)
-_OLLAMA_STOP = ["\n", "Explanation", "Note", "."]
-# Strict guard: any longer text is never parsed (no cleaning)
 _MAX_RESPONSE_TEXT_LEN = 200
 _FAN_COOLDOWN = 60.0  # minimum seconds between fan_mode service calls
 
@@ -37,6 +38,8 @@ _last_same_mode_log_at: float = 0.0
 _SAME_MODE_LOG_THROTTLE = 300.0
 _skip_unavailable_log_at: float = 0.0
 _SKIP_UNAVAILABLE_THROTTLE = 300.0
+
+logger.info("AI worker initialized v%s", AI_WORKER_VERSION)
 
 
 def _log_skipped_not_available() -> None:
@@ -89,8 +92,7 @@ async def _post_generate(
                     logger.debug("[AI] HTTP %s %s", resp.status, txt[:200])
                     return None
                 data = await resp.json()
-                elapsed = time.perf_counter() - t0
-                logger.debug("[AI] response time %.2fs", elapsed)
+                logger.debug("[AI] response time %.2fs", time.perf_counter() - t0)
                 return data
     except asyncio.TimeoutError:
         logger.debug("[AI] request timeout %ss", _TIMEOUT_S)
@@ -113,7 +115,7 @@ async def _post_generate_with_one_retry(
 
 
 def _parse_response_body(resp: Dict[str, Any]) -> Any:
-    """Ollama /api/generate: extract JSON. Reject too-long or non-JSON text (stability on Pi)."""
+    """Ollama /api/generate: log raw, extract first {...} JSON, strict length."""
     raw = (resp or {}).get("response")
     if not raw and isinstance(resp, dict) and "message" in resp:
         c = (resp.get("message") or {}).get("content")
@@ -121,32 +123,50 @@ def _parse_response_body(resp: Dict[str, Any]) -> Any:
             raw = c
     if raw is None:
         return None
+
     if isinstance(raw, dict):
         try:
-            blob = json.dumps(raw)
+            blob = json.dumps(raw, ensure_ascii=False)
         except (TypeError, ValueError):
             return None
+        logger.info("RAW AI RESPONSE: %s", blob)
         if len(blob) > _MAX_RESPONSE_TEXT_LEN:
-            logger.info("[AI] response too long → rejecting (object serializes >%d chars)", _MAX_RESPONSE_TEXT_LEN)
+            logger.info("[AI] response too long → rejecting (object >%d chars)", _MAX_RESPONSE_TEXT_LEN)
             return None
         return raw
+
     if isinstance(raw, list):
         logger.debug("[AI] unexpected list response")
         return None
-    if isinstance(raw, str):
-        s = raw.strip()
-        if not s:
-            return None
-        if len(s) > _MAX_RESPONSE_TEXT_LEN:
-            logger.info("[AI] response too long → rejecting (>%d chars)", _MAX_RESPONSE_TEXT_LEN)
-            return None
-        try:
-            return json.loads(s)
-        except json.JSONDecodeError:
-            # No extraction / cleaning — must be a single valid JSON value only
-            logger.info("[AI] response not valid JSON → rejecting")
-            return None
-    return None
+
+    if not isinstance(raw, str):
+        return None
+
+    s = raw.strip()
+    if not s:
+        return None
+
+    logger.info("RAW AI RESPONSE: %s", s)
+
+    if "{" not in s:
+        logger.info("[AI] no JSON object in response → rejecting")
+        return None
+
+    match = re.search(r"\{.*\}", s, re.DOTALL)
+    if not match:
+        logger.info("[AI] JSON block regex miss → rejecting")
+        return None
+
+    response_text = match.group()
+    if len(response_text) > _MAX_RESPONSE_TEXT_LEN:
+        logger.info("[AI] response too long → rejecting (>%d chars)", _MAX_RESPONSE_TEXT_LEN)
+        return None
+
+    try:
+        return json.loads(response_text)
+    except json.JSONDecodeError:
+        logger.info("[AI] response not valid JSON after extract → rejecting")
+        return None
 
 
 async def run_ai_and_cache(
@@ -168,10 +188,12 @@ async def run_ai_and_cache(
     prompt = ai_prompt.build_hvac_control_prompt(
         indoor_temp, outdoor_temp, is_occupied,
     )
-    logger.info("AI PROMPT SENT: %s", prompt)
-    body   = ai_prompt.ollama_payload(model, prompt)
+    logger.info("PROMPT SENT TO OLLAMA: %s", prompt)
+
+    # Payload must be only: model, prompt, format, stream, options (per debug spec)
+    body = ai_prompt.ollama_payload(model, prompt)
     body["options"] = dict(_OLLAMA_GEN_OPTIONS)
-    body["stop"] = list(_OLLAMA_STOP)
+    logger.info("OLLAMA PAYLOAD: %s", json.dumps(body, ensure_ascii=False))
 
     logger.info("[AI] Called")
     resp = await _post_generate_with_one_retry(base, body)
