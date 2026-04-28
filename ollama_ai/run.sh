@@ -9,8 +9,8 @@ until curl -s "http://127.0.0.1:11434/api/tags" >/dev/null 2>&1; do
   sleep 2
 done
 
-# Keep in sync with Hawaai DEFAULT_OLLAMA_MODEL (tinyllama = fast on Pi)
-OLLAMA_WARMUP_MODEL="tinyllama"
+# Pull / warm model in sync with Hawaai DEFAULT_OLLAMA_MODEL (strict JSON + schema)
+OLLAMA_WARMUP_MODEL="llama3:8b"
 
 echo "Pulling model: ${OLLAMA_WARMUP_MODEL}..."
 ollama pull "${OLLAMA_WARMUP_MODEL}" || echo "Model pull failed"

@@ -685,10 +685,10 @@ export default function Settings() {
             placeholder="http://172.30.32.1:11434"
           />
           <Input
-            label="Ollama model (optional; default tinyllama — try gemma:2b if you need quality)"
+            label="Ollama model (optional; default llama3:8b for reliable JSON — e.g. tinyllama if RAM-limited)"
             value={cfg.ai_ollama_model ?? ''}
             onChange={v => patch('ai_ollama_model', v)}
-            placeholder="tinyllama"
+            placeholder="llama3:8b"
           />
           <Toggle
             label="Manual Override"

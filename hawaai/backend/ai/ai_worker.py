@@ -17,20 +17,30 @@ from .. import config_manager, ha_client
 logger = logging.getLogger(__name__)
 
 # Bumped with each AI transport change — look for "AI worker initialized" in add-on logs
-AI_WORKER_VERSION = "1.2.12"
+AI_WORKER_VERSION = "1.2.14"
+
+# Ollama structured output: JSON Schema (NOT format="json")
+OLLAMA_RESPONSE_FORMAT: Dict[str, Any] = {
+    "type":       "object",
+    "properties": {
+        "target_temp": {"type": "number"},
+        "fan_mode":    {"type": "string"},
+        "confidence":  {"type": "number"},
+    },
+    "required": ["target_temp", "fan_mode", "confidence"],
+}
 
 _DEFAULT_URL = config_manager.DEFAULT_CONFIG["ai_ollama_url"]
 _ollama_url_logged: bool = False
 _GENERATE = "/api/generate"
-_TIMEOUT_S = 15.0
+_TIMEOUT_S = 90.0  # llama3:8b on Pi can exceed 15s; structured output still bounded by num_predict
 _RETRY_DELAY_S = 4.0
-# Exact generation options (no extra top-level fields on request)
 _OLLAMA_GEN_OPTIONS: Dict[str, Any] = {
-    "num_predict":  15,
+    "num_predict":  20,
     "temperature": 0.0,
 }
 _MAX_RESPONSE_TEXT_LEN = 200
-_FAN_COOLDOWN = 60.0  # minimum seconds between fan_mode service calls
+_FAN_COOLDOWN = 60.0
 
 _last_fan_cmd_at: float = 0.0
 _last_applied_action: str = ""
@@ -43,7 +53,6 @@ logger.info("AI worker initialized v%s", AI_WORKER_VERSION)
 
 
 def _log_skipped_not_available() -> None:
-    """Ollama unreachable; throttle to avoid log spam when addon is not installed."""
     global _skip_unavailable_log_at
     now = time.perf_counter()
     if now - _skip_unavailable_log_at < _SKIP_UNAVAILABLE_THROTTLE:
@@ -105,7 +114,6 @@ async def _post_generate(
 async def _post_generate_with_one_retry(
     base: str, body: Dict[str, Any],
 ) -> Optional[Dict[str, Any]]:
-    """Single retry after delay (covers transient load / network on Pi; does not block main loop)."""
     r = await _post_generate(base, body)
     if r is not None:
         return r
@@ -114,8 +122,15 @@ async def _post_generate_with_one_retry(
     return await _post_generate(base, body)
 
 
+def _emit_ai_response_line(obj: Any) -> None:
+    try:
+        txt = json.dumps(obj, ensure_ascii=False, separators=(",", ":"))
+    except (TypeError, ValueError):
+        return
+    logger.info("AI RESPONSE: %s", txt)
+
+
 def _parse_response_body(resp: Dict[str, Any]) -> Any:
-    """Ollama /api/generate: log raw, extract first {...} JSON, strict length."""
     raw = (resp or {}).get("response")
     if not raw and isinstance(resp, dict) and "message" in resp:
         c = (resp.get("message") or {}).get("content")
@@ -126,13 +141,14 @@ def _parse_response_body(resp: Dict[str, Any]) -> Any:
 
     if isinstance(raw, dict):
         try:
-            blob = json.dumps(raw, ensure_ascii=False)
+            blob = json.dumps(raw, ensure_ascii=False, separators=(",", ":"))
         except (TypeError, ValueError):
             return None
         logger.info("RAW AI RESPONSE: %s", blob)
         if len(blob) > _MAX_RESPONSE_TEXT_LEN:
             logger.info("[AI] response too long → rejecting (object >%d chars)", _MAX_RESPONSE_TEXT_LEN)
             return None
+        _emit_ai_response_line(raw)
         return raw
 
     if isinstance(raw, list):
@@ -148,8 +164,8 @@ def _parse_response_body(resp: Dict[str, Any]) -> Any:
 
     logger.info("RAW AI RESPONSE: %s", s)
 
-    if "{" not in s:
-        logger.info("[AI] no JSON object in response → rejecting")
+    if not s.startswith("{"):
+        logger.info("AI INVALID — NOT JSON")
         return None
 
     match = re.search(r"\{.*\}", s, re.DOTALL)
@@ -163,10 +179,13 @@ def _parse_response_body(resp: Dict[str, Any]) -> Any:
         return None
 
     try:
-        return json.loads(response_text)
+        parsed = json.loads(response_text)
     except json.JSONDecodeError:
         logger.info("[AI] response not valid JSON after extract → rejecting")
         return None
+
+    _emit_ai_response_line(parsed)
+    return parsed
 
 
 async def run_ai_and_cache(
@@ -177,7 +196,6 @@ async def run_ai_and_cache(
     outdoor_temp: Optional[float],
     is_occupied: bool,
 ) -> None:
-    """Intended to run as create_task: never block the decision loop for long."""
     if not bool(cfg.get("ai_enabled", False)) or not is_occupied:
         return
 
@@ -190,9 +208,12 @@ async def run_ai_and_cache(
     )
     logger.info("PROMPT SENT TO OLLAMA: %s", prompt)
 
-    # Payload must be only: model, prompt, format, stream, options (per debug spec)
     body = ai_prompt.ollama_payload(model, prompt)
+    body["format"] = dict(OLLAMA_RESPONSE_FORMAT)
+    body["raw"] = True
+    body["stream"] = False
     body["options"] = dict(_OLLAMA_GEN_OPTIONS)
+
     logger.info("OLLAMA PAYLOAD: %s", json.dumps(body, ensure_ascii=False))
 
     logger.info("[AI] Called")
@@ -229,7 +250,6 @@ def fetch_ai_in_background(
     outdoor_temp: Optional[float],
     is_occupied: bool,
 ) -> None:
-    """Non-blocking: schedules Ollama request; does not await."""
     asyncio.create_task(
         run_ai_and_cache(
             cfg, indoor_temp, target_temp, base_effective, outdoor_temp, is_occupied,
@@ -270,7 +290,6 @@ async def apply_ai_fan(
     fan_mode: str,
     action: str,
 ) -> None:
-    """Apply soft fan override from cache (HTTP climate service only; own cooldown)."""
     global _last_fan_cmd_at, _last_applied_action, _last_same_mode_log_at
 
     if not climate_entity or not fan_mode or action in (None, "none"):

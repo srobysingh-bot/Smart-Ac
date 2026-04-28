@@ -9,9 +9,8 @@ logger = logging.getLogger(__name__)
 
 CONFIG_PATH = "/data/hawaai_config.json"
 
-# When `ai_ollama_model` is empty in stored config, AI uses this model name (Ollama tag).
-# tinyllama: smallest/fastest on Pi. Optional: llama3.2:3b if you need quality and have RAM.
-DEFAULT_OLLAMA_MODEL = "tinyllama"
+# Default aligns with Ollama add-on pull; override in Settings if needed (tinyllama is faster but weaker on JSON).
+DEFAULT_OLLAMA_MODEL = "llama3:8b"
 
 # Legacy keys from pre–climate-only installs — stripped from merged config (ignored safely).
 _LEGACY_IR_KEYS = frozenset({

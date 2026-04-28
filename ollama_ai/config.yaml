@@ -1,7 +1,7 @@
-name: "Ollama AI (tinyllama)"
-version: 1.0.9
+name: "Ollama AI (llama3)"
+version: 1.1.0
 slug: ollama_ai
-description: "Ollama with tinyllama (fast CPU) for the HawaAI optional AI layer. HTTP on port 11434. Pulls and warms up on start."
+description: "Ollama with llama3:8b for HawaAI structured HVAC JSON. HTTP 11434. Pull + warmup on start."
 url: https://github.com/srobysingh-bot/Smart-Ac
 arch:
   - aarch64

@@ -1,4 +1,4 @@
-"""HVAC control prompt — Ollama must emit JSON only; no chat content."""
+"""HVAC control prompt for Ollama structured output (JSON schema in request body)."""
 
 from __future__ import annotations
 
@@ -10,40 +10,25 @@ def build_hvac_control_prompt(
     outdoor_temp: Optional[float],
     is_occupied: bool,
 ) -> str:
-    """
-    Return EXACT instruction block (placeholders only: indoor, outdoor, occupied).
-    No system/user split — this entire string is the only `prompt` sent to Ollama.
-    """
-    out = f"{outdoor_temp:.1f}" if outdoor_temp is not None else "unknown"
+    """Minimal prompt; schema enforcement is in API `format` + `raw` (see ai_worker)."""
+    inn = int(round(indoor_temp))
+    out = int(round(outdoor_temp)) if outdoor_temp is not None else "unknown"
     occ = "true" if is_occupied else "false"
-    return f"""You are an HVAC control system.
+    return f"""You are an HVAC controller.
+Return ONLY valid JSON.
 
-Return ONLY valid JSON. No explanation. No text. No markdown.
-
-Format:
-{{"target_temp": number, "fan_mode": "auto|f1|f2|f3|f4|f5", "confidence": number}}
-
-Rules:
-
-* target_temp must be between 22 and 26
-* fan_mode must be one of allowed values
-* confidence must be between 0 and 1
-* Output must be a single JSON object
-* If unsure, still return valid JSON
+Example:
+{{"target_temp":24,"fan_mode":"f2","confidence":0.8}}
 
 Input:
-indoor_temp={indoor_temp:.1f}
+indoor_temp={inn}
 outdoor_temp={out}
-occupied={occ}
-
-Return JSON only."""
+occupied={occ}"""
 
 
 def ollama_payload(model: str, prompt: str) -> Dict[str, Any]:
-    """Minimal body — `options` and `stop` are merged in ai_worker."""
+    """Body extended in ai_worker with format (JSON schema), raw, stream, options."""
     return {
         "model":  model,
         "prompt": prompt,
-        "stream": False,
-        "format": "json",
     }
