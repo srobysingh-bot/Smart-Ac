@@ -3,7 +3,7 @@
 import asyncio
 import logging
 
-from . import config_manager, logic_engine, weather_api
+from . import config_manager, logic_engine, room_registry, weather_api
 
 logger = logging.getLogger(__name__)
 
@@ -48,10 +48,14 @@ async def start() -> None:
         cfg = config_manager.load_config()
         interval = int(cfg.get("logic_interval_seconds", 60))
 
-        try:
-            await logic_engine.tick()
-        except Exception as e:
-            logger.error("[HawaAI] Logic tick error: %s", e)
+        for room in room_registry.list_room_dicts(cfg):
+            rid = room.get("id") or ""
+            if not rid:
+                continue
+            try:
+                await logic_engine.tick(rid)
+            except Exception as e:
+                logger.error("[HawaAI] Logic tick error [%s]: %s", rid, e)
 
         weather_accumulator += interval
         if weather_accumulator >= 600:

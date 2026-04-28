@@ -74,8 +74,10 @@ async def get_entity_state_full(entity_id: str) -> Optional[Dict[str, Any]]:
                 if resp.status == 200:
                     data = await resp.json()
                     return {
-                        "state":      data.get("state"),
-                        "attributes": data.get("attributes", {}),
+                        "state":        data.get("state"),
+                        "attributes": data.get("attributes", {}) or {},
+                        "last_changed": data.get("last_changed"),
+                        "last_updated": data.get("last_updated"),
                     }
                 body = await resp.text()
                 logger.error("[HawaAI] get_entity_state_full(%s) HTTP %s: %s", entity_id, resp.status, body)
@@ -113,6 +115,8 @@ async def get_climate_state(entity_id: str) -> Dict[str, Any]:
         "fan_modes":    fan_modes,             # supported fan speeds for smart_cooling mapping
         "swing_mode":   attrs.get("swing_mode"),
         "is_on":        is_on,
+        "last_changed": full.get("last_changed"),
+        "last_updated": full.get("last_updated"),
     }
 
 

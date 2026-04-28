@@ -2,31 +2,33 @@
 HawaAI FastAPI application.
 
 Routes:
-  GET  /api/status          Live status + current readings
-  GET  /api/sessions        Paginated session history
-  GET  /api/sessions/stats  Today + ML quality stats (for Analytics/Dashboard)
-  GET  /api/sessions/today  Today stats only
-  GET  /api/snapshots       Recent monitoring snapshots (last 2h)
+  GET  /api/status          Live status + readings (?room_id= required)
+  GET  /api/weather         Cached outdoor temperature (no room coupling)
+  GET  /api/sessions        Paginated session history (?room_id= required)
+  GET  /api/sessions/stats  Today + ML quality stats (?room_id= required)
+  GET  /api/sessions/today  Today stats only (?room_id= required)
+  GET  /api/snapshots       Recent monitoring snapshots (?room_id= required)
   GET  /api/config          Current add-on config
   POST /api/config          Save config to /data/hawaai_config.json
   GET  /api/ai              { ai_enabled, ai_provider, ollama + API fields (key masked) }
   POST /api/ai              Set AI settings (merge persist)
-  GET  /api/ai/status       Last AI call status (running/success/timeout/error) for dashboard
+  GET  /api/ai/status       AI worker status (?room_id= required)
   GET  /api/entities        HA entity list for Settings dropdowns
   GET  /api/climate/{id}   Live climate entity state + attributes
   POST /api/climate/{id}/set_temperature
   POST /api/climate/{id}/set_hvac_mode
   POST /api/climate/{id}/set_fan_mode
   GET  /api/brands          AC brand+model library
-  GET  /api/daily           Daily stats for last N days
-  GET  /api/export/csv      Download session CSV
-  GET  /api/export/json     Download session JSON
-  WS   /ws                  Live push of status every 5 s
+  GET  /api/daily           Daily stats for last N days (?room_id= required)
+  GET  /api/export/csv      Download session CSV (?room_id= required)
+  GET  /api/export/json     Download session JSON (?room_id= required)
+  WS   /ws                  Live push per subscribed room_id every 5 s
 """
 
 import asyncio
 import json
 import logging
+from collections import defaultdict
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
@@ -40,13 +42,28 @@ from fastapi import Body, FastAPI, HTTPException, Query, Request, WebSocket, Web
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, HTMLResponse, Response
 
-from . import config_manager, database, logic_engine, scheduler, session_logger, weather_api
+from . import config_manager, database, logic_engine, room_registry, scheduler, session_logger, weather_api
 from . import ha_client
 from .ac_controller import get_brands
 from .ai.ai_worker import get_ai_status, init_ai_worker
 from .utils import parse_presence
 
-_ws_clients: List[WebSocket] = []
+# Room-scoped WebSocket subscribers: broadcast never crosses room_id boundaries.
+_ws_by_room: Dict[str, List[WebSocket]] = defaultdict(list)
+_ws_lock = asyncio.Lock()
+
+
+def _state_ok(raw: Optional[str]) -> bool:
+    if raw is None:
+        return False
+    s = str(raw).strip().lower()
+    return s not in ("unavailable", "unknown", "")
+
+
+def _sensor_health(entity_id: str, raw: Optional[str]) -> Optional[bool]:
+    if not (entity_id or "").strip():
+        return None
+    return _state_ok(raw)
 
 
 def _mask_api_key_response(stored: str) -> str:
@@ -85,7 +102,7 @@ async def lifespan(app: FastAPI):
     logger.info("[HawaAI] Add-on stopped")
 
 
-app = FastAPI(title="HawaAI API", version="1.2.24", lifespan=lifespan)
+app = FastAPI(title="HawaAI API", version="1.3.1", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -213,9 +230,25 @@ async def set_ai_flag(data: Dict[str, Any] = Body(...)):
 
 
 @app.get("/api/ai/status")
-async def get_ai_runtime_status():
-    """Last AI inference attempt (provider, timing, error) for dashboard / ops."""
-    return get_ai_status()
+async def get_ai_runtime_status(room_id: str = Query(..., min_length=1)):
+    """Last AI inference attempt for an explicit room_id."""
+    return get_ai_status(room_id.strip())
+
+
+@app.get("/api/weather")
+async def get_weather_cached():
+    """
+    Outdoor temperature/humidity from the weather cache.
+    Does not require room_id — use for Settings preview and other non-room UI.
+    """
+    weather = await weather_api.get_cached()
+    if not weather:
+        return {"outdoor_temp": None, "outdoor_humidity": None, "available": False}
+    return {
+        "outdoor_temp": weather.get("temp"),
+        "outdoor_humidity": weather.get("humidity"),
+        "available": True,
+    }
 
 
 # ── LIVE STATUS ───────────────────────────────────────────────────────────────
@@ -264,19 +297,15 @@ def _smart_adjustment_reason(
 
 
 @app.get("/api/status")
-async def get_status():
-    """
-    Called by Dashboard every 5 seconds. Single source of truth for all UI state.
-
-    AC state priority (v1.1.17+):
-      1. Power sensor (watts) — physical ground truth — after cooldown expires
-         > 500 W → ON  |  50–500 W → IDLE  |  < 50 W → OFF
-      2. Internal _ac_is_on flag — used during 60 s post-command cooldown or
-         when no power sensor is configured
-      Climate entity is NEVER used to determine ac_on / ac_idle — display only.
-    """
-    cfg     = config_manager.load_config()
-    runtime = logic_engine.get_runtime_state()
+async def get_status(room_id: str = Query(..., min_length=1)):
+    """Dashboard status for one room. `room_id` is required — no default room fallback."""
+    rid = room_id.strip()
+    base = config_manager.load_config()
+    room_def = room_registry.get_room(base, rid)
+    if not room_def:
+        raise HTTPException(status_code=404, detail=f"Unknown room: {rid}")
+    cfg = room_registry.merge_room_config(base, room_def)
+    runtime = logic_engine.get_runtime_state(rid)
 
     indoor_temp_raw  = await ha_client.get_state(cfg.get("indoor_temp_entity", ""))
     presence_raw     = await ha_client.get_state(cfg.get("presence_entity", ""))
@@ -353,6 +382,30 @@ async def get_status():
         smart_adj, outdoor_temp_val, base_target, effective_target,
     )
 
+    ai_snap = get_ai_status(rid)
+    health = {
+        "fetched_at": datetime.now(timezone.utc).isoformat(),
+        "climate": {
+            "entity_id": climate_entity,
+            "available": bool(climate_entity) and _state_ok(climate_data.get("state") if climate_data else None),
+            "state": climate_data.get("state") if climate_data else None,
+            "last_changed": climate_data.get("last_changed"),
+            "last_updated": climate_data.get("last_updated"),
+        },
+        "sensors": {
+            "indoor_temp": _sensor_health(cfg.get("indoor_temp_entity", ""), indoor_temp_raw),
+            "presence": _sensor_health(cfg.get("presence_entity", ""), presence_raw),
+            "energy_power": _sensor_health(cfg.get("energy_power_entity", ""), energy_power_raw),
+            "energy_kwh": _sensor_health(cfg.get("energy_kwh_entity", ""), energy_kwh_raw),
+        },
+        "ai": {
+            "status": ai_snap.get("status"),
+            "last_call": ai_snap.get("last_call"),
+            "last_error": ai_snap.get("last_error"),
+            "circuit_open": ai_snap.get("circuit_open"),
+        },
+    }
+
     return {
         # ── Optional AI layer ──────────────────────────────────────────────────
         "ai_enabled":       bool(cfg.get("ai_enabled", False)),
@@ -416,43 +469,138 @@ async def get_status():
             if indoor_temp is not None else None
         ),
         "last_applied_target":   runtime.get("last_applied_target"),
+        "room_id":               rid,
+        "room_name":             room_def.get("name"),
+        "health":                health,
     }
+
+
+@app.get("/api/rooms")
+async def api_list_rooms():
+    cfg = config_manager.load_config()
+    return {
+        "rooms": [room_registry.public_room_view(r) for r in room_registry.list_room_dicts(cfg)],
+    }
+
+
+@app.post("/api/rooms")
+async def api_create_room(body: Dict[str, Any] = Body(...)):
+    import uuid
+
+    base = config_manager.load_config()
+    rooms = [dict(r) for r in room_registry.list_room_dicts(base)]
+    rid = (str(body.get("id") or "")).strip() or str(uuid.uuid4())[:12]
+    if any(r.get("id") == rid for r in rooms):
+        raise HTTPException(status_code=400, detail="room id already exists")
+    name = (str(body.get("name") or "Room")).strip() or "Room"
+    climate_entity = (str(body.get("climate_entity") or "")).strip()
+    if not climate_entity:
+        raise HTTPException(status_code=400, detail="climate_entity is required")
+    row: Dict[str, Any] = {"id": rid, "name": name, "climate_entity": climate_entity}
+    for k in ("presence_entity", "indoor_temp_entity", "energy_power_entity", "energy_kwh_entity"):
+        v = body.get(k)
+        if v and str(v).strip():
+            row[k] = str(v).strip()
+    if isinstance(body.get("ai_config"), dict):
+        row["ai_config"] = body["ai_config"]
+    rooms.append(row)
+    if not config_manager.save_config({"rooms": rooms}):
+        raise HTTPException(status_code=500, detail="failed to save rooms")
+    return room_registry.public_room_view(row)
+
+
+@app.put("/api/rooms/{room_id}")
+async def api_update_room(room_id: str, body: Dict[str, Any] = Body(...)):
+    base = config_manager.load_config()
+    rooms = [dict(r) for r in room_registry.list_room_dicts(base)]
+    idx = next((i for i, re in enumerate(rooms) if re.get("id") == room_id), None)
+    if idx is None:
+        raise HTTPException(status_code=404, detail="room not found")
+    r = rooms[idx]
+    if "name" in body and body["name"] is not None:
+        r["name"] = str(body["name"]).strip() or r.get("name", "Room")
+    if "climate_entity" in body and body["climate_entity"] is not None:
+        ce = str(body["climate_entity"]).strip()
+        if ce:
+            r["climate_entity"] = ce
+    for k in ("presence_entity", "indoor_temp_entity", "energy_power_entity", "energy_kwh_entity"):
+        if k in body:
+            v = body[k]
+            if v is None or str(v).strip() == "":
+                r.pop(k, None)
+            else:
+                r[k] = str(v).strip()
+    if "ai_config" in body:
+        ac = body["ai_config"]
+        if isinstance(ac, dict):
+            r["ai_config"] = ac
+        elif ac is None:
+            r.pop("ai_config", None)
+    rooms[idx] = r
+    if not config_manager.save_config({"rooms": rooms}):
+        raise HTTPException(status_code=500, detail="failed to save rooms")
+    return room_registry.public_room_view(r)
+
+
+@app.delete("/api/rooms/{room_id}")
+async def api_delete_room(room_id: str):
+    base = config_manager.load_config()
+    rooms = [dict(r) for r in room_registry.list_room_dicts(base)]
+    new_rooms = [r for r in rooms if r.get("id") != room_id]
+    if len(new_rooms) == len(rooms):
+        raise HTTPException(status_code=404, detail="room not found")
+    if not config_manager.save_config({"rooms": new_rooms}):
+        raise HTTPException(status_code=500, detail="failed to save rooms")
+    return {"ok": True}
+
+
+@app.get("/api/rooms/{room_id}/status")
+async def api_room_status(room_id: str):
+    return await get_status(room_id=room_id)
+
+
+@app.get("/api/rooms/{room_id}/ai/status")
+async def api_room_ai_status(room_id: str):
+    return get_ai_status(room_id)
 
 
 # ── SESSIONS ──────────────────────────────────────────────────────────────────
 
 @app.get("/api/sessions")
 async def get_sessions(
+    room_id: str = Query(..., min_length=1),
     limit: int = Query(50, ge=1, le=200),
     offset: int = Query(0, ge=0),
     date_from: Optional[str] = None,
     date_to: Optional[str] = None,
 ):
-    sessions = await database.get_sessions(limit, offset, date_from, date_to)
-    total = await database.get_session_count(date_from, date_to)
+    rid = room_id.strip()
+    sessions = await database.get_sessions(rid, limit, offset, date_from, date_to)
+    total = await database.get_session_count(rid, date_from, date_to)
     return {"sessions": sessions, "total": total, "limit": limit, "offset": offset}
 
 
 @app.get("/api/sessions/stats")
-async def get_stats():
+async def get_stats(room_id: str = Query(..., min_length=1)):
     """Today + ML quality stats (used by Dashboard and Analytics pages)."""
-    today = await database.get_today_stats()
-    ml = await database.get_ml_stats()
+    rid = room_id.strip()
+    today = await database.get_today_stats(rid)
+    ml = await database.get_ml_stats(rid)
     return {"today": today, "ml": ml}
 
 
 @app.get("/api/sessions/today")
-async def get_today_stats():
+async def get_today_stats_route(room_id: str = Query(..., min_length=1)):
     """Today stats only."""
-    return await database.get_today_stats()
+    return await database.get_today_stats(room_id.strip())
 
 
 # ── INSIGHTS ──────────────────────────────────────────────────────────────────
 
 @app.get("/api/insights")
-async def get_insights():
+async def get_insights(room_id: str = Query(..., min_length=1)):
     """
-    Read-only analytics derived from completed sessions.
+    Read-only analytics derived from completed sessions for one room.
     Does not affect any control logic.
 
     Returns cooling_rate, efficiency, best target temperature, cooling type
@@ -460,7 +608,7 @@ async def get_insights():
     Always returns valid JSON — never a 500 error.
     """
     try:
-        return await database.get_insights()
+        return await database.get_insights(room_id.strip())
     except Exception as exc:
         logger.error("[HawaAI] /api/insights error: %s", exc, exc_info=True)
         return {
@@ -478,15 +626,21 @@ async def get_insights():
 # ── SNAPSHOTS ─────────────────────────────────────────────────────────────────
 
 @app.get("/api/snapshots")
-async def get_snapshots(minutes: int = Query(120, ge=5, le=1440)):
-    return await database.get_snapshots_recent(minutes)
+async def get_snapshots(
+    minutes: int = Query(120, ge=5, le=1440),
+    room_id: str = Query(..., min_length=1),
+):
+    return await database.get_snapshots_recent(minutes, room_id.strip())
 
 
 # ── DAILY STATS ───────────────────────────────────────────────────────────────
 
 @app.get("/api/daily")
-async def get_daily(days: int = Query(7, ge=1, le=90)):
-    return await database.get_daily_stats(days)
+async def get_daily(
+    days: int = Query(7, ge=1, le=90),
+    room_id: str = Query(..., min_length=1),
+):
+    return await database.get_daily_stats(days, room_id.strip())
 
 
 # ── CLIMATE ENTITY ────────────────────────────────────────────────────────────
@@ -674,10 +828,11 @@ async def list_brands():
 # ── EXPORT ────────────────────────────────────────────────────────────────────
 
 @app.get("/api/export/csv")
-async def export_csv():
+async def export_csv(room_id: str = Query(..., min_length=1)):
     import io
     import csv
-    sessions = await database.get_all_sessions_for_export()
+    rid = room_id.strip()
+    sessions = await database.get_all_sessions_for_export(rid)
     output = io.StringIO()
     if sessions:
         writer = csv.DictWriter(output, fieldnames=sessions[0].keys())
@@ -692,8 +847,9 @@ async def export_csv():
 
 
 @app.get("/api/export/json")
-async def export_json_route():
-    sessions = await database.get_all_sessions_for_export()
+async def export_json_route(room_id: str = Query(..., min_length=1)):
+    rid = room_id.strip()
+    sessions = await database.get_all_sessions_for_export(rid)
     return Response(
         content=json.dumps(sessions, indent=2, ensure_ascii=False),
         media_type="application/json",
@@ -706,38 +862,95 @@ async def export_json_route():
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
     await websocket.accept()
-    _ws_clients.append(websocket)
+    subscribed: Optional[str] = None
     try:
+        while subscribed is None:
+            try:
+                raw = await websocket.receive_text()
+            except WebSocketDisconnect:
+                return
+            try:
+                msg = json.loads(raw)
+            except json.JSONDecodeError:
+                await websocket.send_json({"type": "error", "detail": "invalid_json"})
+                continue
+            if msg.get("type") != "subscribe":
+                await websocket.send_json({"type": "error", "detail": "subscribe_required"})
+                continue
+            rid = str(msg.get("room_id") or "").strip()
+            if not rid:
+                await websocket.send_json({"type": "error", "detail": "room_id_required"})
+                continue
+            base = config_manager.load_config()
+            if not room_registry.get_room(base, rid):
+                await websocket.send_json({"type": "error", "detail": "unknown_room", "room_id": rid})
+                await websocket.close(code=4404)
+                return
+            async with _ws_lock:
+                _ws_by_room[rid].append(websocket)
+            subscribed = rid
+            await websocket.send_json({"type": "subscribed", "room_id": rid})
+
         while True:
             await websocket.receive_text()
     except WebSocketDisconnect:
         pass
     finally:
-        if websocket in _ws_clients:
-            _ws_clients.remove(websocket)
+        if subscribed:
+            async with _ws_lock:
+                bucket = _ws_by_room.get(subscribed)
+                if bucket and websocket in bucket:
+                    bucket.remove(websocket)
+                if bucket is not None and len(bucket) == 0:
+                    _ws_by_room.pop(subscribed, None)
 
 
 async def _broadcast_loop():
-    """Push live status to all connected WebSocket clients every 5 seconds."""
+    """Push compact runtime ticks only to WebSocket clients subscribed to each room_id."""
     while True:
         await asyncio.sleep(5)
-        if not _ws_clients:
-            continue
-        try:
-            cfg = config_manager.load_config()
-            runtime = logic_engine.get_runtime_state()
-            payload = json.dumps({**runtime, "target_temp": cfg.get("target_temp", 24)}, default=str)
-        except Exception:
-            continue
-        dead = []
-        for ws in list(_ws_clients):
+        async with _ws_lock:
+            snapshot: List[tuple] = [(rid, list(wss)) for rid, wss in _ws_by_room.items() if wss]
+        for rid, clients in snapshot:
+            if not clients:
+                continue
             try:
-                await ws.send_text(payload)
+                base = config_manager.load_config()
+                room_def = room_registry.get_room(base, rid)
+                if not room_def:
+                    payload = json.dumps({"type": "error", "room_id": rid, "detail": "unknown_room"})
+                else:
+                    merged = room_registry.merge_room_config(base, room_def)
+                    runtime = logic_engine.get_runtime_state(rid)
+                    payload = json.dumps(
+                        {
+                            "type": "tick",
+                            **runtime,
+                            "target_temp": merged.get("target_temp", 24),
+                            "room_id": rid,
+                        },
+                        default=str,
+                    )
             except Exception:
-                dead.append(ws)
-        for ws in dead:
-            if ws in _ws_clients:
-                _ws_clients.remove(ws)
+                continue
+
+            dead: List[WebSocket] = []
+            for ws in clients:
+                try:
+                    await ws.send_text(payload)
+                except Exception:
+                    dead.append(ws)
+            if not dead:
+                continue
+            async with _ws_lock:
+                bucket = _ws_by_room.get(rid)
+                if not bucket:
+                    continue
+                for ws in dead:
+                    try:
+                        bucket.remove(ws)
+                    except ValueError:
+                        pass
 
 
 # ── Serve React frontend ──────────────────────────────────────────────────────

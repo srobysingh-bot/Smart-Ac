@@ -5,6 +5,8 @@ import logging
 import os
 from typing import Any, Dict
 
+from . import room_registry
+
 logger = logging.getLogger(__name__)
 
 CONFIG_PATH = "/data/hawaai_config.json"
@@ -51,6 +53,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "energy_tariff_per_kwh": 8.0,
     "currency": "INR",
     "logic_interval_seconds": 60,
+    "rooms": [],
 }
 
 
@@ -138,6 +141,8 @@ def _load_config_merged() -> Dict[str, Any]:
         merged.setdefault("energy_kwh_entity", "")
     elif "energy_sensor_entity" in merged:
         merged.pop("energy_sensor_entity", None)
+
+    room_registry.ensure_migrated(merged)
 
     return merged
 

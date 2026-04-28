@@ -27,21 +27,37 @@ async function request(path, options = {}) {
 }
 
 // ── Status ───────────────────────────────────────────────────────────────────
-export const getStatus = () => request('/status')
+export const getStatus = (roomId) => {
+  if (!roomId) return Promise.reject(new Error('roomId is required'))
+  return request(`/status?room_id=${encodeURIComponent(roomId)}`)
+}
+
+/** Cached outdoor weather — no room coupling (Settings preview). */
+export const getWeather = () => request('/weather')
 
 // ── Sessions ─────────────────────────────────────────────────────────────────
 export const getSessions = (params = {}) => {
+  if (!params.room_id) return Promise.reject(new Error('room_id is required'))
   const q = new URLSearchParams(params).toString()
-  return request(`/sessions${q ? '?' + q : ''}`)
+  return request(`/sessions?${q}`)
 }
-export const getSessionStats = () => request('/sessions/stats')
+
+export const getSessionStats = (roomId) => {
+  if (!roomId) return Promise.reject(new Error('roomId is required'))
+  return request(`/sessions/stats?room_id=${encodeURIComponent(roomId)}`)
+}
 
 // ── Snapshots ────────────────────────────────────────────────────────────────
-export const getSnapshots = (minutes = 120) =>
-  request(`/snapshots?minutes=${minutes}`)
+export const getSnapshots = (minutes = 120, roomId) => {
+  if (!roomId) return Promise.reject(new Error('roomId is required'))
+  return request(`/snapshots?minutes=${minutes}&room_id=${encodeURIComponent(roomId)}`)
+}
 
 // ── Daily stats ───────────────────────────────────────────────────────────────
-export const getDailyStats = (days = 7) => request(`/daily?days=${days}`)
+export const getDailyStats = (days = 7, roomId) => {
+  if (!roomId) return Promise.reject(new Error('roomId is required'))
+  return request(`/daily?days=${days}&room_id=${encodeURIComponent(roomId)}`)
+}
 
 // ── Config ───────────────────────────────────────────────────────────────────
 export const getConfig   = () => request('/config')
@@ -56,12 +72,26 @@ export const setAiEnabled = (ai_enabled) =>
 export const updateAiConfig = (data) =>
   request('/ai', { method: 'POST', body: JSON.stringify(data) })
 
-/** Last AI call lifecycle (GET /api/ai/status). */
-export async function getAiStatus() {
-  return request('/ai/status')
+/** Last AI call lifecycle for a room (GET /api/ai/status). */
+export async function getAiStatus(roomId) {
+  if (!roomId) return Promise.reject(new Error('roomId is required'))
+  return request(`/ai/status?room_id=${encodeURIComponent(roomId)}`)
 }
 
-// ── Brands ───────────────────────────────────────────────────────────────────
+// ── Multi-room ───────────────────────────────────────────────────────────────
+export const getRooms = () => request('/rooms')
+
+export const createRoom = (data) =>
+  request('/rooms', { method: 'POST', body: JSON.stringify(data) })
+
+export const updateRoom = (roomId, data) =>
+  request(`/rooms/${encodeURIComponent(roomId)}`, {
+    method: 'PUT',
+    body: JSON.stringify(data),
+  })
+
+export const deleteRoom = (roomId) =>
+  request(`/rooms/${encodeURIComponent(roomId)}`, { method: 'DELETE' })
 export const getBrands = () => request('/brands')
 
 // ── HA Entities ──────────────────────────────────────────────────────────────
@@ -103,11 +133,15 @@ export const getDevices = () => request('/devices')
 export const getDeviceEntities = (deviceId) => request(`/devices/${encodeURIComponent(deviceId)}/entities`)
 
 // ── Insights ─────────────────────────────────────────────────────────────────
-export const getInsights = () => request('/insights')
+export const getInsights = (roomId) => {
+  if (!roomId) return Promise.reject(new Error('roomId is required'))
+  return request(`/insights?room_id=${encodeURIComponent(roomId)}`)
+}
 
 // ── Export ───────────────────────────────────────────────────────────────────
-export async function downloadExport(format = 'csv') {
-  const res = await fetch(`${BASE}/export/${format}`)
+export async function downloadExport(format = 'csv', roomId) {
+  if (!roomId) throw new Error('roomId is required')
+  const res = await fetch(`${BASE}/export/${format}?room_id=${encodeURIComponent(roomId)}`)
   if (!res.ok) throw new Error('Export failed')
   const blob = await res.blob()
   const cd   = res.headers.get('Content-Disposition') || ''
@@ -119,22 +153,41 @@ export async function downloadExport(format = 'csv') {
   URL.revokeObjectURL(url)
 }
 
-// ── WebSocket live updates ────────────────────────────────────────────────────
-export function connectLive(onMessage, onError) {
+// ── WebSocket live updates (per-room subscribe) ─────────────────────────────
+export function connectLive(roomId, onMessage, onError) {
+  if (!roomId) {
+    if (onError) onError(new Error('roomId is required'))
+    return { ws: null, close: () => {} }
+  }
+  let intentionalClose = false
   const proto  = location.protocol === 'https:' ? 'wss' : 'ws'
-  // Include ingress path prefix so the request routes through HA ingress
-  // e.g.  wss://ha-host/api/hassio_ingress/TOKEN/ws  (via ingress)
-  //   or  ws://localhost:8099/ws                       (direct access)
   const wsPath = INGRESS_PATH + '/ws'
   const ws     = new WebSocket(`${proto}://${location.host}${wsPath}`)
 
+  ws.onopen = () => {
+    try {
+      ws.send(JSON.stringify({ type: 'subscribe', room_id: roomId }))
+    } catch (e) {
+      if (onError) onError(e)
+    }
+  }
   ws.onmessage = (evt) => {
     try { onMessage(JSON.parse(evt.data)) } catch {}
   }
   ws.onerror = onError || (() => {})
   ws.onclose = () => {
-    // Auto-reconnect after 5 s
-    setTimeout(() => connectLive(onMessage, onError), 5000)
+    if (intentionalClose) return
+    setTimeout(() => connectLive(roomId, onMessage, onError), 5000)
   }
-  return ws
+  return {
+    ws,
+    close: () => {
+      intentionalClose = true
+      try {
+        ws.close()
+      } catch {
+        /* ignore */
+      }
+    },
+  }
 }

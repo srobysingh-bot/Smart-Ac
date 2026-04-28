@@ -153,22 +153,37 @@ function buildRecommendations({ avgRate, avgEff, bestTemp, bestRange, counts, tr
 
 // ── Card ──────────────────────────────────────────────────────────────────────
 
-export default function InsightsCard() {
+export default function InsightsCard({ roomId }) {
   const [data,    setData]    = useState(null)
   const [loading, setLoading] = useState(true)
   const [error,   setError]   = useState(null)
 
   useEffect(() => {
+    if (!roomId) {
+      setData(null)
+      setLoading(false)
+      setError(null)
+      return
+    }
     let alive = true
+    setLoading(true)
     const load = () => {
-      getInsights()
-        .then(d  => { if (alive) { setData(d);           setLoading(false) } })
+      getInsights(roomId)
+        .then(d  => { if (alive) { setData(d);           setLoading(false); setError(null) } })
         .catch(e => { if (alive) { setError(e.message); setLoading(false) } })
     }
     load()
     const id = setInterval(load, 5 * 60 * 1000)   // refresh every 5 min
     return () => { alive = false; clearInterval(id) }
-  }, [])
+  }, [roomId])
+
+  if (!roomId) {
+    return (
+      <div className="card flex items-center gap-2 text-xs text-gray-500">
+        Select a room to load insights for that room only.
+      </div>
+    )
+  }
 
   if (loading) {
     return (

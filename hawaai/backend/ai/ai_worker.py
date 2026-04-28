@@ -8,6 +8,7 @@ import logging
 import re
 import threading
 import time
+from collections import defaultdict
 from datetime import datetime, timezone
 from typing import Any, Dict, Optional, Tuple
 
@@ -19,7 +20,7 @@ from .. import config_manager, ha_client
 logger = logging.getLogger(__name__)
 
 # Bumped with each AI transport change — look for "AI worker initialized" in add-on logs
-AI_WORKER_VERSION = "1.2.24"
+AI_WORKER_VERSION = "1.3.0"
 
 # Ollama structured output: JSON Schema only under request "format" (no separate top-level required)
 OLLAMA_RESPONSE_FORMAT: Dict[str, Any] = {
@@ -59,27 +60,38 @@ _OLLAMA_GEN_OPTIONS: Dict[str, Any] = {
 _MAX_RESPONSE_TEXT_LEN = 200
 _FAN_COOLDOWN = 60.0
 
-_last_fan_cmd_at: float = 0.0
-_last_applied_action: str = ""
-_last_same_mode_log_at: float = 0.0
+_fan_by_room: Dict[str, Dict[str, Any]] = defaultdict(
+    lambda: {"last_fan_cmd_at": 0.0, "last_applied_action": "", "same_mode_log_at": 0.0},
+)
 _SAME_MODE_LOG_THROTTLE = 300.0
 _skip_unavailable_log_at: float = 0.0
 _SKIP_UNAVAILABLE_THROTTLE = 300.0
 
 _ai_status_lock = threading.Lock()
-# Runtime AI call tracking for /api/ai/status (dashboard / ops).
-_ai_runtime_status: Dict[str, Any] = {
-    "status": "idle",
-    "last_call": None,
-    "response_time": None,
-    "provider": None,
-    "model": None,
-    "last_error": None,
-}
+# Per-room runtime status for /api/rooms/{id}/ai/status
+_ai_runtime_by_room: Dict[str, Dict[str, Any]] = {}
 
 _circuit_lock = threading.Lock()
-_api_consecutive_failures = 0
-_api_circuit_open_until_mono = 0.0
+# Per-room API circuit: failures count + monotonic deadline when open
+_api_circuit_by_room: Dict[str, Dict[str, float]] = {}
+
+
+def _default_ai_runtime() -> Dict[str, Any]:
+    return {
+        "status": "idle",
+        "last_call": None,
+        "response_time": None,
+        "provider": None,
+        "model": None,
+        "last_error": None,
+    }
+
+
+def _mut_room_ai(room_id: str) -> Dict[str, Any]:
+    with _ai_status_lock:
+        if room_id not in _ai_runtime_by_room:
+            _ai_runtime_by_room[room_id] = _default_ai_runtime()
+        return _ai_runtime_by_room[room_id]
 
 
 def init_ai_worker() -> None:
@@ -87,49 +99,58 @@ def init_ai_worker() -> None:
     logger.info("[AI] Worker ready v%s", AI_WORKER_VERSION)
 
 
-def get_ai_status() -> Dict[str, Any]:
-    """Snapshot of last AI provider call. response_time is round-trip milliseconds (or None)."""
-    with _ai_status_lock:
-        out = dict(_ai_runtime_status)
+def get_ai_status(room_id: str) -> Dict[str, Any]:
+    """Snapshot of last AI provider call for one room."""
+    rid = (room_id or "default").strip() or "default"
+    st = dict(_mut_room_ai(rid))
     now_m = time.monotonic()
     with _circuit_lock:
-        open_c = now_m < _api_circuit_open_until_mono
-        out["circuit_open"] = open_c
-        out["circuit_seconds_remaining"] = (
-            round(_api_circuit_open_until_mono - now_m, 1) if open_c else None
+        c = dict(
+            _api_circuit_by_room.get(rid) or {"failures": 0.0, "open_until": 0.0},
         )
-        out["api_consecutive_failures"] = _api_consecutive_failures
-    return out
+    failures = int(c.get("failures", 0))
+    open_until = float(c.get("open_until", 0.0))
+    open_c = now_m < open_until
+    st["circuit_open"] = open_c
+    st["circuit_seconds_remaining"] = (
+        round(open_until - now_m, 1) if open_c else None
+    )
+    st["api_consecutive_failures"] = failures
+    st["room_id"] = rid
+    return st
 
 
-def _ai_status_set(**kwargs: Any) -> None:
-    with _ai_status_lock:
-        _ai_runtime_status.update(kwargs)
+def _ai_status_set(room_id: str, **kwargs: Any) -> None:
+    _mut_room_ai(room_id).update(kwargs)
 
 
-def _api_circuit_register_success() -> None:
-    global _api_consecutive_failures, _api_circuit_open_until_mono
+def _api_circuit_register_success(room_id: str) -> None:
     with _circuit_lock:
-        _api_consecutive_failures = 0
-        _api_circuit_open_until_mono = 0.0
+        _api_circuit_by_room[room_id] = {"failures": 0.0, "open_until": 0.0}
 
 
-def _api_circuit_register_failure() -> None:
-    global _api_consecutive_failures, _api_circuit_open_until_mono
+def _api_circuit_register_failure(room_id: str) -> None:
     with _circuit_lock:
-        _api_consecutive_failures += 1
-        if _api_consecutive_failures >= _API_CIRCUIT_FAILURE_THRESHOLD:
-            _api_circuit_open_until_mono = time.monotonic() + _API_CIRCUIT_OPEN_SEC
+        c = _api_circuit_by_room.setdefault(
+            room_id, {"failures": 0.0, "open_until": 0.0},
+        )
+        c["failures"] = float(c.get("failures", 0)) + 1.0
+        if c["failures"] >= float(_API_CIRCUIT_FAILURE_THRESHOLD):
+            c["open_until"] = time.monotonic() + _API_CIRCUIT_OPEN_SEC
             logger.warning(
-                "[AI] Circuit breaker open — skipping API for %.0fs (%d consecutive failures)",
+                "[AI][%s] Circuit breaker open — skipping API for %.0fs (%d consecutive failures)",
+                room_id,
                 _API_CIRCUIT_OPEN_SEC,
-                _api_consecutive_failures,
+                int(c["failures"]),
             )
 
 
-def _api_circuit_is_open() -> bool:
+def _api_circuit_is_open(room_id: str) -> bool:
     with _circuit_lock:
-        return time.monotonic() < _api_circuit_open_until_mono
+        c = _api_circuit_by_room.get(room_id)
+        if not c:
+            return False
+        return time.monotonic() < float(c.get("open_until", 0.0))
 
 
 def _iso_utc_now() -> str:
@@ -146,10 +167,11 @@ def _log_skipped_not_available() -> None:
     logger.debug("[AI] Skipped reason: Ollama unreachable or bad response (throttled detail)")
 
 
-def last_ai_log_state() -> Dict[str, Any]:
+def last_ai_log_state(room_id: str) -> Dict[str, Any]:
+    st = _fan_by_room[room_id]
     return {
-        "last_fan_cmd_at": _last_fan_cmd_at,
-        "last_action":     _last_applied_action,
+        "last_fan_cmd_at": st["last_fan_cmd_at"],
+        "last_action":     st["last_applied_action"],
     }
 
 
@@ -460,12 +482,13 @@ def _parse_ollama_response_body(resp: Dict[str, Any]) -> Any:
     return _parse_json_from_model_output(raw)
 
 
-def _api_fallback_to_logic_engine() -> None:
-    logger.info("[AI] API failed → fallback to logic_engine")
-    ai_cache.mark_fetch_done()
+def _api_fallback_to_logic_engine(room_id: str) -> None:
+    logger.info("[AI][%s] API failed → fallback to logic_engine", room_id)
+    ai_cache.mark_fetch_done(room_id)
 
 
 def _try_apply_api_conservative_defaults(
+    room_id: str,
     is_occupied: bool,
     indoor_temp: float,
 ) -> bool:
@@ -483,8 +506,8 @@ def _try_apply_api_conservative_defaults(
             "[AI] Conservative API default rejected by validator — logic_engine only",
         )
         return False
-    ai_cache.set_validated(validated, indoor_temp)
-    ai_cache.mark_fetch_done()
+    ai_cache.set_validated(room_id, validated, indoor_temp)
+    ai_cache.mark_fetch_done(room_id)
     try:
         pj = json.dumps(validated, ensure_ascii=False, separators=(",", ":"))
     except (TypeError, ValueError):
@@ -498,6 +521,7 @@ def _try_apply_api_conservative_defaults(
 
 
 async def run_ai_and_cache(
+    room_id: str,
     cfg: Dict[str, Any],
     indoor_temp: float,
     target_temp: float,
@@ -517,7 +541,7 @@ async def run_ai_and_cache(
         logger.info("[AI] Provider: Ollama")
         base = _base_url(cfg)
         model = _model(cfg)
-        ai_cache.invalidate_if_ai_identity_changed("ollama", model)
+        ai_cache.invalidate_if_ai_identity_changed(room_id, "ollama", model)
         logger.debug("[AI] model=%s", model)
         logger.info("PROMPT SENT TO OLLAMA: %s", prompt)
 
@@ -530,6 +554,7 @@ async def run_ai_and_cache(
         logger.info("OLLAMA PAYLOAD: %s", json.dumps(body, ensure_ascii=False))
 
         _ai_status_set(
+            room_id,
             status="running",
             last_call=_iso_utc_now(),
             provider="ollama",
@@ -542,42 +567,46 @@ async def run_ai_and_cache(
         resp = await _post_generate_with_one_retry(base, body)
         if resp is None:
             _ai_status_set(
+                room_id,
                 status="error",
                 last_error="ollama unreachable or bad response",
                 response_time=round((time.perf_counter() - t_req) * 1000.0, 2),
             )
             _log_skipped_not_available()
-            ai_cache.mark_fetch_done()
+            ai_cache.mark_fetch_done(room_id)
             return
 
         elapsed_ms = (time.perf_counter() - t_req) * 1000.0
         parsed = _parse_ollama_response_body(resp)
         if parsed is None:
             _ai_status_set(
+                room_id,
                 status="error",
                 last_error="unparseable ollama output",
                 response_time=round(elapsed_ms, 2),
             )
             logger.info("[AI] Skipped")
             logger.debug("[AI] Skipped reason: unparseable output")
-            ai_cache.mark_fetch_done()
+            ai_cache.mark_fetch_done(room_id)
             return
 
         validated = ai_validator.validate_ai_payload(parsed, is_occupied)
         if not validated:
             _ai_status_set(
+                room_id,
                 status="error",
                 last_error="ollama output validation failed",
                 response_time=round(elapsed_ms, 2),
             )
             logger.info("[AI] Skipped")
             logger.debug("[AI] Skipped reason: validation failed")
-            ai_cache.mark_fetch_done()
+            ai_cache.mark_fetch_done(room_id)
             return
 
-        ai_cache.set_validated(validated, indoor_temp)
-        ai_cache.mark_fetch_done()
+        ai_cache.set_validated(room_id, validated, indoor_temp)
+        ai_cache.mark_fetch_done(room_id)
         _ai_status_set(
+            room_id,
             status="success",
             response_time=round(elapsed_ms, 2),
             last_error=None,
@@ -599,6 +628,7 @@ async def run_ai_and_cache(
             "[AI] API mode requires non-empty ai_api_key, ai_api_base_url, and ai_api_model",
         )
         _ai_status_set(
+            room_id,
             status="error",
             last_call=_iso_utc_now(),
             provider="api",
@@ -606,17 +636,19 @@ async def run_ai_and_cache(
             last_error="api misconfigured",
             response_time=None,
         )
-        _api_fallback_to_logic_engine()
+        _api_fallback_to_logic_engine(room_id)
         return
 
-    if _api_circuit_is_open():
+    if _api_circuit_is_open(room_id):
         with _circuit_lock:
-            rem = max(0.0, _api_circuit_open_until_mono - time.monotonic())
+            c = _api_circuit_by_room.get(room_id) or {}
+            rem = max(0.0, float(c.get("open_until", 0.0)) - time.monotonic())
         logger.warning(
             "[AI] Circuit breaker open — skipping API (%.0fs remaining)",
             rem,
         )
         _ai_status_set(
+            room_id,
             status="error",
             last_call=_iso_utc_now(),
             provider="api",
@@ -624,10 +656,10 @@ async def run_ai_and_cache(
             last_error=f"circuit open ({round(rem, 0)}s)",
             response_time=None,
         )
-        _api_fallback_to_logic_engine()
+        _api_fallback_to_logic_engine(room_id)
         return
 
-    ai_cache.invalidate_if_ai_identity_changed("api", model_a)
+    ai_cache.invalidate_if_ai_identity_changed(room_id, "api", model_a)
     logger.debug("[AI] model=%s timeout=%.0fs json_object=%s", model_a, timeout_a, use_json_object)
     logger.info("[AI] API key fingerprint (masked): %s", mask_api_key_for_log(key))
     logger.debug("[AI] PROMPT (API): %s", prompt)
@@ -645,6 +677,7 @@ async def run_ai_and_cache(
     logger.info("[AI] Request sent to API (url=%s model=%s)", chat_url, model_a)
 
     _ai_status_set(
+        room_id,
         status="running",
         last_call=_iso_utc_now(),
         provider="api",
@@ -659,20 +692,22 @@ async def run_ai_and_cache(
     elapsed_ms = (time.perf_counter() - t_req) * 1000.0
 
     if resp is None:
-        _api_circuit_register_failure()
+        _api_circuit_register_failure(room_id)
         if err_kind == "timeout":
             _ai_status_set(
+                room_id,
                 status="timeout",
                 last_error=f"timeout after {timeout_a} seconds",
                 response_time=None,
             )
         else:
             _ai_status_set(
+                room_id,
                 status="error",
                 last_error=err_kind or "api request failed",
                 response_time=round(elapsed_ms, 2),
             )
-        _api_fallback_to_logic_engine()
+        _api_fallback_to_logic_engine(room_id)
         return
 
     if (elapsed_ms / 1000.0) > _API_FAST_FAIL_SEC:
@@ -680,59 +715,65 @@ async def run_ai_and_cache(
             "[AI] Slow response → fallback to logic_engine (%.1fs)",
             elapsed_ms / 1000.0,
         )
-        _api_circuit_register_failure()
+        _api_circuit_register_failure(room_id)
         _ai_status_set(
+            room_id,
             status="error",
             last_error=f"slow response ({elapsed_ms / 1000.0:.1f}s > {_API_FAST_FAIL_SEC:.0f}s)",
             response_time=round(elapsed_ms, 2),
         )
-        _api_fallback_to_logic_engine()
+        _api_fallback_to_logic_engine(room_id)
         return
 
     logger.info("[AI] Response received (%.0f ms)", elapsed_ms)
 
     parsed = _parse_api_chat_response(resp)
     if parsed is None:
-        if _try_apply_api_conservative_defaults(is_occupied, indoor_temp):
-            _api_circuit_register_success()
+        if _try_apply_api_conservative_defaults(room_id, is_occupied, indoor_temp):
+            _api_circuit_register_success(room_id)
             _ai_status_set(
+                room_id,
                 status="success",
                 response_time=round(elapsed_ms, 2),
                 last_error=None,
             )
         else:
-            _api_circuit_register_failure()
+            _api_circuit_register_failure(room_id)
             _ai_status_set(
+                room_id,
                 status="error",
                 last_error="unparseable api message",
                 response_time=round(elapsed_ms, 2),
             )
-            _api_fallback_to_logic_engine()
+            _api_fallback_to_logic_engine(room_id)
         return
 
     validated = ai_validator.validate_ai_payload(parsed, is_occupied)
     if not validated:
-        if _try_apply_api_conservative_defaults(is_occupied, indoor_temp):
-            _api_circuit_register_success()
+        if _try_apply_api_conservative_defaults(room_id, is_occupied, indoor_temp):
+            _api_circuit_register_success(room_id)
             _ai_status_set(
+                room_id,
                 status="success",
                 response_time=round(elapsed_ms, 2),
                 last_error=None,
             )
         else:
-            _api_circuit_register_failure()
+            _api_circuit_register_failure(room_id)
             _ai_status_set(
+                room_id,
                 status="error",
                 last_error="api output validation failed",
                 response_time=round(elapsed_ms, 2),
             )
-            _api_fallback_to_logic_engine()
+            _api_fallback_to_logic_engine(room_id)
         return
 
-    ai_cache.set_validated(validated, indoor_temp)
-    ai_cache.mark_fetch_done()
-    _api_circuit_register_success()
+    ai_cache.set_validated(room_id, validated, indoor_temp)
+    ai_cache.mark_fetch_done(room_id)
+    _api_circuit_register_success(room_id)
     _ai_status_set(
+        room_id,
         status="success",
         response_time=round(elapsed_ms, 2),
         last_error=None,
@@ -741,6 +782,7 @@ async def run_ai_and_cache(
 
 
 def fetch_ai_in_background(
+    room_id: str,
     cfg: Dict[str, Any],
     indoor_temp: float,
     target_temp: float,
@@ -750,7 +792,13 @@ def fetch_ai_in_background(
 ) -> None:
     asyncio.create_task(
         run_ai_and_cache(
-            cfg, indoor_temp, target_temp, base_effective, outdoor_temp, is_occupied,
+            room_id,
+            cfg,
+            indoor_temp,
+            target_temp,
+            base_effective,
+            outdoor_temp,
+            is_occupied,
         ),
     )
 
@@ -784,17 +832,18 @@ def _map_logical_fan_to_ha(
 
 
 async def apply_ai_fan(
+    room_id: str,
     climate_entity: str,
     fan_mode: str,
     action: str,
 ) -> None:
-    global _last_fan_cmd_at, _last_applied_action, _last_same_mode_log_at
+    stf = _fan_by_room[room_id]
 
     if not climate_entity or not fan_mode or action in (None, "none"):
         return
 
     now = time.perf_counter()
-    if now - _last_fan_cmd_at < _FAN_COOLDOWN:
+    if now - stf["last_fan_cmd_at"] < _FAN_COOLDOWN:
         return
 
     cstate     = await ha_client.get_climate_state(climate_entity)
@@ -810,8 +859,8 @@ async def apply_ai_fan(
     cur = cstate.get("fan_mode")
     if cur is not None and str(cur).lower() == str(resolved).lower():
         tnow = time.perf_counter()
-        if tnow - _last_same_mode_log_at >= _SAME_MODE_LOG_THROTTLE:
-            _last_same_mode_log_at = tnow
+        if tnow - stf["same_mode_log_at"] >= _SAME_MODE_LOG_THROTTLE:
+            stf["same_mode_log_at"] = tnow
             logger.debug("[AI] Fan skipped (same mode)")
         return
 
@@ -820,8 +869,8 @@ async def apply_ai_fan(
         "fan_mode":   resolved,
     })
     if ok:
-        _last_fan_cmd_at   = time.perf_counter()
-        _last_applied_action = action
+        stf["last_fan_cmd_at"]   = time.perf_counter()
+        stf["last_applied_action"] = action
         logger.debug("[AI] Fan mode %r → %r (action=%s)", fan_mode, resolved, action)
     else:
         logger.debug("[AI] set_fan_mode failed for %s", climate_entity)

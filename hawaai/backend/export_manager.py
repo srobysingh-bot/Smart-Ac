@@ -33,9 +33,9 @@ _CSV_COLUMNS = [
 ]
 
 
-async def export_csv() -> str:
-    """Return all sessions as a UTF-8 CSV string."""
-    rows = await database.get_all_sessions_for_export()
+async def export_csv(room_id: str) -> str:
+    """Return sessions for one room as a UTF-8 CSV string."""
+    rows = await database.get_all_sessions_for_export(room_id)
 
     buf = io.StringIO()
     writer = csv.DictWriter(buf, fieldnames=_CSV_COLUMNS, extrasaction="ignore")
@@ -50,9 +50,9 @@ async def export_csv() -> str:
     return buf.getvalue()
 
 
-async def export_json() -> str:
-    """Return all sessions as a JSON array string."""
-    rows = await database.get_all_sessions_for_export()
+async def export_json(room_id: str) -> str:
+    """Return sessions for one room as a JSON array string."""
+    rows = await database.get_all_sessions_for_export(room_id)
     return json.dumps(rows, indent=2, ensure_ascii=False, default=str)
 
 

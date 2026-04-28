@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState, useCallback } from 'react'
 import { useNavigate } from 'react-router-dom'
-import { getStatus, getSessionStats, getSnapshots, getClimateState, setClimateTemperature, setHvacMode, setFanMode, setSwingMode, getAiStatus } from '../api/smartcool.js'
+import { getStatus, getSessionStats, getSnapshots, getClimateState, setClimateTemperature, setHvacMode, setFanMode, setSwingMode, getAiStatus, getRooms, createRoom, connectLive } from '../api/smartcool.js'
 import ACStatusCard    from '../components/ACStatusCard.jsx'
 import TempGauge       from '../components/TempGauge.jsx'
 import EnergyChart     from '../components/EnergyChart.jsx'
@@ -22,11 +22,17 @@ function formatAiTime(iso) {
   }
 }
 
-function AiStatusCard() {
+const ROOM_LS = 'hawaai_active_room'
+
+function AiStatusCard({ roomId }) {
   const [ai, setAi] = useState(null)
   const load = useCallback(() => {
-    getAiStatus().then(setAi).catch(() => setAi(null))
-  }, [])
+    if (!roomId) {
+      setAi(null)
+      return
+    }
+    getAiStatus(roomId).then(setAi).catch(() => setAi(null))
+  }, [roomId])
 
   useEffect(() => {
     load()
@@ -74,12 +80,179 @@ function AiStatusCard() {
         {row('Failures (streak)', ai?.api_consecutive_failures ?? '—')}
         {row('Last error', ai?.last_error)}
       </div>
-      <p className="text-[10px] text-gray-600 mt-3">Refreshes every 5s · logic_engine always safe if AI fails</p>
+      <p className="text-[10px] text-gray-600 mt-3">Room-scoped · refreshes every 5s</p>
     </div>
   )
 }
 
-// ── Config warning banner ─────────────────────────────────────────────────────
+function RoomHealthCard({ health }) {
+  if (!health) return null
+  const { climate, sensors, ai, fetched_at } = health
+  const row = (name, v) => (
+    <div key={name} className="flex items-center justify-between text-xs gap-2">
+      <span className="text-gray-500 shrink-0">{name}</span>
+      <span>
+        {v === null ? <span className="text-gray-600">n/a</span>
+          : v ? <span className="text-green-400">OK</span> : <span className="text-red-400">Unavailable</span>}
+      </span>
+    </div>
+  )
+  return (
+    <div className="card border border-gray-800/80">
+      <div className="flex items-center justify-between mb-3 gap-2">
+        <p className="text-xs text-gray-500 uppercase tracking-wide">Room health</p>
+        <span className="text-[10px] text-gray-600 font-mono truncate max-w-[200px]" title={fetched_at || ''}>
+          Fetched {fetched_at ? new Date(fetched_at).toLocaleString() : '—'}
+        </span>
+      </div>
+      <div className="grid sm:grid-cols-2 gap-4">
+        <div className="space-y-2">
+          <p className="text-[10px] text-gray-600 uppercase tracking-wide">Climate entity</p>
+          <div className="text-xs space-y-1.5">
+            <div className="flex justify-between gap-2">
+              <span className="text-gray-500">HA availability</span>
+              <span className={climate?.available ? 'text-green-400' : 'text-red-400'}>
+                {climate?.available ? 'Available' : 'Unavailable'}
+              </span>
+            </div>
+            <div className="flex justify-between gap-2">
+              <span className="text-gray-500">State</span>
+              <span className="font-mono text-gray-200 truncate" title={climate?.state}>{climate?.state ?? '—'}</span>
+            </div>
+            <div className="flex justify-between gap-2">
+              <span className="text-gray-500">Last HA update</span>
+              <span className="text-gray-300 text-right truncate" title={climate?.last_updated}>
+                {climate?.last_updated ? new Date(climate.last_updated).toLocaleString() : '—'}
+              </span>
+            </div>
+          </div>
+        </div>
+        <div className="space-y-2">
+          <p className="text-[10px] text-gray-600 uppercase tracking-wide">Sensors · AI</p>
+          <div className="space-y-1">
+            {row('Indoor temp', sensors?.indoor_temp)}
+            {row('Presence', sensors?.presence)}
+            {row('Power', sensors?.energy_power)}
+            {row('Energy meter', sensors?.energy_kwh)}
+            <div className="flex justify-between text-xs pt-1.5 mt-1 border-t border-gray-800 gap-2">
+              <span className="text-gray-500">AI</span>
+              <span className="text-violet-300 font-medium truncate" title={ai?.last_error || ''}>
+                {ai?.status ?? '—'}{ai?.circuit_open ? ' · circuit open' : ''}
+              </span>
+            </div>
+            {ai?.last_call && (
+              <p className="text-[10px] text-gray-600">Last inference: {formatAiTime(ai.last_call)}</p>
+            )}
+            {ai?.last_error && (
+              <p className="text-[10px] text-red-400 break-words">{ai.last_error}</p>
+            )}
+          </div>
+        </div>
+      </div>
+    </div>
+  )
+}
+
+// ── Room selector (multi-room) ────────────────────────────────────────────────
+function RoomStrip({ rooms, activeId, onSelect, onRoomAdded }) {
+  const [open, setOpen] = useState(false)
+  const [name, setName] = useState('')
+  const [entity, setEntity] = useState('')
+  const [busy, setBusy] = useState(false)
+
+  const submit = (e) => {
+    e.preventDefault()
+    if (!entity.trim()) return
+    setBusy(true)
+    createRoom({ name: name.trim() || 'Room', climate_entity: entity.trim() })
+      .then(() => {
+        setName('')
+        setEntity('')
+        setOpen(false)
+        onRoomAdded?.()
+      })
+      .catch(console.error)
+      .finally(() => setBusy(false))
+  }
+
+  if (!rooms?.length && !open) {
+    return (
+      <div className="px-6 py-2 bg-gray-900 border-b border-gray-800 flex flex-wrap items-center gap-3 text-sm">
+        <span className="text-amber-400">No rooms configured.</span>
+        <button type="button" onClick={() => setOpen(true)} className="text-blue-400 hover:underline text-xs">Add room</button>
+        {open && (
+          <form onSubmit={submit} className="flex flex-wrap items-center gap-2 text-xs">
+            <input
+              className="bg-gray-800 border border-gray-600 rounded px-2 py-1 w-32"
+              placeholder="Name"
+              value={name}
+              onChange={e => setName(e.target.value)}
+            />
+            <input
+              className="bg-gray-800 border border-gray-600 rounded px-2 py-1 w-48"
+              placeholder="climate.entity_id"
+              value={entity}
+              onChange={e => setEntity(e.target.value)}
+              required
+            />
+            <button type="submit" disabled={busy} className="px-2 py-1 bg-blue-600 rounded disabled:opacity-40">Save</button>
+          </form>
+        )}
+      </div>
+    )
+  }
+
+  const active = rooms.find(r => r.id === activeId)
+
+  return (
+    <div className="px-6 py-3 bg-gray-900/95 border-b border-gray-800 flex flex-wrap items-center gap-3 text-sm">
+      <div className="flex flex-col min-w-0 flex-1 sm:flex-none sm:max-w-[min(100%,280px)]">
+        <span className="text-[10px] text-gray-500 uppercase tracking-wide">Active room</span>
+        <span className="text-base font-semibold text-gray-100 truncate" title={active?.name}>
+          {active?.name || '—'}
+        </span>
+        {active?.climate_entity && (
+          <span className="text-[11px] text-gray-500 font-mono truncate" title={active.climate_entity}>
+            {active.climate_entity}
+          </span>
+        )}
+      </div>
+      <label className="text-gray-500 text-xs uppercase tracking-wide shrink-0 hidden sm:block">Switch</label>
+      <select
+        className={`bg-gray-800 border rounded-lg px-2 py-1.5 text-xs text-gray-100 max-w-[200px] ${
+          activeId ? 'border-blue-500/70 ring-1 ring-blue-500/25' : 'border-gray-600'
+        }`}
+        value={activeId || ''}
+        onChange={e => onSelect(e.target.value || null)}
+      >
+        <option value="">Select room…</option>
+        {rooms.map(r => (
+          <option key={r.id} value={r.id}>{r.name || r.id}</option>
+        ))}
+      </select>
+      <button type="button" onClick={() => setOpen(v => !v)} className="text-xs text-blue-400 hover:underline">
+        {open ? 'Cancel' : '+ Add room'}
+      </button>
+      {open && (
+        <form onSubmit={submit} className="flex flex-wrap items-center gap-2 text-xs">
+          <input
+            className="bg-gray-800 border border-gray-600 rounded px-2 py-1 w-28"
+            placeholder="Name"
+            value={name}
+            onChange={e => setName(e.target.value)}
+          />
+          <input
+            className="bg-gray-800 border border-gray-600 rounded px-2 py-1 w-44"
+            placeholder="climate.entity"
+            value={entity}
+            onChange={e => setEntity(e.target.value)}
+          />
+          <button type="submit" disabled={busy} className="px-2 py-1 bg-blue-600 rounded disabled:opacity-40">Add</button>
+        </form>
+      )}
+    </div>
+  )
+}
 function ConfigWarning() {
   const navigate = useNavigate()
   return (
@@ -169,13 +342,15 @@ function LiveStatusBar({ status }) {
 }
 
 // ── Today / ML quality strip ──────────────────────────────────────────────────
-function StatsStrip({ stats }) {
+function StatsStrip({ stats, roomName }) {
   const today = stats?.today || {}
   const ml    = stats?.ml    || {}
   return (
     <div className="grid grid-cols-2 gap-4">
       <div className="card">
-        <p className="text-xs text-gray-500 uppercase tracking-wide mb-3">Today</p>
+        <p className="text-xs text-gray-500 uppercase tracking-wide mb-3">
+          Today{roomName ? <span className="normal-case text-gray-400 font-medium"> · {roomName}</span> : null}
+        </p>
         <div className="grid grid-cols-2 gap-y-2 text-sm">
           <span className="text-gray-400">Sessions</span>
           <span className="font-semibold">{today.session_count ?? 0}</span>
@@ -189,7 +364,9 @@ function StatsStrip({ stats }) {
       </div>
 
       <div className="card">
-        <p className="text-xs text-gray-500 uppercase tracking-wide mb-3">ML Data Quality</p>
+        <p className="text-xs text-gray-500 uppercase tracking-wide mb-3">
+          ML Data Quality{roomName ? <span className="normal-case text-gray-400 font-medium"> · {roomName}</span> : null}
+        </p>
         <div className="grid grid-cols-2 gap-y-2 text-sm">
           <span className="text-gray-400">Total sessions</span>
           <span className="font-semibold">{ml.total_sessions ?? 0}</span>
@@ -403,39 +580,115 @@ export default function Dashboard() {
   const [status,    setStatus]    = useState(null)
   const [snapshots, setSnapshots] = useState([])
   const [stats,     setStats]     = useState(null)
+  const [rooms,     setRooms]     = useState([])
+  const [activeRoomId, setActiveRoomId] = useState(null)
   const pollRef = useRef(null)
 
-  const fetchStatus = useCallback(() => {
-    // /api/status is the ONLY source of truth for ac_on, presence, watts, indoor_temp.
-    // No other endpoint or local state should override these values.
-    getStatus()
-      .then(setStatus)
-      .catch(err => console.warn('[HawaAI] Status poll error:', err))
+  const reloadRooms = useCallback(() => {
+    return getRooms()
+      .then(r => {
+        const list = r.rooms || []
+        setRooms(list)
+        return list
+      })
+      .catch(err => {
+        console.warn('[HawaAI] Rooms load error:', err)
+        return []
+      })
   }, [])
 
-  // Initial data load + poll /api/status every 5 seconds
   useEffect(() => {
+    reloadRooms().then(list => {
+      const stored = typeof localStorage !== 'undefined' ? localStorage.getItem(ROOM_LS) : null
+      const byStored = stored ? list.find(x => x.id === stored)?.id : null
+      const only = list.length === 1 ? list[0].id : null
+      setActiveRoomId(byStored ?? only ?? null)
+    })
+  }, [reloadRooms])
+
+  useEffect(() => {
+    if (typeof localStorage === 'undefined') return
+    if (activeRoomId) localStorage.setItem(ROOM_LS, activeRoomId)
+    else localStorage.removeItem(ROOM_LS)
+  }, [activeRoomId])
+
+  useEffect(() => {
+    if (!rooms.length) return
+    if (activeRoomId && !rooms.some(r => r.id === activeRoomId)) {
+      setActiveRoomId(rooms.length === 1 ? rooms[0].id : null)
+    }
+  }, [rooms, activeRoomId])
+
+  const fetchStatus = useCallback(() => {
+    if (!activeRoomId) return
+    getStatus(activeRoomId)
+      .then(setStatus)
+      .catch(err => console.warn('[HawaAI] Status poll error:', err))
+  }, [activeRoomId])
+
+  useEffect(() => {
+    if (!activeRoomId) {
+      setStatus(null)
+      setStats(null)
+      setSnapshots([])
+      return
+    }
     fetchStatus()
-    getSessionStats().then(setStats).catch(console.error)
-    getSnapshots(120).then(setSnapshots).catch(console.error)
+    getSessionStats(activeRoomId).then(setStats).catch(console.error)
+    getSnapshots(120, activeRoomId).then(setSnapshots).catch(console.error)
 
     pollRef.current = setInterval(fetchStatus, 5_000)
     return () => clearInterval(pollRef.current)
-  }, [fetchStatus])
+  }, [fetchStatus, activeRoomId])
 
-  // Refresh snapshots every 30 seconds
   useEffect(() => {
+    if (!activeRoomId) return
+    const { close } = connectLive(
+      activeRoomId,
+      (msg) => {
+        if (msg?.room_id && msg.room_id !== activeRoomId) return
+        if (msg?.type === 'tick') {
+          const { type: _t, ...rest } = msg
+          setStatus(prev => {
+            if (!prev || prev.room_id !== activeRoomId) return prev
+            return { ...prev, ...rest }
+          })
+        }
+      },
+      () => {},
+    )
+    return () => close()
+  }, [activeRoomId])
+
+  useEffect(() => {
+    if (!activeRoomId) return
     const id = setInterval(() => {
-      getSnapshots(120).then(setSnapshots).catch(console.error)
+      getSnapshots(120, activeRoomId).then(setSnapshots).catch(console.error)
     }, 30_000)
     return () => clearInterval(id)
-  }, [])
+  }, [activeRoomId])
 
-  const configIncomplete = status && status.config_complete === false
+  const activeRoom = rooms.find(r => r.id === activeRoomId)
+  const configIncomplete = Boolean(activeRoomId && status && status.config_complete === false)
 
   return (
     <div className="flex flex-col h-full">
+      <RoomStrip
+        rooms={rooms}
+        activeId={activeRoomId}
+        onSelect={setActiveRoomId}
+        onRoomAdded={() => reloadRooms().then(list => {
+          const last = list[list.length - 1]
+          if (last?.id) setActiveRoomId(last.id)
+        })}
+      />
       <LiveStatusBar status={status} />
+
+      {!activeRoomId && rooms.length > 0 && (
+        <div className="mx-6 mt-4 px-4 py-3 bg-gray-800/50 border border-gray-700 rounded-lg text-sm text-gray-300">
+          Select a room above to load dashboard data. Each room is isolated — APIs require an explicit room.
+        </div>
+      )}
 
       {configIncomplete && <ConfigWarning />}
 
@@ -503,7 +756,8 @@ export default function Dashboard() {
           </div>
         </div>
 
-        <AiStatusCard />
+        <AiStatusCard roomId={activeRoomId} />
+        <RoomHealthCard health={status?.health} />
 
         {/* Climate card — only shown when a climate entity is configured */}
         {(status?.climate_entity || status?.ac_entity) && (
@@ -514,7 +768,7 @@ export default function Dashboard() {
         <LiveSessionCard status={status} />
 
         {/* Insights — read-only analytics from completed sessions */}
-        <InsightsCard />
+        <InsightsCard roomId={activeRoomId} />
 
         {/* Real-time chart */}
         <div className="card">
@@ -531,11 +785,11 @@ export default function Dashboard() {
         </div>
 
         {/* Session table + today/ML stats */}
-        <StatsStrip stats={stats} />
+        <StatsStrip stats={stats} roomName={activeRoom?.name} />
 
         <div className="card">
           <p className="text-xs text-gray-500 uppercase tracking-wide mb-4">Recent Sessions</p>
-          <SessionTable limit={10} />
+          <SessionTable limit={10} roomId={activeRoomId} />
         </div>
       </div>
     </div>

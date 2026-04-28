@@ -3,8 +3,10 @@ import {
   BarChart, Bar, LineChart, Line, XAxis, YAxis,
   Tooltip, ResponsiveContainer, CartesianGrid, Legend,
 } from 'recharts'
-import { getDailyStats, getSessionStats, downloadExport } from '../api/smartcool.js'
+import { getDailyStats, getSessionStats, downloadExport, getRooms } from '../api/smartcool.js'
 import { Download, TrendingDown, Zap, Clock } from 'lucide-react'
+
+const ROOM_LS = 'hawaai_active_room'
 
 // ── Summary KPI card ──────────────────────────────────────────────────────────
 function KpiCard({ icon: Icon, label, value, sub, color = 'text-blue-400' }) {
@@ -40,15 +42,36 @@ export default function Analytics() {
   const [stats,    setStats]    = useState(null)
   const [days,     setDays]     = useState(7)
   const [exporting, setExporting] = useState(false)
+  const [rooms, setRooms] = useState([])
+  const [roomId, setRoomId] = useState(null)
 
   useEffect(() => {
-    getDailyStats(days).then(setDaily).catch(console.error)
-    getSessionStats().then(setStats).catch(console.error)
-  }, [days])
+    getRooms()
+      .then(r => {
+        const list = r.rooms || []
+        setRooms(list)
+        const stored = typeof localStorage !== 'undefined' ? localStorage.getItem(ROOM_LS) : null
+        const byStored = stored ? list.find(x => x.id === stored)?.id : null
+        const only = list.length === 1 ? list[0].id : null
+        setRoomId(byStored ?? only ?? null)
+      })
+      .catch(console.error)
+  }, [])
+
+  useEffect(() => {
+    if (!roomId) {
+      setDaily([])
+      setStats(null)
+      return
+    }
+    getDailyStats(days, roomId).then(setDaily).catch(console.error)
+    getSessionStats(roomId).then(setStats).catch(console.error)
+  }, [days, roomId])
 
   const handleExport = async (fmt) => {
+    if (!roomId) return
     setExporting(true)
-    try { await downloadExport(fmt) }
+    try { await downloadExport(fmt, roomId) }
     catch (e) { console.error(e) }
     finally { setExporting(false) }
   }
@@ -59,13 +82,37 @@ export default function Analytics() {
   const totalKwh  = daily.reduce((s, d) => s + (d.kwh  || 0), 0)
   const totalCost = daily.reduce((s, d) => s + (d.cost || 0), 0)
 
+  const activeRoom = rooms.find(r => r.id === roomId)
+
   return (
     <div className="p-6 space-y-6">
       {/* Header */}
-      <div className="flex items-center justify-between">
-        <h1 className="text-xl font-bold">Analytics</h1>
+      <div className="flex flex-wrap items-center justify-between gap-4">
+        <div>
+          <h1 className="text-xl font-bold">Analytics</h1>
+          {activeRoom?.name && (
+            <p className="text-xs text-gray-500 mt-1">Room: <span className="text-gray-300 font-medium">{activeRoom.name}</span></p>
+          )}
+        </div>
 
-        <div className="flex items-center gap-3">
+        <div className="flex flex-wrap items-center gap-3">
+          <div>
+            <label className="text-[10px] text-gray-500 uppercase block mb-0.5">Room</label>
+            <select
+              className="bg-gray-800 border border-blue-500/40 rounded-lg px-2 py-1.5 text-sm text-gray-100"
+              value={roomId || ''}
+              onChange={e => {
+                const id = e.target.value
+                setRoomId(id || null)
+                if (id && typeof localStorage !== 'undefined') localStorage.setItem(ROOM_LS, id)
+              }}
+            >
+              <option value="">Select…</option>
+              {rooms.map(r => (
+                <option key={r.id} value={r.id}>{r.name || r.id}</option>
+              ))}
+            </select>
+          </div>
           {/* Period selector */}
           <div className="flex bg-gray-900 border border-gray-800 rounded-lg overflow-hidden text-sm">
             {[7, 14, 30].map(d => (
@@ -83,7 +130,7 @@ export default function Analytics() {
           <div className="flex gap-2">
             <button
               onClick={() => handleExport('csv')}
-              disabled={exporting}
+              disabled={exporting || !roomId}
               className="flex items-center gap-1.5 px-3 py-1.5 bg-green-700 hover:bg-green-600 disabled:opacity-50 rounded-lg text-sm font-medium transition-colors"
             >
               <Download size={14} />
@@ -91,7 +138,7 @@ export default function Analytics() {
             </button>
             <button
               onClick={() => handleExport('json')}
-              disabled={exporting}
+              disabled={exporting || !roomId}
               className="flex items-center gap-1.5 px-3 py-1.5 bg-gray-700 hover:bg-gray-600 disabled:opacity-50 rounded-lg text-sm font-medium transition-colors"
             >
               <Download size={14} />
@@ -100,6 +147,12 @@ export default function Analytics() {
           </div>
         </div>
       </div>
+
+      {!roomId && rooms.length > 0 && (
+        <div className="px-4 py-3 bg-gray-800/60 border border-gray-700 rounded-lg text-sm text-gray-300">
+          Select a room to load analytics. All metrics and exports are scoped to that room only.
+        </div>
+      )}
 
       {/* KPI strip */}
       <div className="grid grid-cols-4 gap-4">

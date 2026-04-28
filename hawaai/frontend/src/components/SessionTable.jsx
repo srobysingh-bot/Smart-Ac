@@ -74,17 +74,27 @@ function QualityBadge({ quality }) {
 
 // ── Component ─────────────────────────────────────────────────────────────────
 
-export default function SessionTable({ limit = 10 }) {
+export default function SessionTable({ limit = 10, roomId }) {
   const [sessions,    setSessions]    = useState([])
   const [loading,     setLoading]     = useState(true)
   const [showInvalid, setShowInvalid] = useState(false)
 
   useEffect(() => {
-    getSessions({ limit })
+    if (!roomId) {
+      setSessions([])
+      setLoading(false)
+      return
+    }
+    setLoading(true)
+    getSessions({ limit, room_id: roomId })
       .then(r => setSessions(r.sessions || []))
       .catch(console.error)
       .finally(() => setLoading(false))
-  }, [limit])
+  }, [limit, roomId])
+
+  if (!roomId) {
+    return <p className="text-sm text-gray-500 py-4 text-center">Select a room to list sessions.</p>
+  }
 
   if (loading) {
     return <p className="text-sm text-gray-500 py-4 text-center">Loading…</p>

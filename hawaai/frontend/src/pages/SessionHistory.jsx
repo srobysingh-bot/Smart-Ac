@@ -1,8 +1,9 @@
 import { useCallback, useEffect, useState } from 'react'
-import { getSessions } from '../api/smartcool.js'
+import { getSessions, getRooms } from '../api/smartcool.js'
 import { ChevronLeft, ChevronRight, ChevronDown, ChevronUp, Filter } from 'lucide-react'
 
 const PAGE_SIZE = 20
+const ROOM_LS = 'hawaai_active_room'
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -136,17 +137,38 @@ export default function SessionHistory() {
   const [filter,      setFilter]      = useState('all')   // 'all' | 'valid' | 'fast'
   const [showInvalid, setShowInvalid] = useState(false)
   const [loading,     setLoading]     = useState(false)
+  const [rooms,       setRooms]       = useState([])
+  const [activeRoomId, setActiveRoomId] = useState(null)
+
+  useEffect(() => {
+    getRooms()
+      .then(r => {
+        const list = r.rooms || []
+        setRooms(list)
+        const stored = typeof localStorage !== 'undefined' ? localStorage.getItem(ROOM_LS) : null
+        const byStored = stored ? list.find(x => x.id === stored)?.id : null
+        const only = list.length === 1 ? list[0].id : null
+        setActiveRoomId(byStored ?? only ?? null)
+      })
+      .catch(console.error)
+  }, [])
 
   const load = useCallback(() => {
+    if (!activeRoomId) {
+      setSessions([])
+      setTotal(0)
+      setLoading(false)
+      return
+    }
     setLoading(true)
-    const params = { limit: PAGE_SIZE, offset: page * PAGE_SIZE }
+    const params = { limit: PAGE_SIZE, offset: page * PAGE_SIZE, room_id: activeRoomId }
     if (dateFrom) params.date_from = dateFrom
     if (dateTo)   params.date_to   = dateTo + 'T23:59:59'
     getSessions(params)
       .then(r => { setSessions(r.sessions || []); setTotal(r.total || 0) })
       .catch(console.error)
       .finally(() => setLoading(false))
-  }, [page, dateFrom, dateTo])
+  }, [page, dateFrom, dateTo, activeRoomId])
 
   useEffect(() => { load() }, [load])
 
@@ -172,7 +194,28 @@ export default function SessionHistory() {
     <div className="p-6 space-y-4">
       <div className="flex items-center justify-between">
         <h1 className="text-xl font-bold">Session History</h1>
-        <span className="text-sm text-gray-500">{total} total sessions</span>
+        <span className="text-sm text-gray-500">{activeRoomId ? `${total} sessions (this room)` : 'Select a room'}</span>
+      </div>
+
+      <div className="card flex flex-wrap items-center gap-3">
+        <div>
+          <label className="text-xs text-gray-500 block mb-1">Room</label>
+          <select
+            className="bg-gray-800 border border-blue-500/40 rounded-lg px-3 py-2 text-sm text-gray-100"
+            value={activeRoomId || ''}
+            onChange={e => {
+              const id = e.target.value
+              setActiveRoomId(id || null)
+              setPage(0)
+              if (id && typeof localStorage !== 'undefined') localStorage.setItem(ROOM_LS, id)
+            }}
+          >
+            <option value="">Select room…</option>
+            {rooms.map(r => (
+              <option key={r.id} value={r.id}>{r.name || r.id}</option>
+            ))}
+          </select>
+        </div>
       </div>
 
       {/* Filters */}
@@ -207,6 +250,11 @@ export default function SessionHistory() {
       </div>
 
       {/* Table */}
+      {!activeRoomId ? (
+        <div className="card">
+          <p className="text-sm text-gray-500 p-6 text-center">Choose a room to view session history for that room only.</p>
+        </div>
+      ) : (
       <div className="card overflow-x-auto">
         <table className="w-full text-sm">
           <thead>
@@ -291,9 +339,10 @@ export default function SessionHistory() {
           </button>
         )}
       </div>
+      )}
 
       {/* Pagination */}
-      {totalPages > 1 && (
+      {activeRoomId && totalPages > 1 && (
         <div className="flex items-center justify-center gap-4 pt-2">
           <button
             onClick={() => setPage(p => Math.max(0, p - 1))}

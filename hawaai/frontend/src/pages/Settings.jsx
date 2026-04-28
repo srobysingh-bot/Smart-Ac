@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useState } from 'react'
-import { getConfig, getEntities, getDevices, getDeviceEntities, patchConfig, getStatus, setAiEnabled, updateAiConfig } from '../api/smartcool.js'
+import { getConfig, getEntities, getDevices, getDeviceEntities, patchConfig, getWeather, setAiEnabled, updateAiConfig } from '../api/smartcool.js'
 import { Save, RefreshCw, AlertCircle, CheckCircle2, Eye, EyeOff } from 'lucide-react'
 
 // ── Reusable field components ─────────────────────────────────────────────────
@@ -218,8 +218,8 @@ export default function Settings() {
       .catch(err => setDevicesError(String(err)))
 
     // Fetch outdoor temp for Smart Adjustment preview
-    getStatus()
-      .then(s => setOutdoorTemp(s.outdoor_temp ?? null))
+    getWeather()
+      .then(w => setOutdoorTemp(w.outdoor_temp ?? null))
       .catch(() => {})
   }, [])
 

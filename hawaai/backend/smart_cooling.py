@@ -26,6 +26,7 @@ Modes:
 """
 
 import logging
+from collections import defaultdict
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -95,44 +96,54 @@ def _resolve_fan_mode_for_entity(
     return None, log_frag, "unsupported"
 
 
-# ── Module-level state (in-memory, never persisted) ───────────────────────────
+# ── Per-room state (in-memory, never persisted) ───────────────────────────────
 
-# Fan-mode optimizer state
-_current_mode:         str               = "hold"
-_last_adjustment_time: Optional[datetime] = None
-_last_fan_mode:        Optional[str]      = None  # last value **sent to HA** (entity-native)
-
-# Effective-target dispatcher state
 _APPLY_TARGET_COOLDOWN = 180          # seconds between temperature commands
-_last_apply_target_time: Optional[datetime] = None
-_last_applied_target:    Optional[float]    = None
+
+
+def _new_room_state() -> Dict[str, Any]:
+    return {
+        "current_mode": "hold",
+        "last_adjustment_time": None,
+        "last_fan_mode": None,
+        "last_apply_target_time": None,
+        "last_applied_target": None,
+    }
+
+
+_room_state: Dict[str, Dict[str, Any]] = defaultdict(_new_room_state)
+
+
+def _rs(room_id: str) -> Dict[str, Any]:
+    return _room_state[room_id]
 
 
 # ── Public accessors ──────────────────────────────────────────────────────────
 
-def get_state() -> Dict[str, Any]:
+def get_state(room_id: str) -> Dict[str, Any]:
     """Returns current smart cooling state for /api/status and /api/runtime."""
+    st = _rs(room_id)
     return {
-        "smart_mode":          _current_mode,
-        "smart_fan_mode":      _last_fan_mode,
-        "last_applied_target": _last_applied_target,
+        "smart_mode":          st["current_mode"],
+        "smart_fan_mode":      st["last_fan_mode"],
+        "last_applied_target": st["last_applied_target"],
     }
 
 
-def reset() -> None:
-    """Reset all smart cooling state when a session ends or AC turns off."""
-    global _current_mode, _last_adjustment_time, _last_fan_mode, \
-           _last_apply_target_time, _last_applied_target
-    _current_mode           = "hold"
-    _last_adjustment_time   = None
-    _last_fan_mode          = None
-    _last_apply_target_time = None
-    _last_applied_target    = None
+def reset(room_id: str) -> None:
+    """Reset smart cooling state for one room when a session ends or AC turns off."""
+    st = _rs(room_id)
+    st["current_mode"] = "hold"
+    st["last_adjustment_time"] = None
+    st["last_fan_mode"] = None
+    st["last_apply_target_time"] = None
+    st["last_applied_target"] = None
 
 
 # ── Core function ─────────────────────────────────────────────────────────────
 
 async def apply_smart_cooling(
+    room_id: str,
     indoor_temp:    float,
     target_temp:    float,
     ac_on:          bool,
@@ -162,11 +173,10 @@ async def apply_smart_cooling(
       fan_mode — target fan mode string, or None if no action
       action   — short string describing what happened this tick
     """
-    global _current_mode, _last_adjustment_time, _last_fan_mode
-
+    st = _rs(room_id)
     delta = round(indoor_temp - target_temp, 2)
     result: Dict[str, Any] = {
-        "mode":     _current_mode,
+        "mode":     st["current_mode"],
         "delta":    delta,
         "fan_mode": None,
         "action":   "no_change",
@@ -184,12 +194,12 @@ async def apply_smart_cooling(
 
     # AC must be actively cooling (compressor ON) — not idle, not off
     if not ac_on or ac_idle:
-        _current_mode = "hold"
+        st["current_mode"] = "hold"
         result.update(mode="hold", action="ac_off_or_idle")
         return result
 
     if not is_occupied:
-        _current_mode = "hold"
+        st["current_mode"] = "hold"
         result.update(mode="hold", action="vacant")
         return result
 
@@ -203,8 +213,8 @@ async def apply_smart_cooling(
         target_fan_mode = FAN_NORMAL
     else:
         # Comfortable — reset to hold but don't issue a fan command
-        _current_mode       = "hold"
-        _last_fan_mode      = None   # allow re-applying next time room heats up
+        st["current_mode"] = "hold"
+        st["last_fan_mode"] = None   # allow re-applying next time room heats up
         result.update(mode="hold", action="no_change")
         logger.info(
             "[HawaAI] Smart Mode: hold | Delta: %.1f°C (≤ %.1f°C threshold)",
@@ -217,7 +227,7 @@ async def apply_smart_cooling(
 
     # ── No climate entity — log only, no service call ────────────────────────
     if not climate_entity:
-        _current_mode    = target_mode
+        st["current_mode"]    = target_mode
         result["action"] = "no_climate_entity"
         logger.info(
             "[HawaAI] Smart Mode: %s | Delta: %.1f°C | Fan target: %s "
@@ -247,7 +257,7 @@ async def apply_smart_cooling(
     )
 
     if resolved is None:
-        _current_mode    = target_mode
+        st["current_mode"]    = target_mode
         result["action"]  = "fan_mode_unsupported"
         logger.warning(
             "[HawaAI] Fan mode not supported — skipping (logical=%r, %s) "
@@ -262,9 +272,9 @@ async def apply_smart_cooling(
 
     # Skip if AC already reports this *entity-native* mode
     if cur_norm and cur_norm == res_norm:
-        _current_mode    = target_mode
+        st["current_mode"]    = target_mode
         result["action"] = "skip_same"
-        _last_fan_mode   = resolved
+        st["last_fan_mode"]   = resolved
         logger.info(
             "[HawaAI] smart_cooling fan: skipped (AC already at %r, current=%r)",
             resolved, cur_fan,
@@ -272,8 +282,8 @@ async def apply_smart_cooling(
         return result
 
     # Compare to last *applied* entity-native value (HA state may lag one tick)
-    if _last_fan_mode is not None and str(_last_fan_mode).lower() == res_norm:
-        _current_mode    = target_mode
+    if st["last_fan_mode"] is not None and str(st["last_fan_mode"]).lower() == res_norm:
+        st["current_mode"]    = target_mode
         result["action"] = "skip_same"
         logger.debug(
             "[HawaAI] Smart Mode: %s — last fan command was already %r, no resend",
@@ -283,10 +293,10 @@ async def apply_smart_cooling(
 
     # ── Cooldown guard ────────────────────────────────────────────────────────
     now = datetime.now(timezone.utc)
-    if _last_adjustment_time is not None:
-        secs_since = (now - _last_adjustment_time).total_seconds()
+    if st["last_adjustment_time"] is not None:
+        secs_since = (now - st["last_adjustment_time"]).total_seconds()
         if secs_since < ADJUSTMENT_COOLDOWN:
-            _current_mode    = target_mode
+            st["current_mode"]    = target_mode
             result["action"] = "skip_cooldown"
             logger.debug(
                 "[HawaAI] Smart Mode: %s — adjustment cooldown %.0fs / %ds",
@@ -310,16 +320,16 @@ async def apply_smart_cooling(
     })
 
     if ok:
-        _current_mode         = target_mode
-        _last_fan_mode        = resolved
-        _last_adjustment_time = now
+        st["current_mode"]         = target_mode
+        st["last_fan_mode"]        = resolved
+        st["last_adjustment_time"] = now
         result["action"]      = "set_fan"
         logger.info(
             "[HawaAI] smart_cooling fan: applied %r (requested logical=%r) ✓",
             resolved, target_fan_mode,
         )
     else:
-        _current_mode    = target_mode
+        st["current_mode"]    = target_mode
         result["action"] = "set_fan_failed"
         # Do not set _last_fan_mode — will retry; temperature logic unaffected
         logger.error(
@@ -334,6 +344,7 @@ async def apply_smart_cooling(
 # ── Effective target dispatcher ───────────────────────────────────────────────
 
 async def apply_effective_target(
+    room_id: str,
     climate_entity:   str,
     effective_target: float,
     current_target:   Optional[float],
@@ -361,7 +372,7 @@ async def apply_effective_target(
       [HawaAI] Smart adj: outdoor=41.0°C → effective target 23.0°C (config=24.0°C)
       [HawaAI] Applied smart temp → 23.0°C
     """
-    global _last_apply_target_time, _last_applied_target
+    st = _rs(room_id)
 
     # ── Guards ────────────────────────────────────────────────────────────────
 
@@ -389,8 +400,8 @@ async def apply_effective_target(
 
     # Rate limiter: minimum 180 s between commands
     now = datetime.now(timezone.utc)
-    if _last_apply_target_time is not None:
-        secs = (now - _last_apply_target_time).total_seconds()
+    if st["last_apply_target_time"] is not None:
+        secs = (now - st["last_apply_target_time"]).total_seconds()
         if secs < _APPLY_TARGET_COOLDOWN:
             logger.debug(
                 "[HawaAI] apply_effective_target: cooldown %.0fs / %ds",
@@ -402,8 +413,8 @@ async def apply_effective_target(
     try:
         ok = await ha_client.set_climate_temperature(climate_entity, effective_f)
         if ok:
-            _last_apply_target_time = now
-            _last_applied_target    = effective_f
+            st["last_apply_target_time"] = now
+            st["last_applied_target"]    = effective_f
             logger.info(
                 "[HawaAI] Applied smart temp → %.1f°C  "
                 "(was %.1f°C on %s)",

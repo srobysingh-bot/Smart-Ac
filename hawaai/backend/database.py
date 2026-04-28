@@ -88,6 +88,8 @@ async def init_db() -> None:
             "ALTER TABLE sessions ADD COLUMN cooling_rate  REAL",   # °C / min
             "ALTER TABLE sessions ADD COLUMN cooling_type  TEXT",   # fast / normal / slow
             "ALTER TABLE sessions ADD COLUMN efficiency    REAL",   # °C / kWh
+            "ALTER TABLE sessions ADD COLUMN room_id TEXT DEFAULT ''",
+            "ALTER TABLE snapshots ADD COLUMN room_id TEXT DEFAULT ''",
         ):
             try:
                 await db.execute(col_sql)
@@ -203,8 +205,8 @@ async def insert_session_start(session: Dict[str, Any]) -> None:
                 (session_id, start_time, indoor_temp_start, outdoor_temp_start,
                  outdoor_humidity_start, target_temp, ac_entity_id, ac_brand,
                  ac_model, room_name, presence_trigger, energy_start_kwh,
-                 day_of_week, hour_of_day)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                 day_of_week, hour_of_day, room_id)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             """,
             (
                 session["session_id"],
@@ -221,6 +223,7 @@ async def insert_session_start(session: Dict[str, Any]) -> None:
                 session.get("energy_start_kwh"),
                 session.get("day_of_week"),
                 session.get("hour_of_day"),
+                session.get("room_id") or "",
             ),
         )
         await db.commit()
@@ -263,15 +266,17 @@ async def update_session_end(session_id: str, end_data: Dict[str, Any]) -> None:
 
 
 async def get_sessions(
+    room_id: str,
     limit: int = 50,
     offset: int = 0,
     date_from: Optional[str] = None,
     date_to: Optional[str] = None,
 ) -> List[Dict]:
+    rid = (room_id or "").strip()
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
-        query = "SELECT * FROM sessions WHERE is_archived = 0"
-        params: list = []
+        query = "SELECT * FROM sessions WHERE is_archived = 0 AND room_id = ?"
+        params: list = [rid]
         if date_from:
             query += " AND start_time >= ?"
             params.append(date_from)
@@ -287,12 +292,14 @@ async def get_sessions(
 
 
 async def get_session_count(
+    room_id: str,
     date_from: Optional[str] = None,
     date_to: Optional[str] = None,
 ) -> int:
+    rid = (room_id or "").strip()
     async with aiosqlite.connect(DB_PATH) as db:
-        query = "SELECT COUNT(*) FROM sessions WHERE is_archived = 0"
-        params: list = []
+        query = "SELECT COUNT(*) FROM sessions WHERE is_archived = 0 AND room_id = ?"
+        params: list = [rid]
         if date_from:
             query += " AND start_time >= ?"
             params.append(date_from)
@@ -304,11 +311,13 @@ async def get_session_count(
             return row[0] if row else 0
 
 
-async def get_all_sessions_for_export() -> List[Dict]:
+async def get_all_sessions_for_export(room_id: str) -> List[Dict]:
+    rid = (room_id or "").strip()
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         async with db.execute(
-            "SELECT * FROM sessions ORDER BY start_time DESC"
+            "SELECT * FROM sessions WHERE room_id = ? ORDER BY start_time DESC",
+            (rid,),
         ) as cursor:
             rows = await cursor.fetchall()
             return [_enrich_session(dict(r)) for r in rows]
@@ -335,8 +344,8 @@ async def insert_snapshot(snapshot: Dict[str, Any]) -> None:
         await db.execute(
             """
             INSERT INTO snapshots
-                (session_id, timestamp, indoor_temp, outdoor_temp, ac_state, watt_draw, presence)
-            VALUES (?,?,?,?,?,?,?)
+                (session_id, timestamp, indoor_temp, outdoor_temp, ac_state, watt_draw, presence, room_id)
+            VALUES (?,?,?,?,?,?,?,?)
             """,
             (
                 snapshot.get("session_id"),
@@ -346,18 +355,24 @@ async def insert_snapshot(snapshot: Dict[str, Any]) -> None:
                 1 if snapshot.get("ac_state") else 0,
                 snapshot.get("watt_draw"),
                 1 if snapshot.get("presence") else 0,
+                snapshot.get("room_id") or "",
             ),
         )
         await db.commit()
 
 
-async def get_snapshots_recent(minutes: int = 120) -> List[Dict]:
+async def get_snapshots_recent(minutes: int = 120, room_id: str = "") -> List[Dict]:
     since = (datetime.utcnow() - timedelta(minutes=minutes)).isoformat()
+    rid = (room_id or "").strip()
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         async with db.execute(
-            "SELECT * FROM snapshots WHERE timestamp >= ? ORDER BY timestamp ASC",
-            (since,),
+            """
+            SELECT * FROM snapshots
+            WHERE timestamp >= ? AND room_id = ?
+            ORDER BY timestamp ASC
+            """,
+            (since, rid),
         ) as cursor:
             rows = await cursor.fetchall()
             return [dict(r) for r in rows]
@@ -367,7 +382,8 @@ async def get_snapshots_recent(minutes: int = 120) -> List[Dict]:
 # Stats
 # ─────────────────────────────────────────────────────────────────────────────
 
-async def get_today_stats() -> Dict[str, Any]:
+async def get_today_stats(room_id: str) -> Dict[str, Any]:
+    rid = (room_id or "").strip()
     today = datetime.utcnow().date().isoformat()
     tomorrow = (datetime.utcnow().date() + timedelta(days=1)).isoformat()
     async with aiosqlite.connect(DB_PATH) as db:
@@ -384,9 +400,9 @@ async def get_today_stats() -> Dict[str, Any]:
                     END
                 ), 0)                                 AS total_ac_minutes
             FROM sessions
-            WHERE start_time >= ? AND start_time < ? AND is_archived = 0
+            WHERE start_time >= ? AND start_time < ? AND is_archived = 0 AND room_id = ?
             """,
-            (today, tomorrow),
+            (today, tomorrow, rid),
         ) as cursor:
             row = await cursor.fetchone()
             if row:
@@ -399,7 +415,8 @@ async def get_today_stats() -> Dict[str, Any]:
     return {"session_count": 0, "total_kwh": 0.0, "total_cost": 0.0, "total_ac_minutes": 0.0}
 
 
-async def get_daily_stats(days: int = 7) -> List[Dict]:
+async def get_daily_stats(days: int = 7, room_id: str = "") -> List[Dict]:
+    rid = (room_id or "").strip()
     async with aiosqlite.connect(DB_PATH) as db:
         async with db.execute(
             """
@@ -410,11 +427,11 @@ async def get_daily_stats(days: int = 7) -> List[Dict]:
                 COALESCE(SUM(cost_estimate), 0)        AS cost,
                 COALESCE(AVG(time_to_cool_minutes), 0) AS avg_cool_time
             FROM sessions
-            WHERE start_time >= DATE('now', ?) AND is_archived = 0
+            WHERE start_time >= DATE('now', ?) AND is_archived = 0 AND room_id = ?
             GROUP BY DATE(start_time)
             ORDER BY date ASC
             """,
-            (f"-{days} days",),
+            (f"-{days} days", rid),
         ) as cursor:
             rows = await cursor.fetchall()
             return [
@@ -473,7 +490,7 @@ def _build_empty_insights(reason: str) -> Dict[str, Any]:
     }
 
 
-async def get_insights() -> Dict[str, Any]:
+async def get_insights(room_id: str) -> Dict[str, Any]:
     """
     Compute analytics insights at the API layer from enriched completed sessions.
 
@@ -489,6 +506,7 @@ async def get_insights() -> Dict[str, Any]:
     Never raises. Always returns valid JSON.
     """
     try:
+        rid = (room_id or "").strip()
         # ── Fetch recent completed sessions ───────────────────────────────────
         async with aiosqlite.connect(DB_PATH) as db:
             db.row_factory = aiosqlite.Row
@@ -497,9 +515,11 @@ async def get_insights() -> Dict[str, Any]:
                 SELECT * FROM sessions
                 WHERE end_time IS NOT NULL
                   AND is_archived = 0
+                  AND room_id = ?
                 ORDER BY start_time DESC
                 LIMIT 200
-                """
+                """,
+                (rid,),
             ) as cur:
                 rows = await cur.fetchall()
 
@@ -644,7 +664,8 @@ async def get_insights() -> Dict[str, Any]:
         return _build_empty_insights("error")
 
 
-async def get_ml_stats() -> Dict[str, Any]:
+async def get_ml_stats(room_id: str) -> Dict[str, Any]:
+    rid = (room_id or "").strip()
     async with aiosqlite.connect(DB_PATH) as db:
         async with db.execute(
             """
@@ -653,7 +674,9 @@ async def get_ml_stats() -> Dict[str, Any]:
                 AVG(time_to_cool_minutes) AS avg_cool,
                 COUNT(CASE WHEN end_time IS NOT NULL THEN 1 END) * 100.0 / MAX(COUNT(*), 1) AS completeness
             FROM sessions
-            """
+            WHERE room_id = ?
+            """,
+            (rid,),
         ) as cursor:
             row = await cursor.fetchone()
             if row:

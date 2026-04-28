@@ -1,5 +1,10 @@
 # HawaAI add-on — release notes
 
+## 1.3.1
+
+- Production multi-room isolation: room-scoped WebSocket subscribe/broadcast, required `room_id` on status, sessions, analytics, snapshots, exports, and AI status APIs.
+- Per-room analytics and dashboard health (climate, sensors, AI); stricter `merge_room_config` (no `rooms` blob leakage); `GET /api/weather` for uncoupled outdoor preview in Settings.
+
 ## 1.2.1
 
 - Fix: add-on build directory renamed to **`hawaai/`** to match the `slug: hawaai` in `config.yaml` (ensures `Dockerfile` and `config.yaml` are on the build path Home Assistant uses).
