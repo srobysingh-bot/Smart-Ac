@@ -1,5 +1,11 @@
 # HawaAI add-on — release notes
 
+## 1.3.3
+
+- **UX:** `RoomContext` — active room persists across Dashboard, Sessions, Analytics, and Settings (`localStorage` + `?room_id=` on all sidebar links).
+- **ML / data quality:** Every `ai_decisions` row has a **`snapshot_id`** (minimal snapshot if needed); optional **`indoor_humidity_entity`** and **`indoor_humidity`** on snapshots; **`time_to_target_minutes`** and **`temp_drop_rate`** from session snapshots; full **`raw_json`** (no truncation); **`user_adjusted`**, **`user_target_temp`**, **`adjustment_delay_seconds`** on AI rows (heuristic from climate vs AI setpoint).
+- API: room CRUD accepts **`indoor_humidity_entity`**.
+
 ## 1.3.2
 
 - Persistent SQLite at `/data/hawaai.db` with `map: data:rw`; automatic DB backup on add-on startup and shutdown (under `/data/hawaai_db_backups/`, pruned).

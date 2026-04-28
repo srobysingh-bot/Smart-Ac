@@ -3,10 +3,9 @@ import {
   BarChart, Bar, LineChart, Line, XAxis, YAxis,
   Tooltip, ResponsiveContainer, CartesianGrid, Legend,
 } from 'recharts'
-import { getDailyStats, getSessionStats, downloadExport, getRooms } from '../api/smartcool.js'
+import { getDailyStats, getSessionStats, downloadExport } from '../api/smartcool.js'
+import { useRoom } from '../context/RoomContext.jsx'
 import { Download, TrendingDown, Zap, Clock } from 'lucide-react'
-
-const ROOM_LS = 'hawaai_active_room'
 
 // ── Summary KPI card ──────────────────────────────────────────────────────────
 function KpiCard({ icon: Icon, label, value, sub, color = 'text-blue-400' }) {
@@ -38,25 +37,11 @@ function ChartTooltip({ active, payload, label }) {
 }
 
 export default function Analytics() {
+  const { rooms, activeRoomId: roomId, setActiveRoom } = useRoom()
   const [daily,    setDaily]    = useState([])
   const [stats,    setStats]    = useState(null)
   const [days,     setDays]     = useState(7)
   const [exporting, setExporting] = useState(false)
-  const [rooms, setRooms] = useState([])
-  const [roomId, setRoomId] = useState(null)
-
-  useEffect(() => {
-    getRooms()
-      .then(r => {
-        const list = r.rooms || []
-        setRooms(list)
-        const stored = typeof localStorage !== 'undefined' ? localStorage.getItem(ROOM_LS) : null
-        const byStored = stored ? list.find(x => x.id === stored)?.id : null
-        const only = list.length === 1 ? list[0].id : null
-        setRoomId(byStored ?? only ?? null)
-      })
-      .catch(console.error)
-  }, [])
 
   useEffect(() => {
     if (!roomId) {
@@ -103,8 +88,7 @@ export default function Analytics() {
               value={roomId || ''}
               onChange={e => {
                 const id = e.target.value
-                setRoomId(id || null)
-                if (id && typeof localStorage !== 'undefined') localStorage.setItem(ROOM_LS, id)
+                setActiveRoom(id || null)
               }}
             >
               <option value="">Select…</option>

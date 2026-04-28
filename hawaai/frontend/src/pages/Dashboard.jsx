@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState, useCallback } from 'react'
 import { useNavigate } from 'react-router-dom'
-import { getStatus, getSessionStats, getSnapshots, getClimateState, setClimateTemperature, setHvacMode, setFanMode, setSwingMode, getAiStatus, getRooms, createRoom, connectLive } from '../api/smartcool.js'
+import { getStatus, getSessionStats, getSnapshots, getClimateState, setClimateTemperature, setHvacMode, setFanMode, setSwingMode, getAiStatus, createRoom, connectLive } from '../api/smartcool.js'
+import { useRoom } from '../context/RoomContext.jsx'
 import ACStatusCard    from '../components/ACStatusCard.jsx'
 import TempGauge       from '../components/TempGauge.jsx'
 import EnergyChart from '../components/EnergyChart.jsx'
@@ -22,8 +23,6 @@ function formatAiTime(iso) {
     return iso
   }
 }
-
-const ROOM_LS = 'hawaai_active_room'
 
 function AiStatusCard({ roomId }) {
   const [ai, setAi] = useState(null)
@@ -257,12 +256,8 @@ function RoomStrip({ rooms, activeId, onSelect, onRoomAdded }) {
 function ConfigWarning({ roomId }) {
   const navigate = useNavigate()
   const go = () => {
-    const q = roomId
-      ? `?room_id=${encodeURIComponent(roomId)}`
-      : (typeof localStorage !== 'undefined' && localStorage.getItem(ROOM_LS))
-        ? `?room_id=${encodeURIComponent(localStorage.getItem(ROOM_LS))}`
-        : ''
-    navigate(`/settings${q}`)
+    const search = roomId ? `?room_id=${encodeURIComponent(roomId)}` : ''
+    navigate({ pathname: '/settings', search })
   }
   return (
     <div className="flex items-center gap-3 mx-6 mt-4 px-4 py-3 bg-yellow-900/40 border border-yellow-700 rounded-lg text-sm">
@@ -588,47 +583,11 @@ function ClimateCard({ entityId }) {
 // ── Page ──────────────────────────────────────────────────────────────────────
 export default function Dashboard() {
   const navigate = useNavigate()
+  const { activeRoomId, setActiveRoom, rooms, refreshRooms } = useRoom()
   const [status,    setStatus]    = useState(null)
   const [snapshots, setSnapshots] = useState([])
   const [stats,     setStats]     = useState(null)
-  const [rooms,     setRooms]     = useState([])
-  const [activeRoomId, setActiveRoomId] = useState(null)
   const pollRef = useRef(null)
-
-  const reloadRooms = useCallback(() => {
-    return getRooms()
-      .then(r => {
-        const list = r.rooms || []
-        setRooms(list)
-        return list
-      })
-      .catch(err => {
-        console.warn('[HawaAI] Rooms load error:', err)
-        return []
-      })
-  }, [])
-
-  useEffect(() => {
-    reloadRooms().then(list => {
-      const stored = typeof localStorage !== 'undefined' ? localStorage.getItem(ROOM_LS) : null
-      const byStored = stored ? list.find(x => x.id === stored)?.id : null
-      const only = list.length === 1 ? list[0].id : null
-      setActiveRoomId(byStored ?? only ?? null)
-    })
-  }, [reloadRooms])
-
-  useEffect(() => {
-    if (typeof localStorage === 'undefined') return
-    if (activeRoomId) localStorage.setItem(ROOM_LS, activeRoomId)
-    else localStorage.removeItem(ROOM_LS)
-  }, [activeRoomId])
-
-  useEffect(() => {
-    if (!rooms.length) return
-    if (activeRoomId && !rooms.some(r => r.id === activeRoomId)) {
-      setActiveRoomId(rooms.length === 1 ? rooms[0].id : null)
-    }
-  }, [rooms, activeRoomId])
 
   const fetchStatus = useCallback(() => {
     if (!activeRoomId) return
@@ -687,13 +646,12 @@ export default function Dashboard() {
       <RoomStrip
         rooms={rooms}
         activeId={activeRoomId}
-        onSelect={setActiveRoomId}
-        onRoomAdded={() => reloadRooms().then(list => {
+        onSelect={setActiveRoom}
+        onRoomAdded={() => refreshRooms().then(list => {
           const last = list[list.length - 1]
           if (last?.id) {
-            setActiveRoomId(last.id)
-            if (typeof localStorage !== 'undefined') localStorage.setItem(ROOM_LS, last.id)
-            navigate(`/settings?room_id=${encodeURIComponent(last.id)}`)
+            setActiveRoom(last.id)
+            navigate({ pathname: '/settings' })
           }
         })}
       />

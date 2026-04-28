@@ -6,6 +6,7 @@ import {
   Settings,
   Wind,
 } from 'lucide-react'
+import { RoomProvider, useRoom } from './context/RoomContext.jsx'
 import Dashboard      from './pages/Dashboard.jsx'
 import SessionHistory from './pages/SessionHistory.jsx'
 import Analytics      from './pages/Analytics.jsx'
@@ -19,9 +20,11 @@ const NAV_ITEMS = [
 ]
 
 function NavItem({ to, icon: Icon, label }) {
+  const { activeRoomId } = useRoom()
+  const suffix = activeRoomId ? `?room_id=${encodeURIComponent(activeRoomId)}` : ''
   return (
     <NavLink
-      to={to}
+      to={`${to}${suffix}`}
       end={to === '/'}
       className={({ isActive }) =>
         `flex items-center gap-3 px-3 py-2.5 rounded-lg text-sm font-medium transition-colors
@@ -40,7 +43,8 @@ function NavItem({ to, icon: Icon, label }) {
 export default function App() {
   return (
     <HashRouter>
-      <div className="flex h-screen overflow-hidden">
+      <RoomProvider>
+        <div className="flex h-screen overflow-hidden">
         {/* Sidebar */}
         <aside className="w-56 shrink-0 flex flex-col bg-gray-900 border-r border-gray-800 p-4 gap-1">
           {/* Brand */}
@@ -54,7 +58,7 @@ export default function App() {
           ))}
 
           <div className="mt-auto text-xs text-gray-600 px-1 pt-4">
-            v1.0.4 · All data local
+            v1.3.3 · All data local
           </div>
         </aside>
 
@@ -68,6 +72,7 @@ export default function App() {
           </Routes>
         </main>
       </div>
+      </RoomProvider>
     </HashRouter>
   )
 }

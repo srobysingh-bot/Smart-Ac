@@ -24,6 +24,8 @@ class _RoomSession:
 
 
 _rs: Dict[str, _RoomSession] = defaultdict(_RoomSession)
+# Latest SQLite snapshot row id per room (for AI ↔ snapshot linkage).
+_last_snapshot_id: Dict[str, int] = {}
 
 
 def _room(room_id: str) -> _RoomSession:
@@ -95,27 +97,40 @@ async def end_session(room_id: str, data: Dict[str, Any]) -> None:
     cooling_rate: Optional[float] = None
     cooling_type: Optional[str] = None
     efficiency: Optional[float] = None
+    time_to_target_minutes: Optional[float] = None
+    temp_drop_rate_snap: Optional[float] = None
 
     try:
         _start = float(indoor_start) if indoor_start is not None else None
         _end = float(indoor_end) if indoor_end is not None else None
+        snap_metrics = await database.compute_cooling_snapshot_metrics(s.current_session_id)
+        time_to_target_minutes = snap_metrics.get("time_to_target_minutes")
+        temp_drop_rate_snap = snap_metrics.get("temp_drop_rate")
+        tt_target = time_to_target_minutes
+        tdrop = temp_drop_rate_snap
+
         _dur = float(duration_min) if duration_min is not None else 0.0
         _energy = float(energy_kwh) if energy_kwh is not None else 0.0
 
-        if (
-            _start is not None
-            and _end is not None
-            and _dur > ANALYTICS_WARMUP_MINUTES
-        ):
+        rate_for_type: Optional[float] = tdrop
+        dur_for_type: Optional[float] = tt_target
+        if rate_for_type is None and _start is not None and _end is not None and _dur > ANALYTICS_WARMUP_MINUTES:
             delta = _start - _end
             if delta > 0 and _dur > 0:
-                cooling_rate = round(delta / _dur, 4)
-                if cooling_rate > 0.5:
-                    cooling_type = "fast"
-                elif cooling_rate >= 0.2:
-                    cooling_type = "normal"
-                else:
-                    cooling_type = "slow"
+                rate_for_type = delta / _dur
+            dur_for_type = _dur
+
+        if rate_for_type is not None and (dur_for_type or 0) > ANALYTICS_WARMUP_MINUTES:
+            cooling_rate = round(float(rate_for_type), 4)
+            if cooling_rate > 0.5:
+                cooling_type = "fast"
+            elif cooling_rate >= 0.2:
+                cooling_type = "normal"
+            else:
+                cooling_type = "slow"
+        else:
+            cooling_rate = None
+            cooling_type = None
 
         if (
             _start is not None
@@ -128,15 +143,20 @@ async def end_session(room_id: str, data: Dict[str, Any]) -> None:
 
         if cooling_rate is not None:
             logger.info(
-                "[HawaAI] Analytics [%s] — cooling_rate=%.4f°C/min (%s) | efficiency=%s°C/kWh",
+                "[HawaAI] Analytics [%s] — cooling_rate=%.4f°C/min (%s) | efficiency=%s°C/kWh | "
+                "snap_t_target=%s min | snap_drop_rate=%s",
                 room_id,
                 cooling_rate,
                 cooling_type,
                 f"{efficiency:.2f}" if efficiency is not None else "N/A",
+                tt_target,
+                tdrop,
             )
     except Exception as exc:
         logger.warning("[HawaAI] Analytics calculation skipped [%s]: %s", room_id, exc)
         cooling_rate = cooling_type = efficiency = None
+        time_to_target_minutes = None
+        temp_drop_rate_snap = None
 
     rs = str(data.get("reason_stopped") or "")
     uo = data.get("user_override")
@@ -160,6 +180,8 @@ async def end_session(room_id: str, data: Dict[str, Any]) -> None:
         "cooling_time": duration_min,
         "energy_used": energy_kwh,
         "user_override": uo,
+        "time_to_target_minutes": time_to_target_minutes,
+        "temp_drop_rate": temp_drop_rate_snap,
     }
 
     await database.update_session_end(s.current_session_id, end_data)
@@ -182,8 +204,8 @@ def mark_cooled(room_id: str) -> None:
         s.cooled_at = datetime.now(timezone.utc)
 
 
-async def add_snapshot(room_id: str, session_id: Optional[str], data: Dict[str, Any]) -> None:
-    """Insert a monitoring snapshot (called every tick while AC is on)."""
+async def add_snapshot(room_id: str, session_id: Optional[str], data: Dict[str, Any]) -> int:
+    """Insert a monitoring snapshot (called every tick while AC is on). Returns row id."""
     snap = {
         "session_id": session_id,
         "room_id": room_id,
@@ -191,6 +213,7 @@ async def add_snapshot(room_id: str, session_id: Optional[str], data: Dict[str, 
         "indoor_temp": data.get("indoor_temp"),
         "outdoor_temp": data.get("outdoor_temp"),
         "outdoor_humidity": data.get("outdoor_humidity"),
+        "indoor_humidity": data.get("indoor_humidity"),
         "ac_state": data.get("ac_state", False),
         "watt_draw": data.get("watt_draw", 0.0),
         "presence": data.get("presence", True),
@@ -201,7 +224,46 @@ async def add_snapshot(room_id: str, session_id: Optional[str], data: Dict[str, 
         "ai_fan_mode": data.get("ai_fan_mode"),
         "ai_confidence": data.get("ai_confidence"),
     }
-    await database.insert_snapshot(snap)
+    row_id = await database.insert_snapshot(snap)
+    _last_snapshot_id[room_id] = row_id
+    return row_id
+
+
+def last_snapshot_id(room_id: str) -> Optional[int]:
+    return _last_snapshot_id.get(room_id)
+
+
+async def ensure_snapshot_id_for_ai(room_id: str) -> int:
+    """
+    Latest snapshot for the room, or insert a minimal row so ai_decisions.snapshot_id
+    is always populated.
+    """
+    sid = _last_snapshot_id.get(room_id)
+    if sid is not None:
+        return sid
+    now = datetime.now(timezone.utc).isoformat()
+    row_id = await database.insert_snapshot(
+        {
+            "session_id": current_session_id(room_id),
+            "room_id": room_id,
+            "timestamp": now,
+            "indoor_temp": None,
+            "outdoor_temp": None,
+            "outdoor_humidity": None,
+            "indoor_humidity": None,
+            "ac_state": False,
+            "watt_draw": 0.0,
+            "presence": True,
+            "setpoint": None,
+            "fan_mode": None,
+            "energy_kwh": None,
+            "ai_target_temp": None,
+            "ai_fan_mode": None,
+            "ai_confidence": None,
+        },
+    )
+    _last_snapshot_id[room_id] = row_id
+    return row_id
 
 
 async def get_sessions(room_id: str, limit: int = 50, offset: int = 0) -> List[Dict]:

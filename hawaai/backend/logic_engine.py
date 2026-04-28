@@ -34,10 +34,11 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Dict, List, Optional
 
-from . import ac_adapter, config_manager, ha_client, session_logger, smart_cooling, weather_api
+from . import ac_adapter, config_manager, database, ha_client, session_logger, smart_cooling, weather_api
 from . import room_registry
 from .ai import (
     apply_ai_fan,
+    ai_cache,
     fetch_ai_in_background,
     get_cached,
     should_run_ai,
@@ -79,6 +80,54 @@ _COOLDOWN_SECS: int = 60
 # Power-based state thresholds
 _WATTS_COMPRESSOR: float = 500.0   # watts above this → compressor running (AC ON)
 _WATTS_FAN_ONLY:   float = 50.0    # watts between FAN_ONLY and COMPRESSOR → IDLE (fan only)
+
+
+async def _maybe_record_ai_user_adjustment(
+    room_id: str,
+    cfg: dict,
+    climate_data: dict,
+    now: datetime,
+) -> None:
+    """
+    If climate setpoint diverges from the last AI recommendation (and config baseline),
+    label the pending ai_decisions row for ML (user override heuristic).
+    """
+    if not bool(cfg.get("ai_enabled", False)):
+        return
+    pend = ai_cache.get_pending_ml_label(room_id)
+    if not pend or not climate_data:
+        return
+    decision_id, ts_iso, ai_target = pend
+    raw_ct = climate_data.get("target_temp")
+    if raw_ct is None:
+        return
+    try:
+        ct = float(raw_ct)
+    except (TypeError, ValueError):
+        return
+    try:
+        t_dec = datetime.fromisoformat(str(ts_iso).replace("Z", "+00:00"))
+        if t_dec.tzinfo is None:
+            t_dec = t_dec.replace(tzinfo=timezone.utc)
+        delay = (now - t_dec).total_seconds()
+    except (TypeError, ValueError):
+        return
+    if delay < 90:
+        return
+    if abs(ct - ai_target) <= 0.55:
+        ai_cache.clear_pending_ml_label(room_id)
+        return
+    base_t = float(cfg.get("target_temp", 24))
+    if abs(ct - ai_target) > 0.55 and abs(ct - base_t) > 0.12:
+        await database.update_ai_decision_ml_labels(
+            decision_id,
+            user_adjusted=1,
+            user_target_temp=ct,
+            adjustment_delay_seconds=delay,
+        )
+        ai_cache.clear_pending_ml_label(room_id)
+    elif delay > 14_400:
+        ai_cache.clear_pending_ml_label(room_id)
 
 
 def smart_temp_adjustment_enabled(cfg: dict) -> bool:
@@ -263,6 +312,16 @@ async def tick(room_id: str) -> None:
             )
     effective_target = base_effective
 
+    indoor_humidity: Optional[float] = None
+    ih_entity = (cfg.get("indoor_humidity_entity") or "").strip()
+    if ih_entity:
+        raw_ih = await ha_client.get_state(ih_entity)
+        if raw_ih not in (None, "unavailable", "unknown", ""):
+            try:
+                indoor_humidity = float(raw_ih)
+            except (ValueError, TypeError):
+                pass
+
     # ── Read live energy/power from HA ────────────────────────────────────────
     energy_power_entity = cfg.get("energy_power_entity", "")
     energy_watts: float = 0.0
@@ -414,6 +473,7 @@ async def tick(room_id: str) -> None:
             "indoor_temp":   indoor_temp,
             "outdoor_temp":  outdoor_temp,
             "outdoor_humidity": outdoor_humidity,
+            "indoor_humidity": indoor_humidity,
             "ac_state":      ac_on,
             "watt_draw":     energy_watts,
             "presence":      is_occupied,
@@ -425,6 +485,8 @@ async def tick(room_id: str) -> None:
             "ai_confidence": ai_conf,
         },
     )
+
+    await _maybe_record_ai_user_adjustment(room_id, cfg, climate_data or {}, now)
 
     # Collect a watts reading for this tick (used for energy calculation at session end).
     if session_logger.current_session_id(room_id) and energy_watts_valid:

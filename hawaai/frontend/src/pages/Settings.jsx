@@ -1,14 +1,13 @@
-import { useCallback, useEffect, useState, useMemo } from 'react'
-import { useSearchParams } from 'react-router-dom'
+import { useCallback, useEffect, useState } from 'react'
 import {
   getRoom,
-  getRooms,
   getEntities,
   getDevices,
   getDeviceEntities,
   getWeather,
   updateRoom,
 } from '../api/smartcool.js'
+import { useRoom } from '../context/RoomContext.jsx'
 import { Save, RefreshCw, AlertCircle, CheckCircle2, Eye, EyeOff } from 'lucide-react'
 
 // ── Reusable field components ─────────────────────────────────────────────────
@@ -183,8 +182,6 @@ const CURRENCY_OPTIONS = [
   { value: 'AED', label: 'AED Dirham'     },
 ]
 
-const ROOM_LS = 'hawaai_active_room'
-
 /** Persisted under each room's `settings` in config (non-entity fields). */
 const ROOM_SETTINGS_KEYS = [
   'target_temp', 'hysteresis', 'vacancy_timeout_minutes', 'logic_interval_seconds',
@@ -200,15 +197,10 @@ const AI_CONFIG_KEYS = [
 
 // ── Main Settings page (room-scoped: GET/PUT /api/rooms/{room_id}) ─────────────
 export default function Settings() {
-  const [searchParams, setSearchParams] = useSearchParams()
-  const roomId = useMemo(
-    () => (searchParams.get('room_id') || '').trim() || null,
-    [searchParams],
-  )
+  const { activeRoomId: roomId, setActiveRoom, rooms: roomsList, refreshRooms } = useRoom()
 
   const [cfg,        setCfg]        = useState({})
   const [entities,   setEntities]   = useState([])
-  const [roomsList,  setRoomsList]  = useState([])
   const [roomTitle,  setRoomTitle]  = useState('')
   const [loadError,  setLoadError]  = useState(null)
   const [saving,     setSaving]     = useState(false)
@@ -220,6 +212,7 @@ export default function Settings() {
   // Per-dropdown search state (each search is independent)
   const [presenceSearch,    setPresenceSearch]    = useState('')
   const [tempSearch,        setTempSearch]        = useState('')
+  const [humiditySearch,   setHumiditySearch]    = useState('')
   const [climateSearch,     setClimateSearch]     = useState('')
   const [energyPowerSearch, setEnergyPowerSearch] = useState('')
   const [energyKwhSearch,   setEnergyKwhSearch]   = useState('')
@@ -238,25 +231,6 @@ export default function Settings() {
       .then(w => setOutdoorTemp(w.outdoor_temp ?? null))
       .catch(() => {})
   }, [])
-
-  useEffect(() => {
-    getRooms()
-      .then(r => setRoomsList(r.rooms || []))
-      .catch(console.error)
-  }, [])
-
-  useEffect(() => {
-    if (!roomsList.length) return
-    const url = (searchParams.get('room_id') || '').trim()
-    const ls = typeof localStorage !== 'undefined' ? localStorage.getItem(ROOM_LS) : null
-    const valid = (id) => id && roomsList.some(x => x.id === id)
-    const pick =
-      valid(url) ? url : valid(ls) ? ls : roomsList.length === 1 ? roomsList[0].id : null
-    if (pick) {
-      if (typeof localStorage !== 'undefined') localStorage.setItem(ROOM_LS, pick)
-      if (url !== pick) setSearchParams({ room_id: pick }, { replace: true })
-    }
-  }, [roomsList, searchParams, setSearchParams])
 
   useEffect(() => {
     if (!roomId) {
@@ -326,6 +300,7 @@ export default function Settings() {
         climate_entity: (cfg.ac_entity || cfg.climate_entity || '').trim(),
         presence_entity: cfg.presence_entity?.trim() || null,
         indoor_temp_entity: cfg.indoor_temp_entity?.trim() || null,
+        indoor_humidity_entity: cfg.indoor_humidity_entity?.trim() || null,
         energy_power_entity: cfg.energy_power_entity?.trim() || null,
         energy_kwh_entity: cfg.energy_kwh_entity?.trim() || null,
         settings,
@@ -339,6 +314,7 @@ export default function Settings() {
       if (c.ai_api_key === '***') c.ai_api_key = ''
       setCfg(c)
       setRoomTitle(detail.room?.name || roomId)
+      refreshRooms().catch(() => {})
     } catch (err) {
       console.error('Save failed:', err)
       setSaveStatus('error')
@@ -443,8 +419,7 @@ export default function Settings() {
               onChange={e => {
                 const id = e.target.value
                 if (!id) return
-                localStorage.setItem(ROOM_LS, id)
-                setSearchParams({ room_id: id })
+                setActiveRoom(id)
               }}
             >
               <option value="">Choose a room…</option>
@@ -496,8 +471,7 @@ export default function Settings() {
             onChange={e => {
               const id = e.target.value
               if (!id) return
-              localStorage.setItem(ROOM_LS, id)
-              setSearchParams({ room_id: id })
+              setActiveRoom(id)
             }}
           >
             {roomsList.map(r => (
@@ -583,6 +557,16 @@ export default function Settings() {
           entities={allSensors}
           search={tempSearch}
           onSearchChange={setTempSearch}
+        />
+
+        {/* Indoor humidity (optional, ML / comfort) */}
+        <EntityDropdown
+          label="Indoor Humidity (optional, sensor.*)"
+          value={cfg.indoor_humidity_entity || ''}
+          onChange={v => patch('indoor_humidity_entity', v)}
+          entities={allSensors}
+          search={humiditySearch}
+          onSearchChange={setHumiditySearch}
         />
 
         {/* ── Energy Monitoring ─────────────────────────────────────────────── */}

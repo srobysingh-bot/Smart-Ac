@@ -105,7 +105,7 @@ async def lifespan(app: FastAPI):
     logger.info("[HawaAI] Add-on stopped")
 
 
-app = FastAPI(title="HawaAI API", version="1.3.2", lifespan=lifespan)
+app = FastAPI(title="HawaAI API", version="1.3.3", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -534,7 +534,13 @@ async def api_create_room(body: Dict[str, Any] = Body(...)):
     if not climate_entity:
         raise HTTPException(status_code=400, detail="climate_entity is required")
     row: Dict[str, Any] = {"id": rid, "name": name, "climate_entity": climate_entity}
-    for k in ("presence_entity", "indoor_temp_entity", "energy_power_entity", "energy_kwh_entity"):
+    for k in (
+        "presence_entity",
+        "indoor_temp_entity",
+        "indoor_humidity_entity",
+        "energy_power_entity",
+        "energy_kwh_entity",
+    ):
         v = body.get(k)
         if v and str(v).strip():
             row[k] = str(v).strip()
@@ -560,7 +566,13 @@ async def api_update_room(room_id: str, body: Dict[str, Any] = Body(...)):
         ce = str(body["climate_entity"]).strip()
         if ce:
             r["climate_entity"] = ce
-    for k in ("presence_entity", "indoor_temp_entity", "energy_power_entity", "energy_kwh_entity"):
+    for k in (
+        "presence_entity",
+        "indoor_temp_entity",
+        "indoor_humidity_entity",
+        "energy_power_entity",
+        "energy_kwh_entity",
+    ):
         if k in body:
             v = body[k]
             if v is None or str(v).strip() == "":

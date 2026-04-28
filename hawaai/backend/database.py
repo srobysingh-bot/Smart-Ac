@@ -6,7 +6,7 @@ import shutil
 from collections import defaultdict
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -155,6 +155,12 @@ async def init_db() -> None:
             "ALTER TABLE snapshots ADD COLUMN ai_target_temp REAL",
             "ALTER TABLE snapshots ADD COLUMN ai_fan_mode TEXT",
             "ALTER TABLE snapshots ADD COLUMN ai_confidence REAL",
+            "ALTER TABLE snapshots ADD COLUMN indoor_humidity REAL",
+            "ALTER TABLE sessions ADD COLUMN time_to_target_minutes REAL",
+            "ALTER TABLE sessions ADD COLUMN temp_drop_rate REAL",
+            "ALTER TABLE ai_decisions ADD COLUMN user_adjusted INTEGER DEFAULT 0",
+            "ALTER TABLE ai_decisions ADD COLUMN user_target_temp REAL",
+            "ALTER TABLE ai_decisions ADD COLUMN adjustment_delay_seconds REAL",
         ):
             try:
                 await db.execute(col_sql)
@@ -312,7 +318,9 @@ async def update_session_end(session_id: str, end_data: Dict[str, Any]) -> None:
                 efficiency           = ?,
                 cooling_time         = ?,
                 energy_used          = ?,
-                user_override        = ?
+                user_override        = ?,
+                time_to_target_minutes = ?,
+                temp_drop_rate       = ?
             WHERE session_id = ?
             """,
             (
@@ -330,6 +338,8 @@ async def update_session_end(session_id: str, end_data: Dict[str, Any]) -> None:
                 end_data.get("cooling_time"),
                 end_data.get("energy_used"),
                 end_data.get("user_override"),
+                end_data.get("time_to_target_minutes"),
+                end_data.get("temp_drop_rate"),
                 session_id,
             ),
         )
@@ -406,23 +416,130 @@ async def archive_old_sessions(days: int = 90) -> int:
         return result.rowcount
 
 
+def _parse_row_ts(val: Any) -> Optional[datetime]:
+    if val is None:
+        return None
+    s = str(val).replace("Z", "+00:00")
+    try:
+        return datetime.fromisoformat(s)
+    except ValueError:
+        try:
+            return datetime.strptime(str(val)[:19], "%Y-%m-%d %H:%M:%S")
+        except ValueError:
+            return None
+
+
+async def compute_cooling_snapshot_metrics(session_id: str) -> Dict[str, Optional[float]]:
+    """
+    Derive time_to_target_minutes and temp_drop_rate (°C/min) from session snapshots only.
+
+    Target band: first snapshot time where indoor_temp <= session.target_temp + 0.25 °C.
+    If never reached, fall back to (start indoor − last indoor) / snapshot span in minutes.
+    """
+    out: Dict[str, Optional[float]] = {
+        "time_to_target_minutes": None,
+        "temp_drop_rate": None,
+    }
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            """
+            SELECT start_time, indoor_temp_start, target_temp
+            FROM sessions WHERE session_id = ?
+            """,
+            (session_id,),
+        ) as cur:
+            sess = await cur.fetchone()
+        if not sess:
+            return out
+        start_wall = _parse_row_ts(sess["start_time"])
+        if start_wall is None:
+            return out
+        try:
+            indoor_start = float(sess["indoor_temp_start"]) if sess["indoor_temp_start"] is not None else None
+        except (TypeError, ValueError):
+            indoor_start = None
+        try:
+            target = float(sess["target_temp"]) if sess["target_temp"] is not None else None
+        except (TypeError, ValueError):
+            target = None
+        async with db.execute(
+            """
+            SELECT timestamp, indoor_temp FROM snapshots
+            WHERE session_id = ?
+            ORDER BY timestamp ASC
+            """,
+            (session_id,),
+        ) as cur:
+            rows = await cur.fetchall()
+
+    if not rows or indoor_start is None:
+        return out
+
+    band = 0.25
+    if target is not None:
+        threshold = target + band
+        for r in rows:
+            if r["indoor_temp"] is None:
+                continue
+            try:
+                ti = float(r["indoor_temp"])
+            except (TypeError, ValueError):
+                continue
+            ts = _parse_row_ts(r["timestamp"])
+            if ts is None:
+                continue
+            if ti <= threshold:
+                minutes = max(0.0, (ts - start_wall).total_seconds() / 60.0)
+                if minutes > 0.05:
+                    drop = indoor_start - ti
+                    out["time_to_target_minutes"] = round(minutes, 2)
+                    out["temp_drop_rate"] = round(drop / minutes, 4) if drop > 0 else None
+                return out
+
+    # Fallback: net drop over observed snapshot window
+    parsed: List[Tuple[datetime, float]] = []
+    for r in rows:
+        if r["indoor_temp"] is None:
+            continue
+        ts = _parse_row_ts(r["timestamp"])
+        if ts is None:
+            continue
+        try:
+            parsed.append((ts, float(r["indoor_temp"])))
+        except (TypeError, ValueError):
+            continue
+    if len(parsed) < 2:
+        return out
+    t0, v0 = parsed[0]
+    t1, v1 = parsed[-1]
+    span = (t1 - t0).total_seconds() / 60.0
+    if span < 0.5:
+        return out
+    drop = v0 - v1
+    if drop <= 0:
+        return out
+    out["temp_drop_rate"] = round(drop / span, 4)
+    return out
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Snapshots
 # ─────────────────────────────────────────────────────────────────────────────
 
-async def insert_snapshot(snapshot: Dict[str, Any]) -> None:
+async def insert_snapshot(snapshot: Dict[str, Any]) -> int:
     w = snapshot.get("watt_draw")
     if w is None:
         w = snapshot.get("power_watts")
     async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute(
+        cur = await db.execute(
             """
             INSERT INTO snapshots
                 (session_id, timestamp, indoor_temp, outdoor_temp, outdoor_humidity,
-                 ac_state, watt_draw, power_watts, presence, room_id,
+                 indoor_humidity, ac_state, watt_draw, power_watts, presence, room_id,
                  setpoint, fan_mode, energy_kwh,
                  ai_target_temp, ai_fan_mode, ai_confidence)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             """,
             (
                 snapshot.get("session_id"),
@@ -430,6 +547,7 @@ async def insert_snapshot(snapshot: Dict[str, Any]) -> None:
                 snapshot.get("indoor_temp"),
                 snapshot.get("outdoor_temp"),
                 snapshot.get("outdoor_humidity"),
+                snapshot.get("indoor_humidity"),
                 1 if snapshot.get("ac_state") else 0,
                 w,
                 w,
@@ -444,6 +562,7 @@ async def insert_snapshot(snapshot: Dict[str, Any]) -> None:
             ),
         )
         await db.commit()
+        return int(cur.lastrowid)
 
 
 async def insert_ai_decision(row: Dict[str, Any]) -> int:
@@ -453,8 +572,9 @@ async def insert_ai_decision(row: Dict[str, Any]) -> int:
             """
             INSERT INTO ai_decisions
                 (ts, room_id, session_id, snapshot_id, target_temp, fan_mode, confidence,
-                 action, provider, model, raw_json)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?)
+                 action, provider, model, raw_json,
+                 user_adjusted, user_target_temp, adjustment_delay_seconds)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             """,
             (
                 row.get("ts"),
@@ -468,10 +588,34 @@ async def insert_ai_decision(row: Dict[str, Any]) -> int:
                 row.get("provider"),
                 row.get("model"),
                 row.get("raw_json"),
+                int(row.get("user_adjusted") or 0),
+                row.get("user_target_temp"),
+                row.get("adjustment_delay_seconds"),
             ),
         )
         await db.commit()
         return int(cur.lastrowid)
+
+
+async def update_ai_decision_ml_labels(
+    decision_id: int,
+    *,
+    user_adjusted: int,
+    user_target_temp: Optional[float],
+    adjustment_delay_seconds: float,
+) -> None:
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            """
+            UPDATE ai_decisions SET
+                user_adjusted = ?,
+                user_target_temp = ?,
+                adjustment_delay_seconds = ?
+            WHERE id = ?
+            """,
+            (user_adjusted, user_target_temp, adjustment_delay_seconds, decision_id),
+        )
+        await db.commit()
 
 
 async def get_ai_decisions_recent(

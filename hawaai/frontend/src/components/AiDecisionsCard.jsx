@@ -72,6 +72,10 @@ export default function AiDecisionsCard({ roomId }) {
                 <th className="py-2 pr-3 font-medium">Fan</th>
                 <th className="py-2 pr-3 font-medium">Conf.</th>
                 <th className="py-2 pr-3 font-medium">Action</th>
+                <th className="py-2 pr-3 font-medium">Snap</th>
+                <th className="py-2 pr-3 font-medium">User adj.</th>
+                <th className="py-2 pr-3 font-medium">User °C</th>
+                <th className="py-2 pr-3 font-medium">Δs</th>
                 <th className="py-2 pr-3 font-medium">Provider</th>
               </tr>
             </thead>
@@ -83,6 +87,18 @@ export default function AiDecisionsCard({ roomId }) {
                   <td className="py-2 pr-3 font-mono text-xs">{d.fan_mode || '—'}</td>
                   <td className="py-2 pr-3">{d.confidence != null ? Number(d.confidence).toFixed(2) : '—'}</td>
                   <td className="py-2 pr-3">{d.action || '—'}</td>
+                  <td className="py-2 pr-3 text-xs text-gray-500 font-mono" title={`snapshot ${d.snapshot_id ?? ''}`}>
+                    {d.snapshot_id ?? '—'}
+                  </td>
+                  <td className="py-2 pr-3">{d.user_adjusted ? 'Y' : '—'}</td>
+                  <td className="py-2 pr-3">
+                    {d.user_target_temp != null ? `${Number(d.user_target_temp).toFixed(1)}°` : '—'}
+                  </td>
+                  <td className="py-2 pr-3 text-xs">
+                    {d.adjustment_delay_seconds != null
+                      ? `${Math.round(Number(d.adjustment_delay_seconds))}s`
+                      : '—'}
+                  </td>
                   <td className="py-2 pr-3 text-xs text-gray-500">
                     {d.provider}{d.model ? ` / ${d.model}` : ''}
                   </td>

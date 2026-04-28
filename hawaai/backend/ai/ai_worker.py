@@ -497,17 +497,19 @@ async def _persist_ai_decision(
     """Store one validated AI output for audit / future ML training."""
     try:
         if isinstance(raw_obj, (dict, list)):
-            raw_json = json.dumps(raw_obj, ensure_ascii=False, separators=(",", ":"))[:8000]
+            raw_json = json.dumps(raw_obj, ensure_ascii=False, separators=(",", ":"))
         elif raw_obj is None:
             raw_json = None
         else:
-            raw_json = str(raw_obj)[:8000]
-        await database.insert_ai_decision(
+            raw_json = str(raw_obj)
+        ts_utc = datetime.now(timezone.utc).isoformat()
+        snap_id = await session_logger.ensure_snapshot_id_for_ai(room_id)
+        row_id = await database.insert_ai_decision(
             {
-                "ts": datetime.now(timezone.utc).isoformat(),
+                "ts": ts_utc,
                 "room_id": room_id,
                 "session_id": session_logger.current_session_id(room_id),
-                "snapshot_id": None,
+                "snapshot_id": snap_id,
                 "target_temp": validated.get("target_temp"),
                 "fan_mode": validated.get("fan_mode"),
                 "confidence": validated.get("confidence"),
@@ -515,8 +517,16 @@ async def _persist_ai_decision(
                 "provider": provider,
                 "model": (model or ""),
                 "raw_json": raw_json,
+                "user_adjusted": 0,
+                "user_target_temp": None,
+                "adjustment_delay_seconds": None,
             }
         )
+        try:
+            at = float(validated["target_temp"])
+        except (KeyError, TypeError, ValueError):
+            at = 24.0
+        ai_cache.set_pending_ml_label(room_id, row_id, ts_utc, at)
     except Exception:
         logger.exception("[AI] ai_decisions insert failed")
 

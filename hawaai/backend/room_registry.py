@@ -19,6 +19,7 @@ DEFAULT_ROOM_ID = "default"
 _ROOM_ENTITY_KEYS = (
     "presence_entity",
     "indoor_temp_entity",
+    "indoor_humidity_entity",
     "energy_power_entity",
     "energy_kwh_entity",
 )

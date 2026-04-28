@@ -1,9 +1,9 @@
 import { useCallback, useEffect, useState } from 'react'
-import { getSessions, getRooms } from '../api/smartcool.js'
+import { getSessions } from '../api/smartcool.js'
+import { useRoom } from '../context/RoomContext.jsx'
 import { ChevronLeft, ChevronRight, ChevronDown, ChevronUp, Filter } from 'lucide-react'
 
 const PAGE_SIZE = 20
-const ROOM_LS = 'hawaai_active_room'
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -129,6 +129,7 @@ function FilterBar({ active, onChange }) {
 // ── Page ──────────────────────────────────────────────────────────────────────
 
 export default function SessionHistory() {
+  const { rooms, activeRoomId, setActiveRoom } = useRoom()
   const [sessions,    setSessions]    = useState([])
   const [total,       setTotal]       = useState(0)
   const [page,        setPage]        = useState(0)
@@ -137,21 +138,10 @@ export default function SessionHistory() {
   const [filter,      setFilter]      = useState('all')   // 'all' | 'valid' | 'fast'
   const [showInvalid, setShowInvalid] = useState(false)
   const [loading,     setLoading]     = useState(false)
-  const [rooms,       setRooms]       = useState([])
-  const [activeRoomId, setActiveRoomId] = useState(null)
 
   useEffect(() => {
-    getRooms()
-      .then(r => {
-        const list = r.rooms || []
-        setRooms(list)
-        const stored = typeof localStorage !== 'undefined' ? localStorage.getItem(ROOM_LS) : null
-        const byStored = stored ? list.find(x => x.id === stored)?.id : null
-        const only = list.length === 1 ? list[0].id : null
-        setActiveRoomId(byStored ?? only ?? null)
-      })
-      .catch(console.error)
-  }, [])
+    setPage(0)
+  }, [activeRoomId])
 
   const load = useCallback(() => {
     if (!activeRoomId) {
@@ -205,9 +195,8 @@ export default function SessionHistory() {
             value={activeRoomId || ''}
             onChange={e => {
               const id = e.target.value
-              setActiveRoomId(id || null)
+              setActiveRoom(id || null)
               setPage(0)
-              if (id && typeof localStorage !== 'undefined') localStorage.setItem(ROOM_LS, id)
             }}
           >
             <option value="">Select room…</option>

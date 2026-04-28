@@ -6,7 +6,7 @@ import logging
 import random
 import time
 from collections import defaultdict
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -118,3 +118,19 @@ def throttle_cache_use_log(room_id: str) -> bool:
         st["_last_cache_info_log"] = now
         return True
     return False
+
+
+# Latest AI decision row awaiting user-adjustment labeling (ML).
+_PENDING_ML: Dict[str, Optional[Tuple[int, str, float]]] = {}
+
+
+def set_pending_ml_label(room_id: str, decision_id: int, ts_iso: str, ai_target_temp: float) -> None:
+    _PENDING_ML[room_id] = (decision_id, ts_iso, float(ai_target_temp))
+
+
+def get_pending_ml_label(room_id: str) -> Optional[Tuple[int, str, float]]:
+    return _PENDING_ML.get(room_id)
+
+
+def clear_pending_ml_label(room_id: str) -> None:
+    _PENDING_ML.pop(room_id, None)
