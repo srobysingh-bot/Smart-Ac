@@ -43,7 +43,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "ai_api_key": "",
     "ai_api_base_url": "",
     "ai_api_model": "",
-    "ai_api_timeout": 20,
+    "ai_api_timeout": 60,
     "weather_api_key": "",
     "weather_city": "",
     "weather_provider": "openweathermap",
@@ -89,9 +89,9 @@ def load_config() -> Dict[str, Any]:
     merged["ai_provider"] = "api" if _prov == "api" else "ollama"
 
     try:
-        _to = int(merged.get("ai_api_timeout", 20))
+        _to = int(merged.get("ai_api_timeout", 60))
     except (TypeError, ValueError):
-        _to = 20
+        _to = 60
     merged["ai_api_timeout"] = max(5, min(120, _to))
 
     # Ollama URL: empty or legacy unresolvable hostname → HA host default.

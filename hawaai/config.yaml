@@ -1,5 +1,5 @@
 name: HawaAI AC Optimizer
-version: 1.2.19
+version: 1.2.20
 slug: hawaai
 description: AI-powered AC optimization using presence, temperature, and energy data
 url: https://github.com/srobysingh-bot/Smart-Ac
@@ -48,7 +48,7 @@ options:
   ai_api_key: ""
   ai_api_base_url: ""
   ai_api_model: ""
-  ai_api_timeout: 20
+  ai_api_timeout: 60
 schema:
   weather_api_key: password?
   weather_city: str?

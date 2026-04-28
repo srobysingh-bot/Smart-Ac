@@ -56,6 +56,9 @@ export const setAiEnabled = (ai_enabled) =>
 export const updateAiConfig = (data) =>
   request('/ai', { method: 'POST', body: JSON.stringify(data) })
 
+/** Last AI call lifecycle (GET /api/ai/status). */
+export const getAiStatus = () => request('/ai/status')
+
 // ── Brands ───────────────────────────────────────────────────────────────────
 export const getBrands = () => request('/brands')
 

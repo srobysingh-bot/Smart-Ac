@@ -11,6 +11,7 @@ Routes:
   POST /api/config          Save config to /data/hawaai_config.json
   GET  /api/ai              { ai_enabled, ai_provider, ollama + API fields (key masked) }
   POST /api/ai              Set AI settings (merge persist)
+  GET  /api/ai/status       Last AI call status (running/success/timeout/error) for dashboard
   GET  /api/entities        HA entity list for Settings dropdowns
   GET  /api/climate/{id}   Live climate entity state + attributes
   POST /api/climate/{id}/set_temperature
@@ -39,6 +40,7 @@ from fastapi.responses import FileResponse, HTMLResponse, Response
 from . import config_manager, database, logic_engine, scheduler, session_logger, weather_api
 from . import ha_client
 from .ac_controller import get_brands
+from .ai.ai_worker import get_ai_status
 from .utils import parse_presence
 
 logger = logging.getLogger(__name__)
@@ -79,7 +81,7 @@ async def lifespan(app: FastAPI):
     logger.info("[HawaAI] Add-on stopped")
 
 
-app = FastAPI(title="HawaAI API", version="1.2.19", lifespan=lifespan)
+app = FastAPI(title="HawaAI API", version="1.2.20", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -132,9 +134,9 @@ async def get_ai_flag():
     prov = (str(cfg.get("ai_provider") or "ollama")).strip().lower()
     prov_norm = "api" if prov == "api" else "ollama"
     try:
-        tout = int(cfg.get("ai_api_timeout", 20))
+        tout = int(cfg.get("ai_api_timeout", 60))
     except (TypeError, ValueError):
-        tout = 20
+        tout = 60
     return {
         "ai_enabled": bool(cfg.get("ai_enabled", False)),
         "ai_provider": prov_norm,
@@ -169,7 +171,7 @@ async def set_ai_flag(data: Dict[str, Any] = Body(...)):
         try:
             patch["ai_api_timeout"] = int(data["ai_api_timeout"])
         except (TypeError, ValueError):
-            patch["ai_api_timeout"] = 20
+            patch["ai_api_timeout"] = 60
     if "ai_api_key" in data and data.get("ai_api_key") is not None:
         k = str(data["ai_api_key"] or "").strip()
         if k and k != "***":
@@ -186,9 +188,9 @@ async def set_ai_flag(data: Dict[str, Any] = Body(...)):
     prov = (str(out.get("ai_provider") or "ollama")).strip().lower()
     prov_norm = "api" if prov == "api" else "ollama"
     try:
-        tout_o = int(out.get("ai_api_timeout", 20))
+        tout_o = int(out.get("ai_api_timeout", 60))
     except (TypeError, ValueError):
-        tout_o = 20
+        tout_o = 60
     return {
         "ai_enabled": bool(out.get("ai_enabled", False)),
         "ai_provider": prov_norm,
@@ -200,6 +202,12 @@ async def set_ai_flag(data: Dict[str, Any] = Body(...)):
         "ai_api_key_set": bool((str(out.get("ai_api_key") or "")).strip()),
         "default_ollama_model": config_manager.DEFAULT_OLLAMA_MODEL,
     }
+
+
+@app.get("/api/ai/status")
+async def get_ai_runtime_status():
+    """Last AI inference attempt (provider, timing, error) for dashboard / ops."""
+    return get_ai_status()
 
 
 # ── LIVE STATUS ───────────────────────────────────────────────────────────────

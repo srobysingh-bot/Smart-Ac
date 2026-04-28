@@ -724,7 +724,7 @@ export default function Settings() {
               />
               <Input
                 label="API request timeout (seconds)"
-                value={cfg.ai_api_timeout ?? 20}
+                value={cfg.ai_api_timeout ?? 60}
                 onChange={v => patch('ai_api_timeout', v)}
                 type="number"
                 min={5}
