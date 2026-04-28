@@ -1,7 +1,7 @@
-name: "Ollama AI (llama3)"
-version: 1.1.0
+name: "Ollama AI (gemma2b)"
+version: 1.1.1
 slug: ollama_ai
-description: "Ollama with llama3:8b for HawaAI structured HVAC JSON. HTTP 11434. Pull + warmup on start."
+description: "Ollama gemma:2b for HawaAI structured HVAC JSON. HTTP 11434. Pull + warmup on start."
 url: https://github.com/srobysingh-bot/Smart-Ac
 arch:
   - aarch64

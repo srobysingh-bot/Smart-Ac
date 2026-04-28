@@ -9,8 +9,8 @@ logger = logging.getLogger(__name__)
 
 CONFIG_PATH = "/data/hawaai_config.json"
 
-# Default aligns with Ollama add-on pull; override in Settings if needed (tinyllama is faster but weaker on JSON).
-DEFAULT_OLLAMA_MODEL = "llama3:8b"
+# Default matches Ollama add-on pull (gemma:2b); override in Settings if needed.
+DEFAULT_OLLAMA_MODEL = "gemma:2b"
 
 # Legacy keys from pre–climate-only installs — stripped from merged config (ignored safely).
 _LEGACY_IR_KEYS = frozenset({

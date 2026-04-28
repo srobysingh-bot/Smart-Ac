@@ -17,15 +17,18 @@ from .. import config_manager, ha_client
 logger = logging.getLogger(__name__)
 
 # Bumped with each AI transport change — look for "AI worker initialized" in add-on logs
-AI_WORKER_VERSION = "1.2.14"
+AI_WORKER_VERSION = "1.2.15"
 
-# Ollama structured output: JSON Schema (NOT format="json")
+# Ollama structured output: JSON Schema only under request "format" (no separate top-level required)
 OLLAMA_RESPONSE_FORMAT: Dict[str, Any] = {
-    "type":       "object",
+    "type": "object",
     "properties": {
         "target_temp": {"type": "number"},
-        "fan_mode":    {"type": "string"},
-        "confidence":  {"type": "number"},
+        "fan_mode": {
+            "type": "string",
+            "enum": ["auto", "f1", "f2", "f3", "f4", "f5"],
+        },
+        "confidence": {"type": "number"},
     },
     "required": ["target_temp", "fan_mode", "confidence"],
 }
@@ -33,7 +36,7 @@ OLLAMA_RESPONSE_FORMAT: Dict[str, Any] = {
 _DEFAULT_URL = config_manager.DEFAULT_CONFIG["ai_ollama_url"]
 _ollama_url_logged: bool = False
 _GENERATE = "/api/generate"
-_TIMEOUT_S = 90.0  # llama3:8b on Pi can exceed 15s; structured output still bounded by num_predict
+_TIMEOUT_S = 30.0
 _RETRY_DELAY_S = 4.0
 _OLLAMA_GEN_OPTIONS: Dict[str, Any] = {
     "num_predict":  20,
@@ -130,6 +133,11 @@ def _emit_ai_response_line(obj: Any) -> None:
     logger.info("AI RESPONSE: %s", txt)
 
 
+def _log_invalid_json_full_raw(context: str, raw: Any) -> None:
+    """Debug: full model output when parse/validation path fails (no truncation)."""
+    logger.warning("[AI] INVALID JSON (%s) — full raw: %r", context, raw)
+
+
 def _parse_response_body(resp: Dict[str, Any]) -> Any:
     raw = (resp or {}).get("response")
     if not raw and isinstance(resp, dict) and "message" in resp:
@@ -137,50 +145,60 @@ def _parse_response_body(resp: Dict[str, Any]) -> Any:
         if c:
             raw = c
     if raw is None:
+        logger.warning("[AI] INVALID JSON (empty response field) — full message: %r", resp)
         return None
 
     if isinstance(raw, dict):
         try:
             blob = json.dumps(raw, ensure_ascii=False, separators=(",", ":"))
         except (TypeError, ValueError):
+            _log_invalid_json_full_raw("dict serialize failed", raw)
             return None
         logger.info("RAW AI RESPONSE: %s", blob)
         if len(blob) > _MAX_RESPONSE_TEXT_LEN:
+            _log_invalid_json_full_raw("dict too long", raw)
             logger.info("[AI] response too long → rejecting (object >%d chars)", _MAX_RESPONSE_TEXT_LEN)
             return None
         _emit_ai_response_line(raw)
         return raw
 
     if isinstance(raw, list):
+        _log_invalid_json_full_raw("unexpected list", raw)
         logger.debug("[AI] unexpected list response")
         return None
 
     if not isinstance(raw, str):
+        _log_invalid_json_full_raw("unexpected type", raw)
         return None
 
     s = raw.strip()
     if not s:
+        _log_invalid_json_full_raw("empty string", raw)
         return None
 
     logger.info("RAW AI RESPONSE: %s", s)
 
     if not s.startswith("{"):
+        _log_invalid_json_full_raw("does not start with brace", raw)
         logger.info("AI INVALID — NOT JSON")
         return None
 
     match = re.search(r"\{.*\}", s, re.DOTALL)
     if not match:
+        _log_invalid_json_full_raw("regex miss", raw)
         logger.info("[AI] JSON block regex miss → rejecting")
         return None
 
     response_text = match.group()
     if len(response_text) > _MAX_RESPONSE_TEXT_LEN:
+        _log_invalid_json_full_raw("extracted block too long", raw)
         logger.info("[AI] response too long → rejecting (>%d chars)", _MAX_RESPONSE_TEXT_LEN)
         return None
 
     try:
         parsed = json.loads(response_text)
     except json.JSONDecodeError:
+        _log_invalid_json_full_raw("json.loads failed", raw)
         logger.info("[AI] response not valid JSON after extract → rejecting")
         return None
 
