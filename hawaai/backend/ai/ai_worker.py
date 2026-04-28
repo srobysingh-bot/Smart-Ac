@@ -19,7 +19,7 @@ from .. import config_manager, ha_client
 logger = logging.getLogger(__name__)
 
 # Bumped with each AI transport change — look for "AI worker initialized" in add-on logs
-AI_WORKER_VERSION = "1.2.20"
+AI_WORKER_VERSION = "1.2.22"
 
 # Ollama structured output: JSON Schema only under request "format" (no separate top-level required)
 OLLAMA_RESPONSE_FORMAT: Dict[str, Any] = {
@@ -41,6 +41,11 @@ _GENERATE = "/api/generate"
 _TIMEOUT_S = 30.0
 _RETRY_DELAY_S = 4.0
 _API_RETRY_DELAY_S = 2.0
+# HVAC: reject model output if round-trip exceeds this (seconds) — logic_engine takes over.
+_API_FAST_FAIL_SEC = 10.0
+# After this many consecutive API failures, pause API calls for _API_CIRCUIT_OPEN_SEC.
+_API_CIRCUIT_FAILURE_THRESHOLD = 3
+_API_CIRCUIT_OPEN_SEC = 120.0
 # Safe HVAC hint when API returns 200 but body is unusable (validated before cache).
 _API_CONSERVATIVE_DEFAULT: Dict[str, Any] = {
     "target_temp": 24,
@@ -72,18 +77,56 @@ _ai_runtime_status: Dict[str, Any] = {
     "last_error": None,
 }
 
+_circuit_lock = threading.Lock()
+_api_consecutive_failures = 0
+_api_circuit_open_until_mono = 0.0
+
 logger.info("AI worker initialized v%s", AI_WORKER_VERSION)
 
 
 def get_ai_status() -> Dict[str, Any]:
     """Snapshot of last AI provider call. response_time is round-trip milliseconds (or None)."""
     with _ai_status_lock:
-        return dict(_ai_runtime_status)
+        out = dict(_ai_runtime_status)
+    now_m = time.monotonic()
+    with _circuit_lock:
+        open_c = now_m < _api_circuit_open_until_mono
+        out["circuit_open"] = open_c
+        out["circuit_seconds_remaining"] = (
+            round(_api_circuit_open_until_mono - now_m, 1) if open_c else None
+        )
+        out["api_consecutive_failures"] = _api_consecutive_failures
+    return out
 
 
 def _ai_status_set(**kwargs: Any) -> None:
     with _ai_status_lock:
         _ai_runtime_status.update(kwargs)
+
+
+def _api_circuit_register_success() -> None:
+    global _api_consecutive_failures, _api_circuit_open_until_mono
+    with _circuit_lock:
+        _api_consecutive_failures = 0
+        _api_circuit_open_until_mono = 0.0
+
+
+def _api_circuit_register_failure() -> None:
+    global _api_consecutive_failures, _api_circuit_open_until_mono
+    with _circuit_lock:
+        _api_consecutive_failures += 1
+        if _api_consecutive_failures >= _API_CIRCUIT_FAILURE_THRESHOLD:
+            _api_circuit_open_until_mono = time.monotonic() + _API_CIRCUIT_OPEN_SEC
+            logger.warning(
+                "[AI] Circuit breaker open — skipping API for %.0fs (%d consecutive failures)",
+                _API_CIRCUIT_OPEN_SEC,
+                _api_consecutive_failures,
+            )
+
+
+def _api_circuit_is_open() -> bool:
+    with _circuit_lock:
+        return time.monotonic() < _api_circuit_open_until_mono
 
 
 def _iso_utc_now() -> str:
@@ -546,6 +589,7 @@ async def run_ai_and_cache(
     base_u = (cfg.get("ai_api_base_url") or "").strip().rstrip("/")
     model_a = _api_model(cfg)
     timeout_a = _api_timeout_s(cfg)
+    use_json_object = bool(cfg.get("ai_api_json_object_format", False))
 
     if not key or not base_u or not model_a:
         logger.error(
@@ -562,21 +606,39 @@ async def run_ai_and_cache(
         _api_fallback_to_logic_engine()
         return
 
+    if _api_circuit_is_open():
+        with _circuit_lock:
+            rem = max(0.0, _api_circuit_open_until_mono - time.monotonic())
+        logger.warning(
+            "[AI] Circuit breaker open — skipping API (%.0fs remaining)",
+            rem,
+        )
+        _ai_status_set(
+            status="error",
+            last_call=_iso_utc_now(),
+            provider="api",
+            model=model_a,
+            last_error=f"circuit open ({round(rem, 0)}s)",
+            response_time=None,
+        )
+        _api_fallback_to_logic_engine()
+        return
+
     ai_cache.invalidate_if_ai_identity_changed("api", model_a)
-    logger.debug("[AI] model=%s timeout=%.0fs", model_a, timeout_a)
+    logger.debug("[AI] model=%s timeout=%.0fs json_object=%s", model_a, timeout_a, use_json_object)
     logger.info("[AI] API key fingerprint (masked): %s", mask_api_key_for_log(key))
     logger.debug("[AI] PROMPT (API): %s", prompt)
 
     chat_url = f"{base_u}/chat/completions"
-    # OpenAI-compatible; omit response_format if provider returns 400.
     req_body: Dict[str, Any] = {
         "model": model_a,
         "messages": [{"role": "user", "content": prompt}],
         "temperature": 0.0,
         "max_tokens": 20,
         "stream": False,
-        "response_format": {"type": "json_object"},
     }
+    if use_json_object:
+        req_body["response_format"] = {"type": "json_object"}
     logger.info("[AI] Request sent to API (url=%s model=%s)", chat_url, model_a)
 
     _ai_status_set(
@@ -594,6 +656,7 @@ async def run_ai_and_cache(
     elapsed_ms = (time.perf_counter() - t_req) * 1000.0
 
     if resp is None:
+        _api_circuit_register_failure()
         if err_kind == "timeout":
             _ai_status_set(
                 status="timeout",
@@ -609,17 +672,33 @@ async def run_ai_and_cache(
         _api_fallback_to_logic_engine()
         return
 
+    if (elapsed_ms / 1000.0) > _API_FAST_FAIL_SEC:
+        logger.warning(
+            "[AI] Slow response → fallback to logic_engine (%.1fs)",
+            elapsed_ms / 1000.0,
+        )
+        _api_circuit_register_failure()
+        _ai_status_set(
+            status="error",
+            last_error=f"slow response ({elapsed_ms / 1000.0:.1f}s > {_API_FAST_FAIL_SEC:.0f}s)",
+            response_time=round(elapsed_ms, 2),
+        )
+        _api_fallback_to_logic_engine()
+        return
+
     logger.info("[AI] Response received (%.0f ms)", elapsed_ms)
 
     parsed = _parse_api_chat_response(resp)
     if parsed is None:
         if _try_apply_api_conservative_defaults(is_occupied, indoor_temp):
+            _api_circuit_register_success()
             _ai_status_set(
                 status="success",
                 response_time=round(elapsed_ms, 2),
                 last_error=None,
             )
         else:
+            _api_circuit_register_failure()
             _ai_status_set(
                 status="error",
                 last_error="unparseable api message",
@@ -631,12 +710,14 @@ async def run_ai_and_cache(
     validated = ai_validator.validate_ai_payload(parsed, is_occupied)
     if not validated:
         if _try_apply_api_conservative_defaults(is_occupied, indoor_temp):
+            _api_circuit_register_success()
             _ai_status_set(
                 status="success",
                 response_time=round(elapsed_ms, 2),
                 last_error=None,
             )
         else:
+            _api_circuit_register_failure()
             _ai_status_set(
                 status="error",
                 last_error="api output validation failed",
@@ -647,6 +728,7 @@ async def run_ai_and_cache(
 
     ai_cache.set_validated(validated, indoor_temp)
     ai_cache.mark_fetch_done()
+    _api_circuit_register_success()
     _ai_status_set(
         status="success",
         response_time=round(elapsed_ms, 2),

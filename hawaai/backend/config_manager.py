@@ -44,6 +44,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "ai_api_base_url": "",
     "ai_api_model": "",
     "ai_api_timeout": 60,
+    "ai_api_json_object_format": False,
     "weather_api_key": "",
     "weather_city": "",
     "weather_provider": "openweathermap",
@@ -94,9 +95,13 @@ def load_config() -> Dict[str, Any]:
         _to = 60
     merged["ai_api_timeout"] = max(5, min(120, _to))
 
+    if merged.get("ai_api_json_object_format") is None:
+        merged["ai_api_json_object_format"] = False
+    else:
+        merged["ai_api_json_object_format"] = bool(merged.get("ai_api_json_object_format"))
+
     # Ollama URL: empty or legacy unresolvable hostname → HA host default.
     _ou = (str(merged.get("ai_ollama_url") or "")).strip()
-    if not _ou or "ollama_ai" in _ou.lower():
         merged["ai_ollama_url"] = DEFAULT_CONFIG["ai_ollama_url"]
 
     # Single AC entity: ac_entity wins, else climate_entity (supervisor / old saves).

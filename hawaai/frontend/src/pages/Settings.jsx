@@ -233,7 +233,8 @@ export default function Settings() {
         key === 'ai_api_key' ||
         key === 'ai_api_base_url' ||
         key === 'ai_api_model' ||
-        key === 'ai_api_timeout'
+        key === 'ai_api_timeout' ||
+        key === 'ai_api_json_object_format'
       ) {
         updateAiConfig({ [key]: val }).catch((err) => {
           console.error('Failed to save AI field', key, err)
@@ -699,7 +700,9 @@ export default function Settings() {
               <option value="api">API (OpenAI-compatible)</option>
             </select>
             <p className="text-xs text-gray-500 mt-1">
-              Ollama keeps the existing default URL; API mode uses your base URL and model from the fields below.
+              OpenAI-compatible HTTPS only. Fast option (user-configured): Groq — base URL{' '}
+              <code className="text-gray-400">https://api.groq.com/openai/v1</code>, model e.g.{' '}
+              <code className="text-gray-400">llama3-8b-8192</code>. Not hardcoded; enter in fields below.
             </p>
           </div>
           {cfg.ai_provider === 'api' ? (
@@ -714,13 +717,13 @@ export default function Settings() {
                 label="API base URL"
                 value={cfg.ai_api_base_url ?? ''}
                 onChange={v => patch('ai_api_base_url', v)}
-                placeholder="https://api.openai.com/v1"
+                placeholder="https://api.groq.com/openai/v1"
               />
               <Input
                 label="API model name"
                 value={cfg.ai_api_model ?? ''}
                 onChange={v => patch('ai_api_model', v)}
-                placeholder="e.g. gpt-4o-mini"
+                placeholder="e.g. llama3-8b-8192"
               />
               <Input
                 label="API request timeout (seconds)"
@@ -730,6 +733,12 @@ export default function Settings() {
                 min={5}
                 max={120}
                 step={1}
+              />
+              <Toggle
+                label="Request JSON object mode (response_format)"
+                description="Enable only if your API supports OpenAI json_object (e.g. some OpenAI models). Off by default for Groq and other fast endpoints."
+                checked={cfg.ai_api_json_object_format === true}
+                onChange={v => patch('ai_api_json_object_format', v)}
               />
             </>
           ) : (

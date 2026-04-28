@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState, useCallback } from 'react'
 import { useNavigate } from 'react-router-dom'
-import { getStatus, getSessionStats, getSnapshots, getClimateState, setClimateTemperature, setHvacMode, setFanMode, setSwingMode } from '../api/smartcool.js'
+import { getStatus, getSessionStats, getSnapshots, getClimateState, setClimateTemperature, setHvacMode, setFanMode, setSwingMode, getAiStatus } from '../api/smartcool.js'
 import ACStatusCard    from '../components/ACStatusCard.jsx'
 import TempGauge       from '../components/TempGauge.jsx'
 import EnergyChart     from '../components/EnergyChart.jsx'
@@ -9,7 +9,75 @@ import SessionTable    from '../components/SessionTable.jsx'
 import InsightsCard    from '../components/InsightsCard.jsx'
 import LiveSessionCard from '../components/LiveSessionCard.jsx'
 import SmartAdjustmentCard from '../components/SmartAdjustmentCard.jsx'
-import { Thermometer, Wind, Zap, Cloud, AlertTriangle, Minus, Plus, Loader } from 'lucide-react'
+import { Thermometer, Wind, Zap, Cloud, AlertTriangle, Minus, Plus, Loader, Brain } from 'lucide-react'
+
+function formatAiTime(iso) {
+  if (!iso) return '—'
+  try {
+    const d = new Date(iso)
+    if (Number.isNaN(d.getTime())) return iso
+    return d.toLocaleString()
+  } catch {
+    return iso
+  }
+}
+
+function AiStatusCard() {
+  const [ai, setAi] = useState(null)
+  const load = useCallback(() => {
+    getAiStatus().then(setAi).catch(() => setAi(null))
+  }, [])
+
+  useEffect(() => {
+    load()
+    const id = setInterval(load, 5_000)
+    return () => clearInterval(id)
+  }, [load])
+
+  const st = ai?.status ?? 'idle'
+  const border =
+    st === 'success'
+      ? 'border-green-600/80 bg-green-950/25'
+      : st === 'running'
+        ? 'border-yellow-600/80 bg-yellow-950/20'
+        : st === 'idle'
+          ? 'border-gray-700 bg-gray-900/50'
+          : 'border-red-600/80 bg-red-950/20'
+
+  const rt = ai?.response_time
+  const row = (label, val) => (
+    <div className="flex justify-between gap-2 text-xs">
+      <span className="text-gray-500">{label}</span>
+      <span className="text-gray-200 font-medium text-right truncate max-w-[60%]" title={val != null ? String(val) : ''}>
+        {val != null && val !== '' ? val : '—'}
+      </span>
+    </div>
+  )
+
+  return (
+    <div className={`card border ${border}`}>
+      <div className="flex items-center gap-2 mb-3">
+        <Brain size={18} className="text-violet-400 shrink-0" aria-hidden />
+        <p className="text-xs text-gray-500 uppercase tracking-wide">🧠 AI Status</p>
+      </div>
+      {ai?.circuit_open && (
+        <div className="mb-2 text-xs text-amber-400 font-medium">
+          Circuit open — API paused {ai.circuit_seconds_remaining != null ? `(${ai.circuit_seconds_remaining}s)` : ''}
+        </div>
+      )}
+      <div className="space-y-2">
+        {row('Status', st)}
+        {row('Provider', ai?.provider)}
+        {row('Model', ai?.model)}
+        {row('Last call', formatAiTime(ai?.last_call))}
+        {row('Response time', rt != null ? `${rt} ms` : '—')}
+        {row('Failures (streak)', ai?.api_consecutive_failures ?? '—')}
+        {row('Last error', ai?.last_error)}
+      </div>
+      <p className="text-[10px] text-gray-600 mt-3">Refreshes every 5s · logic_engine always safe if AI fails</p>
+    </div>
+  )
+}
 
 // ── Config warning banner ─────────────────────────────────────────────────────
 function ConfigWarning() {
@@ -434,6 +502,8 @@ export default function Dashboard() {
             </div>
           </div>
         </div>
+
+        <AiStatusCard />
 
         {/* Climate card — only shown when a climate entity is configured */}
         {(status?.climate_entity || status?.ac_entity) && (

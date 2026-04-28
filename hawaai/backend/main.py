@@ -81,7 +81,7 @@ async def lifespan(app: FastAPI):
     logger.info("[HawaAI] Add-on stopped")
 
 
-app = FastAPI(title="HawaAI API", version="1.2.20", lifespan=lifespan)
+app = FastAPI(title="HawaAI API", version="1.2.22", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -145,6 +145,7 @@ async def get_ai_flag():
         "ai_api_base_url": (str(cfg.get("ai_api_base_url") or "")).strip(),
         "ai_api_model": (str(cfg.get("ai_api_model") or "")).strip(),
         "ai_api_timeout": tout,
+        "ai_api_json_object_format": bool(cfg.get("ai_api_json_object_format", False)),
         "ai_api_key_set": bool((str(cfg.get("ai_api_key") or "")).strip()),
         "default_ollama_model": config_manager.DEFAULT_OLLAMA_MODEL,
     }
@@ -176,6 +177,8 @@ async def set_ai_flag(data: Dict[str, Any] = Body(...)):
         k = str(data["ai_api_key"] or "").strip()
         if k and k != "***":
             patch["ai_api_key"] = k
+    if "ai_api_json_object_format" in data and data.get("ai_api_json_object_format") is not None:
+        patch["ai_api_json_object_format"] = bool(data["ai_api_json_object_format"])
     if not patch:
         raise HTTPException(
             status_code=400,
@@ -199,6 +202,7 @@ async def set_ai_flag(data: Dict[str, Any] = Body(...)):
         "ai_api_base_url": (str(out.get("ai_api_base_url") or "")).strip(),
         "ai_api_model": (str(out.get("ai_api_model") or "")).strip(),
         "ai_api_timeout": tout_o,
+        "ai_api_json_object_format": bool(out.get("ai_api_json_object_format", False)),
         "ai_api_key_set": bool((str(out.get("ai_api_key") or "")).strip()),
         "default_ollama_model": config_manager.DEFAULT_OLLAMA_MODEL,
     }
