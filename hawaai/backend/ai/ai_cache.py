@@ -19,7 +19,7 @@ _TEMP_REFETCH_DELTA = 1.0
 _DEFER_STABLE_S = 300.0
 
 _last_valid: Optional[Dict[str, Any]] = None
-_last_ollama_model: Optional[str] = None
+_last_ai_identity: Optional[str] = None
 _context_indoor: Optional[float] = None
 _last_tick_occupied: Optional[bool] = None
 
@@ -90,16 +90,24 @@ def set_validated(v: Dict[str, Any], indoor_temp: Optional[float] = None) -> Non
         _context_indoor = float(indoor_temp)
 
 
-def invalidate_if_ollama_model_changed(resolved_model: str) -> None:
-    """Clear cached AI output when the configured Ollama model changes (UI vs backend stay aligned)."""
-    global _last_ollama_model, _last_valid, _next_fetch_at, _context_indoor
-    r = (resolved_model or "").strip()
-    if _last_ollama_model is not None and r != _last_ollama_model:
+def invalidate_if_ai_identity_changed(provider: str, resolved_model: str) -> None:
+    """Clear cached AI output when provider or model changes."""
+    global _last_ai_identity, _last_valid, _next_fetch_at, _context_indoor
+    p = (provider or "ollama").strip().lower()
+    if p not in ("ollama", "api"):
+        p = "ollama"
+    r = f"{p}:{(resolved_model or '').strip()}"
+    if _last_ai_identity is not None and r != _last_ai_identity:
         _last_valid = None
         _context_indoor = None
         _next_fetch_at = 0.0
-        logger.debug("[AI] Ollama model changed — cache invalidated")
-    _last_ollama_model = r
+        logger.debug("[AI] Provider/model changed — cache invalidated")
+    _last_ai_identity = r
+
+
+def invalidate_if_ollama_model_changed(resolved_model: str) -> None:
+    """Backward-compatible alias (Ollama-only installs)."""
+    invalidate_if_ai_identity_changed("ollama", resolved_model)
 
 
 def throttle_cache_use_log() -> bool:

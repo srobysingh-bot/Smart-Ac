@@ -1,10 +1,11 @@
-"""HTTP client for Ollama (localhost or configurable base URL). Non-blocking: called via asyncio.create_task."""
+"""AI inference: OpenAI-compatible API or Ollama (local). Non-blocking via asyncio.create_task."""
 
 from __future__ import annotations
 
 import asyncio
 import json
 import logging
+import random
 import re
 import time
 from typing import Any, Dict, Optional, Tuple
@@ -17,7 +18,7 @@ from .. import config_manager, ha_client
 logger = logging.getLogger(__name__)
 
 # Bumped with each AI transport change — look for "AI worker initialized" in add-on logs
-AI_WORKER_VERSION = "1.2.15"
+AI_WORKER_VERSION = "1.2.19"
 
 # Ollama structured output: JSON Schema only under request "format" (no separate top-level required)
 OLLAMA_RESPONSE_FORMAT: Dict[str, Any] = {
@@ -38,6 +39,13 @@ _ollama_url_logged: bool = False
 _GENERATE = "/api/generate"
 _TIMEOUT_S = 30.0
 _RETRY_DELAY_S = 4.0
+_API_RETRY_DELAY_S = 2.0
+# Safe HVAC hint when API returns 200 but body is unusable (validated before cache).
+_API_CONSERVATIVE_DEFAULT: Dict[str, Any] = {
+    "target_temp": 24,
+    "fan_mode": "auto",
+    "confidence": 0.5,
+}
 _OLLAMA_GEN_OPTIONS: Dict[str, Any] = {
     "num_predict":  20,
     "temperature": 0.0,
@@ -90,64 +98,63 @@ def _model(cfg: Dict[str, Any]) -> str:
     return m or config_manager.DEFAULT_OLLAMA_MODEL
 
 
-async def _post_generate(
-    base: str, body: Dict[str, Any],
-) -> Optional[Dict[str, Any]]:
-    url = f"{base}{_GENERATE}"
-    timeout = aiohttp.ClientTimeout(total=_TIMEOUT_S)
-    t0 = time.perf_counter()
+def _ai_provider(cfg: Dict[str, Any]) -> str:
+    p = (str(cfg.get("ai_provider") or "ollama")).strip().lower()
+    return "api" if p == "api" else "ollama"
+
+
+def _api_model(cfg: Dict[str, Any]) -> str:
+    return (cfg.get("ai_api_model") or "").strip()
+
+
+def _api_timeout_s(cfg: Dict[str, Any]) -> float:
     try:
-        async with aiohttp.ClientSession(timeout=timeout) as session:
-            async with session.post(url, json=body) as resp:
-                if resp.status != 200:
-                    txt = await resp.text()
-                    logger.debug("[AI] HTTP %s %s", resp.status, txt[:200])
-                    return None
-                data = await resp.json()
-                logger.debug("[AI] response time %.2fs", time.perf_counter() - t0)
-                return data
-    except asyncio.TimeoutError:
-        logger.debug("[AI] request timeout %ss", _TIMEOUT_S)
-        return None
-    except aiohttp.ClientError as e:
-        logger.debug("[AI] client error: %s", e)
-        return None
-
-
-async def _post_generate_with_one_retry(
-    base: str, body: Dict[str, Any],
-) -> Optional[Dict[str, Any]]:
-    r = await _post_generate(base, body)
-    if r is not None:
-        return r
-    logger.debug("[AI] retry in %.0fs", _RETRY_DELAY_S)
-    await asyncio.sleep(_RETRY_DELAY_S)
-    return await _post_generate(base, body)
-
-
-def _emit_ai_response_line(obj: Any) -> None:
-    try:
-        txt = json.dumps(obj, ensure_ascii=False, separators=(",", ":"))
+        t = float(cfg.get("ai_api_timeout", 20))
     except (TypeError, ValueError):
-        return
-    logger.info("AI RESPONSE: %s", txt)
+        t = 20.0
+    return max(5.0, min(120.0, t))
 
 
-def _log_invalid_json_full_raw(context: str, raw: Any) -> None:
-    """Debug: full model output when parse/validation path fails (no truncation)."""
-    logger.warning("[AI] INVALID JSON (%s) — full raw: %r", context, raw)
+def mask_api_key_for_log(secret: str) -> str:
+    """Never log raw keys; use only for 'configured' hints (not full secret)."""
+    s = (secret or "").strip()
+    if not s:
+        return "(not set)"
+    if len(s) <= 8:
+        return "****"
+    return f"{s[:3]}****{s[-4:]}"
 
 
-def _parse_response_body(resp: Dict[str, Any]) -> Any:
-    raw = (resp or {}).get("response")
-    if not raw and isinstance(resp, dict) and "message" in resp:
-        c = (resp.get("message") or {}).get("content")
-        if c:
-            raw = c
-    if raw is None:
-        logger.warning("[AI] INVALID JSON (empty response field) — full message: %r", resp)
+def _normalize_message_content(content: Any) -> Any:
+    """OpenAI-compatible message content: str or multimodal list."""
+    if content is None:
+        return None
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts: list = []
+        for p in content:
+            if isinstance(p, dict) and isinstance(p.get("text"), str):
+                parts.append(p["text"])
+            elif isinstance(p, str):
+                parts.append(p)
+        return "".join(parts) if parts else None
+    return content
+
+
+def _extract_chat_completion_content(resp: Dict[str, Any]) -> Any:
+    try:
+        ch = resp.get("choices") or []
+        if not ch:
+            return None
+        msg = (ch[0] or {}).get("message") or {}
+        return msg.get("content")
+    except (TypeError, IndexError, AttributeError):
         return None
 
+
+def _parse_json_from_model_output(raw: Any) -> Any:
+    """Turn model output (string or dict) into parsed JSON object or None."""
     if isinstance(raw, dict):
         try:
             blob = json.dumps(raw, ensure_ascii=False, separators=(",", ":"))
@@ -206,6 +213,200 @@ def _parse_response_body(resp: Dict[str, Any]) -> Any:
     return parsed
 
 
+async def _post_generate(
+    base: str, body: Dict[str, Any],
+) -> Optional[Dict[str, Any]]:
+    url = f"{base}{_GENERATE}"
+    timeout = aiohttp.ClientTimeout(total=_TIMEOUT_S)
+    t0 = time.perf_counter()
+    try:
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.post(url, json=body) as resp:
+                if resp.status != 200:
+                    txt = await resp.text()
+                    logger.debug("[AI] HTTP %s %s", resp.status, txt[:200])
+                    return None
+                data = await resp.json()
+                logger.debug("[AI] response time %.2fs", time.perf_counter() - t0)
+                return data
+    except asyncio.TimeoutError:
+        logger.debug("[AI] request timeout %ss", _TIMEOUT_S)
+        return None
+    except aiohttp.ClientError as e:
+        logger.debug("[AI] client error: %s", e)
+        return None
+
+
+async def _post_chat_completions(
+    url: str,
+    api_key: str,
+    body: Dict[str, Any],
+    timeout_s: float,
+) -> Tuple[Optional[Dict[str, Any]], bool]:
+    """
+    POST chat/completions. Returns (data, retryable).
+    retryable is True only for timeout / transport errors — outer wrapper may retry once.
+    HTTP 429: waits 2–3s and repeats the request once inside this function.
+    """
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }
+    timeout = aiohttp.ClientTimeout(total=timeout_s)
+    t0 = time.perf_counter()
+    try:
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            for attempt in range(2):
+                async with session.post(url, json=body, headers=headers) as resp:
+                    if resp.status == 429:
+                        await resp.text()
+                        if attempt == 0:
+                            delay = 2.0 + random.random()
+                            logger.warning(
+                                "[AI] API rate limited (HTTP 429); retry in %.1fs",
+                                delay,
+                            )
+                            await asyncio.sleep(delay)
+                            continue
+                        logger.warning("[AI] API HTTP 429 after retry")
+                        return None, False
+                    if resp.status != 200:
+                        txt = await resp.text()
+                        logger.warning(
+                            "[AI] API HTTP %s (%.2fs) body[:200]=%r",
+                            resp.status,
+                            time.perf_counter() - t0,
+                            (txt or "")[:200],
+                        )
+                        return None, False
+                    try:
+                        data = await resp.json()
+                    except (aiohttp.ContentTypeError, json.JSONDecodeError) as e:
+                        logger.warning("[AI] API response body not valid JSON: %s", e)
+                        return None, False
+                    logger.debug(
+                        "[AI] API response time %.2fs",
+                        time.perf_counter() - t0,
+                    )
+                    return data, False
+            return None, False
+    except asyncio.TimeoutError:
+        logger.warning("[AI] API timeout after %s seconds", timeout_s)
+        return None, True
+    except aiohttp.ClientError as e:
+        logger.warning("[AI] API client error: %s", e)
+        return None, True
+
+
+async def _post_chat_completions_with_one_retry(
+    url: str,
+    api_key: str,
+    body: Dict[str, Any],
+    timeout_s: float,
+) -> Optional[Dict[str, Any]]:
+    """On transport/timeout failure only: wait 2s and retry once. HTTP errors: no retry."""
+    data, retryable = await _post_chat_completions(url, api_key, body, timeout_s)
+    if data is not None:
+        return data
+    if not retryable:
+        return None
+    logger.debug("[AI] API transport/timeout — retry in %.0fs", _API_RETRY_DELAY_S)
+    await asyncio.sleep(_API_RETRY_DELAY_S)
+    data, _ = await _post_chat_completions(url, api_key, body, timeout_s)
+    return data
+
+
+async def _post_generate_with_one_retry(
+    base: str, body: Dict[str, Any],
+) -> Optional[Dict[str, Any]]:
+    r = await _post_generate(base, body)
+    if r is not None:
+        return r
+    logger.debug("[AI] retry in %.0fs", _RETRY_DELAY_S)
+    await asyncio.sleep(_RETRY_DELAY_S)
+    return await _post_generate(base, body)
+
+
+def _emit_ai_response_line(obj: Any) -> None:
+    try:
+        txt = json.dumps(obj, ensure_ascii=False, separators=(",", ":"))
+    except (TypeError, ValueError):
+        return
+    logger.info("AI RESPONSE: %s", txt)
+
+
+def _log_invalid_json_full_raw(context: str, raw: Any) -> None:
+    """Debug: full model output when parse/validation path fails (no truncation)."""
+    logger.warning("[AI] INVALID JSON (%s) — full raw: %r", context, raw)
+
+
+def _parse_api_chat_response(resp: Dict[str, Any]) -> Any:
+    """Parse OpenAI-compatible chat completion JSON only (no Ollama fields)."""
+    if not isinstance(resp, dict) or "choices" not in resp:
+        logger.warning("[AI] API response missing choices[]")
+        return None
+    raw = _normalize_message_content(_extract_chat_completion_content(resp))
+    if raw is None:
+        logger.warning("[AI] API message content empty — invalid")
+        return None
+    if isinstance(raw, str):
+        s = raw.strip()
+        if not s:
+            logger.warning("[AI] API message content empty — invalid")
+            return None
+        if not s.startswith("{"):
+            logger.warning("[AI] API message content does not start with '{' — invalid")
+            return None
+    return _parse_json_from_model_output(raw)
+
+
+def _parse_ollama_response_body(resp: Dict[str, Any]) -> Any:
+    """Normalize Ollama /api/generate response → JSON object for ai_validator."""
+    if not isinstance(resp, dict):
+        return None
+    raw = (resp or {}).get("response")
+    if not raw and "message" in resp:
+        c = (resp.get("message") or {}).get("content")
+        if c:
+            raw = c
+    if raw is None:
+        logger.warning("[AI] INVALID JSON (empty response field) — full message: %r", resp)
+        return None
+    return _parse_json_from_model_output(raw)
+
+
+def _api_fallback_to_logic_engine() -> None:
+    logger.info("[AI] API failed → fallback to logic_engine")
+    ai_cache.mark_fetch_done()
+
+
+def _try_apply_api_conservative_defaults(
+    is_occupied: bool,
+    indoor_temp: float,
+) -> bool:
+    """
+    When the API returns HTTP 200 but the model output is unusable, apply a
+    validated conservative hint so behavior stays deterministic. If validation
+    fails (e.g. occupancy edge), return False and let logic_engine run alone.
+    """
+    validated = ai_validator.validate_ai_payload(
+        dict(_API_CONSERVATIVE_DEFAULT),
+        is_occupied,
+    )
+    if not validated:
+        logger.warning(
+            "[AI] Conservative API default rejected by validator — logic_engine only",
+        )
+        return False
+    ai_cache.set_validated(validated, indoor_temp)
+    ai_cache.mark_fetch_done()
+    logger.info(
+        "[AI] API output invalid — applied conservative default "
+        "(target_temp=24, fan_mode=auto, confidence=0.5)",
+    )
+    return True
+
+
 async def run_ai_and_cache(
     cfg: Dict[str, Any],
     indoor_temp: float,
@@ -217,42 +418,100 @@ async def run_ai_and_cache(
     if not bool(cfg.get("ai_enabled", False)) or not is_occupied:
         return
 
-    base   = _base_url(cfg)
-    model  = _model(cfg)
-    ai_cache.invalidate_if_ollama_model_changed(model)
-    logger.debug("[AI] model=%s", model)
     prompt = ai_prompt.build_hvac_control_prompt(
         indoor_temp, outdoor_temp, is_occupied,
     )
-    logger.info("PROMPT SENT TO OLLAMA: %s", prompt)
+    provider = _ai_provider(cfg)
 
-    body = ai_prompt.ollama_payload(model, prompt)
-    body["format"] = dict(OLLAMA_RESPONSE_FORMAT)
-    body["raw"] = True
-    body["stream"] = False
-    body["options"] = dict(_OLLAMA_GEN_OPTIONS)
+    if provider == "ollama":
+        logger.info("[AI] Provider: Ollama")
+        base   = _base_url(cfg)
+        model  = _model(cfg)
+        ai_cache.invalidate_if_ai_identity_changed("ollama", model)
+        logger.debug("[AI] model=%s", model)
+        logger.info("PROMPT SENT TO OLLAMA: %s", prompt)
 
-    logger.info("OLLAMA PAYLOAD: %s", json.dumps(body, ensure_ascii=False))
+        body = ai_prompt.ollama_payload(model, prompt)
+        body["format"] = dict(OLLAMA_RESPONSE_FORMAT)
+        body["raw"] = True
+        body["stream"] = False
+        body["options"] = dict(_OLLAMA_GEN_OPTIONS)
 
-    logger.info("[AI] Called")
-    resp = await _post_generate_with_one_retry(base, body)
-    if resp is None:
-        _log_skipped_not_available()
+        logger.info("OLLAMA PAYLOAD: %s", json.dumps(body, ensure_ascii=False))
+
+        logger.info("[AI] Called")
+        resp = await _post_generate_with_one_retry(base, body)
+        if resp is None:
+            _log_skipped_not_available()
+            ai_cache.mark_fetch_done()
+            return
+
+        parsed = _parse_ollama_response_body(resp)
+        if parsed is None:
+            logger.info("[AI] Skipped")
+            logger.debug("[AI] Skipped reason: unparseable output")
+            ai_cache.mark_fetch_done()
+            return
+
+        validated = ai_validator.validate_ai_payload(parsed, is_occupied)
+        if not validated:
+            logger.info("[AI] Skipped")
+            logger.debug("[AI] Skipped reason: validation failed")
+            ai_cache.mark_fetch_done()
+            return
+
+        ai_cache.set_validated(validated, indoor_temp)
         ai_cache.mark_fetch_done()
+        logger.info("[AI] Applied")
         return
 
-    parsed = _parse_response_body(resp)
+    # OpenAI-compatible HTTP API
+    logger.info("[AI] Provider: API")
+    key = (cfg.get("ai_api_key") or "").strip()
+    base_u = (cfg.get("ai_api_base_url") or "").strip().rstrip("/")
+    model_a = _api_model(cfg)
+    timeout_a = _api_timeout_s(cfg)
+
+    if not key or not base_u or not model_a:
+        logger.error(
+            "[AI] API mode requires non-empty ai_api_key, ai_api_base_url, and ai_api_model",
+        )
+        _api_fallback_to_logic_engine()
+        return
+
+    ai_cache.invalidate_if_ai_identity_changed("api", model_a)
+    logger.debug("[AI] model=%s timeout=%.0fs", model_a, timeout_a)
+    logger.info("[AI] API key fingerprint (masked): %s", mask_api_key_for_log(key))
+    logger.info("PROMPT SENT TO AI (API): %s", prompt)
+
+    chat_url = f"{base_u}/chat/completions"
+    # OpenAI-compatible; omit if provider returns 400 (not all endpoints support json_object).
+    req_body: Dict[str, Any] = {
+        "model": model_a,
+        "messages": [{"role": "user", "content": prompt}],
+        "temperature": 0,
+        "max_tokens": 50,
+        "response_format": {"type": "json_object"},
+    }
+    logger.info("[AI] Request sent to API (url=%s model=%s)", chat_url, model_a)
+
+    resp = await _post_chat_completions_with_one_retry(chat_url, key, req_body, timeout_a)
+    if resp is None:
+        _api_fallback_to_logic_engine()
+        return
+
+    logger.info("[AI] Response received")
+
+    parsed = _parse_api_chat_response(resp)
     if parsed is None:
-        logger.info("[AI] Skipped")
-        logger.debug("[AI] Skipped reason: unparseable output")
-        ai_cache.mark_fetch_done()
+        if not _try_apply_api_conservative_defaults(is_occupied, indoor_temp):
+            _api_fallback_to_logic_engine()
         return
 
     validated = ai_validator.validate_ai_payload(parsed, is_occupied)
     if not validated:
-        logger.info("[AI] Skipped")
-        logger.debug("[AI] Skipped reason: validation failed")
-        ai_cache.mark_fetch_done()
+        if not _try_apply_api_conservative_defaults(is_occupied, indoor_temp):
+            _api_fallback_to_logic_engine()
         return
 
     ai_cache.set_validated(validated, indoor_temp)

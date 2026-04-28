@@ -205,6 +205,7 @@ export default function Settings() {
       .then(([c, e]) => {
         const cleaned = { ...c }
         if (cleaned.weather_api_key === '***') cleaned.weather_api_key = ''
+        if (cleaned.ai_api_key === '***') cleaned.ai_api_key = ''
         setCfg(cleaned)
         setEntities(e)
       })
@@ -225,9 +226,17 @@ export default function Settings() {
   const patch = useCallback((key, val) => {
     setCfg(prev => {
       const next = { ...prev, [key]: val }
-      if (key === 'ai_ollama_url' || key === 'ai_ollama_model') {
+      if (
+        key === 'ai_ollama_url' ||
+        key === 'ai_ollama_model' ||
+        key === 'ai_provider' ||
+        key === 'ai_api_key' ||
+        key === 'ai_api_base_url' ||
+        key === 'ai_api_model' ||
+        key === 'ai_api_timeout'
+      ) {
         updateAiConfig({ [key]: val }).catch((err) => {
-          console.error('Failed to save Ollama field', key, err)
+          console.error('Failed to save AI field', key, err)
         })
       }
       return next
@@ -240,6 +249,7 @@ export default function Settings() {
     try {
       const payload = { ...cfg }
       if (!payload.weather_api_key) delete payload.weather_api_key
+      if (!payload.ai_api_key) delete payload.ai_api_key
       await patchConfig(payload)
       setSaveStatus('ok')
       setSaveMsg('Settings saved — logic engine updated')
@@ -667,7 +677,7 @@ export default function Settings() {
           />
           <Toggle
             label="Enable AI Optimization"
-            description="Optional Ollama (Gemma) HTTP layer — soft setpoint and fan hints. Default points to the Home Assistant host (172.30.32.1) where Ollama is exposed; override if needed."
+            description="Soft setpoint and fan hints from an AI model. Choose Ollama (local) or an OpenAI-compatible cloud API below — no credentials are hardcoded."
             checked={cfg.ai_enabled ?? false}
             onChange={async (v) => {
               patch('ai_enabled', v)
@@ -678,18 +688,66 @@ export default function Settings() {
               }
             }}
           />
-          <Input
-            label="Ollama base URL (leave empty to use default: 172.30.32.1)"
-            value={cfg.ai_ollama_url ?? ''}
-            onChange={v => patch('ai_ollama_url', v)}
-            placeholder="http://172.30.32.1:11434"
-          />
-          <Input
-            label="Ollama model (optional; default gemma:2b — fast, structured JSON on Pi)"
-            value={cfg.ai_ollama_model ?? ''}
-            onChange={v => patch('ai_ollama_model', v)}
-            placeholder="gemma:2b"
-          />
+          <div>
+            <Label>AI Provider</Label>
+            <select
+              className="w-full bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm text-gray-100 focus:outline-none focus:border-blue-500"
+              value={cfg.ai_provider === 'api' ? 'api' : 'ollama'}
+              onChange={e => patch('ai_provider', e.target.value)}
+            >
+              <option value="ollama">Ollama (local)</option>
+              <option value="api">API (OpenAI-compatible)</option>
+            </select>
+            <p className="text-xs text-gray-500 mt-1">
+              Ollama keeps the existing default URL; API mode uses your base URL and model from the fields below.
+            </p>
+          </div>
+          {cfg.ai_provider === 'api' ? (
+            <>
+              <PasswordInput
+                label="API key"
+                value={cfg.ai_api_key ?? ''}
+                onChange={v => patch('ai_api_key', v)}
+                placeholder="Required when provider is API"
+              />
+              <Input
+                label="API base URL"
+                value={cfg.ai_api_base_url ?? ''}
+                onChange={v => patch('ai_api_base_url', v)}
+                placeholder="https://api.openai.com/v1"
+              />
+              <Input
+                label="API model name"
+                value={cfg.ai_api_model ?? ''}
+                onChange={v => patch('ai_api_model', v)}
+                placeholder="e.g. gpt-4o-mini"
+              />
+              <Input
+                label="API request timeout (seconds)"
+                value={cfg.ai_api_timeout ?? 20}
+                onChange={v => patch('ai_api_timeout', v)}
+                type="number"
+                min={5}
+                max={120}
+                step={1}
+              />
+            </>
+          ) : (
+            <>
+              <Input
+                label="Ollama base URL (leave empty to use default: 172.30.32.1)"
+                value={cfg.ai_ollama_url ?? ''}
+                onChange={v => patch('ai_ollama_url', v)}
+                placeholder="http://172.30.32.1:11434"
+              />
+              <Input
+                label="Ollama model (optional; default gemma:2b — fast, structured JSON on Pi)"
+                value={cfg.ai_ollama_model ?? ''}
+                onChange={v => patch('ai_ollama_model', v)}
+                placeholder="gemma:2b"
+              />
+            </>
+          )}
           <Toggle
             label="Manual Override"
             description="Disable all automation"

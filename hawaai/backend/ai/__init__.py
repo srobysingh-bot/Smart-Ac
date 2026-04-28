@@ -1,4 +1,4 @@
-"""Optional Ollama-based AI layer (HTTP only, soft overrides)."""
+"""Optional AI layer: Ollama (local) or OpenAI-compatible HTTP API (soft HVAC overrides)."""
 
 from .ai_cache import get_cached, mark_fetch_done, set_validated, should_run_ai, throttle_cache_use_log
 from .ai_validator import validate_ai_payload

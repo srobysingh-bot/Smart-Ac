@@ -9,8 +9,8 @@ Routes:
   GET  /api/snapshots       Recent monitoring snapshots (last 2h)
   GET  /api/config          Current add-on config
   POST /api/config          Save config to /data/hawaai_config.json
-  GET  /api/ai              { ai_enabled, ai_ollama_url, ai_ollama_model, default_ollama_model }
-  POST /api/ai              Set ai_enabled and/or Ollama URL/model (merge persist)
+  GET  /api/ai              { ai_enabled, ai_provider, ollama + API fields (key masked) }
+  POST /api/ai              Set AI settings (merge persist)
   GET  /api/entities        HA entity list for Settings dropdowns
   GET  /api/climate/{id}   Live climate entity state + attributes
   POST /api/climate/{id}/set_temperature
@@ -47,6 +47,13 @@ logging.basicConfig(level=logging.INFO)
 _ws_clients: List[WebSocket] = []
 
 
+def _mask_api_key_response(stored: str) -> str:
+    """Never expose raw API keys to clients; non-empty keys surface as a single placeholder."""
+    return "***" if (stored or "").strip() else ""
+
+
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     await database.init_db()
@@ -60,7 +67,9 @@ async def lifespan(app: FastAPI):
         "enabled" if smart_on else "disabled",
     )
     if bool(cfg.get("ai_enabled", False)):
-        logger.info("[AI] Enabled")
+        ap = (str(cfg.get("ai_provider") or "ollama")).strip().lower()
+        prov_label = "API" if ap == "api" else "Ollama"
+        logger.info("[AI] Enabled (provider=%s)", prov_label)
     else:
         logger.info("[AI] Disabled (default)")
     asyncio.create_task(scheduler.start())
@@ -70,7 +79,7 @@ async def lifespan(app: FastAPI):
     logger.info("[HawaAI] Add-on stopped")
 
 
-app = FastAPI(title="HawaAI API", version="1.2.15", lifespan=lifespan)
+app = FastAPI(title="HawaAI API", version="1.2.19", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -90,6 +99,8 @@ async def get_config():
     masked = dict(cfg)
     if masked.get("weather_api_key"):
         masked["weather_api_key"] = "***"
+    mk = (masked.get("ai_api_key") or "").strip()
+    masked["ai_api_key"] = _mask_api_key_response(mk)
     return masked
 
 
@@ -97,7 +108,7 @@ async def get_config():
 async def save_config(data: Dict[str, Any] = Body(...)):
     """Frontend POSTs full config on Save. Persists to /data/hawaai_config.json."""
     # Don't overwrite secrets with masked placeholder
-    for secret_key in ("weather_api_key",):
+    for secret_key in ("weather_api_key", "ai_api_key"):
         if data.get(secret_key) == "***" or data.get(secret_key) == "":
             data.pop(secret_key, None)
 
@@ -116,12 +127,23 @@ async def reload_config():
 
 @app.get("/api/ai")
 async def get_ai_flag():
-    """Expose optional Ollama layer flags and current URL/model (full config in /api/config)."""
+    """Expose AI layer flags; API key is never returned raw (see /api/config)."""
     cfg = config_manager.load_config()
+    prov = (str(cfg.get("ai_provider") or "ollama")).strip().lower()
+    prov_norm = "api" if prov == "api" else "ollama"
+    try:
+        tout = int(cfg.get("ai_api_timeout", 20))
+    except (TypeError, ValueError):
+        tout = 20
     return {
         "ai_enabled": bool(cfg.get("ai_enabled", False)),
+        "ai_provider": prov_norm,
         "ai_ollama_url": (str(cfg.get("ai_ollama_url") or "")).strip(),
         "ai_ollama_model": (str(cfg.get("ai_ollama_model") or "")).strip(),
+        "ai_api_base_url": (str(cfg.get("ai_api_base_url") or "")).strip(),
+        "ai_api_model": (str(cfg.get("ai_api_model") or "")).strip(),
+        "ai_api_timeout": tout,
+        "ai_api_key_set": bool((str(cfg.get("ai_api_key") or "")).strip()),
         "default_ollama_model": config_manager.DEFAULT_OLLAMA_MODEL,
     }
 
@@ -132,23 +154,50 @@ async def set_ai_flag(data: Dict[str, Any] = Body(...)):
     patch: Dict[str, Any] = {}
     if "ai_enabled" in data:
         patch["ai_enabled"] = bool(data["ai_enabled"])
+    if "ai_provider" in data and data.get("ai_provider") is not None:
+        p = str(data["ai_provider"] or "ollama").strip().lower()
+        patch["ai_provider"] = "api" if p == "api" else "ollama"
     if "ai_ollama_url" in data and data.get("ai_ollama_url") is not None:
         patch["ai_ollama_url"] = str(data["ai_ollama_url"] or "").strip()
     if "ai_ollama_model" in data and data.get("ai_ollama_model") is not None:
         patch["ai_ollama_model"] = str(data["ai_ollama_model"] or "").strip()
+    if "ai_api_base_url" in data and data.get("ai_api_base_url") is not None:
+        patch["ai_api_base_url"] = str(data["ai_api_base_url"] or "").strip().rstrip("/")
+    if "ai_api_model" in data and data.get("ai_api_model") is not None:
+        patch["ai_api_model"] = str(data["ai_api_model"] or "").strip()
+    if "ai_api_timeout" in data and data.get("ai_api_timeout") is not None:
+        try:
+            patch["ai_api_timeout"] = int(data["ai_api_timeout"])
+        except (TypeError, ValueError):
+            patch["ai_api_timeout"] = 20
+    if "ai_api_key" in data and data.get("ai_api_key") is not None:
+        k = str(data["ai_api_key"] or "").strip()
+        if k and k != "***":
+            patch["ai_api_key"] = k
     if not patch:
         raise HTTPException(
             status_code=400,
-            detail="At least one of: ai_enabled, ai_ollama_url, ai_ollama_model",
+            detail="At least one AI field required (e.g. ai_enabled, ai_provider, ai_ollama_url)",
         )
     ok = config_manager.save_config(patch)
     if not ok:
         raise HTTPException(status_code=500, detail="Failed to save config")
     out = config_manager.load_config()
+    prov = (str(out.get("ai_provider") or "ollama")).strip().lower()
+    prov_norm = "api" if prov == "api" else "ollama"
+    try:
+        tout_o = int(out.get("ai_api_timeout", 20))
+    except (TypeError, ValueError):
+        tout_o = 20
     return {
         "ai_enabled": bool(out.get("ai_enabled", False)),
+        "ai_provider": prov_norm,
         "ai_ollama_url": (str(out.get("ai_ollama_url") or "")).strip(),
         "ai_ollama_model": (str(out.get("ai_ollama_model") or "")).strip(),
+        "ai_api_base_url": (str(out.get("ai_api_base_url") or "")).strip(),
+        "ai_api_model": (str(out.get("ai_api_model") or "")).strip(),
+        "ai_api_timeout": tout_o,
+        "ai_api_key_set": bool((str(out.get("ai_api_key") or "")).strip()),
         "default_ollama_model": config_manager.DEFAULT_OLLAMA_MODEL,
     }
 

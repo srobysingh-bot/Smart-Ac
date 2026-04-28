@@ -37,8 +37,13 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "smart_cooling_enabled": False,  # fan boost/normal via climate entity when enabled
     "manual_override": False,
     "ai_enabled": False,
+    "ai_provider": "ollama",
     "ai_ollama_url": "http://172.30.32.1:11434",
     "ai_ollama_model": "",
+    "ai_api_key": "",
+    "ai_api_base_url": "",
+    "ai_api_model": "",
+    "ai_api_timeout": 20,
     "weather_api_key": "",
     "weather_city": "",
     "weather_provider": "openweathermap",
@@ -79,6 +84,15 @@ def load_config() -> Dict[str, Any]:
 
     if merged.get("ai_enabled") is None:
         merged["ai_enabled"] = False
+
+    _prov = (str(merged.get("ai_provider") or "ollama")).strip().lower()
+    merged["ai_provider"] = "api" if _prov == "api" else "ollama"
+
+    try:
+        _to = int(merged.get("ai_api_timeout", 20))
+    except (TypeError, ValueError):
+        _to = 20
+    merged["ai_api_timeout"] = max(5, min(120, _to))
 
     # Ollama URL: empty or legacy unresolvable hostname → HA host default.
     _ou = (str(merged.get("ai_ollama_url") or "")).strip()
