@@ -1,5 +1,14 @@
-import { useCallback, useEffect, useState } from 'react'
-import { getConfig, getEntities, getDevices, getDeviceEntities, patchConfig, getWeather, setAiEnabled, updateAiConfig } from '../api/smartcool.js'
+import { useCallback, useEffect, useState, useMemo } from 'react'
+import { useSearchParams } from 'react-router-dom'
+import {
+  getRoom,
+  getRooms,
+  getEntities,
+  getDevices,
+  getDeviceEntities,
+  getWeather,
+  updateRoom,
+} from '../api/smartcool.js'
 import { Save, RefreshCw, AlertCircle, CheckCircle2, Eye, EyeOff } from 'lucide-react'
 
 // ── Reusable field components ─────────────────────────────────────────────────
@@ -174,10 +183,34 @@ const CURRENCY_OPTIONS = [
   { value: 'AED', label: 'AED Dirham'     },
 ]
 
-// ── Main Settings page ────────────────────────────────────────────────────────
+const ROOM_LS = 'hawaai_active_room'
+
+/** Persisted under each room's `settings` in config (non-entity fields). */
+const ROOM_SETTINGS_KEYS = [
+  'target_temp', 'hysteresis', 'vacancy_timeout_minutes', 'logic_interval_seconds',
+  'energy_tariff_per_kwh', 'currency', 'use_presence', 'use_outdoor_temp',
+  'smart_temp_adjustment', 'smart_cooling_enabled', 'manual_override',
+  'ac_brand', 'ac_model', 'weather_provider', 'weather_api_key', 'weather_city',
+]
+
+const AI_CONFIG_KEYS = [
+  'ai_enabled', 'ai_provider', 'ai_ollama_url', 'ai_ollama_model',
+  'ai_api_key', 'ai_api_base_url', 'ai_api_model', 'ai_api_timeout', 'ai_api_json_object_format',
+]
+
+// ── Main Settings page (room-scoped: GET/PUT /api/rooms/{room_id}) ─────────────
 export default function Settings() {
+  const [searchParams, setSearchParams] = useSearchParams()
+  const roomId = useMemo(
+    () => (searchParams.get('room_id') || '').trim() || null,
+    [searchParams],
+  )
+
   const [cfg,        setCfg]        = useState({})
   const [entities,   setEntities]   = useState([])
+  const [roomsList,  setRoomsList]  = useState([])
+  const [roomTitle,  setRoomTitle]  = useState('')
+  const [loadError,  setLoadError]  = useState(null)
   const [saving,     setSaving]     = useState(false)
   const [saveStatus, setSaveStatus] = useState(null)
   const [saveMsg,    setSaveMsg]    = useState('')
@@ -201,59 +234,111 @@ export default function Settings() {
   const [loadingEntities, setLoadingEntities] = useState(false)
 
   useEffect(() => {
-    Promise.all([getConfig(), getEntities()])
-      .then(([c, e]) => {
-        const cleaned = { ...c }
-        if (cleaned.weather_api_key === '***') cleaned.weather_api_key = ''
-        if (cleaned.ai_api_key === '***') cleaned.ai_api_key = ''
-        setCfg(cleaned)
-        setEntities(e)
-      })
-      .catch(console.error)
-      .finally(() => setLoading(false))
-
-    // Load HA device registry for energy device selector
-    getDevices()
-      .then(setAllDevices)
-      .catch(err => setDevicesError(String(err)))
-
-    // Fetch outdoor temp for Smart Adjustment preview
     getWeather()
       .then(w => setOutdoorTemp(w.outdoor_temp ?? null))
       .catch(() => {})
   }, [])
 
+  useEffect(() => {
+    getRooms()
+      .then(r => setRoomsList(r.rooms || []))
+      .catch(console.error)
+  }, [])
+
+  useEffect(() => {
+    if (!roomsList.length) return
+    const url = (searchParams.get('room_id') || '').trim()
+    const ls = typeof localStorage !== 'undefined' ? localStorage.getItem(ROOM_LS) : null
+    const valid = (id) => id && roomsList.some(x => x.id === id)
+    const pick =
+      valid(url) ? url : valid(ls) ? ls : roomsList.length === 1 ? roomsList[0].id : null
+    if (pick) {
+      if (typeof localStorage !== 'undefined') localStorage.setItem(ROOM_LS, pick)
+      if (url !== pick) setSearchParams({ room_id: pick }, { replace: true })
+    }
+  }, [roomsList, searchParams, setSearchParams])
+
+  useEffect(() => {
+    if (!roomId) {
+      setCfg({})
+      setRoomTitle('')
+      setLoading(false)
+      return
+    }
+    let alive = true
+    setLoading(true)
+    setDevicesError(null)
+    setLoadError(null)
+    Promise.all([
+      getRoom(roomId),
+      getEntities(),
+      getDevices().catch(err => {
+        setDevicesError(String(err))
+        return []
+      }),
+    ])
+      .then(([detail, e, devs]) => {
+        if (!alive) return
+        const c = { ...detail.effective }
+        if (c.weather_api_key === '***') c.weather_api_key = ''
+        if (c.ai_api_key === '***') c.ai_api_key = ''
+        setCfg(c)
+        setRoomTitle(detail.room?.name || roomId)
+        setEntities(e)
+        setAllDevices(devs)
+      })
+      .catch(err => {
+        console.error(err)
+        if (alive) {
+          setCfg({})
+          setLoadError(err?.message || String(err))
+        }
+      })
+      .finally(() => {
+        if (alive) setLoading(false)
+      })
+    return () => { alive = false }
+  }, [roomId])
+
   const patch = useCallback((key, val) => {
-    setCfg(prev => {
-      const next = { ...prev, [key]: val }
-      if (
-        key === 'ai_ollama_url' ||
-        key === 'ai_ollama_model' ||
-        key === 'ai_provider' ||
-        key === 'ai_api_key' ||
-        key === 'ai_api_base_url' ||
-        key === 'ai_api_model' ||
-        key === 'ai_api_timeout' ||
-        key === 'ai_api_json_object_format'
-      ) {
-        updateAiConfig({ [key]: val }).catch((err) => {
-          console.error('Failed to save AI field', key, err)
-        })
-      }
-      return next
-    })
+    setCfg(prev => ({ ...prev, [key]: val }))
   }, [])
 
   const handleSave = async () => {
+    if (!roomId) return
     setSaving(true)
     setSaveStatus(null)
     try {
-      const payload = { ...cfg }
-      if (!payload.weather_api_key) delete payload.weather_api_key
-      if (!payload.ai_api_key) delete payload.ai_api_key
-      await patchConfig(payload)
+      const settings = {}
+      for (const k of ROOM_SETTINGS_KEYS) {
+        if (cfg[k] !== undefined) settings[k] = cfg[k]
+      }
+      if (!settings.weather_api_key) delete settings.weather_api_key
+
+      const ai_config = {}
+      for (const k of AI_CONFIG_KEYS) {
+        if (cfg[k] !== undefined) ai_config[k] = cfg[k]
+      }
+      if (!ai_config.ai_api_key) delete ai_config.ai_api_key
+
+      await updateRoom(roomId, {
+        name: (cfg.room_name || roomTitle || 'Room').trim(),
+        climate_entity: (cfg.ac_entity || cfg.climate_entity || '').trim(),
+        presence_entity: cfg.presence_entity?.trim() || null,
+        indoor_temp_entity: cfg.indoor_temp_entity?.trim() || null,
+        energy_power_entity: cfg.energy_power_entity?.trim() || null,
+        energy_kwh_entity: cfg.energy_kwh_entity?.trim() || null,
+        settings,
+        ai_config,
+      })
       setSaveStatus('ok')
-      setSaveMsg('Settings saved — logic engine updated')
+      setSaveMsg('Room settings saved — logic engine updated')
+      const detail = await getRoom(roomId)
+      const c = { ...detail.effective }
+      if (c.weather_api_key === '***') c.weather_api_key = ''
+      if (c.ai_api_key === '***') c.ai_api_key = ''
+      setCfg(c)
+      setRoomTitle(detail.room?.name || roomId)
     } catch (err) {
       console.error('Save failed:', err)
       setSaveStatus('error')
@@ -334,7 +419,7 @@ export default function Settings() {
     setLoadingEntities(false)
   }
 
-  if (loading) {
+  if (loading && roomId) {
     return (
       <div className="flex items-center justify-center h-full text-gray-500">
         Loading configuration…
@@ -342,33 +427,95 @@ export default function Settings() {
     )
   }
 
+  if (!roomId) {
+    return (
+      <div className="max-w-2xl mx-auto p-6 space-y-4">
+        <h1 className="text-xl font-bold">Settings</h1>
+        <p className="text-sm text-gray-400">Select a room to edit. Settings apply only to that room — nothing is shared between rooms.</p>
+        {roomsList.length === 0 ? (
+          <div className="card text-sm text-gray-400">No rooms yet. Add one from the Dashboard.</div>
+        ) : (
+          <div className="card space-y-2">
+            <label className="text-xs text-gray-500 uppercase">Room</label>
+            <select
+              className="w-full bg-gray-800 border border-blue-500/40 rounded-lg px-3 py-2 text-sm text-gray-100"
+              value=""
+              onChange={e => {
+                const id = e.target.value
+                if (!id) return
+                localStorage.setItem(ROOM_LS, id)
+                setSearchParams({ room_id: id })
+              }}
+            >
+              <option value="">Choose a room…</option>
+              {roomsList.map(r => (
+                <option key={r.id} value={r.id}>{r.name || r.id}</option>
+              ))}
+            </select>
+          </div>
+        )}
+      </div>
+    )
+  }
+
   return (
     <div className="max-w-2xl mx-auto p-6 space-y-8">
 
-      {/* Header + Save button */}
-      <div className="flex items-center justify-between">
-        <h1 className="text-xl font-bold">Settings</h1>
-        <div className="flex items-center gap-2">
-          {saveStatus === 'ok' && (
-            <span className="flex items-center gap-1 text-green-400 text-sm">
-              <CheckCircle2 size={16} /> {saveMsg}
-            </span>
-          )}
-          {saveStatus === 'error' && (
-            <span className="flex items-center gap-1 text-red-400 text-sm">
-              <AlertCircle size={16} /> {saveMsg}
-            </span>
-          )}
-          <button
-            onClick={handleSave}
-            disabled={saving}
-            className="flex items-center gap-2 px-4 py-2 bg-blue-600 hover:bg-blue-500 disabled:opacity-50 rounded-lg text-sm font-medium transition-colors"
+      {/* Header + room switcher + Save */}
+      <div className="space-y-3">
+        <div className="flex flex-wrap items-center justify-between gap-3">
+          <h1 className="text-xl font-bold">
+            Settings — <span className="text-blue-300">{roomTitle || roomId}</span>
+          </h1>
+          <div className="flex items-center gap-2">
+            {saveStatus === 'ok' && (
+              <span className="flex items-center gap-1 text-green-400 text-sm">
+                <CheckCircle2 size={16} /> {saveMsg}
+              </span>
+            )}
+            {saveStatus === 'error' && (
+              <span className="flex items-center gap-1 text-red-400 text-sm">
+                <AlertCircle size={16} /> {saveMsg}
+              </span>
+            )}
+            <button
+              onClick={handleSave}
+              disabled={saving}
+              className="flex items-center gap-2 px-4 py-2 bg-blue-600 hover:bg-blue-500 disabled:opacity-50 rounded-lg text-sm font-medium transition-colors"
+            >
+              {saving ? <RefreshCw size={15} className="animate-spin" /> : <Save size={15} />}
+              Save
+            </button>
+          </div>
+        </div>
+        <div className="flex flex-wrap items-center gap-2 text-sm">
+          <span className="text-gray-500">Switch room:</span>
+          <select
+            className="bg-gray-800 border border-blue-500/40 rounded-lg px-2 py-1.5 text-xs text-gray-100"
+            value={roomId}
+            onChange={e => {
+              const id = e.target.value
+              if (!id) return
+              localStorage.setItem(ROOM_LS, id)
+              setSearchParams({ room_id: id })
+            }}
           >
-            {saving ? <RefreshCw size={15} className="animate-spin" /> : <Save size={15} />}
-            Save
-          </button>
+            {roomsList.map(r => (
+              <option key={r.id} value={r.id}>{r.name || r.id}</option>
+            ))}
+          </select>
+          <span className="text-[11px] text-gray-600 font-mono truncate max-w-[200px]" title={roomId}>
+            id: {roomId}
+          </span>
         </div>
       </div>
+
+      {loadError && (
+        <div className="flex items-center gap-2 px-4 py-3 bg-red-900/30 border border-red-700 rounded-lg text-sm text-red-300">
+          <AlertCircle size={16} />
+          Could not load this room ({roomId}). It may have been removed.
+        </div>
+      )}
 
       {/* AC Control — single pipeline */}
       <div className="card space-y-4">
@@ -683,7 +830,7 @@ export default function Settings() {
             onChange={async (v) => {
               patch('ai_enabled', v)
               try {
-                await setAiEnabled(v)
+                await updateRoom(roomId, { ai_config: { ai_enabled: v } })
               } catch (e) {
                 console.error(e)
               }

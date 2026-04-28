@@ -15,7 +15,7 @@ from typing import Any, Dict, Optional, Tuple
 import aiohttp
 
 from . import ai_cache, ai_prompt, ai_validator
-from .. import config_manager, ha_client
+from .. import config_manager, database, ha_client, session_logger
 
 logger = logging.getLogger(__name__)
 
@@ -487,15 +487,49 @@ def _api_fallback_to_logic_engine(room_id: str) -> None:
     ai_cache.mark_fetch_done(room_id)
 
 
+async def _persist_ai_decision(
+    room_id: str,
+    provider: str,
+    model: str,
+    validated: Dict[str, Any],
+    raw_obj: Any,
+) -> None:
+    """Store one validated AI output for audit / future ML training."""
+    try:
+        if isinstance(raw_obj, (dict, list)):
+            raw_json = json.dumps(raw_obj, ensure_ascii=False, separators=(",", ":"))[:8000]
+        elif raw_obj is None:
+            raw_json = None
+        else:
+            raw_json = str(raw_obj)[:8000]
+        await database.insert_ai_decision(
+            {
+                "ts": datetime.now(timezone.utc).isoformat(),
+                "room_id": room_id,
+                "session_id": session_logger.current_session_id(room_id),
+                "snapshot_id": None,
+                "target_temp": validated.get("target_temp"),
+                "fan_mode": validated.get("fan_mode"),
+                "confidence": validated.get("confidence"),
+                "action": validated.get("action"),
+                "provider": provider,
+                "model": (model or ""),
+                "raw_json": raw_json,
+            }
+        )
+    except Exception:
+        logger.exception("[AI] ai_decisions insert failed")
+
+
 def _try_apply_api_conservative_defaults(
     room_id: str,
     is_occupied: bool,
     indoor_temp: float,
-) -> bool:
+) -> Optional[Dict[str, Any]]:
     """
     When the API returns HTTP 200 but the model output is unusable, apply a
     validated conservative hint so behavior stays deterministic. If validation
-    fails (e.g. occupancy edge), return False and let logic_engine run alone.
+    fails (e.g. occupancy edge), return None and let logic_engine run alone.
     """
     validated = ai_validator.validate_ai_payload(
         dict(_API_CONSERVATIVE_DEFAULT),
@@ -505,7 +539,7 @@ def _try_apply_api_conservative_defaults(
         logger.warning(
             "[AI] Conservative API default rejected by validator — logic_engine only",
         )
-        return False
+        return None
     ai_cache.set_validated(room_id, validated, indoor_temp)
     ai_cache.mark_fetch_done(room_id)
     try:
@@ -517,7 +551,7 @@ def _try_apply_api_conservative_defaults(
         "[AI] API output invalid — applied conservative default "
         "(target_temp=24, fan_mode=auto, confidence=0.5)",
     )
-    return True
+    return validated
 
 
 async def run_ai_and_cache(
@@ -613,6 +647,7 @@ async def run_ai_and_cache(
         )
         logger.info("[AI] Response received (%.0f ms)", elapsed_ms)
         logger.info("[AI] Applied")
+        await _persist_ai_decision(room_id, "ollama", model, validated, parsed)
         return
 
     # OpenAI-compatible HTTP API — no Ollama code paths below.
@@ -729,7 +764,11 @@ async def run_ai_and_cache(
 
     parsed = _parse_api_chat_response(resp)
     if parsed is None:
-        if _try_apply_api_conservative_defaults(room_id, is_occupied, indoor_temp):
+        cons = _try_apply_api_conservative_defaults(room_id, is_occupied, indoor_temp)
+        if cons:
+            await _persist_ai_decision(
+                room_id, "api", model_a, cons, dict(_API_CONSERVATIVE_DEFAULT),
+            )
             _api_circuit_register_success(room_id)
             _ai_status_set(
                 room_id,
@@ -750,7 +789,11 @@ async def run_ai_and_cache(
 
     validated = ai_validator.validate_ai_payload(parsed, is_occupied)
     if not validated:
-        if _try_apply_api_conservative_defaults(room_id, is_occupied, indoor_temp):
+        cons = _try_apply_api_conservative_defaults(room_id, is_occupied, indoor_temp)
+        if cons:
+            await _persist_ai_decision(
+                room_id, "api", model_a, cons, dict(_API_CONSERVATIVE_DEFAULT),
+            )
             _api_circuit_register_success(room_id)
             _ai_status_set(
                 room_id,
@@ -779,6 +822,7 @@ async def run_ai_and_cache(
         last_error=None,
     )
     logger.info("[AI] Applied")
+    await _persist_ai_decision(room_id, "api", model_a, validated, parsed)
 
 
 def fetch_ai_in_background(

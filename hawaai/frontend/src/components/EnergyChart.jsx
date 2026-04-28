@@ -15,32 +15,32 @@ function CustomTooltip({ active, payload, label }) {
       <p className="text-gray-400 mb-1">{label}</p>
       {payload.map(p => (
         <p key={p.dataKey} style={{ color: p.color || p.fill }}>
-          {p.name}: <strong>{typeof p.value === 'number' ? p.value.toFixed(1) : p.value}</strong>
+          {p.name}: <strong>{typeof p.value === 'number' ? p.value.toFixed(2) : p.value}</strong>
         </p>
       ))}
     </div>
   )
 }
 
-export default function EnergyChart({ snapshots = [], targetTemp = null }) {
+/** Indoor / outdoor / climate setpoint vs time (last N snapshots). */
+export function TemperatureTimelineChart({ snapshots = [], targetTemp = null }) {
   const data = snapshots.map(s => ({
-    time:     formatTime(s.timestamp),
-    indoor:   s.indoor_temp,
-    outdoor:  s.outdoor_temp,
-    watts:    s.watt_draw,
-    ac:       s.ac_state ? 1 : 0,
+    time: formatTime(s.timestamp),
+    indoor: s.indoor_temp,
+    outdoor: s.outdoor_temp,
+    setpoint: s.setpoint,
   }))
 
   if (data.length === 0) {
     return (
-      <div className="flex items-center justify-center h-44 text-gray-600 text-sm">
-        No data yet — start a session to see real-time charts
+      <div className="flex items-center justify-center h-40 text-gray-600 text-sm">
+        No temperature samples yet
       </div>
     )
   }
 
   return (
-    <ResponsiveContainer width="100%" height={240}>
+    <ResponsiveContainer width="100%" height={220}>
       <ComposedChart data={data} margin={{ left: 0, right: 10, top: 4, bottom: 0 }}>
         <CartesianGrid strokeDasharray="3 3" stroke="#1f2937" />
         <XAxis
@@ -48,58 +48,23 @@ export default function EnergyChart({ snapshots = [], targetTemp = null }) {
           tick={{ fill: '#6b7280', fontSize: 11 }}
           interval="preserveStartEnd"
         />
-        {/* Left axis: temperature */}
         <YAxis
-          yAxisId="temp"
           domain={['auto', 'auto']}
           tick={{ fill: '#6b7280', fontSize: 11 }}
-          width={32}
+          width={36}
           unit="°"
-        />
-        {/* Right axis: watts */}
-        <YAxis
-          yAxisId="watts"
-          orientation="right"
-          tick={{ fill: '#6b7280', fontSize: 11 }}
-          width={45}
-          unit=" W"
         />
         <Tooltip content={<CustomTooltip />} />
 
-        {/* AC on/off shading bar */}
-        <Bar
-          yAxisId="watts"
-          dataKey="ac"
-          name="AC"
-          fill="#3b82f6"
-          opacity={0.12}
-          barSize={99999}
-          isAnimationActive={false}
-        />
-
-        {/* Watt draw line */}
-        <Line
-          yAxisId="watts"
-          type="monotone"
-          dataKey="watts"
-          name="Watts"
-          stroke="#f59e0b"
-          strokeWidth={1.5}
-          dot={false}
-          isAnimationActive={false}
-        />
-
-        {/* Target temp reference line */}
         {targetTemp != null && (
           <ReferenceLine
-            yAxisId="temp"
             y={targetTemp}
             stroke="#60a5fa"
             strokeDasharray="6 3"
             strokeWidth={1.5}
           >
             <Label
-              value={`Target ${targetTemp}°`}
+              value={`Config target ${targetTemp}°`}
               position="insideTopRight"
               fill="#60a5fa"
               fontSize={10}
@@ -107,9 +72,7 @@ export default function EnergyChart({ snapshots = [], targetTemp = null }) {
           </ReferenceLine>
         )}
 
-        {/* Indoor temp line */}
         <Line
-          yAxisId="temp"
           type="monotone"
           dataKey="indoor"
           name="Indoor °C"
@@ -118,10 +81,7 @@ export default function EnergyChart({ snapshots = [], targetTemp = null }) {
           dot={false}
           isAnimationActive={false}
         />
-
-        {/* Outdoor temp line */}
         <Line
-          yAxisId="temp"
           type="monotone"
           dataKey="outdoor"
           name="Outdoor °C"
@@ -131,7 +91,110 @@ export default function EnergyChart({ snapshots = [], targetTemp = null }) {
           dot={false}
           isAnimationActive={false}
         />
+        <Line
+          type="monotone"
+          dataKey="setpoint"
+          name="Climate setpoint °C"
+          stroke="#a78bfa"
+          strokeWidth={1.5}
+          dot={false}
+          isAnimationActive={false}
+        />
       </ComposedChart>
     </ResponsiveContainer>
+  )
+}
+
+/** Power draw + cumulative meter kWh vs time. */
+export function EnergyTimelineChart({ snapshots = [] }) {
+  const data = snapshots.map(s => ({
+    time: formatTime(s.timestamp),
+    watts: s.watt_draw ?? s.power_watts,
+    kwh: s.energy_kwh,
+    ac: s.ac_state ? 1 : 0,
+  }))
+
+  if (data.length === 0) {
+    return (
+      <div className="flex items-center justify-center h-40 text-gray-600 text-sm">
+        No energy samples yet
+      </div>
+    )
+  }
+
+  return (
+    <ResponsiveContainer width="100%" height={220}>
+      <ComposedChart data={data} margin={{ left: 0, right: 10, top: 4, bottom: 0 }}>
+        <CartesianGrid strokeDasharray="3 3" stroke="#1f2937" />
+        <XAxis
+          dataKey="time"
+          tick={{ fill: '#6b7280', fontSize: 11 }}
+          interval="preserveStartEnd"
+        />
+        <YAxis
+          yAxisId="watts"
+          tick={{ fill: '#6b7280', fontSize: 11 }}
+          width={42}
+          label={{ value: 'W', angle: -90, position: 'insideLeft', fill: '#6b7280', fontSize: 10 }}
+        />
+        <YAxis
+          yAxisId="kwh"
+          orientation="right"
+          tick={{ fill: '#6b7280', fontSize: 11 }}
+          width={48}
+          domain={['auto', 'auto']}
+          label={{ value: 'kWh', angle: 90, position: 'insideRight', fill: '#6b7280', fontSize: 10 }}
+        />
+        <Tooltip content={<CustomTooltip />} />
+
+        <Bar
+          yAxisId="watts"
+          dataKey="ac"
+          name="AC on"
+          fill="#3b82f6"
+          opacity={0.12}
+          barSize={99999}
+          isAnimationActive={false}
+        />
+
+        <Line
+          yAxisId="watts"
+          type="monotone"
+          dataKey="watts"
+          name="Power (W)"
+          stroke="#f59e0b"
+          strokeWidth={1.5}
+          dot={false}
+          isAnimationActive={false}
+        />
+        <Line
+          yAxisId="kwh"
+          type="monotone"
+          dataKey="kwh"
+          name="Meter kWh"
+          stroke="#34d399"
+          strokeWidth={1.5}
+          dot={false}
+          isAnimationActive={false}
+          connectNulls
+        />
+      </ComposedChart>
+    </ResponsiveContainer>
+  )
+}
+
+/** @deprecated Use TemperatureTimelineChart + EnergyTimelineChart */
+export default function EnergyChart({ snapshots = [], targetTemp = null }) {
+  return (
+    <div className="space-y-6">
+      <div>
+        <p className="text-xs text-gray-500 mb-2">Temperature</p>
+        <TemperatureTimelineChart snapshots={snapshots} targetTemp={targetTemp} />
+      </div>
+      <div>
+        <p className="text-xs text-gray-500 mb-2">Energy</p>
+        <EnergyTimelineChart snapshots={snapshots} />
+      </div>
+    </div>
   )
 }

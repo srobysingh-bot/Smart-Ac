@@ -127,12 +127,24 @@ def merge_room_config(global_cfg: Dict[str, Any], room: Dict[str, Any]) -> Dict[
         for k, v in ai.items():
             if k in _AI_OVERRIDE_KEYS:
                 out[k] = v
+    sett = room.get("settings")
+    if isinstance(sett, dict):
+        for k, v in sett.items():
+            if v is None:
+                continue
+            out[k] = copy.deepcopy(v) if isinstance(v, (dict, list)) else v
     return out
 
 
 def public_room_view(room: Dict[str, Any]) -> Dict[str, Any]:
     """Strip secrets for API list/detail (ai_config may hold api key)."""
     r = dict(room)
+    sett = r.get("settings")
+    if isinstance(sett, dict):
+        sett = dict(sett)
+        if sett.get("weather_api_key"):
+            sett["weather_api_key"] = "***" if str(sett.get("weather_api_key")).strip() else ""
+        r["settings"] = sett
     ac = r.get("ai_config")
     if isinstance(ac, dict):
         ac = dict(ac)

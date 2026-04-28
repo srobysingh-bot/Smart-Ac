@@ -1,5 +1,13 @@
 # HawaAI add-on — release notes
 
+## 1.3.2
+
+- Persistent SQLite at `/data/hawaai.db` with `map: data:rw`; automatic DB backup on add-on startup and shutdown (under `/data/hawaai_db_backups/`, pruned).
+- Non-destructive schema evolution (`ALTER TABLE` only); snapshots extended for ML (humidity, setpoint, fan, power, meter kWh, AI fields); sessions include `cooling_time`, `energy_used`, `user_override`; new `ai_decisions` table linked by `room_id` and `session_id`.
+- Session end prefers **meter delta** kWh when `energy_kwh_entity` + start reading exist; else estimates from power samples.
+- API: `GET /api/ai/decisions?room_id=&limit=`.
+- Dashboard: separate **temperature vs time** and **energy vs time** charts; **AI decision history** card.
+
 ## 1.3.1
 
 - Production multi-room isolation: room-scoped WebSocket subscribe/broadcast, required `room_id` on status, sessions, analytics, snapshots, exports, and AI status APIs.

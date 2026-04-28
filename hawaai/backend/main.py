@@ -13,6 +13,7 @@ Routes:
   GET  /api/ai              { ai_enabled, ai_provider, ollama + API fields (key masked) }
   POST /api/ai              Set AI settings (merge persist)
   GET  /api/ai/status       AI worker status (?room_id= required)
+  GET  /api/ai/decisions    Recent AI model outputs (?room_id= required)
   GET  /api/entities        HA entity list for Settings dropdowns
   GET  /api/climate/{id}   Live climate entity state + attributes
   POST /api/climate/{id}/set_temperature
@@ -75,6 +76,7 @@ def _mask_api_key_response(stored: str) -> str:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    database.backup_db("startup")
     await database.init_db()
     cfg = config_manager.load_config()
     ac_ent = (cfg.get("ac_entity") or cfg.get("climate_entity") or "").strip() or "(not set)"
@@ -99,10 +101,11 @@ async def lifespan(app: FastAPI):
     asyncio.create_task(_broadcast_loop())
     logger.info("[HawaAI] Add-on started")
     yield
+    database.backup_db("shutdown")
     logger.info("[HawaAI] Add-on stopped")
 
 
-app = FastAPI(title="HawaAI API", version="1.3.1", lifespan=lifespan)
+app = FastAPI(title="HawaAI API", version="1.3.2", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -233,6 +236,15 @@ async def set_ai_flag(data: Dict[str, Any] = Body(...)):
 async def get_ai_runtime_status(room_id: str = Query(..., min_length=1)):
     """Last AI inference attempt for an explicit room_id."""
     return get_ai_status(room_id.strip())
+
+
+@app.get("/api/ai/decisions")
+async def get_ai_decisions(
+    room_id: str = Query(..., min_length=1),
+    limit: int = Query(50, ge=1, le=200),
+):
+    """Persisted AI outputs for ML / audit (scoped per room_id)."""
+    return {"decisions": await database.get_ai_decisions_recent(room_id.strip(), limit)}
 
 
 @app.get("/api/weather")
@@ -483,6 +495,31 @@ async def api_list_rooms():
     }
 
 
+def _mask_effective_room_settings(eff: Dict[str, Any]) -> Dict[str, Any]:
+    """Mask secrets in merged effective config for GET /api/rooms/{id}."""
+    masked = dict(eff)
+    if (masked.get("weather_api_key") or "").strip():
+        masked["weather_api_key"] = "***"
+    mk = (masked.get("ai_api_key") or "").strip()
+    masked["ai_api_key"] = _mask_api_key_response(mk)
+    return masked
+
+
+@app.get("/api/rooms/{room_id}")
+async def api_get_room(room_id: str):
+    """Room row + merged effective config (same shape as legacy global /config for the form)."""
+    rid = room_id.strip()
+    base = config_manager.load_config()
+    room_def = room_registry.get_room(base, rid)
+    if not room_def:
+        raise HTTPException(status_code=404, detail="room not found")
+    eff = room_registry.merge_room_config(base, room_def)
+    return {
+        "room": room_registry.public_room_view(room_def),
+        "effective": _mask_effective_room_settings(eff),
+    }
+
+
 @app.post("/api/rooms")
 async def api_create_room(body: Dict[str, Any] = Body(...)):
     import uuid
@@ -530,10 +567,32 @@ async def api_update_room(room_id: str, body: Dict[str, Any] = Body(...)):
                 r.pop(k, None)
             else:
                 r[k] = str(v).strip()
+    if "settings" in body:
+        inc = body["settings"]
+        if isinstance(inc, dict):
+            cur_s = dict(r.get("settings") or {})
+            for sk, sv in inc.items():
+                if sk in ("weather_api_key", "ai_api_key") and sv in (None, "", "***"):
+                    continue
+                if sv is None:
+                    cur_s.pop(sk, None)
+                else:
+                    cur_s[sk] = sv
+            r["settings"] = cur_s
+        elif inc is None:
+            r.pop("settings", None)
     if "ai_config" in body:
         ac = body["ai_config"]
         if isinstance(ac, dict):
-            r["ai_config"] = ac
+            cur_ai = dict(r.get("ai_config") or {})
+            for ak, av in ac.items():
+                if ak == "ai_api_key" and av in (None, "", "***"):
+                    continue
+                if av is None:
+                    cur_ai.pop(ak, None)
+                else:
+                    cur_ai[ak] = av
+            r["ai_config"] = cur_ai
         elif ac is None:
             r.pop("ai_config", None)
     rooms[idx] = r

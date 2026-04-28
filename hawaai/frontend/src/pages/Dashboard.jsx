@@ -3,7 +3,8 @@ import { useNavigate } from 'react-router-dom'
 import { getStatus, getSessionStats, getSnapshots, getClimateState, setClimateTemperature, setHvacMode, setFanMode, setSwingMode, getAiStatus, getRooms, createRoom, connectLive } from '../api/smartcool.js'
 import ACStatusCard    from '../components/ACStatusCard.jsx'
 import TempGauge       from '../components/TempGauge.jsx'
-import EnergyChart     from '../components/EnergyChart.jsx'
+import EnergyChart from '../components/EnergyChart.jsx'
+import AiDecisionsCard from '../components/AiDecisionsCard.jsx'
 import PresenceBadge   from '../components/PresenceBadge.jsx'
 import SessionTable    from '../components/SessionTable.jsx'
 import InsightsCard    from '../components/InsightsCard.jsx'
@@ -253,8 +254,16 @@ function RoomStrip({ rooms, activeId, onSelect, onRoomAdded }) {
     </div>
   )
 }
-function ConfigWarning() {
+function ConfigWarning({ roomId }) {
   const navigate = useNavigate()
+  const go = () => {
+    const q = roomId
+      ? `?room_id=${encodeURIComponent(roomId)}`
+      : (typeof localStorage !== 'undefined' && localStorage.getItem(ROOM_LS))
+        ? `?room_id=${encodeURIComponent(localStorage.getItem(ROOM_LS))}`
+        : ''
+    navigate(`/settings${q}`)
+  }
   return (
     <div className="flex items-center gap-3 mx-6 mt-4 px-4 py-3 bg-yellow-900/40 border border-yellow-700 rounded-lg text-sm">
       <AlertTriangle size={16} className="text-yellow-400 shrink-0" />
@@ -262,7 +271,8 @@ function ConfigWarning() {
         Sensors not configured — go to Settings to set up your devices
       </span>
       <button
-        onClick={() => navigate('/settings')}
+        type="button"
+        onClick={go}
         className="px-3 py-1 bg-yellow-700 hover:bg-yellow-600 rounded text-yellow-100 text-xs font-medium transition-colors"
       >
         Go to Settings
@@ -577,6 +587,7 @@ function ClimateCard({ entityId }) {
 
 // ── Page ──────────────────────────────────────────────────────────────────────
 export default function Dashboard() {
+  const navigate = useNavigate()
   const [status,    setStatus]    = useState(null)
   const [snapshots, setSnapshots] = useState([])
   const [stats,     setStats]     = useState(null)
@@ -679,7 +690,11 @@ export default function Dashboard() {
         onSelect={setActiveRoomId}
         onRoomAdded={() => reloadRooms().then(list => {
           const last = list[list.length - 1]
-          if (last?.id) setActiveRoomId(last.id)
+          if (last?.id) {
+            setActiveRoomId(last.id)
+            if (typeof localStorage !== 'undefined') localStorage.setItem(ROOM_LS, last.id)
+            navigate(`/settings?room_id=${encodeURIComponent(last.id)}`)
+          }
         })}
       />
       <LiveStatusBar status={status} />
@@ -690,7 +705,7 @@ export default function Dashboard() {
         </div>
       )}
 
-      {configIncomplete && <ConfigWarning />}
+      {configIncomplete && <ConfigWarning roomId={activeRoomId} />}
 
       <div className="flex-1 overflow-y-auto p-6 space-y-6">
         {/* Top cards row */}
@@ -767,6 +782,8 @@ export default function Dashboard() {
         {/* Live session card — visible only when a session is active */}
         <LiveSessionCard status={status} />
 
+        <AiDecisionsCard roomId={activeRoomId} />
+
         {/* Insights — read-only analytics from completed sessions */}
         <InsightsCard roomId={activeRoomId} />
 
@@ -777,7 +794,7 @@ export default function Dashboard() {
           </p>
           {snapshots.length === 0 ? (
             <p className="text-sm text-gray-600 py-8 text-center">
-              Waiting for first session to start
+              Waiting for telemetry — snapshots appear once the engine runs for this room
             </p>
           ) : (
             <EnergyChart snapshots={snapshots} targetTemp={status?.target_temp} />

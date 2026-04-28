@@ -81,6 +81,11 @@ export async function getAiStatus(roomId) {
 // ── Multi-room ───────────────────────────────────────────────────────────────
 export const getRooms = () => request('/rooms')
 
+export const getRoom = (roomId) => {
+  if (!roomId) return Promise.reject(new Error('roomId is required'))
+  return request(`/rooms/${encodeURIComponent(roomId)}`)
+}
+
 export const createRoom = (data) =>
   request('/rooms', { method: 'POST', body: JSON.stringify(data) })
 
@@ -151,6 +156,13 @@ export async function downloadExport(format = 'csv', roomId) {
   const a   = document.createElement('a')
   a.href = url; a.download = filename; a.click()
   URL.revokeObjectURL(url)
+}
+
+/** Recent persisted AI outputs (ML / audit). */
+export async function getAiDecisions(roomId, limit = 50) {
+  if (!roomId) return Promise.reject(new Error('roomId is required'))
+  const q = new URLSearchParams({ room_id: roomId, limit: String(limit) }).toString()
+  return request(`/ai/decisions?${q}`)
 }
 
 // ── WebSocket live updates (per-room subscribe) ─────────────────────────────

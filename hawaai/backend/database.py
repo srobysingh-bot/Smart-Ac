@@ -2,6 +2,7 @@
 
 import aiosqlite
 import logging
+import shutil
 from collections import defaultdict
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -10,6 +11,35 @@ from typing import Any, Dict, List, Optional
 logger = logging.getLogger(__name__)
 
 DB_PATH = "/data/hawaai.db"
+BACKUP_DIR = "/data/hawaai_db_backups"
+MAX_DB_BACKUPS = 8
+
+
+def backup_db(tag: str = "manual") -> None:
+    """
+    Copy SQLite DB to /data/hawaai_db_backups/ (survives addon image rebuilds when map data:rw).
+    Prunes oldest backups beyond MAX_DB_BACKUPS. Never uses DROP.
+    """
+    try:
+        src = Path(DB_PATH)
+        if not src.is_file():
+            logger.info("[DB] Skip backup — no database file yet at %s", DB_PATH)
+            return
+        dest_dir = Path(BACKUP_DIR)
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        ts = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+        dest = dest_dir / f"hawaai_{tag}_{ts}.db"
+        shutil.copy2(src, dest)
+        logger.info("[DB] Backup written: %s", dest)
+        backups = sorted(dest_dir.glob("hawaai_*.db"), key=lambda p: p.stat().st_mtime, reverse=True)
+        for old in backups[MAX_DB_BACKUPS:]:
+            try:
+                old.unlink()
+                logger.info("[DB] Pruned old backup %s", old.name)
+            except OSError as exc:
+                logger.warning("[DB] Could not remove %s: %s", old, exc)
+    except Exception as exc:
+        logger.error("[DB] Backup failed: %s", exc, exc_info=True)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -18,6 +48,7 @@ DB_PATH = "/data/hawaai.db"
 
 async def init_db() -> None:
     """Create all tables and indexes if they do not already exist."""
+    Path("/data").mkdir(parents=True, exist_ok=True)
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute("""
             CREATE TABLE IF NOT EXISTS sessions (
@@ -68,6 +99,23 @@ async def init_db() -> None:
             )
         """)
 
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS ai_decisions (
+                id             INTEGER PRIMARY KEY AUTOINCREMENT,
+                ts             DATETIME NOT NULL,
+                room_id        TEXT NOT NULL,
+                session_id     TEXT,
+                snapshot_id    INTEGER,
+                target_temp    REAL,
+                fan_mode       TEXT,
+                confidence     REAL,
+                action         TEXT,
+                provider       TEXT,
+                model          TEXT,
+                raw_json       TEXT
+            )
+        """)
+
         # Performance indexes
         await db.execute(
             "CREATE INDEX IF NOT EXISTS idx_sessions_start    ON sessions(start_time)"
@@ -81,6 +129,12 @@ async def init_db() -> None:
         await db.execute(
             "CREATE INDEX IF NOT EXISTS idx_snapshots_ts      ON snapshots(timestamp)"
         )
+        await db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_ai_decisions_room ON ai_decisions(room_id)"
+        )
+        await db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_ai_decisions_ts   ON ai_decisions(ts)"
+        )
 
         # Analytics columns — added non-destructively so existing DBs keep working.
         # SQLite returns an error if the column already exists; we suppress it.
@@ -89,7 +143,18 @@ async def init_db() -> None:
             "ALTER TABLE sessions ADD COLUMN cooling_type  TEXT",   # fast / normal / slow
             "ALTER TABLE sessions ADD COLUMN efficiency    REAL",   # °C / kWh
             "ALTER TABLE sessions ADD COLUMN room_id TEXT DEFAULT ''",
+            "ALTER TABLE sessions ADD COLUMN cooling_time REAL",
+            "ALTER TABLE sessions ADD COLUMN energy_used REAL",
+            "ALTER TABLE sessions ADD COLUMN user_override INTEGER DEFAULT 0",
             "ALTER TABLE snapshots ADD COLUMN room_id TEXT DEFAULT ''",
+            "ALTER TABLE snapshots ADD COLUMN outdoor_humidity REAL",
+            "ALTER TABLE snapshots ADD COLUMN setpoint REAL",
+            "ALTER TABLE snapshots ADD COLUMN fan_mode TEXT",
+            "ALTER TABLE snapshots ADD COLUMN power_watts REAL",
+            "ALTER TABLE snapshots ADD COLUMN energy_kwh REAL",
+            "ALTER TABLE snapshots ADD COLUMN ai_target_temp REAL",
+            "ALTER TABLE snapshots ADD COLUMN ai_fan_mode TEXT",
+            "ALTER TABLE snapshots ADD COLUMN ai_confidence REAL",
         ):
             try:
                 await db.execute(col_sql)
@@ -244,7 +309,10 @@ async def update_session_end(session_id: str, end_data: Dict[str, Any]) -> None:
                 avg_watt_draw        = ?,
                 cooling_rate         = ?,
                 cooling_type         = ?,
-                efficiency           = ?
+                efficiency           = ?,
+                cooling_time         = ?,
+                energy_used          = ?,
+                user_override        = ?
             WHERE session_id = ?
             """,
             (
@@ -259,6 +327,9 @@ async def update_session_end(session_id: str, end_data: Dict[str, Any]) -> None:
                 end_data.get("cooling_rate"),
                 end_data.get("cooling_type"),
                 end_data.get("efficiency"),
+                end_data.get("cooling_time"),
+                end_data.get("energy_used"),
+                end_data.get("user_override"),
                 session_id,
             ),
         )
@@ -340,25 +411,87 @@ async def archive_old_sessions(days: int = 90) -> int:
 # ─────────────────────────────────────────────────────────────────────────────
 
 async def insert_snapshot(snapshot: Dict[str, Any]) -> None:
+    w = snapshot.get("watt_draw")
+    if w is None:
+        w = snapshot.get("power_watts")
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(
             """
             INSERT INTO snapshots
-                (session_id, timestamp, indoor_temp, outdoor_temp, ac_state, watt_draw, presence, room_id)
-            VALUES (?,?,?,?,?,?,?,?)
+                (session_id, timestamp, indoor_temp, outdoor_temp, outdoor_humidity,
+                 ac_state, watt_draw, power_watts, presence, room_id,
+                 setpoint, fan_mode, energy_kwh,
+                 ai_target_temp, ai_fan_mode, ai_confidence)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             """,
             (
                 snapshot.get("session_id"),
                 snapshot.get("timestamp"),
                 snapshot.get("indoor_temp"),
                 snapshot.get("outdoor_temp"),
+                snapshot.get("outdoor_humidity"),
                 1 if snapshot.get("ac_state") else 0,
-                snapshot.get("watt_draw"),
+                w,
+                w,
                 1 if snapshot.get("presence") else 0,
                 snapshot.get("room_id") or "",
+                snapshot.get("setpoint"),
+                snapshot.get("fan_mode"),
+                snapshot.get("energy_kwh"),
+                snapshot.get("ai_target_temp"),
+                snapshot.get("ai_fan_mode"),
+                snapshot.get("ai_confidence"),
             ),
         )
         await db.commit()
+
+
+async def insert_ai_decision(row: Dict[str, Any]) -> int:
+    """Persist one AI model output for ML / audit. Returns new row id."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute(
+            """
+            INSERT INTO ai_decisions
+                (ts, room_id, session_id, snapshot_id, target_temp, fan_mode, confidence,
+                 action, provider, model, raw_json)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?)
+            """,
+            (
+                row.get("ts"),
+                row.get("room_id") or "",
+                row.get("session_id"),
+                row.get("snapshot_id"),
+                row.get("target_temp"),
+                row.get("fan_mode"),
+                row.get("confidence"),
+                row.get("action"),
+                row.get("provider"),
+                row.get("model"),
+                row.get("raw_json"),
+            ),
+        )
+        await db.commit()
+        return int(cur.lastrowid)
+
+
+async def get_ai_decisions_recent(
+    room_id: str,
+    limit: int = 50,
+) -> List[Dict[str, Any]]:
+    rid = (room_id or "").strip()
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            """
+            SELECT * FROM ai_decisions
+            WHERE room_id = ?
+            ORDER BY ts DESC
+            LIMIT ?
+            """,
+            (rid, limit),
+        ) as cursor:
+            rows = await cursor.fetchall()
+            return [dict(r) for r in rows]
 
 
 async def get_snapshots_recent(minutes: int = 120, room_id: str = "") -> List[Dict]:

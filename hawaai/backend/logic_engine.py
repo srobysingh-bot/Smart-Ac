@@ -277,6 +277,16 @@ async def tick(room_id: str) -> None:
             except (ValueError, TypeError):
                 energy_watts = 0.0
 
+    energy_kwh_reading: Optional[float] = None
+    kwh_entity_snap = (cfg.get("energy_kwh_entity") or "").strip()
+    if kwh_entity_snap:
+        raw_ke = await ha_client.get_state(kwh_entity_snap)
+        if raw_ke not in (None, "unavailable", "unknown", ""):
+            try:
+                energy_kwh_reading = float(raw_ke)
+            except (ValueError, TypeError):
+                energy_kwh_reading = None
+
     # STEP 6A — Cooldown gate timer
     #
     # Compute this FIRST so it can guard the power-based state decision below.
@@ -370,16 +380,49 @@ async def tick(room_id: str) -> None:
         )
 
     # STEP 8 — Write monitoring snapshot
+    outdoor_humidity = weather.get("humidity") if weather else None
+    ai_rec = get_cached(room_id) if cfg.get("ai_enabled", False) else None
+    sp = None
+    fm = None
+    if climate_data:
+        sp = climate_data.get("target_temp")
+        fm = climate_data.get("fan_mode")
+
+    ai_tgt = ai_fan = ai_conf = None
+    if ai_rec:
+        try:
+            if ai_rec.get("target_temp") is not None:
+                ai_tgt = float(ai_rec["target_temp"])
+        except (TypeError, ValueError):
+            pass
+        try:
+            if ai_rec.get("fan_mode") is not None:
+                ai_fan = str(ai_rec["fan_mode"])
+        except (TypeError, ValueError):
+            pass
+        try:
+            if ai_rec.get("confidence") is not None:
+                ai_conf = float(ai_rec["confidence"])
+        except (TypeError, ValueError):
+            pass
+
     await session_logger.add_snapshot(
         room_id,
         session_logger.current_session_id(room_id),
         {
-            "timestamp":    now.isoformat(),
-            "indoor_temp":  indoor_temp,
-            "outdoor_temp": outdoor_temp,
-            "ac_state":     ac_on,
-            "watt_draw":    energy_watts,
-            "presence":     is_occupied,
+            "timestamp":       now.isoformat(),
+            "indoor_temp":   indoor_temp,
+            "outdoor_temp":  outdoor_temp,
+            "outdoor_humidity": outdoor_humidity,
+            "ac_state":      ac_on,
+            "watt_draw":     energy_watts,
+            "presence":      is_occupied,
+            "setpoint":      sp,
+            "fan_mode":      fm,
+            "energy_kwh":    energy_kwh_reading,
+            "ai_target_temp": ai_tgt,
+            "ai_fan_mode": ai_fan,
+            "ai_confidence": ai_conf,
         },
     )
 
@@ -584,21 +627,45 @@ async def _close_session(room_id: str, cfg: dict, indoor_temp: float, reason: st
 
     if st.watts_samples:
         avg_watts = sum(st.watts_samples) / len(st.watts_samples)
+        peak_watts = max(st.watts_samples)
     else:
         avg_watts = 0.0
+        peak_watts = None
 
     logger.info("[HawaAI][%s] Avg watts: %.0f W (%d samples)", room_id, avg_watts, len(st.watts_samples))
 
-    if st.watts_samples and avg_watts >= 100.0 and duration_secs > 0:
-        kwh_consumed: Optional[float] = max(0.0, (avg_watts * duration_secs) / 3_600_000.0)
-        kwh_consumed = round(kwh_consumed, 4)
-        tariff = float(cfg.get("energy_tariff_per_kwh", 8.0))
-        cost: Optional[float] = round(kwh_consumed * tariff, 2)
-        logger.info("[HawaAI][%s] Energy: %.4f kWh | Cost: ₹%.2f", room_id, kwh_consumed, cost)
+    kwh_consumed: Optional[float] = None
+    energy_from_meter = False
+    kwh_entity = (cfg.get("energy_kwh_entity") or "").strip()
+    if kwh_entity and st.session_start_kwh is not None:
+        raw_end = await ha_client.get_state(kwh_entity)
+        if raw_end not in (None, "unavailable", "unknown", ""):
+            try:
+                end_k = float(raw_end)
+                kwh_consumed = max(0.0, round(end_k - float(st.session_start_kwh), 4))
+                energy_from_meter = True
+            except (ValueError, TypeError):
+                kwh_consumed = None
+
+    if kwh_consumed is None:
+        if st.watts_samples and avg_watts >= 100.0 and duration_secs > 0:
+            kwh_consumed = max(0.0, (avg_watts * duration_secs) / 3_600_000.0)
+            kwh_consumed = round(kwh_consumed, 4)
+
+    tariff = float(cfg.get("energy_tariff_per_kwh", 8.0))
+    cost: Optional[float] = (
+        round(kwh_consumed * tariff, 2) if kwh_consumed is not None else None
+    )
+    if kwh_consumed is not None:
+        logger.info(
+            "[HawaAI][%s] Session energy: %.4f kWh (%s) | Cost: ₹%.2f",
+            room_id,
+            kwh_consumed,
+            "meter" if energy_from_meter else "estimated from power",
+            cost or 0.0,
+        )
     else:
-        kwh_consumed = None
-        cost = None
-        logger.info("[HawaAI][%s] Energy: N/A (no power sensor data) | Cost: N/A", room_id)
+        logger.info("[HawaAI][%s] Energy: N/A (no meter / power data) | Cost: N/A", room_id)
 
     await session_logger.end_session(room_id, {
         "end_time":              now.isoformat(),
@@ -608,6 +675,8 @@ async def _close_session(room_id: str, cfg: dict, indoor_temp: float, reason: st
         "energy_kwh":            kwh_consumed,
         "cost":                  cost,
         "avg_watts":             round(avg_watts, 1) if avg_watts else None,
+        "peak_watts":            round(peak_watts, 1) if peak_watts is not None else None,
+        "user_override":         1 if reason in ("power_off", "manual", "manual_off") else 0,
     })
 
     st.session_start_time = None

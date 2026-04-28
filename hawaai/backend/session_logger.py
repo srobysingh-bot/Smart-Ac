@@ -138,6 +138,13 @@ async def end_session(room_id: str, data: Dict[str, Any]) -> None:
         logger.warning("[HawaAI] Analytics calculation skipped [%s]: %s", room_id, exc)
         cooling_rate = cooling_type = efficiency = None
 
+    rs = str(data.get("reason_stopped") or "")
+    uo = data.get("user_override")
+    if uo is None:
+        uo = 1 if rs in ("power_off", "manual", "manual_off") else 0
+    else:
+        uo = int(uo)
+
     end_data = {
         "end_time": end_time,
         "indoor_temp_end": indoor_end,
@@ -150,6 +157,9 @@ async def end_session(room_id: str, data: Dict[str, Any]) -> None:
         "cooling_rate": cooling_rate,
         "cooling_type": cooling_type,
         "efficiency": efficiency,
+        "cooling_time": duration_min,
+        "energy_used": energy_kwh,
+        "user_override": uo,
     }
 
     await database.update_session_end(s.current_session_id, end_data)
@@ -180,9 +190,16 @@ async def add_snapshot(room_id: str, session_id: Optional[str], data: Dict[str, 
         "timestamp": data.get("timestamp", datetime.now(timezone.utc).isoformat()),
         "indoor_temp": data.get("indoor_temp"),
         "outdoor_temp": data.get("outdoor_temp"),
+        "outdoor_humidity": data.get("outdoor_humidity"),
         "ac_state": data.get("ac_state", False),
         "watt_draw": data.get("watt_draw", 0.0),
         "presence": data.get("presence", True),
+        "setpoint": data.get("setpoint"),
+        "fan_mode": data.get("fan_mode"),
+        "energy_kwh": data.get("energy_kwh"),
+        "ai_target_temp": data.get("ai_target_temp"),
+        "ai_fan_mode": data.get("ai_fan_mode"),
+        "ai_confidence": data.get("ai_confidence"),
     }
     await database.insert_snapshot(snap)
 
