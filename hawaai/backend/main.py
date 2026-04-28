@@ -32,6 +32,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
 import aiohttp
 from fastapi import Body, FastAPI, HTTPException, Query, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
@@ -40,11 +43,8 @@ from fastapi.responses import FileResponse, HTMLResponse, Response
 from . import config_manager, database, logic_engine, scheduler, session_logger, weather_api
 from . import ha_client
 from .ac_controller import get_brands
-from .ai.ai_worker import get_ai_status
+from .ai.ai_worker import get_ai_status, init_ai_worker
 from .utils import parse_presence
-
-logger = logging.getLogger(__name__)
-logging.basicConfig(level=logging.INFO)
 
 _ws_clients: List[WebSocket] = []
 
@@ -74,6 +74,10 @@ async def lifespan(app: FastAPI):
         logger.info("[AI] Enabled (provider=%s)", prov_label)
     else:
         logger.info("[AI] Disabled (default)")
+    try:
+        init_ai_worker()
+    except Exception:
+        logger.exception("[AI] AI worker startup hook failed — continuing without AI bootstrap")
     asyncio.create_task(scheduler.start())
     asyncio.create_task(_broadcast_loop())
     logger.info("[HawaAI] Add-on started")
@@ -81,7 +85,7 @@ async def lifespan(app: FastAPI):
     logger.info("[HawaAI] Add-on stopped")
 
 
-app = FastAPI(title="HawaAI API", version="1.2.22", lifespan=lifespan)
+app = FastAPI(title="HawaAI API", version="1.2.24", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,

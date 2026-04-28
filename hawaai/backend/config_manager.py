@@ -56,12 +56,27 @@ DEFAULT_CONFIG: Dict[str, Any] = {
 
 def load_config() -> Dict[str, Any]:
     """Always read fresh from disk. Merges defaults so new keys always have values."""
+    try:
+        return _load_config_merged()
+    except Exception:
+        logger.exception("[HawaAI] Config load failed — using DEFAULT_CONFIG")
+        return dict(DEFAULT_CONFIG)
+
+
+def _load_config_merged() -> Dict[str, Any]:
+    """Merge disk + supervisor options + defaults. Raises on unexpected data; caller wraps."""
     # First try the persisted UI config
     saved: Dict[str, Any] = {}
     try:
         if os.path.exists(CONFIG_PATH):
             with open(CONFIG_PATH, "r", encoding="utf-8") as f:
-                saved = json.load(f)
+                raw = json.load(f)
+            if isinstance(raw, dict):
+                saved = raw
+            else:
+                logger.error("[HawaAI] Config file is not a JSON object — ignoring")
+    except json.JSONDecodeError as e:
+        logger.error("[HawaAI] Failed to parse config JSON: %s", e)
     except Exception as e:
         logger.error("[HawaAI] Failed to load config: %s", e)
 
@@ -71,13 +86,15 @@ def load_config() -> Dict[str, Any]:
         options_path = "/data/options.json"
         if os.path.exists(options_path):
             with open(options_path, "r", encoding="utf-8") as f:
-                options = json.load(f)
+                raw_o = json.load(f)
+            if isinstance(raw_o, dict):
+                options = raw_o
     except Exception:
         pass
 
     # Merge: defaults < supervisor options < persisted UI config
     # Upgrade-safe: new keys (e.g. ai_enabled, ai_ollama_url) appear without wiping user data.
-    merged = {**DEFAULT_CONFIG, **options, **saved}
+    merged: Dict[str, Any] = {**DEFAULT_CONFIG, **options, **saved}
 
     # Drop legacy Broadlink / IR keys — old JSON may still contain them; never used.
     for _k in _LEGACY_IR_KEYS:
@@ -100,9 +117,15 @@ def load_config() -> Dict[str, Any]:
     else:
         merged["ai_api_json_object_format"] = bool(merged.get("ai_api_json_object_format"))
 
-    # Ollama URL: empty or legacy unresolvable hostname → HA host default.
-    _ou = (str(merged.get("ai_ollama_url") or "")).strip()
-        merged["ai_ollama_url"] = DEFAULT_CONFIG["ai_ollama_url"]
+    # Ollama URL: only apply default when using Ollama. API mode does not assume Ollama exists.
+    _ou_stripped = (str(merged.get("ai_ollama_url") or "")).strip()
+    if merged["ai_provider"] == "ollama":
+        if not _ou_stripped:
+            merged["ai_ollama_url"] = (str(DEFAULT_CONFIG.get("ai_ollama_url") or "")).strip()
+        else:
+            merged["ai_ollama_url"] = _ou_stripped
+    else:
+        merged["ai_ollama_url"] = _ou_stripped
 
     # Single AC entity: ac_entity wins, else climate_entity (supervisor / old saves).
     _ace = (merged.get("ac_entity") or merged.get("climate_entity") or "").strip()

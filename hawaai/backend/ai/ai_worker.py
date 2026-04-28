@@ -19,7 +19,7 @@ from .. import config_manager, ha_client
 logger = logging.getLogger(__name__)
 
 # Bumped with each AI transport change — look for "AI worker initialized" in add-on logs
-AI_WORKER_VERSION = "1.2.22"
+AI_WORKER_VERSION = "1.2.24"
 
 # Ollama structured output: JSON Schema only under request "format" (no separate top-level required)
 OLLAMA_RESPONSE_FORMAT: Dict[str, Any] = {
@@ -81,7 +81,10 @@ _circuit_lock = threading.Lock()
 _api_consecutive_failures = 0
 _api_circuit_open_until_mono = 0.0
 
-logger.info("AI worker initialized v%s", AI_WORKER_VERSION)
+
+def init_ai_worker() -> None:
+    """Called once at FastAPI startup. Must not raise — wrap caller in try/except."""
+    logger.info("[AI] Worker ready v%s", AI_WORKER_VERSION)
 
 
 def get_ai_status() -> Dict[str, Any]:
