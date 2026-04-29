@@ -44,6 +44,24 @@ export function RoomProvider({ children }) {
     return () => { alive = false }
   }, [refreshRooms])
 
+  const setActiveRoom = useCallback((id) => {
+    const nextId = id ? String(id).trim() || null : null
+    setActiveRoomId(nextId)
+    if (typeof localStorage !== 'undefined') {
+      if (nextId) localStorage.setItem(ROOM_STORAGE_KEY, nextId)
+      else localStorage.removeItem(ROOM_STORAGE_KEY)
+    }
+    setSearchParams(
+      (prev) => {
+        const next = new URLSearchParams(prev)
+        if (nextId) next.set('room_id', nextId)
+        else next.delete('room_id')
+        return next
+      },
+      { replace: true },
+    )
+  }, [setSearchParams])
+
   // One-time: URL room_id (valid) > localStorage > single room
   useEffect(() => {
     if (!rooms.length) return
@@ -152,7 +170,7 @@ export function RoomProvider({ children }) {
     if (!activeRoomId) return
     if (rooms.some((r) => r.id === activeRoomId)) return
 
-    const pick = rooms.length === 1 ? rooms[0].id : null
+    const pick = rooms[0]?.id ?? null
     setActiveRoomId(pick)
     if (pick) {
       if (typeof localStorage !== 'undefined') {
@@ -196,33 +214,27 @@ export function RoomProvider({ children }) {
     )
   }, [pathname, activeRoomId, searchParams, setSearchParams])
 
-  const setActiveRoom = useCallback((id) => {
-    const nextId = id ? String(id).trim() || null : null
-    setActiveRoomId(nextId)
-    if (typeof localStorage !== 'undefined') {
-      if (nextId) localStorage.setItem(ROOM_STORAGE_KEY, nextId)
-      else localStorage.removeItem(ROOM_STORAGE_KEY)
-    }
-    setSearchParams(
-      (prev) => {
-        const next = new URLSearchParams(prev)
-        if (nextId) next.set('room_id', nextId)
-        else next.delete('room_id')
-        return next
-      },
-      { replace: true },
-    )
-  }, [setSearchParams])
+  const roomsEmpty = !roomsLoading && rooms.length === 0
+
+  // No rooms from API — reset init so the next non-empty list re-runs URL/LS bootstrap; clear selection.
+  useEffect(() => {
+    if (roomsLoading) return
+    if (rooms.length > 0) return
+    initRef.current = false
+    if (!activeRoomId && !searchParams.has('room_id')) return
+    setActiveRoom(null)
+  }, [roomsLoading, rooms, activeRoomId, searchParams, setActiveRoom])
 
   const value = useMemo(
     () => ({
       rooms,
       roomsLoading,
+      roomsEmpty,
       refreshRooms,
       activeRoomId,
       setActiveRoom,
     }),
-    [rooms, roomsLoading, refreshRooms, activeRoomId, setActiveRoom],
+    [rooms, roomsLoading, roomsEmpty, refreshRooms, activeRoomId, setActiveRoom],
   )
 
   return <RoomContext.Provider value={value}>{children}</RoomContext.Provider>

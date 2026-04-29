@@ -626,7 +626,7 @@ function DashboardNeedsRoomGate({ rooms, onSelectRoom, onOpenSettings }) {
       <div className="container-app px-4 sm:px-6 py-10 max-w-xl mx-auto">
         <div className="rounded-xl border border-gray-700 bg-gray-900/80 p-6 sm:p-8 text-center shadow-lg">
           <Wind size={40} className="mx-auto text-blue-400 mb-4" aria-hidden />
-          <h2 className="text-lg font-semibold text-white mb-2">No rooms yet</h2>
+          <h2 className="text-lg font-semibold text-white mb-2">No rooms configured</h2>
           <p className="text-sm text-gray-400 mb-6 leading-relaxed">
             The dashboard loads live data per room. Add a room in Settings, then pick it from the strip above.
             Nothing is shown until a room is selected so data is never mixed between spaces.
@@ -673,7 +673,7 @@ function DashboardNeedsRoomGate({ rooms, onSelectRoom, onOpenSettings }) {
 // ── Page ──────────────────────────────────────────────────────────────────────
 export default function Dashboard() {
   const navigate = useNavigate()
-  const { activeRoomId, setActiveRoom, rooms, refreshRooms, roomsLoading } = useRoom()
+  const { activeRoomId, setActiveRoom, rooms, refreshRooms, roomsLoading, roomsEmpty } = useRoom()
   const [status,    setStatus]    = useState(null)
   const [snapshots, setSnapshots] = useState([])
   const [stats,     setStats]     = useState(null)
@@ -751,6 +751,12 @@ export default function Dashboard() {
         <div className="container-app px-4 py-12 text-center text-sm text-gray-500">
           Loading rooms…
         </div>
+      ) : !hasRoom && roomsEmpty ? (
+        <DashboardNeedsRoomGate
+          rooms={[]}
+          onSelectRoom={setActiveRoom}
+          onOpenSettings={() => navigate({ pathname: '/settings' })}
+        />
       ) : !hasRoom ? (
         <DashboardNeedsRoomGate
           rooms={rooms}

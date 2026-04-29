@@ -1,9 +1,11 @@
 """Read and write add-on configuration from /data/hawaai_config.json."""
 
+import copy
+import glob
 import json
 import logging
 import os
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
 from . import room_registry
 from .temperature_schedule import validate_timezone_optional
@@ -11,6 +13,9 @@ from .temperature_schedule import validate_timezone_optional
 logger = logging.getLogger(__name__)
 
 CONFIG_PATH = "/data/hawaai_config.json"
+
+# Last successful merged config (survives single bad load so rooms are not silently wiped).
+_last_known_good_config: Optional[Dict[str, Any]] = None
 
 # Default matches Ollama add-on pull (gemma:2b); override in Settings if needed.
 DEFAULT_OLLAMA_MODEL = "gemma:2b"
@@ -23,17 +28,15 @@ _LEGACY_IR_KEYS = frozenset({
 DEFAULT_CONFIG: Dict[str, Any] = {
     "presence_entity": "",
     "indoor_temp_entity": "",
-    # Primary AC entity (Aerostate). Synced to climate_entity for engine/API compatibility.
     "ac_entity": "",
     "climate_entity": "",
-    "energy_power_entity": "",   # live watts sensor  (e.g. sensor.study_sensor_power)
-    "energy_kwh_entity": "",     # cumulative kWh sensor (e.g. sensor.study_sensor_power_usage)
+    "energy_power_entity": "",
+    "energy_kwh_entity": "",
     "ac_brand": "",
     "ac_model": "",
     "room_name": "Living Room",
     "target_temp": 24,
     "hysteresis": 1.5,
-    # Control band: ON above target+half, OFF below target−half (°C each side)
     "control_hysteresis_half_deg": 0.5,
     "min_command_interval_seconds": 150,
     "manual_override_duration_minutes": 10,
@@ -47,8 +50,8 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "vacancy_timeout_minutes": 5,
     "use_presence": True,
     "use_outdoor_temp": True,
-    "smart_temp_adjustment": True,   # raise/lower effective target based on outdoor temp
-    "smart_cooling_enabled": False,  # fan boost/normal via climate entity when enabled
+    "smart_temp_adjustment": True,
+    "smart_cooling_enabled": False,
     "manual_override": False,
     "ai_enabled": False,
     "ai_provider": "ollama",
@@ -72,50 +75,77 @@ DEFAULT_CONFIG: Dict[str, Any] = {
 }
 
 
-def load_config() -> Dict[str, Any]:
-    """Always read fresh from disk. Merges defaults so new keys always have values."""
+def _read_json_dict(path: str) -> Dict[str, Any]:
+    """Read JSON object from path; return {} if missing / invalid."""
+    if not os.path.isfile(path):
+        return {}
     try:
-        return _load_config_merged()
-    except Exception:
-        logger.exception("[HawaAI] Config load failed — using DEFAULT_CONFIG")
-        return dict(DEFAULT_CONFIG)
-
-
-def _load_config_merged() -> Dict[str, Any]:
-    """Merge disk + supervisor options + defaults. Raises on unexpected data; caller wraps."""
-    # First try the persisted UI config
-    saved: Dict[str, Any] = {}
-    try:
-        if os.path.exists(CONFIG_PATH):
-            with open(CONFIG_PATH, "r", encoding="utf-8") as f:
-                raw = json.load(f)
-            if isinstance(raw, dict):
-                saved = raw
-            else:
-                logger.error("[HawaAI] Config file is not a JSON object — ignoring")
+        with open(path, "r", encoding="utf-8") as f:
+            raw = json.load(f)
+        return raw if isinstance(raw, dict) else {}
     except json.JSONDecodeError as e:
-        logger.error("[HawaAI] Failed to parse config JSON: %s", e)
-    except Exception as e:
-        logger.error("[HawaAI] Failed to load config: %s", e)
+        logger.error("[HawaAI] Invalid JSON at %s: %s", path, e)
+        return {}
+    except OSError as e:
+        logger.error("[HawaAI] Cannot read %s: %s", path, e)
+        return {}
 
-    # Also layer in /data/options.json written by HA supervisor (lower priority)
-    options: Dict[str, Any] = {}
-    try:
-        options_path = "/data/options.json"
-        if os.path.exists(options_path):
-            with open(options_path, "r", encoding="utf-8") as f:
-                raw_o = json.load(f)
-            if isinstance(raw_o, dict):
-                options = raw_o
-    except Exception:
-        pass
 
-    # Merge: defaults < supervisor options < persisted UI config
-    # Upgrade-safe: new keys (e.g. ai_enabled, ai_ollama_url) appear without wiping user data.
-    merged: Dict[str, Any] = {**DEFAULT_CONFIG, **options, **saved}
+def _backup_config_paths_newest_first() -> list:
+    paths: list = []
+    for p in glob.glob("/data/hawaai_backup*.json"):
+        paths.append(p)
+    # Optional static backup alongside primary config
+    bak = "/data/hawaai_config.json.bak"
+    if os.path.isfile(bak):
+        paths.append(bak)
+    for p in glob.glob("/data/hawaai_backup*.yaml"):
+        paths.append(p)
+    for p in glob.glob("/data/hawaai_backup*.yml"):
+        paths.append(p)
+    # Newest first (best effort recover)
+    def _mtime(p: str) -> float:
+        try:
+            return os.path.getmtime(p)
+        except OSError:
+            return 0.0
+
+    paths.sort(key=_mtime, reverse=True)
+    return paths
+
+
+def _read_config_dict_from_backup_path(path: str) -> Dict[str, Any]:
+    """JSON or YAML (if PyYAML not available, skip yaml)."""
+    low = path.lower()
+    if low.endswith(".json"):
+        return _read_json_dict(path)
+    if low.endswith((".yaml", ".yml")):
+        try:
+            import yaml  # type: ignore
+        except ImportError:
+            logger.warning("[HawaAI] Skipping YAML backup %s — PyYAML not installed", path)
+            return {}
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                raw = yaml.safe_load(f)
+            return raw if isinstance(raw, dict) else {}
+        except Exception as e:
+            logger.error("[HawaAI] Failed to read YAML backup %s: %s", path, e)
+            return {}
+    return {}
+
+
+def _assemble_merged_config(saved: Dict[str, Any], options: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Deep-copy defaults, then layer supervisor options and saved UI config.
+    Never mutate DEFAULT_CONFIG in place.
+    """
+    merged: Dict[str, Any] = copy.deepcopy(DEFAULT_CONFIG)
+    merged.update(options or {})
+    merged.update(saved or {})
+
     merged["timezone"] = validate_timezone_optional(merged.get("timezone"))
 
-    # Drop legacy Broadlink / IR keys — old JSON may still contain them; never used.
     for _k in _LEGACY_IR_KEYS:
         merged.pop(_k, None)
 
@@ -136,7 +166,6 @@ def _load_config_merged() -> Dict[str, Any]:
     else:
         merged["ai_api_json_object_format"] = bool(merged.get("ai_api_json_object_format"))
 
-    # Ollama URL: only apply default when using Ollama. API mode does not assume Ollama exists.
     _ou_stripped = (str(merged.get("ai_ollama_url") or "")).strip()
     if merged["ai_provider"] == "ollama":
         if not _ou_stripped:
@@ -146,12 +175,10 @@ def _load_config_merged() -> Dict[str, Any]:
     else:
         merged["ai_ollama_url"] = _ou_stripped
 
-    # Single AC entity: ac_entity wins, else climate_entity (supervisor / old saves).
     _ace = (merged.get("ac_entity") or merged.get("climate_entity") or "").strip()
     merged["ac_entity"] = _ace
     merged["climate_entity"] = _ace
 
-    # Migration: rename legacy energy_sensor_entity → energy_power_entity
     if "energy_sensor_entity" in merged and "energy_power_entity" not in merged:
         merged["energy_power_entity"] = merged.pop("energy_sensor_entity")
         merged.setdefault("energy_kwh_entity", "")
@@ -159,7 +186,60 @@ def _load_config_merged() -> Dict[str, Any]:
         merged.pop("energy_sensor_entity", None)
 
     room_registry.ensure_migrated(merged)
+    return merged
 
+
+def load_config() -> Dict[str, Any]:
+    """
+    Load merged config. On primary failure: try backup files, then last in-memory snapshot.
+    Only uses DEFAULT_CONFIG alone if nothing else is recoverable (logged CRITICAL).
+    """
+    global _last_known_good_config
+
+    def _remember(merged: Dict[str, Any]) -> Dict[str, Any]:
+        global _last_known_good_config
+        _last_known_good_config = copy.deepcopy(merged)
+        return merged
+
+    try:
+        saved = _read_json_dict(CONFIG_PATH)
+        opts = _read_json_dict("/data/options.json")
+        merged = _assemble_merged_config(saved, opts)
+        return _remember(merged)
+
+    except Exception:
+        logger.exception(
+            "[HawaAI] CRITICAL: Primary config assembly failed (%s) — attempting backup files",
+            CONFIG_PATH,
+        )
+
+    opts_sup = _read_json_dict("/data/options.json")
+
+    for bpath in _backup_config_paths_newest_first():
+        try:
+            raw = _read_config_dict_from_backup_path(bpath)
+            if not raw:
+                continue
+            merged = _assemble_merged_config(raw, opts_sup)
+            logger.error("[HawaAI] Recovered configuration from backup file: %s", bpath)
+            return _remember(merged)
+        except Exception:
+            logger.warning("[HawaAI] Backup config unusable: %s", bpath, exc_info=True)
+
+    if _last_known_good_config is not None:
+        logger.critical(
+            "[HawaAI] CRITICAL: Disk config failed — serving last known good in-memory config "
+            "(rooms and settings preserved until primary file is fixed).",
+        )
+        return copy.deepcopy(_last_known_good_config)
+
+    logger.critical(
+        "[HawaAI] CRITICAL: No valid config on disk, no usable backup, no in-memory cache — "
+        "using DEFAULT_CONFIG (empty rooms). Repair %s or restore a backup.",
+        CONFIG_PATH,
+    )
+    merged = _assemble_merged_config({}, opts_sup)
+    _last_known_good_config = copy.deepcopy(merged)
     return merged
 
 

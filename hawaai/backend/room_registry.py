@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import copy
 import logging
+import secrets
 import uuid
 from typing import Any, Dict, List, Optional
 
@@ -24,6 +25,9 @@ _ROOM_ENTITY_KEYS = (
     "energy_kwh_entity",
 )
 
+# Minimum length for persisted room ids (collision resistance + readability).
+_MIN_ROOM_ID_LEN = 6
+
 # Optional AI-related keys allowed inside room["ai_config"].
 _AI_OVERRIDE_KEYS = frozenset({
     "ai_enabled",
@@ -36,6 +40,40 @@ _AI_OVERRIDE_KEYS = frozenset({
     "ai_api_timeout",
     "ai_api_json_object_format",
 })
+
+
+def _new_room_id() -> str:
+    """12 hex chars from a UUID `.hex`; never wrap uuid4() with str()."""
+    try:
+        return uuid.uuid4().hex[:12]
+    except Exception:
+        logger.exception("[ROOM] failed to generate room id via uuid — using secrets.token_hex(6)")
+        return secrets.token_hex(6)
+
+
+def _ensure_stable_room_id(raw_id: str) -> str:
+    """Reserved / empty / short ids get a new persistent id."""
+    rid = raw_id.strip()
+    lower = rid.lower()
+    if lower == "default":
+        nid = _new_room_id()
+        logger.error(
+            "[ROOM] Reserved room id 'default' renamed to %s — update bookmarks/dashboard ?room_id=",
+            nid,
+        )
+        rid = nid
+    elif not rid:
+        rid = _new_room_id()
+    if isinstance(rid, str) and len(rid) < _MIN_ROOM_ID_LEN:
+        nid = _new_room_id()
+        logger.warning(
+            "[ROOM] Short room id %r rejected (len<%s) — regenerated as %s",
+            rid,
+            _MIN_ROOM_ID_LEN,
+            nid,
+        )
+        rid = nid
+    return rid
 
 
 def ensure_migrated(cfg: Dict[str, Any]) -> None:
@@ -53,7 +91,7 @@ def ensure_migrated(cfg: Dict[str, Any]) -> None:
         cfg["rooms"] = []
         return
     name = (cfg.get("room_name") or "Living Room").strip() or "Living Room"
-    new_id = str(uuid.uuid4()).hex[:12]
+    new_id = _new_room_id()
     rooms.append(
         {
             "id": new_id,
@@ -69,21 +107,17 @@ def _normalize_room_list(rooms: List[Dict[str, Any]]) -> None:
     for r in rooms:
         if not isinstance(r, dict):
             continue
-        raw_id = str(r.get("id") or "").strip()
-        lower = raw_id.lower()
-        if lower == "default":
-            rid = str(uuid.uuid4()).hex[:12]
-            logger.error(
-                "[ROOM] Reserved room id 'default' renamed to %s — update bookmarks/dashboard ?room_id=",
-                rid,
-            )
-        elif not raw_id:
-            rid = str(uuid.uuid4()).hex[:12]
-        else:
-            rid = raw_id
-        r["id"] = rid
-        r["name"] = (str(r.get("name") or "Room")).strip() or "Room"
-        r["climate_entity"] = (str(r.get("climate_entity") or "")).strip()
+        try:
+            raw_id = str(r.get("id") or "").strip()
+            rid = _ensure_stable_room_id(raw_id)
+            r["id"] = rid
+            r["name"] = (str(r.get("name") or "Room")).strip() or "Room"
+            r["climate_entity"] = (str(r.get("climate_entity") or "")).strip()
+        except Exception:
+            logger.exception("[ROOM] failed to normalize room entry — assigning new id")
+            r["id"] = _new_room_id()
+            r["name"] = (str(r.get("name") or "Room")).strip() or "Room"
+            r["climate_entity"] = (str(r.get("climate_entity") or "")).strip()
 
 
 def list_room_dicts(cfg: Dict[str, Any]) -> List[Dict[str, Any]]:
