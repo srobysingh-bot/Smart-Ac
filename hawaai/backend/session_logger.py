@@ -225,6 +225,9 @@ def mark_cooled(room_id: str) -> None:
 async def add_snapshot(room_id: str, session_id: Optional[str], data: Dict[str, Any]) -> int:
     """Insert a monitoring snapshot (called every tick while AC is on). Returns row id."""
     rid = _require_room(room_id)
+    if not session_id:
+        logger.debug("[session_logger] add_snapshot skipped — no session_id (room=%s)", rid)
+        return 0
     snap = {
         "session_id": session_id,
         "room_id": rid,
@@ -264,12 +267,15 @@ async def ensure_snapshot_id_for_ai(room_id: str) -> int:
     """
     rid = _require_room(room_id)
     sid = _last_snapshot_id.get(rid)
-    if sid is not None:
+    if sid is not None and sid != 0:
         return sid
+    csid = current_session_id(rid)
+    if not csid:
+        return 0
     now = datetime.now(timezone.utc).isoformat()
     row_id = await database.insert_snapshot(
         {
-            "session_id": current_session_id(rid),
+            "session_id": csid,
             "room_id": rid,
             "timestamp": now,
             "indoor_temp": None,
@@ -292,7 +298,8 @@ async def ensure_snapshot_id_for_ai(room_id: str) -> int:
             "ai_adjust_applied": None,
         },
     )
-    _last_snapshot_id[rid] = row_id
+    if row_id:
+        _last_snapshot_id[rid] = row_id
     return row_id
 
 

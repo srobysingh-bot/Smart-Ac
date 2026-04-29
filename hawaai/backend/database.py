@@ -542,6 +542,10 @@ async def insert_snapshot(snapshot: Dict[str, Any]) -> int:
     if not rid:
         logger.error("[DB] insert_snapshot rejected — missing room_id (session_id=%s)", snapshot.get("session_id"))
         raise ValueError("room_id is required for insert_snapshot")
+    sid = snapshot.get("session_id")
+    if sid is None or (isinstance(sid, str) and not sid.strip()):
+        logger.debug("[DB] insert_snapshot skipped — missing session_id (room_id=%s)", rid)
+        return 0
     logger.info("[DB] writing snapshot for room_id=%s session_id=%s", rid, snapshot.get("session_id"))
     w = snapshot.get("watt_draw")
     if w is None:

@@ -115,7 +115,7 @@ async def lifespan(app: FastAPI):
     logger.info("[HawaAI] Add-on stopped")
 
 
-app = FastAPI(title="HawaAI API", version="1.4.5", lifespan=lifespan)
+app = FastAPI(title="HawaAI API", version="1.4.6", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -359,36 +359,37 @@ async def _dashboard_status_payload(rid: str) -> Dict[str, Any]:
     energy_watts = safe_float(energy_power_raw)
     energy_kwh   = safe_float(energy_kwh_raw)
 
-    # ── Determine ac_on + ac_idle from power sensor (mirrors logic_engine) ────
+    # ── Determine ac_on + ac_idle (power truth OR runtime intent; avoids stale OFF) ─
     cooldown_active = runtime.get("cooldown_active", False)
     watts_on_thr    = runtime.get("watts_on_threshold",   500.0)
     watts_idle_thr  = runtime.get("watts_idle_threshold",  50.0)
+
+    rt_ac_on = bool(runtime.get("ac_is_on", False))
+    pwr_hi = energy_watts is not None and energy_watts > watts_on_thr
+    effective_ac_on = pwr_hi or rt_ac_on
 
     ac_idle: bool = False
     power_source: str
 
     if energy_watts is not None and not cooldown_active:
-        # Power sensor available and cooldown expired — use watts as truth
         if energy_watts > watts_on_thr:
-            ac_on        = True
+            ac_on        = effective_ac_on
             ac_idle      = False
             power_source = "watts"
         elif energy_watts >= watts_idle_thr:
-            ac_on        = runtime.get("ac_is_on", False)
+            ac_on        = effective_ac_on
             ac_idle      = True
             power_source = "watts_idle"
         else:
-            ac_on        = False
+            ac_on        = effective_ac_on
             ac_idle      = False
             power_source = "watts"
     elif cooldown_active:
-        # Just sent a command — trust internal flag until AC responds
-        ac_on        = runtime.get("ac_is_on", False)
+        ac_on        = effective_ac_on
         ac_idle      = False
         power_source = "cooldown"
     else:
-        # No power sensor configured
-        ac_on        = runtime.get("ac_is_on", False)
+        ac_on        = rt_ac_on
         ac_idle      = False
         power_source = "internal"
 
@@ -453,7 +454,8 @@ async def _dashboard_status_payload(rid: str) -> Dict[str, Any]:
         "ai_enabled":       bool(cfg.get("ai_enabled", False)),
         "ai_cached":        bool(runtime.get("ai_cached")),
         # ── Core state ────────────────────────────────────────────────────────
-        "ac_on":            ac_on,
+        "ac_on":             ac_on,
+        "effective_ac_on":   effective_ac_on,
         "ac_idle":          ac_idle,       # fan running, compressor off (50–500 W)
         "power_source":     power_source,  # "watts" | "watts_idle" | "cooldown" | "internal"
         "indoor_temp":      indoor_temp,
@@ -475,6 +477,8 @@ async def _dashboard_status_payload(rid: str) -> Dict[str, Any]:
         "secs_since_cmd":   runtime.get("secs_since_cmd"),
         "last_ac_on_at":    runtime.get("last_ac_on_at"),
         "last_ac_off_at":   runtime.get("last_ac_off_at"),
+        "last_power_confirmed_on":  runtime.get("last_power_confirmed_on"),
+        "last_power_confirmed_off": runtime.get("last_power_confirmed_off"),
         # ── Config ────────────────────────────────────────────────────────────
         "manual_override":  cfg.get("manual_override", False),
         "config_complete":  bool(
