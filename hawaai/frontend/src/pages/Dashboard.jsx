@@ -776,6 +776,8 @@ export default function Dashboard() {
             runtime={displayStatus?.runtime}
             wattDraw={displayStatus?.watt_draw}
             sessionKwh={displayStatus?.session_kwh}
+            lastAcOnAt={displayStatus?.last_ac_on_at}
+            lastAcOffAt={displayStatus?.last_ac_off_at}
             hasClimateEntity={!!(displayStatus?.climate_entity || displayStatus?.ac_entity)}
             acCurrentTemp={displayStatus?.ac_current_temp}
             acTargetTemp={displayStatus?.ac_target_temp}

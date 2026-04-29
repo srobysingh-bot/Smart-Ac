@@ -83,6 +83,19 @@ function StateChip({ acOn, acIdle }) {
   )
 }
 
+function formatEpochLine(epochSec, label) {
+  if (epochSec == null || !Number.isFinite(Number(epochSec))) return null
+  const d = new Date(Number(epochSec) * 1000)
+  if (Number.isNaN(d.getTime())) return null
+  const clock = d.toLocaleTimeString(undefined, { hour: 'numeric', minute: '2-digit' })
+  const secAgo = Math.floor((Date.now() - d.getTime()) / 1000)
+  const ago =
+    secAgo < 90 ? `${secAgo}s ago`
+      : secAgo < 3600 ? `${Math.floor(secAgo / 60)} min ago`
+        : `${Math.floor(secAgo / 3600)}h ago`
+  return `${label}: ${clock} (${ago})`
+}
+
 export default function ACStatusCard({
   acOn,
   acIdle = false,
@@ -90,6 +103,8 @@ export default function ACStatusCard({
   runtime,
   wattDraw,
   sessionKwh,
+  lastAcOnAt,
+  lastAcOffAt,
   // Smart cooling (read-only display)
   smartCoolingEnabled = false,
   smartMode,
@@ -104,6 +119,8 @@ export default function ACStatusCard({
   hasClimateEntity,
 }) {
   const [timer, setTimer] = useState(null)
+  const acOnLine = formatEpochLine(lastAcOnAt, acOn && !acIdle ? 'Running since' : 'Last ON')
+  const acOffLine = formatEpochLine(lastAcOffAt, 'Last OFF')
 
   // Timer runs while AC is ON or IDLE (session is active)
   const sessionActive = acOn || acIdle
@@ -130,6 +147,14 @@ export default function ACStatusCard({
           fanMode={smartFanMode}
           delta={smartDelta}
         />
+      )}
+
+      {(acOnLine || acOffLine) && (
+        <div className="rounded-lg border border-gray-800/80 bg-gray-900/40 px-2.5 py-2 space-y-1">
+          <p className="text-[10px] uppercase tracking-wide text-gray-500">AC events</p>
+          {acOnLine && <p className="text-xs text-gray-300">{acOnLine}</p>}
+          {acOffLine && <p className="text-xs text-gray-400">{acOffLine}</p>}
+        </div>
       )}
 
       {/* Timer / idle message / off message */}

@@ -115,7 +115,7 @@ async def lifespan(app: FastAPI):
     logger.info("[HawaAI] Add-on stopped")
 
 
-app = FastAPI(title="HawaAI API", version="1.4.4", lifespan=lifespan)
+app = FastAPI(title="HawaAI API", version="1.4.5", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -473,6 +473,8 @@ async def _dashboard_status_payload(rid: str) -> Dict[str, Any]:
         "cooldown_active":  cooldown_active,
         "last_command":     runtime.get("last_command"),
         "secs_since_cmd":   runtime.get("secs_since_cmd"),
+        "last_ac_on_at":    runtime.get("last_ac_on_at"),
+        "last_ac_off_at":   runtime.get("last_ac_off_at"),
         # ── Config ────────────────────────────────────────────────────────────
         "manual_override":  cfg.get("manual_override", False),
         "config_complete":  bool(

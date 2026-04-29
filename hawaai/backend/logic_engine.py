@@ -30,6 +30,7 @@ Cooldown (60 s after any climate command):
 """
 
 import logging
+import time
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional, Tuple
@@ -78,6 +79,9 @@ class RoomRuntime:
     last_sent_command_key: Optional[str] = None
     compressor_on_since: Optional[datetime] = None
     compressor_off_since: Optional[datetime] = None
+    # Epoch seconds (UTC wall); set when we observe ON/OFF transitions (command + power sync).
+    last_ac_on_at: Optional[float] = None
+    last_ac_off_at: Optional[float] = None
 
 
 _runtime_by_room: Dict[str, RoomRuntime] = {}
@@ -289,8 +293,26 @@ def _gate_turn_ac_on(
     return True
 
 
-def _gate_turn_ac_off(room_id: str, cfg: dict, now: datetime) -> bool:
+def _gate_turn_ac_off(room_id: str, cfg: dict, now: datetime, *, force: bool = False) -> bool:
+    """
+    Decide whether to send an OFF command.
+
+    Never skip because "duplicate off" fingerprint — HA/device can miss commands;
+    rely on internal state (intent) only for "already off".
+    Vacancy/security path uses ``force=True`` to bypass throttle + compressor protections.
+    """
     st = _rt(room_id)
+    if not st.ac_is_on:
+        logger.info(
+            "[HawaAI][%s] Skip OFF: AC already OFF (internal state)",
+            room_id,
+        )
+        return False
+
+    if force:
+        logger.info("[HawaAI][%s] Enforcing OFF (force=vacancy or safety bypass)", room_id)
+        return True
+
     min_iv = float(cfg.get("min_command_interval_seconds", 150))
 
     secs = _seconds_since_last_command(st, now)
@@ -298,15 +320,6 @@ def _gate_turn_ac_off(room_id: str, cfg: dict, now: datetime) -> bool:
         logger.info(
             "[HawaAI][%s] Skip OFF: cooldown (%.0fs < %.0fs)",
             room_id, secs, min_iv,
-        )
-        return False
-
-    fp = _fingerprint_turn_off()
-    if st.last_sent_command_key == fp:
-        logger.info(
-            "[HawaAI][%s] Skip OFF: duplicate command (%s)",
-            room_id,
-            fp,
         )
         return False
 
@@ -675,6 +688,7 @@ async def tick(room_id: str) -> None:
                     "— syncing internal flag", room_id, energy_watts, _WATTS_COMPRESSOR,
                 )
                 st.ac_is_on = True
+                st.last_ac_on_at = now.timestamp()
         elif energy_watts >= _WATTS_FAN_ONLY:
             # IDLE zone: compressor is resting between cycles. Keep current state
             # so we don't oscillate. The engine already knows its intent.
@@ -690,6 +704,7 @@ async def tick(room_id: str) -> None:
                     "— syncing internal flag", room_id, energy_watts, _WATTS_FAN_ONLY,
                 )
                 st.ac_is_on = False
+                st.last_ac_off_at = now.timestamp()
                 # ── CRITICAL: close any open session ─────────────────────────
                 if st.session_start_time is not None:
                     logger.info(
@@ -890,7 +905,9 @@ async def tick(room_id: str) -> None:
                 room_id,
                 vacancy_duration,
             )
-            await _turn_ac_off(room_id, cfg, indoor_temp, reason="vacant", now=now)
+            await _turn_ac_off(
+                room_id, cfg, indoor_temp, reason="vacant", now=now, force=True,
+            )
 
         return
 
@@ -1034,6 +1051,7 @@ async def _turn_ac_on(
     st.session_start_kwh = start_kwh
 
     st.ac_is_on = True
+    st.last_ac_on_at = time.time()
     cmd_ts = datetime.now(timezone.utc)
     st.session_start_time = cmd_ts
     st.session_start_temp = indoor_temp
@@ -1144,19 +1162,29 @@ async def _close_session(room_id: str, cfg: dict, indoor_temp: float, reason: st
     smart_cooling.reset(room_id)
 
 
-async def _turn_ac_off(room_id: str, cfg: dict, indoor_temp: float, reason: str, now: Optional[datetime] = None) -> None:
+async def _turn_ac_off(
+    room_id: str,
+    cfg: dict,
+    indoor_temp: float,
+    reason: str,
+    now: Optional[datetime] = None,
+    *,
+    force: bool = False,
+) -> None:
     st = _rt(room_id)
     climate_entity = (cfg.get("climate_entity") or "").strip()
 
     tnow = now if now is not None else datetime.now(timezone.utc)
-    if not _gate_turn_ac_off(room_id, cfg, tnow):
+    if not _gate_turn_ac_off(room_id, cfg, tnow, force=force):
         return
 
     await ac_adapter.turn_off(climate_entity)
 
     clear_setpoint_command_tracking(room_id)
 
+    ts_off = time.time()
     st.ac_is_on = False
+    st.last_ac_off_at = ts_off
     cmd_ts = datetime.now(timezone.utc)
     st.last_command_time = cmd_ts
     st.last_command = "off"
@@ -1197,6 +1225,8 @@ def get_runtime_state(room_id: str) -> dict:
         sp_secs = round((now - st.last_setpoint_command_at).total_seconds(), 1)
     return {
         "ac_is_on":              st.ac_is_on,
+        "last_ac_on_at":         st.last_ac_on_at,
+        "last_ac_off_at":        st.last_ac_off_at,
         "ai_enabled":            bool(merged.get("ai_enabled", False)),
         "ai_cached":             _ce is not None,
         "session_id":            session_logger.current_session_id(room_id),
