@@ -1,5 +1,15 @@
 # HawaAI add-on — release notes
 
+## 1.4.12
+
+- **Runtime / telemetry:** Ensure a cooling **session exists before telemetry snapshots** (including HA startup when the AC is already ON), with a reconcile path before writing snapshots — avoids dropped ML/telemetry rows.
+- **Control:** User API authority window **bypasses the global IR cooldown** for ON gating (`_gate_turn_ac_on`); other guards unchanged.
+- **Safety:** Critical OFF paths (**safety**, **thermostat_reached**) always use **`force=True`** to `_turn_ac_off` explicitly.
+- **Presence:** Unknown/unavailable presence falls back to **last known** occupancy, otherwise **occupied=True**.
+- **Rooms:** **`room_id`** normalized (**lower**, **strip**) for runtime, scheduler, **`get_runtime_state`**, API and WebSocket room resolution (**case-insensitive** config lookup via `resolve_room_definition`).
+- **Logging:** `[TICK]` lines include **`temp_mode`** (schedule/temperature mode) and **`ha_mode`** (climate entity mode).
+- **Tests:** Unit coverage for normalize/resolve and mixed-case **`get_runtime_state`**.
+
 ## 1.4.0
 
 - **UI:** Fully responsive Dashboard and app shell — bottom navigation on phones, top navigation on tablets/desktop; grids and cards (`container-app`); charts use fluid heights; larger touch targets; no horizontal overflow.

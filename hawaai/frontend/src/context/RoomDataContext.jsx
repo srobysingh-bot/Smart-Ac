@@ -20,6 +20,7 @@ const RoomDataContext = createContext(null)
 export function RoomDataProvider({ children }) {
   const { activeRoomId } = useRoom()
   const loadGenRef = useRef(0)
+  const wsConnectedRef = useRef(false)
 
   const [state, setState] = useState({
     status: null,
@@ -52,8 +53,7 @@ export function RoomDataProvider({ children }) {
     const gen = ++loadGenRef.current
     const rid = activeRoomId
     let cancelled = false
-
-    setState((prev) => ({
+    wsConnectedRef.current = false
       status: null,
       snapshots: [],
       ai: null,
@@ -104,16 +104,36 @@ export function RoomDataProvider({ children }) {
 
     load()
 
-    const pollStatus = window.setInterval(() => {
+    const { close } = connectLive(rid, (msg) => {
+      if (cancelled || gen !== loadGenRef.current) return
+      if (!msg || msg.type !== 'tick') return
+      if (msg.room_id != null && msg.room_id !== rid) return
+      wsConnectedRef.current = true
+      setState((prev) => {
+        if (gen !== loadGenRef.current) return prev
+        if (!prev.status) return prev
+        return {
+          ...prev,
+          status: {
+            ...prev.status,
+            ...msg,
+            effective_ac_on: msg.effective_ac_on ?? msg.ac_is_on ?? prev.status.effective_ac_on,
+          },
+        }
+      })
+    })
+
+    const pollId = window.setInterval(() => {
+      if (wsConnectedRef.current) return
       getStatus(rid)
         .then((s) => {
           if (cancelled || gen !== loadGenRef.current) return
           setState((prev) => ({ ...prev, status: s }))
         })
         .catch(() => {})
-    }, 5000)
+    }, 15000)
 
-    const pollSnapshots = window.setInterval(() => {
+    const snapId = window.setInterval(() => {
       getSnapshots(120, rid)
         .then((snaps) => {
           if (cancelled || gen !== loadGenRef.current) return
@@ -122,7 +142,7 @@ export function RoomDataProvider({ children }) {
         .catch(() => {})
     }, 30000)
 
-    const pollAi = window.setInterval(() => {
+    const pollAiId = window.setInterval(() => {
       getAiStatus(rid)
         .then((ai) => {
           if (cancelled || gen !== loadGenRef.current) return
@@ -131,28 +151,11 @@ export function RoomDataProvider({ children }) {
         .catch(() => {})
     }, 5000)
 
-    const { close } = connectLive(rid, (msg) => {
-      if (cancelled || gen !== loadGenRef.current) return
-      if (!msg || msg.type !== 'tick') return
-
-      const { type: _t, room_id: tickRoom, ...rest } = msg
-      if (!tickRoom || tickRoom !== rid) return
-
-      setState((prev) => {
-        if (gen !== loadGenRef.current) return prev
-        if (!tickRoom || tickRoom !== rid) return prev
-        const cur = prev.status
-        const merged = cur ? { ...cur, ...rest } : { ...rest }
-        if (merged.room_id != null && merged.room_id !== rid) return prev
-        return { ...prev, status: merged }
-      })
-    })
-
     return () => {
       cancelled = true
-      window.clearInterval(pollStatus)
-      window.clearInterval(pollSnapshots)
-      window.clearInterval(pollAi)
+      window.clearInterval(pollId)
+      window.clearInterval(snapId)
+      window.clearInterval(pollAiId)
       close()
     }
   }, [activeRoomId])

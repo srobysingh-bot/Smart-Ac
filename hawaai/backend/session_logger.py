@@ -250,6 +250,9 @@ async def add_snapshot(room_id: str, session_id: Optional[str], data: Dict[str, 
         "effective_after_weather": data.get("effective_after_weather"),
         "effective_final_temp": data.get("effective_final_temp"),
         "ai_adjust_applied": data.get("ai_adjust_applied"),
+        "target_temp": data.get("target_temp"),
+        "control_source": data.get("control_source"),
+        "hvac_mode": data.get("hvac_mode"),
     }
     row_id = await database.insert_snapshot(snap)
     _last_snapshot_id[rid] = row_id

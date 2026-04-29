@@ -172,6 +172,16 @@ async def init_db() -> None:
             except Exception:
                 pass  # column already exists — safe to ignore
 
+        for stmt in (
+            "ALTER TABLE snapshots ADD COLUMN target_temp REAL",
+            "ALTER TABLE snapshots ADD COLUMN control_source TEXT",
+            "ALTER TABLE snapshots ADD COLUMN hvac_mode TEXT",
+        ):
+            try:
+                await db.execute(stmt)
+            except Exception:
+                pass  # column already exists — safe to ignore
+
         await db.commit()
     logger.info("Database ready at %s", DB_PATH)
 
@@ -559,8 +569,9 @@ async def insert_snapshot(snapshot: Dict[str, Any]) -> int:
                  setpoint, fan_mode, energy_kwh,
                  ai_target_temp, ai_fan_mode, ai_confidence,
                  schedule_slot, schedule_base_temp, effective_after_weather,
-                 effective_final_temp, ai_adjust_applied)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                 effective_final_temp, ai_adjust_applied,
+                 target_temp, control_source, hvac_mode)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             """,
             (
                 snapshot.get("session_id"),
@@ -585,6 +596,9 @@ async def insert_snapshot(snapshot: Dict[str, Any]) -> int:
                 snapshot.get("effective_after_weather"),
                 snapshot.get("effective_final_temp"),
                 snapshot.get("ai_adjust_applied"),
+                snapshot.get("target_temp"),
+                snapshot.get("control_source"),
+                snapshot.get("hvac_mode"),
             ),
         )
         await db.commit()
@@ -681,6 +695,35 @@ async def get_snapshots_recent(minutes: int = 120, room_id: str = "") -> List[Di
             ORDER BY timestamp ASC
             """,
             (since, rid),
+        ) as cursor:
+            rows = await cursor.fetchall()
+            return [dict(r) for r in rows]
+
+
+async def get_snapshots_for_ml(room_id: str, limit: int = 10000) -> List[Dict[str, Any]]:
+    """Rows with non-null ML-critical fields for export."""
+    rid = (room_id or "").strip()
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            """
+            SELECT
+                session_id, room_id, timestamp, indoor_temp, outdoor_temp,
+                indoor_humidity, outdoor_humidity, target_temp, effective_final_temp,
+                ac_state, power_watts, fan_mode, hvac_mode, presence,
+                control_source, schedule_slot, ai_adjust_applied
+            FROM snapshots
+            WHERE room_id = ?
+              AND session_id IS NOT NULL
+              AND indoor_temp IS NOT NULL
+              AND ac_state IS NOT NULL
+              AND presence IS NOT NULL
+              AND control_source IS NOT NULL
+              AND effective_final_temp IS NOT NULL
+            ORDER BY timestamp DESC
+            LIMIT ?
+            """,
+            (rid, limit),
         ) as cursor:
             rows = await cursor.fetchall()
             return [dict(r) for r in rows]

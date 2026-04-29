@@ -324,16 +324,19 @@ function LiveStatusBar({ status }) {
   const {
     indoor_temp, outdoor_temp, presence, ac_on, ac_idle, watt_draw,
     ac_current_temp, cooldown_active, last_command, secs_since_cmd, power_source,
+    effective_ac_on,
   } = status || {}
+
+  const acCore = effective_ac_on != null ? Boolean(effective_ac_on) : Boolean(ac_on)
 
   const displayTemp = indoor_temp
   const tempFromAC  = status != null && indoor_temp == null && ac_current_temp != null
 
-  // State display: ON (green) / IDLE (amber) / OFF (gray)
-  const acColor  = ac_on && !ac_idle ? 'text-green-400'
+  // State display: ON (green) / IDLE (amber) / OFF (gray) — server-derived
+  const acColor  = acCore && !ac_idle ? 'text-green-400'
                  : ac_idle           ? 'text-yellow-400'
                  :                    'text-gray-500'
-  const acLabel  = ac_on && !ac_idle ? 'ON'
+  const acLabel  = acCore && !ac_idle ? 'ON'
                  : ac_idle           ? 'IDLE'
                  :                    'OFF'
 
@@ -770,7 +773,7 @@ export default function Dashboard() {
             indoorFromAC={displayStatus?.indoor_temp == null && displayStatus?.ac_current_temp != null}
           />
           <ACStatusCard
-            acOn={displayStatus?.ac_on}
+            acOn={displayStatus?.effective_ac_on ?? displayStatus?.ac_on}
             acIdle={displayStatus?.ac_idle ?? false}
             sessionStart={displayStatus?.session_start || displayStatus?.runtime?.session_start}
             runtime={displayStatus?.runtime}

@@ -63,9 +63,9 @@ async def start() -> None:
                 )
                 continue
             try:
-                await logic_engine.tick(rid)
+                await logic_engine.tick(logic_engine.normalize_room_id(rid))
             except Exception as e:
-                logger.error("[HawaAI] Logic tick error [%s]: %s", rid, e)
+                logger.error("[HawaAI] Logic tick error [%s]: %s", rid, e, exc_info=True)
 
         weather_accumulator += interval
         if weather_accumulator >= 600:

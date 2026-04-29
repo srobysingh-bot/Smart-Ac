@@ -23,12 +23,14 @@ Routes:
   GET  /api/daily           Daily stats for last N days (?room_id= required)
   GET  /api/export/csv      Download session CSV (?room_id= required)
   GET  /api/export/json     Download session JSON (?room_id= required)
+  GET  /api/export/ml_snapshots Clean ML snapshot rows (?room_id= required)
   WS   /ws                  Live push per subscribed room_id every 5 s
 """
 
 import asyncio
 import json
 import logging
+import time
 from collections import defaultdict
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
@@ -54,6 +56,34 @@ from .utils import parse_presence
 # Room-scoped WebSocket subscribers: broadcast never crosses room_id boundaries.
 _ws_by_room: Dict[str, List[WebSocket]] = defaultdict(list)
 _ws_lock = asyncio.Lock()
+
+_api_last_command: Dict[str, float] = defaultdict(float)
+_API_RATE_LIMIT_SECS = 10
+
+
+def _check_api_rate_limit(room_id: str) -> bool:
+    """Returns True if the command is allowed. Returns False if too soon."""
+    mono = time.monotonic()
+    last = _api_last_command[room_id]
+    if mono - last < _API_RATE_LIMIT_SECS:
+        return False
+    _api_last_command[room_id] = mono
+    return True
+
+
+def _room_id_for_climate_entity(entity_id: str) -> Optional[str]:
+    """Resolve configured room whose climate entity matches HA entity id."""
+    eid = (entity_id or "").strip()
+    if not eid:
+        return None
+    base = config_manager.load_config()
+    for r in room_registry.list_room_dicts(base):
+        eff = room_registry.merge_room_config(base, r)
+        ce = (eff.get("climate_entity") or eff.get("ac_entity") or "").strip()
+        if ce == eid:
+            rid = (r.get("id") or "").strip()
+            return rid if rid else None
+    return None
 
 
 def _state_ok(raw: Optional[str]) -> bool:
@@ -115,7 +145,7 @@ async def lifespan(app: FastAPI):
     logger.info("[HawaAI] Add-on stopped")
 
 
-app = FastAPI(title="HawaAI API", version="1.4.11", lifespan=lifespan)
+app = FastAPI(title="HawaAI API", version="1.4.12", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -336,11 +366,10 @@ async def get_status(room_id: str = Query(..., min_length=1)):
 async def _dashboard_status_payload(rid: str) -> Dict[str, Any]:
     """Build /api/status JSON. `rid` must be non-empty; unknown room raises 404."""
     base = config_manager.load_config()
-    room_def = room_registry.get_room(base, rid)
+    room_def = logic_engine.resolve_room_definition(base, rid)
     if not room_def:
         raise HTTPException(status_code=404, detail=f"Unknown room: {rid}")
     cfg = room_registry.merge_room_config(base, room_def)
-    runtime = logic_engine.get_runtime_state(rid)
 
     indoor_temp_raw  = await ha_client.get_state(cfg.get("indoor_temp_entity", ""))
     presence_raw     = await ha_client.get_state(cfg.get("presence_entity", ""))
@@ -359,42 +388,13 @@ async def _dashboard_status_payload(rid: str) -> Dict[str, Any]:
     energy_watts = safe_float(energy_power_raw)
     energy_kwh   = safe_float(energy_kwh_raw)
 
-    # ── Determine ac_on + ac_idle (power truth OR runtime intent; avoids stale OFF) ─
-    cooldown_active = runtime.get("cooldown_active", False)
-    watts_on_thr    = runtime.get("watts_on_threshold",   500.0)
-    watts_idle_thr  = runtime.get("watts_idle_threshold",  50.0)
+    runtime = logic_engine.get_runtime_state(rid)
+    ac_on = bool(runtime.get("ac_is_on", False))
+    ac_idle = bool(runtime.get("ac_idle", False))
+    power_source = str(runtime.get("power_source", "internal"))
+    cooldown_active = bool(runtime.get("cooldown_active", False))
 
-    rt_ac_on = bool(runtime.get("ac_is_on", False))
-    pwr_hi = energy_watts is not None and energy_watts > watts_on_thr
-    effective_ac_on = pwr_hi or rt_ac_on
-
-    ac_idle: bool = False
-    power_source: str
-
-    if energy_watts is not None and not cooldown_active:
-        if energy_watts > watts_on_thr:
-            ac_on        = effective_ac_on
-            ac_idle      = False
-            power_source = "watts"
-        elif energy_watts >= watts_idle_thr:
-            ac_on        = effective_ac_on
-            ac_idle      = True
-            power_source = "watts_idle"
-        else:
-            ac_on        = effective_ac_on
-            ac_idle      = False
-            power_source = "watts"
-    elif cooldown_active:
-        ac_on        = effective_ac_on
-        ac_idle      = False
-        power_source = "cooldown"
-    else:
-        ac_on        = rt_ac_on
-        ac_idle      = False
-        power_source = "internal"
-
-    # Aerostate — single source of truth for displayed AC state.
-    # HawaAI now commands via Aerostate; this reads live state back.
+    # Aerostate — live climate read for UI labels (ON/OFF from logic runtime)
     climate_entity = (cfg.get("ac_entity") or cfg.get("climate_entity") or "").strip()
     climate_data: dict = {}
     if climate_entity:
@@ -413,11 +413,14 @@ async def _dashboard_status_payload(rid: str) -> Dict[str, Any]:
         base_target, outdoor_temp_val, smart_curve,
     )
     tm = str(cfg.get("temperature_mode") or "manual")
-    effective_target, ai_adjust_applied = logic_engine.bounded_effective_from_ai_cache(
-        rid,
-        cfg,
-        effective_after_weather,
-        is_occupied,
+    try:
+        effective_target = float(runtime.get("target_temp"))
+    except (TypeError, ValueError):
+        effective_target = effective_after_weather
+    ai_adjust_applied = (
+        tm == "schedule_ai"
+        and bool(cfg.get("ai_enabled", False))
+        and abs(float(effective_target) - float(effective_after_weather)) >= 0.01
     )
 
     rt = _runtime_block(runtime)
@@ -455,7 +458,7 @@ async def _dashboard_status_payload(rid: str) -> Dict[str, Any]:
         "ai_cached":        bool(runtime.get("ai_cached")),
         # ── Core state ────────────────────────────────────────────────────────
         "ac_on":             ac_on,
-        "effective_ac_on":   effective_ac_on,
+        "effective_ac_on":   ac_on,
         "ac_idle":          ac_idle,       # fan running, compressor off (50–500 W)
         "power_source":     power_source,  # "watts" | "watts_idle" | "cooldown" | "internal"
         "indoor_temp":      indoor_temp,
@@ -479,6 +482,8 @@ async def _dashboard_status_payload(rid: str) -> Dict[str, Any]:
         "last_ac_off_at":   runtime.get("last_ac_off_at"),
         "last_power_confirmed_on":  runtime.get("last_power_confirmed_on"),
         "last_power_confirmed_off": runtime.get("last_power_confirmed_off"),
+        "control_source":           runtime.get("control_source", "none"),
+        "last_command_source":      runtime.get("last_command_source", "system"),
         # ── Config ────────────────────────────────────────────────────────────
         "manual_override":  cfg.get("manual_override", False),
         "config_complete":  bool(
@@ -554,7 +559,7 @@ async def api_get_room(room_id: str):
     """Room row + merged effective config (same shape as legacy global /config for the form)."""
     rid = _require_room_query(room_id)
     base = config_manager.load_config()
-    room_def = room_registry.get_room(base, rid)
+    room_def = logic_engine.resolve_room_definition(base, rid)
     if not room_def:
         raise HTTPException(status_code=404, detail="room not found")
     eff = room_registry.merge_room_config(base, room_def)
@@ -801,6 +806,14 @@ async def get_climate_state(entity_id: str):
 @app.post("/api/climate/{entity_id:path}/set_temperature")
 async def climate_set_temperature(entity_id: str, data: Dict[str, Any] = Body(...)):
     """Set climate setpoint. Body: {"temperature": 24}"""
+    rid_room = _room_id_for_climate_entity(entity_id)
+    if rid_room:
+        if not _check_api_rate_limit(rid_room):
+            raise HTTPException(
+                status_code=429,
+                detail="Command rate limit: wait 10 seconds between commands",
+            )
+        logic_engine.record_user_api_command(rid_room)
     temperature = data.get("temperature")
     if temperature is None:
         return {"success": False, "error": "temperature field required"}
@@ -814,6 +827,14 @@ async def climate_set_temperature(entity_id: str, data: Dict[str, Any] = Body(..
 @app.post("/api/climate/{entity_id:path}/set_hvac_mode")
 async def climate_set_hvac_mode(entity_id: str, data: Dict[str, Any] = Body(...)):
     """Set HVAC mode. Body: {"hvac_mode": "cool"}"""
+    rid_room = _room_id_for_climate_entity(entity_id)
+    if rid_room:
+        if not _check_api_rate_limit(rid_room):
+            raise HTTPException(
+                status_code=429,
+                detail="Command rate limit: wait 10 seconds between commands",
+            )
+        logic_engine.record_user_api_command(rid_room)
     hvac_mode = data.get("hvac_mode")
     if not hvac_mode:
         return {"success": False, "error": "hvac_mode field required"}
@@ -827,6 +848,14 @@ async def climate_set_hvac_mode(entity_id: str, data: Dict[str, Any] = Body(...)
 @app.post("/api/climate/{entity_id:path}/set_fan_mode")
 async def climate_set_fan_mode(entity_id: str, data: Dict[str, Any] = Body(...)):
     """Set fan mode. Body: {"fan_mode": "auto"}"""
+    rid_room = _room_id_for_climate_entity(entity_id)
+    if rid_room:
+        if not _check_api_rate_limit(rid_room):
+            raise HTTPException(
+                status_code=429,
+                detail="Command rate limit: wait 10 seconds between commands",
+            )
+        logic_engine.record_user_api_command(rid_room)
     fan_mode = data.get("fan_mode")
     if not fan_mode:
         return {"success": False, "error": "fan_mode field required"}
@@ -840,6 +869,14 @@ async def climate_set_fan_mode(entity_id: str, data: Dict[str, Any] = Body(...))
 @app.post("/api/climate/{entity_id:path}/set_swing_mode")
 async def climate_set_swing_mode(entity_id: str, data: Dict[str, Any] = Body(...)):
     """Set swing mode. Body: {"swing_mode": "auto"}"""
+    rid_room = _room_id_for_climate_entity(entity_id)
+    if rid_room:
+        if not _check_api_rate_limit(rid_room):
+            raise HTTPException(
+                status_code=429,
+                detail="Command rate limit: wait 10 seconds between commands",
+            )
+        logic_engine.record_user_api_command(rid_room)
     swing_mode = data.get("swing_mode")
     if not swing_mode:
         return {"success": False, "error": "swing_mode field required"}
@@ -974,6 +1011,30 @@ async def export_json_route(room_id: str = Query(..., min_length=1)):
     )
 
 
+@app.get("/api/export/ml_snapshots")
+async def export_ml_snapshots(room_id: str = Query(..., min_length=1), limit: int = 10000):
+    """
+    Export clean ML training data.
+    Filters out any row with null in critical columns.
+    """
+    rid = _require_room_query(room_id)
+    rows = await database.get_snapshots_for_ml(room_id=rid, limit=limit)
+
+    required = [
+        "session_id", "room_id", "indoor_temp", "ac_state",
+        "presence", "control_source", "effective_final_temp",
+    ]
+    clean = [
+        r for r in rows
+        if all(r.get(col) is not None for col in required)
+    ]
+
+    if not clean:
+        return {"rows": 0, "data": []}
+
+    return {"rows": len(clean), "data": clean}
+
+
 # ── WebSocket ─────────────────────────────────────────────────────────────────
 
 @app.websocket("/ws")
@@ -1000,14 +1061,15 @@ async def websocket_endpoint(websocket: WebSocket):
                 await websocket.send_json({"type": "error", "detail": "room_id_required"})
                 continue
             base = config_manager.load_config()
-            if not room_registry.get_room(base, rid):
+            if not logic_engine.resolve_room_definition(base, rid):
                 await websocket.send_json({"type": "error", "detail": "unknown_room", "room_id": rid})
                 await websocket.close(code=4404)
                 return
+            rid_canon = logic_engine.normalize_room_id(rid)
             async with _ws_lock:
-                _ws_by_room[rid].append(websocket)
-            subscribed = rid
-            await websocket.send_json({"type": "subscribed", "room_id": rid})
+                _ws_by_room[rid_canon].append(websocket)
+            subscribed = rid_canon
+            await websocket.send_json({"type": "subscribed", "room_id": rid_canon})
 
         while True:
             await websocket.receive_text()
@@ -1034,7 +1096,7 @@ async def _broadcast_loop():
                 continue
             try:
                 base = config_manager.load_config()
-                room_def = room_registry.get_room(base, rid)
+                room_def = logic_engine.resolve_room_definition(base, rid)
                 if not room_def:
                     payload = json.dumps({"type": "error", "room_id": rid, "detail": "unknown_room"})
                 else:
@@ -1045,6 +1107,8 @@ async def _broadcast_loop():
                         {
                             "type": "tick",
                             **runtime,
+                            "effective_ac_on": runtime.get("ac_is_on", False),
+                            "control_source": runtime.get("control_source", "none"),
                             "target_temp": sched_bt,
                             "schedule_slot": sched_slot,
                             "temperature_mode": merged.get("temperature_mode") or "manual",
