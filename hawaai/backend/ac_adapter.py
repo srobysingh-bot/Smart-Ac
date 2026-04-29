@@ -22,8 +22,8 @@ from . import ha_client
 logger = logging.getLogger(__name__)
 
 # Minimum temperature delta to warrant a set_temperature call (°C).
-# Wider band avoids duplicate ON / setpoint spam when Aerostate already matches.
-_TEMP_DEAD_BAND: float = 1.0
+# Matches logic_engine meaningful_setpoint_delta_deg / anti-chatter.
+_TEMP_DEAD_BAND: float = 0.5
 
 
 async def turn_on(

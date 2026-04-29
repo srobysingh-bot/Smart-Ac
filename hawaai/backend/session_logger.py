@@ -223,6 +223,11 @@ async def add_snapshot(room_id: str, session_id: Optional[str], data: Dict[str, 
         "ai_target_temp": data.get("ai_target_temp"),
         "ai_fan_mode": data.get("ai_fan_mode"),
         "ai_confidence": data.get("ai_confidence"),
+        "schedule_slot": data.get("schedule_slot"),
+        "schedule_base_temp": data.get("schedule_base_temp"),
+        "effective_after_weather": data.get("effective_after_weather"),
+        "effective_final_temp": data.get("effective_final_temp"),
+        "ai_adjust_applied": data.get("ai_adjust_applied"),
     }
     row_id = await database.insert_snapshot(snap)
     _last_snapshot_id[room_id] = row_id
@@ -260,6 +265,11 @@ async def ensure_snapshot_id_for_ai(room_id: str) -> int:
             "ai_target_temp": None,
             "ai_fan_mode": None,
             "ai_confidence": None,
+            "schedule_slot": None,
+            "schedule_base_temp": None,
+            "effective_after_weather": None,
+            "effective_final_temp": None,
+            "ai_adjust_applied": None,
         },
     )
     _last_snapshot_id[room_id] = row_id

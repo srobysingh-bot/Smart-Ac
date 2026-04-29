@@ -188,7 +188,47 @@ const ROOM_SETTINGS_KEYS = [
   'energy_tariff_per_kwh', 'currency', 'use_presence', 'use_outdoor_temp',
   'smart_temp_adjustment', 'smart_cooling_enabled', 'manual_override',
   'ac_brand', 'ac_model', 'weather_provider', 'weather_api_key', 'weather_city',
+  'temperature_mode', 'timezone', 'schedule',
 ]
+
+const SCHEDULE_SLOT_ROWS = [
+  { key: 'morning_temp', label: 'Morning', hours: '06:00–12:00' },
+  { key: 'afternoon_temp', label: 'Afternoon', hours: '12:00–17:00' },
+  { key: 'evening_temp', label: 'Evening', hours: '17:00–22:00' },
+  { key: 'night_temp', label: 'Night', hours: '22:00–06:00' },
+]
+
+function slotKeyForHour24(hour) {
+  if (hour >= 22 || hour < 6) return 'night_temp'
+  if (hour < 12) return 'morning_temp'
+  if (hour < 17) return 'afternoon_temp'
+  return 'evening_temp'
+}
+
+/** Rough preview of which schedule row is active — uses timezone field or browser zone. */
+function previewScheduleSlotKey(cfg) {
+  const tz = String(cfg.timezone || '').trim() || Intl.DateTimeFormat().resolvedOptions().timeZone
+  let hour = new Date().getHours()
+  try {
+    const parts = new Intl.DateTimeFormat('en-GB', { timeZone: tz, hour: 'numeric', hourCycle: 'h23' }).formatToParts(new Date())
+    const hp = parts.find((p) => p.type === 'hour')
+    if (hp != null && hp.value !== undefined) hour = Number(hp.value)
+  } catch {
+    /* keep local hour */
+  }
+  return { hour, key: slotKeyForHour24(hour) }
+}
+
+function previewBaseDegC(cfg) {
+  const mode = cfg.temperature_mode || 'manual'
+  if (mode === 'manual') return Number(cfg.target_temp ?? 24)
+  const sch = cfg.schedule || {}
+  const { key } = previewScheduleSlotKey(cfg)
+  const fallback = Number(cfg.target_temp ?? 24)
+  const raw = sch[key]
+  const n = raw !== undefined && raw !== '' ? Number(raw) : fallback
+  return Number.isFinite(n) ? n : fallback
+}
 
 const AI_CONFIG_KEYS = [
   'ai_enabled', 'ai_provider', 'ai_ollama_url', 'ai_ollama_model',
@@ -276,6 +316,16 @@ export default function Settings() {
 
   const patch = useCallback((key, val) => {
     setCfg(prev => ({ ...prev, [key]: val }))
+  }, [])
+
+  const patchScheduleTemp = useCallback((key, val) => {
+    setCfg(prev => ({
+      ...prev,
+      schedule: {
+        ...(prev.schedule && typeof prev.schedule === 'object' ? prev.schedule : {}),
+        [key]: val,
+      },
+    }))
   }, [])
 
   const handleSave = async () => {
@@ -397,7 +447,7 @@ export default function Settings() {
 
   if (loading && roomId) {
     return (
-      <div className="flex items-center justify-center h-full text-gray-500">
+      <div className="flex items-center justify-center min-h-[40vh] text-gray-500 px-6">
         Loading configuration…
       </div>
     )
@@ -405,7 +455,7 @@ export default function Settings() {
 
   if (!roomId) {
     return (
-      <div className="max-w-2xl mx-auto p-6 space-y-4">
+      <div className="container-app max-w-2xl px-4 sm:px-6 py-6 pb-24 md:pb-8 space-y-4 min-w-0">
         <h1 className="text-xl font-bold">Settings</h1>
         <p className="text-sm text-gray-400">Select a room to edit. Settings apply only to that room — nothing is shared between rooms.</p>
         {roomsList.length === 0 ? (
@@ -434,7 +484,7 @@ export default function Settings() {
   }
 
   return (
-    <div className="max-w-2xl mx-auto p-6 space-y-8">
+    <div className="container-app max-w-2xl px-4 sm:px-6 py-6 pb-24 md:pb-12 space-y-8 min-w-0">
 
       {/* Header + room switcher + Save */}
       <div className="space-y-3">
@@ -756,8 +806,89 @@ export default function Settings() {
           min={16} max={30} step={1} unit="°C"
         />
         <p className="text-xs text-gray-500 -mt-3">
-          AC turns ON above target + hysteresis, OFF below target − hysteresis.
+          {(cfg.temperature_mode || 'manual') === 'manual'
+            ? 'Manual setpoint — AC compares indoor temp against this (± hysteresis) after outdoor smart adjustment.'
+            : 'Baseline / fallback degrees — also fills new schedule defaults. In Schedule modes, timing uses rows below.'}
         </p>
+
+        {/* Temperature schedule */}
+        <div className="border border-gray-800 rounded-xl p-4 space-y-4">
+          <SectionHeader>Temperature Schedule</SectionHeader>
+          <p className="text-xs text-gray-500 -mt-2">
+            Fixed time bands (local clock). Edit °C only. Use <strong className="text-gray-400">Manual</strong> to ignore schedule
+            and use the slider above alone.
+          </p>
+          <div>
+            <Label>Mode</Label>
+            <select
+              className="w-full bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm text-gray-100 focus:outline-none focus:border-blue-500"
+              value={cfg.temperature_mode || 'manual'}
+              onChange={e => patch('temperature_mode', e.target.value)}
+            >
+              <option value="manual">Manual</option>
+              <option value="schedule">Schedule</option>
+              <option value="schedule_ai">Schedule + AI</option>
+            </select>
+            <p className="text-xs text-gray-500 mt-1 leading-relaxed">
+              <strong className="text-gray-400">Manual</strong> — one fixed °C target (above).&nbsp;
+              <strong className="text-gray-400">Schedule</strong> — four time bands with your °C per band + outdoor smart curve.&nbsp;
+              <strong className="text-gray-400">Schedule + AI</strong> — same as Schedule, plus optional model nudge within ±1°C (enable AI below).
+            </p>
+          </div>
+          <Input
+            label="Schedule timezone (IANA, optional)"
+            value={cfg.timezone ?? ''}
+            onChange={v => patch('timezone', v)}
+            placeholder="e.g. Asia/Kolkata — empty uses TZ env or UTC on the server"
+          />
+          {(() => {
+            const tm = cfg.temperature_mode || 'manual'
+            if (tm === 'manual') return null
+            const { hour, key: activeKey } = previewScheduleSlotKey(cfg)
+            return (
+              <p className="text-xs text-amber-200/90 bg-amber-900/20 border border-amber-800/50 rounded-lg px-3 py-2">
+                Preview — local hour&nbsp;
+                <span className="font-mono">{String(hour).padStart(2, '0')}:00</span>
+                {' → active row '}
+                <span className="font-semibold text-amber-100">
+                  {SCHEDULE_SLOT_ROWS.find(r => r.key === activeKey)?.label ?? '—'}
+                </span>
+                {' '}(uses timezone above when set).
+              </p>
+            )
+          })()}
+          <div className="space-y-2">
+            <p className="text-xs font-semibold text-gray-400">Slot temperatures (°C)</p>
+            {SCHEDULE_SLOT_ROWS.map(row => (
+              <div
+                key={row.key}
+                className={`grid grid-cols-[1fr_auto_auto] items-center gap-2 rounded-lg px-2 py-1.5 ${
+                  (cfg.temperature_mode || 'manual') !== 'manual' &&
+                  previewScheduleSlotKey(cfg).key === row.key
+                    ? 'bg-blue-900/25 border border-blue-700/40'
+                    : ''
+                }`}
+              >
+                <span className="text-sm text-gray-200">{row.label}</span>
+                <span className="text-xs text-gray-500 tabular-nums">{row.hours}</span>
+                <input
+                  type="number"
+                  min={16}
+                  max={30}
+                  step={1}
+                  disabled={(cfg.temperature_mode || 'manual') === 'manual'}
+                  className="w-20 bg-gray-800 border border-gray-700 rounded-lg px-2 py-1.5 text-sm text-gray-100 text-right disabled:opacity-40"
+                  value={
+                    cfg.schedule?.[row.key] !== undefined && cfg.schedule?.[row.key] !== ''
+                      ? cfg.schedule[row.key]
+                      : (cfg.target_temp ?? 24)
+                  }
+                  onChange={e => patchScheduleTemp(row.key, Number(e.target.value))}
+                />
+              </div>
+            ))}
+          </div>
+        </div>
 
         <Slider
           label="Hysteresis Band"
@@ -898,8 +1029,8 @@ export default function Settings() {
         </div>
 
         {/* ── Smart Adjustment Preview ───────────────────────────────────── */}
-        {cfg.smart_temp_adjustment !== false && (() => {
-          const t = cfg.target_temp ?? 24
+        {cfg.smart_temp_adjustment !== false && cfg.use_outdoor_temp !== false && (() => {
+          const t = previewBaseDegC(cfg)
           const outdoor = outdoorTemp
           let adj = 0
           if (outdoor !== null) {

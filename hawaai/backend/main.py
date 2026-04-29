@@ -46,7 +46,9 @@ from fastapi.responses import FileResponse, HTMLResponse, Response
 from . import config_manager, database, logic_engine, room_registry, scheduler, session_logger, weather_api
 from . import ha_client
 from .ac_controller import get_brands
+from .ai import get_cached
 from .ai.ai_worker import get_ai_status, init_ai_worker
+from .temperature_schedule import resolve_base_target_temp
 from .utils import parse_presence
 
 # Room-scoped WebSocket subscribers: broadcast never crosses room_id boundaries.
@@ -381,17 +383,24 @@ async def get_status(room_id: str = Query(..., min_length=1)):
     if indoor_temp is None and climate_data:
         indoor_temp = climate_data.get("current_temp")
 
-    # Effective target — same formula as logic_engine (single source of truth)
-    smart_adj        = logic_engine.smart_temp_adjustment_enabled(cfg)
-    base_target      = float(cfg.get("target_temp", 24))
+    # Effective target — same pipeline as logic_engine.tick (manual / schedule × weather ± optional AI clamp)
+    base_target, schedule_slot = resolve_base_target_temp(cfg)
+    smart_curve = logic_engine.smart_temp_adjustment_enabled(cfg) and bool(cfg.get("use_outdoor_temp", True))
     outdoor_temp_val = weather.get("temp") if weather else None
-    effective_target = logic_engine.compute_effective_target(
-        base_target, outdoor_temp_val, smart_adj,
+    effective_after_weather = logic_engine.compute_effective_target(
+        base_target, outdoor_temp_val, smart_curve,
+    )
+    tm = str(cfg.get("temperature_mode") or "manual")
+    effective_target, ai_adjust_applied = logic_engine.bounded_effective_from_ai_cache(
+        rid,
+        cfg,
+        effective_after_weather,
+        is_occupied,
     )
 
     rt = _runtime_block(runtime)
     reason = _smart_adjustment_reason(
-        smart_adj, outdoor_temp_val, base_target, effective_target,
+        smart_curve, outdoor_temp_val, base_target, effective_after_weather,
     )
 
     ai_snap = get_ai_status(rid)
@@ -448,11 +457,16 @@ async def get_status(room_id: str = Query(..., min_length=1)):
         "config_complete":  bool(
             cfg.get("presence_entity") and cfg.get("indoor_temp_entity")
         ),
-        "target_temp":      base_target,
+        "target_temp": base_target,
+        "schedule_base_temp": base_target,
         "effective_target": effective_target,
+        "effective_after_weather": effective_after_weather,
+        "temperature_mode": tm,
+        "schedule_slot": schedule_slot,
+        "ai_adjust_applied": ai_adjust_applied,
         "climate_entity":   climate_entity,
         "ac_entity":        climate_entity,
-        "smart_adjustment":           smart_adj,
+        "smart_adjustment":           smart_curve,
         "smart_adjustment_reason":    reason,
         # ── Aerostate — live state read back from the climate entity ───────────
         # This is the single UI truth for what the AC is currently doing.
@@ -993,11 +1007,14 @@ async def _broadcast_loop():
                 else:
                     merged = room_registry.merge_room_config(base, room_def)
                     runtime = logic_engine.get_runtime_state(rid)
+                    sched_bt, sched_slot = resolve_base_target_temp(merged)
                     payload = json.dumps(
                         {
                             "type": "tick",
                             **runtime,
-                            "target_temp": merged.get("target_temp", 24),
+                            "target_temp": sched_bt,
+                            "schedule_slot": sched_slot,
+                            "temperature_mode": merged.get("temperature_mode") or "manual",
                             "room_id": rid,
                         },
                         default=str,

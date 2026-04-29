@@ -577,7 +577,11 @@ async def run_ai_and_cache(
         return
 
     prompt = ai_prompt.build_hvac_control_prompt(
-        indoor_temp, outdoor_temp, is_occupied,
+        indoor_temp,
+        outdoor_temp,
+        is_occupied,
+        baseline_deg_c=base_effective,
+        baseline_max_adjust_c=1.0,
     )
     provider = _ai_provider(cfg)
 
@@ -844,6 +848,7 @@ def fetch_ai_in_background(
     outdoor_temp: Optional[float],
     is_occupied: bool,
 ) -> None:
+    ai_cache.mark_ai_infer_scheduled(room_id, cfg)
     asyncio.create_task(
         run_ai_and_cache(
             room_id,

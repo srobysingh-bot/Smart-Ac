@@ -161,6 +161,11 @@ async def init_db() -> None:
             "ALTER TABLE ai_decisions ADD COLUMN user_adjusted INTEGER DEFAULT 0",
             "ALTER TABLE ai_decisions ADD COLUMN user_target_temp REAL",
             "ALTER TABLE ai_decisions ADD COLUMN adjustment_delay_seconds REAL",
+            "ALTER TABLE snapshots ADD COLUMN schedule_slot TEXT",
+            "ALTER TABLE snapshots ADD COLUMN schedule_base_temp REAL",
+            "ALTER TABLE snapshots ADD COLUMN effective_after_weather REAL",
+            "ALTER TABLE snapshots ADD COLUMN effective_final_temp REAL",
+            "ALTER TABLE snapshots ADD COLUMN ai_adjust_applied INTEGER",
         ):
             try:
                 await db.execute(col_sql)
@@ -538,8 +543,10 @@ async def insert_snapshot(snapshot: Dict[str, Any]) -> int:
                 (session_id, timestamp, indoor_temp, outdoor_temp, outdoor_humidity,
                  indoor_humidity, ac_state, watt_draw, power_watts, presence, room_id,
                  setpoint, fan_mode, energy_kwh,
-                 ai_target_temp, ai_fan_mode, ai_confidence)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                 ai_target_temp, ai_fan_mode, ai_confidence,
+                 schedule_slot, schedule_base_temp, effective_after_weather,
+                 effective_final_temp, ai_adjust_applied)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             """,
             (
                 snapshot.get("session_id"),
@@ -559,6 +566,11 @@ async def insert_snapshot(snapshot: Dict[str, Any]) -> int:
                 snapshot.get("ai_target_temp"),
                 snapshot.get("ai_fan_mode"),
                 snapshot.get("ai_confidence"),
+                snapshot.get("schedule_slot"),
+                snapshot.get("schedule_base_temp"),
+                snapshot.get("effective_after_weather"),
+                snapshot.get("effective_final_temp"),
+                snapshot.get("ai_adjust_applied"),
             ),
         )
         await db.commit()

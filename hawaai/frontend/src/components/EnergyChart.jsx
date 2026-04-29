@@ -40,8 +40,9 @@ export function TemperatureTimelineChart({ snapshots = [], targetTemp = null }) 
   }
 
   return (
-    <ResponsiveContainer width="100%" height={220}>
-      <ComposedChart data={data} margin={{ left: 0, right: 10, top: 4, bottom: 0 }}>
+    <div className="w-full min-w-0 mx-auto h-[clamp(168px,42vw,288px)]">
+      <ResponsiveContainer width="100%" height="100%">
+      <ComposedChart data={data} margin={{ left: 0, right: 4, top: 4, bottom: 0 }}>
         <CartesianGrid strokeDasharray="3 3" stroke="#1f2937" />
         <XAxis
           dataKey="time"
@@ -101,7 +102,8 @@ export function TemperatureTimelineChart({ snapshots = [], targetTemp = null }) 
           isAnimationActive={false}
         />
       </ComposedChart>
-    </ResponsiveContainer>
+      </ResponsiveContainer>
+    </div>
   )
 }
 
@@ -123,8 +125,9 @@ export function EnergyTimelineChart({ snapshots = [] }) {
   }
 
   return (
-    <ResponsiveContainer width="100%" height={220}>
-      <ComposedChart data={data} margin={{ left: 0, right: 10, top: 4, bottom: 0 }}>
+    <div className="w-full min-w-0 mx-auto h-[clamp(168px,42vw,288px)]">
+      <ResponsiveContainer width="100%" height="100%">
+      <ComposedChart data={data} margin={{ left: 0, right: 4, top: 4, bottom: 0 }}>
         <CartesianGrid strokeDasharray="3 3" stroke="#1f2937" />
         <XAxis
           dataKey="time"
@@ -179,7 +182,8 @@ export function EnergyTimelineChart({ snapshots = [] }) {
           connectNulls
         />
       </ComposedChart>
-    </ResponsiveContainer>
+      </ResponsiveContainer>
+    </div>
   )
 }
 

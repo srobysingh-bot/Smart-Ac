@@ -11,6 +11,7 @@ import SessionTable    from '../components/SessionTable.jsx'
 import InsightsCard    from '../components/InsightsCard.jsx'
 import LiveSessionCard from '../components/LiveSessionCard.jsx'
 import SmartAdjustmentCard from '../components/SmartAdjustmentCard.jsx'
+import TemperaturePlanCard from '../components/TemperaturePlanCard.jsx'
 import { Thermometer, Wind, Zap, Cloud, AlertTriangle, Minus, Plus, Loader, Brain } from 'lucide-react'
 
 function formatAiTime(iso) {
@@ -177,25 +178,33 @@ function RoomStrip({ rooms, activeId, onSelect, onRoomAdded }) {
 
   if (!rooms?.length && !open) {
     return (
-      <div className="px-6 py-2 bg-gray-900 border-b border-gray-800 flex flex-wrap items-center gap-3 text-sm">
+      <div className="container-app px-4 sm:px-6 py-3 bg-gray-900 border-b border-gray-800 flex flex-col sm:flex-row flex-wrap items-stretch sm:items-center gap-3 text-sm min-w-0">
         <span className="text-amber-400">No rooms configured.</span>
-        <button type="button" onClick={() => setOpen(true)} className="text-blue-400 hover:underline text-xs">Add room</button>
+        <button
+          type="button"
+          onClick={() => setOpen(true)}
+          className="touch-target sm:min-h-0 sm:min-w-0 sm:px-4 sm:py-2 text-sm text-blue-400 bg-gray-800 rounded-lg border border-gray-700 shrink-0 self-start"
+        >
+          Add room
+        </button>
         {open && (
-          <form onSubmit={submit} className="flex flex-wrap items-center gap-2 text-xs">
+          <form onSubmit={submit} className="flex flex-col sm:flex-row flex-wrap items-stretch gap-2 text-xs w-full sm:w-auto">
             <input
-              className="bg-gray-800 border border-gray-600 rounded px-2 py-1 w-32"
+              className="bg-gray-800 border border-gray-600 rounded-lg px-3 py-2 min-h-[44px] sm:min-h-0 w-full sm:w-36"
               placeholder="Name"
               value={name}
               onChange={e => setName(e.target.value)}
             />
             <input
-              className="bg-gray-800 border border-gray-600 rounded px-2 py-1 w-48"
+              className="bg-gray-800 border border-gray-600 rounded-lg px-3 py-2 min-h-[44px] sm:min-h-0 w-full sm:min-w-[12rem] flex-1"
               placeholder="climate.entity_id"
               value={entity}
               onChange={e => setEntity(e.target.value)}
               required
             />
-            <button type="submit" disabled={busy} className="px-2 py-1 bg-blue-600 rounded disabled:opacity-40">Save</button>
+            <button type="submit" disabled={busy} className="min-h-[44px] px-4 py-2 bg-blue-600 rounded-lg disabled:opacity-40 text-sm">
+              Save
+            </button>
           </form>
         )}
       </div>
@@ -203,53 +212,81 @@ function RoomStrip({ rooms, activeId, onSelect, onRoomAdded }) {
   }
 
   const active = rooms.find(r => r.id === activeId)
+  const selClass = `bg-gray-800 border rounded-lg px-3 text-sm text-gray-100 w-full min-h-[44px] md:min-h-0 md:max-w-[min(100%,280px)] md:w-auto ${
+    activeId ? 'border-blue-500/70 ring-1 ring-blue-500/25' : 'border-gray-600'
+  }`
 
   return (
-    <div className="px-6 py-3 bg-gray-900/95 border-b border-gray-800 flex flex-wrap items-center gap-3 text-sm">
-      <div className="flex flex-col min-w-0 flex-1 sm:flex-none sm:max-w-[min(100%,280px)]">
+    <div className="container-app px-4 sm:px-6 py-3 bg-gray-900/95 border-b border-gray-800 flex flex-col lg:flex-row lg:flex-wrap lg:items-end gap-3 lg:gap-4 text-sm min-w-0">
+      <div className="flex flex-col min-w-0 w-full lg:flex-1 lg:max-w-md">
         <span className="text-[10px] text-gray-500 uppercase tracking-wide">Active room</span>
         <span className="text-base font-semibold text-gray-100 truncate" title={active?.name}>
           {active?.name || '—'}
         </span>
         {active?.climate_entity && (
-          <span className="text-[11px] text-gray-500 font-mono truncate" title={active.climate_entity}>
+          <span className="text-[11px] text-gray-500 font-mono truncate hidden sm:block" title={active.climate_entity}>
             {active.climate_entity}
           </span>
         )}
       </div>
-      <label className="text-gray-500 text-xs uppercase tracking-wide shrink-0 hidden sm:block">Switch</label>
-      <select
-        className={`bg-gray-800 border rounded-lg px-2 py-1.5 text-xs text-gray-100 max-w-[200px] ${
-          activeId ? 'border-blue-500/70 ring-1 ring-blue-500/25' : 'border-gray-600'
-        }`}
-        value={activeId || ''}
-        onChange={e => onSelect(e.target.value || null)}
-      >
-        <option value="">Select room…</option>
-        {rooms.map(r => (
-          <option key={r.id} value={r.id}>{r.name || r.id}</option>
-        ))}
-      </select>
-      <button type="button" onClick={() => setOpen(v => !v)} className="text-xs text-blue-400 hover:underline">
-        {open ? 'Cancel' : '+ Add room'}
-      </button>
-      {open && (
-        <form onSubmit={submit} className="flex flex-wrap items-center gap-2 text-xs">
-          <input
-            className="bg-gray-800 border border-gray-600 rounded px-2 py-1 w-28"
-            placeholder="Name"
-            value={name}
-            onChange={e => setName(e.target.value)}
-          />
-          <input
-            className="bg-gray-800 border border-gray-600 rounded px-2 py-1 w-44"
-            placeholder="climate.entity"
-            value={entity}
-            onChange={e => setEntity(e.target.value)}
-          />
-          <button type="submit" disabled={busy} className="px-2 py-1 bg-blue-600 rounded disabled:opacity-40">Add</button>
-        </form>
-      )}
+
+      {/* Mobile / narrow: full-width dropdown only */}
+      <div className="w-full min-w-0 md:hidden">
+        <label className="sr-only" htmlFor="room-select-mobile">Switch room</label>
+        <select
+          id="room-select-mobile"
+          className={selClass}
+          value={activeId || ''}
+          onChange={e => onSelect(e.target.value || null)}
+        >
+          <option value="">Select room…</option>
+          {rooms.map(r => (
+            <option key={r.id} value={r.id}>{r.name || r.id}</option>
+          ))}
+        </select>
+      </div>
+
+      {/* Tablet+ : row with select + actions */}
+      <div className="hidden md:flex flex-wrap items-center gap-3 min-w-0">
+        <label className="text-gray-500 text-xs uppercase tracking-wide shrink-0 hidden lg:inline">Switch</label>
+        <select
+          className={`${selClass.replace('w-full ', '')} min-w-[11rem]`}
+          value={activeId || ''}
+          onChange={e => onSelect(e.target.value || null)}
+          aria-label="Switch room"
+        >
+          <option value="">Select room…</option>
+          {rooms.map(r => (
+            <option key={r.id} value={r.id}>{r.name || r.id}</option>
+          ))}
+        </select>
+        <button
+          type="button"
+          onClick={() => setOpen(v => !v)}
+          className="min-h-[40px] px-3 py-2 rounded-lg text-sm text-blue-400 border border-blue-500/30 hover:bg-blue-950/40 transition-colors"
+        >
+          {open ? 'Cancel' : '+ Add room'}
+        </button>
+        {open && (
+          <form onSubmit={submit} className="flex flex-wrap items-center gap-2 w-full xl:w-auto mt-1 xl:mt-0">
+            <input
+              className="bg-gray-800 border border-gray-600 rounded-lg px-3 py-2 text-sm w-28 min-w-0"
+              placeholder="Name"
+              value={name}
+              onChange={e => setName(e.target.value)}
+            />
+            <input
+              className="bg-gray-800 border border-gray-600 rounded-lg px-3 py-2 text-sm min-w-[10rem] flex-1 max-w-xs"
+              placeholder="climate.entity"
+              value={entity}
+              onChange={e => setEntity(e.target.value)}
+            />
+            <button type="submit" disabled={busy} className="min-h-[40px] px-4 py-2 bg-blue-600 rounded-lg disabled:opacity-40 text-sm">
+              Add
+            </button>
+          </form>
+        )}
+      </div>
     </div>
   )
 }
@@ -260,15 +297,15 @@ function ConfigWarning({ roomId }) {
     navigate({ pathname: '/settings', search })
   }
   return (
-    <div className="flex items-center gap-3 mx-6 mt-4 px-4 py-3 bg-yellow-900/40 border border-yellow-700 rounded-lg text-sm">
-      <AlertTriangle size={16} className="text-yellow-400 shrink-0" />
-      <span className="text-yellow-200 flex-1">
+    <div className="container-app flex flex-col sm:flex-row sm:items-center gap-3 mx-4 sm:mx-auto mt-4 px-4 py-3 bg-yellow-900/40 border border-yellow-700 rounded-xl text-sm max-w-full min-w-0">
+      <AlertTriangle size={16} className="text-yellow-400 shrink-0" aria-hidden />
+      <span className="text-yellow-200 flex-1 min-w-0">
         Sensors not configured — go to Settings to set up your devices
       </span>
       <button
         type="button"
         onClick={go}
-        className="px-3 py-1 bg-yellow-700 hover:bg-yellow-600 rounded text-yellow-100 text-xs font-medium transition-colors"
+        className="shrink-0 min-h-[44px] sm:min-h-[40px] px-4 py-2 bg-yellow-700 hover:bg-yellow-600 rounded-lg text-yellow-100 text-sm font-medium transition-colors w-full sm:w-auto tap-highlight-none"
       >
         Go to Settings
       </button>
@@ -295,7 +332,10 @@ function LiveStatusBar({ status }) {
                  :                    'OFF'
 
   return (
-    <div className="flex flex-wrap items-center gap-3 px-6 py-3 bg-gray-900 border-b border-gray-800 text-sm">
+    <nav
+      className="flex flex-col gap-y-3 gap-x-2 px-4 sm:px-6 py-3 bg-gray-900 border-b border-gray-800 text-sm min-w-0 sm:flex-row sm:flex-wrap sm:items-center"
+      aria-label="Live environment"
+    >
       <span className="flex items-center gap-1.5">
         <Thermometer size={15} className={tempFromAC ? 'text-blue-400' : 'text-orange-400'} />
         Indoor:{' '}
@@ -308,15 +348,15 @@ function LiveStatusBar({ status }) {
           </span>
         )}
       </span>
-      <span className="text-gray-700">|</span>
+      <span className="hidden sm:inline text-gray-700" aria-hidden>|</span>
       <span className="flex items-center gap-1.5">
         <Cloud size={15} className="text-sky-400" />
         Outside:{' '}
         <strong>{outdoor_temp != null ? `${Number(outdoor_temp).toFixed(1)}°C` : '—'}</strong>
       </span>
-      <span className="text-gray-700">|</span>
+      <span className="hidden sm:inline text-gray-700" aria-hidden>|</span>
       <PresenceBadge present={presence} />
-      <span className="text-gray-700">|</span>
+      <span className="hidden sm:inline text-gray-700" aria-hidden>|</span>
       {/* AC state — from power sensor (watts) or internal flag */}
       <span className="flex items-center gap-1.5">
         <Zap size={15} className={acColor} />
@@ -334,7 +374,7 @@ function LiveStatusBar({ status }) {
       {/* Cooldown indicator — shows briefly after every IR command */}
       {cooldown_active && (
         <>
-          <span className="text-gray-700">|</span>
+          <span className="hidden sm:inline text-gray-700" aria-hidden>|</span>
           <span className="text-xs text-yellow-400 flex items-center gap-1"
                 title={`${secs_since_cmd?.toFixed(0)}s since ${last_command} command`}>
             <Loader size={11} className="animate-spin" />
@@ -342,16 +382,14 @@ function LiveStatusBar({ status }) {
           </span>
         </>
       )}
-    </div>
+    </nav>
   )
 }
-
-// ── Today / ML quality strip ──────────────────────────────────────────────────
 function StatsStrip({ stats, roomName }) {
   const today = stats?.today || {}
   const ml    = stats?.ml    || {}
   return (
-    <div className="grid grid-cols-2 gap-4">
+    <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
       <div className="card">
         <p className="text-xs text-gray-500 uppercase tracking-wide mb-3">
           Today{roomName ? <span className="normal-case text-gray-400 font-medium"> · {roomName}</span> : null}
@@ -469,61 +507,60 @@ function ClimateCard({ entityId }) {
           hvac_modes, fan_modes, swing_modes, friendly_name } = climate
 
   return (
-    <div className="card space-y-4">
+    <div className="card space-y-4 min-w-0">
       {/* Header */}
-      <div className="flex items-center justify-between">
+      <div className="flex items-center justify-between gap-3 flex-wrap">
         <div>
           <p className="text-xs text-gray-500 uppercase tracking-wide">AC Climate</p>
-          <p className="text-sm text-gray-300 mt-0.5">{friendly_name}</p>
+          <p className="text-sm text-gray-300 mt-0.5 break-words">{friendly_name}</p>
         </div>
-        <span className={`px-3 py-1 rounded-full text-xs font-semibold ${HVAC_MODE_COLORS[hvac_mode] ?? 'bg-gray-700 text-gray-300'}`}>
+        <span className={`shrink-0 px-3 py-1 rounded-full text-xs font-semibold ${HVAC_MODE_COLORS[hvac_mode] ?? 'bg-gray-700 text-gray-300'}`}>
           {HVAC_MODE_LABELS[hvac_mode] ?? hvac_mode ?? '—'}
         </span>
       </div>
 
-      {/* Temperature row */}
-      <div className="flex items-center justify-between">
-        {/* Current temp */}
-        <div className="text-center">
+      {/* Temperature row — stacks on narrow viewports */}
+      <div className="flex flex-col gap-6 sm:flex-row sm:flex-wrap sm:items-start sm:justify-between">
+        <div className="text-center sm:text-left min-w-[6rem]">
           <p className="text-3xl font-bold text-blue-400">
             {current_temperature != null ? `${current_temperature.toFixed(1)}°` : '—'}
           </p>
           <p className="text-xs text-gray-500 mt-0.5">Current</p>
         </div>
 
-        {/* Setpoint with ±controls */}
-        <div className="flex flex-col items-center gap-1">
+        <div className="flex flex-col items-center gap-2 mx-auto sm:mx-0 min-w-[8rem]">
           <p className="text-xs text-gray-500">Setpoint</p>
           <div className="flex items-center gap-2">
             <button
               disabled={busy || hvac_mode === 'off'}
               onClick={() => adjustTemp(-1)}
-              className="w-8 h-8 rounded-lg bg-gray-700 hover:bg-gray-600 disabled:opacity-40 flex items-center justify-center transition-colors"
+              className="w-11 h-11 shrink-0 rounded-lg bg-gray-700 hover:bg-gray-600 disabled:opacity-40 flex items-center justify-center transition-colors tap-highlight-none"
+              type="button"
             >
-              <Minus size={14} />
+              <Minus size={14} aria-hidden />
             </button>
-            <span className="text-2xl font-bold w-14 text-center">
+            <span className="text-2xl font-bold w-14 text-center tabular-nums">
               {temperature != null ? `${temperature}°` : '—'}
             </span>
             <button
               disabled={busy || hvac_mode === 'off'}
               onClick={() => adjustTemp(+1)}
-              className="w-8 h-8 rounded-lg bg-gray-700 hover:bg-gray-600 disabled:opacity-40 flex items-center justify-center transition-colors"
+              className="w-11 h-11 shrink-0 rounded-lg bg-gray-700 hover:bg-gray-600 disabled:opacity-40 flex items-center justify-center transition-colors tap-highlight-none"
+              type="button"
             >
-              <Plus size={14} />
+              <Plus size={14} aria-hidden />
             </button>
           </div>
         </div>
 
-        {/* Fan mode */}
-        <div className="text-center">
+        <div className="text-center sm:text-right min-w-0 flex-1 sm:flex-initial">
           <p className="text-xs text-gray-500 mb-1">Fan</p>
           {fan_modes && fan_modes.length > 0 ? (
             <select
               disabled={busy || hvac_mode === 'off'}
               value={fan_mode ?? ''}
               onChange={e => sendCommand(() => setFanMode(entityId, e.target.value))}
-              className="bg-gray-700 border border-gray-600 rounded-lg px-2 py-1 text-xs text-gray-100 focus:outline-none focus:border-blue-500 disabled:opacity-40"
+              className="bg-gray-700 border border-gray-600 rounded-lg px-2 py-2 min-h-[44px] max-w-full text-xs text-gray-100 focus:outline-none focus:border-blue-500 disabled:opacity-40"
             >
               {fan_modes.map(m => <option key={m} value={m}>{m}</option>)}
             </select>
@@ -543,7 +580,7 @@ function ClimateCard({ entityId }) {
                 key={mode}
                 disabled={busy}
                 onClick={() => sendCommand(() => setHvacMode(entityId, mode))}
-                className={`px-3 py-1 rounded-lg text-xs font-medium transition-colors disabled:opacity-40 ${
+                className={`min-h-[40px] px-3 py-2 rounded-lg text-xs font-medium transition-colors disabled:opacity-40 tap-highlight-none ${
                   mode === hvac_mode
                     ? HVAC_MODE_COLORS[mode] ?? 'bg-blue-600 text-white'
                     : 'bg-gray-700 text-gray-300 hover:bg-gray-600'
@@ -564,7 +601,7 @@ function ClimateCard({ entityId }) {
             disabled={busy || hvac_mode === 'off'}
             value={swing_mode ?? ''}
             onChange={e => sendCommand(() => setSwingMode(entityId, e.target.value))}
-            className="bg-gray-700 border border-gray-600 rounded-lg px-2 py-1 text-xs text-gray-100 focus:outline-none disabled:opacity-40"
+            className="bg-gray-700 border border-gray-600 rounded-lg px-2 py-2 min-h-[44px] text-xs text-gray-100 focus:outline-none disabled:opacity-40 max-w-full"
           >
             {swing_modes.map(m => <option key={m} value={m}>{m}</option>)}
           </select>
@@ -642,7 +679,7 @@ export default function Dashboard() {
   const configIncomplete = Boolean(activeRoomId && status && status.config_complete === false)
 
   return (
-    <div className="flex flex-col h-full">
+    <div className="flex flex-col h-full min-w-0">
       <RoomStrip
         rooms={rooms}
         activeId={activeRoomId}
@@ -658,16 +695,22 @@ export default function Dashboard() {
       <LiveStatusBar status={status} />
 
       {!activeRoomId && rooms.length > 0 && (
-        <div className="mx-6 mt-4 px-4 py-3 bg-gray-800/50 border border-gray-700 rounded-lg text-sm text-gray-300">
+        <div className="container-app mx-4 sm:mx-auto mt-4 px-4 py-3 bg-gray-800/50 border border-gray-700 rounded-xl text-sm text-gray-300">
           Select a room above to load dashboard data. Each room is isolated — APIs require an explicit room.
         </div>
       )}
 
       {configIncomplete && <ConfigWarning roomId={activeRoomId} />}
 
-      <div className="flex-1 overflow-y-auto p-6 space-y-6">
-        {/* Top cards row */}
-        <div className="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-4 gap-4">
+      {activeRoomId && status && (
+        <div className="container-app px-4 sm:px-6 pb-2 shrink-0 min-w-0">
+          <TemperaturePlanCard status={status} />
+        </div>
+      )}
+
+      <div className="container-app flex-1 overflow-y-auto overflow-x-hidden px-4 sm:px-6 py-4 sm:py-6 pb-8 space-y-6 min-w-0">
+        {/* Cards — 1 col · 2 cols tablet · 3 lg · 4 xl */}
+        <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-4 min-w-0">
           <TempGauge
             indoor={status?.indoor_temp ?? status?.ac_current_temp}
             outdoor={status?.outdoor_temp}

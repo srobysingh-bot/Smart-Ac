@@ -11,6 +11,8 @@ import logging
 import uuid
 from typing import Any, Dict, List, Optional
 
+from . import temperature_schedule
+
 logger = logging.getLogger(__name__)
 
 DEFAULT_ROOM_ID = "default"
@@ -134,6 +136,7 @@ def merge_room_config(global_cfg: Dict[str, Any], room: Dict[str, Any]) -> Dict[
             if v is None:
                 continue
             out[k] = copy.deepcopy(v) if isinstance(v, (dict, list)) else v
+    temperature_schedule.ensure_temperature_schedule_defaults(out)
     return out
 
 

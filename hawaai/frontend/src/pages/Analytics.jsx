@@ -70,9 +70,9 @@ export default function Analytics() {
   const activeRoom = rooms.find(r => r.id === roomId)
 
   return (
-    <div className="p-6 space-y-6">
+    <div className="container-app px-4 sm:px-6 py-4 sm:py-6 pb-24 md:pb-10 space-y-6 min-w-0">
       {/* Header */}
-      <div className="flex flex-wrap items-center justify-between gap-4">
+      <div className="flex flex-col gap-4 md:flex-row md:flex-wrap md:items-start md:justify-between">
         <div>
           <h1 className="text-xl font-bold">Analytics</h1>
           {activeRoom?.name && (
@@ -80,11 +80,11 @@ export default function Analytics() {
           )}
         </div>
 
-        <div className="flex flex-wrap items-center gap-3">
+        <div className="flex flex-col sm:flex-row sm:flex-wrap w-full md:w-auto gap-3 md:justify-end md:items-end">
           <div>
             <label className="text-[10px] text-gray-500 uppercase block mb-0.5">Room</label>
             <select
-              className="bg-gray-800 border border-blue-500/40 rounded-lg px-2 py-1.5 text-sm text-gray-100"
+              className="w-full sm:w-auto min-h-[44px] bg-gray-800 border border-blue-500/40 rounded-lg px-3 py-2 text-sm text-gray-100"
               value={roomId || ''}
               onChange={e => {
                 const id = e.target.value
@@ -98,12 +98,12 @@ export default function Analytics() {
             </select>
           </div>
           {/* Period selector */}
-          <div className="flex bg-gray-900 border border-gray-800 rounded-lg overflow-hidden text-sm">
+          <div className="flex bg-gray-900 border border-gray-800 rounded-lg overflow-hidden text-sm w-full sm:w-auto">
             {[7, 14, 30].map(d => (
               <button
                 key={d}
                 onClick={() => setDays(d)}
-                className={`px-3 py-1.5 ${days === d ? 'bg-blue-600 text-white' : 'text-gray-400 hover:bg-gray-800'}`}
+                className={`flex-1 min-h-[44px] sm:min-h-0 px-3 py-2 text-sm tap-highlight-none ${days === d ? 'bg-blue-600 text-white' : 'text-gray-400 hover:bg-gray-800'}`}
               >
                 {d}d
               </button>
@@ -111,11 +111,11 @@ export default function Analytics() {
           </div>
 
           {/* Export buttons */}
-          <div className="flex gap-2">
+          <div className="flex flex-wrap gap-2 w-full sm:w-auto">
             <button
               onClick={() => handleExport('csv')}
               disabled={exporting || !roomId}
-              className="flex items-center gap-1.5 px-3 py-1.5 bg-green-700 hover:bg-green-600 disabled:opacity-50 rounded-lg text-sm font-medium transition-colors"
+              className="flex flex-1 sm:flex-initial justify-center items-center gap-2 min-h-[44px] px-4 py-2 bg-green-700 hover:bg-green-600 disabled:opacity-50 rounded-lg text-sm font-medium transition-colors tap-highlight-none"
             >
               <Download size={14} />
               CSV
@@ -123,7 +123,7 @@ export default function Analytics() {
             <button
               onClick={() => handleExport('json')}
               disabled={exporting || !roomId}
-              className="flex items-center gap-1.5 px-3 py-1.5 bg-gray-700 hover:bg-gray-600 disabled:opacity-50 rounded-lg text-sm font-medium transition-colors"
+              className="flex flex-1 sm:flex-initial justify-center items-center gap-2 min-h-[44px] px-4 py-2 bg-gray-700 hover:bg-gray-600 disabled:opacity-50 rounded-lg text-sm font-medium transition-colors tap-highlight-none"
             >
               <Download size={14} />
               JSON
@@ -139,7 +139,7 @@ export default function Analytics() {
       )}
 
       {/* KPI strip */}
-      <div className="grid grid-cols-4 gap-4">
+      <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
         <KpiCard
           icon={Zap}
           label={`${days}d Total Energy`}
@@ -169,9 +169,10 @@ export default function Analytics() {
       </div>
 
       {/* Daily energy bar chart */}
-      <div className="card">
+      <div className="card min-w-0">
         <p className="text-xs text-gray-500 uppercase tracking-wide mb-4">Daily Energy (kWh)</p>
-        <ResponsiveContainer width="100%" height={220}>
+        <div className="w-full min-h-[200px] h-[clamp(188px,42vw,272px)]">
+        <ResponsiveContainer width="100%" height="100%">
           <BarChart data={daily} margin={{ left: 0, right: 10, top: 4, bottom: 0 }}>
             <CartesianGrid strokeDasharray="3 3" stroke="#1f2937" />
             <XAxis dataKey="date" tick={{ fill: '#6b7280', fontSize: 11 }} tickFormatter={d => d?.slice(5)} />
@@ -180,12 +181,14 @@ export default function Analytics() {
             <Bar dataKey="kwh" name="kWh" fill="#3b82f6" radius={[4,4,0,0]} />
           </BarChart>
         </ResponsiveContainer>
+        </div>
       </div>
 
       {/* Daily cost line chart */}
-      <div className="card">
+      <div className="card min-w-0">
         <p className="text-xs text-gray-500 uppercase tracking-wide mb-4">Daily Cost (₹)</p>
-        <ResponsiveContainer width="100%" height={200}>
+        <div className="w-full min-h-[184px] h-[clamp(176px,40vw,240px)]">
+        <ResponsiveContainer width="100%" height="100%">
           <LineChart data={daily} margin={{ left: 0, right: 10, top: 4, bottom: 0 }}>
             <CartesianGrid strokeDasharray="3 3" stroke="#1f2937" />
             <XAxis dataKey="date" tick={{ fill: '#6b7280', fontSize: 11 }} tickFormatter={d => d?.slice(5)} />
@@ -201,13 +204,15 @@ export default function Analytics() {
             />
           </LineChart>
         </ResponsiveContainer>
+        </div>
       </div>
 
       {/* Avg cool time + sessions bar */}
-      <div className="grid grid-cols-2 gap-4">
-        <div className="card">
+      <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+        <div className="card min-w-0">
           <p className="text-xs text-gray-500 uppercase tracking-wide mb-4">Sessions per Day</p>
-          <ResponsiveContainer width="100%" height={180}>
+          <div className="w-full min-h-[160px] h-[clamp(148px,36vw,200px)]">
+          <ResponsiveContainer width="100%" height="100%">
             <BarChart data={daily} margin={{ left: 0, right: 10, top: 4, bottom: 0 }}>
               <CartesianGrid strokeDasharray="3 3" stroke="#1f2937" />
               <XAxis dataKey="date" tick={{ fill: '#6b7280', fontSize: 11 }} tickFormatter={d => d?.slice(5)} />
@@ -216,11 +221,13 @@ export default function Analytics() {
               <Bar dataKey="sessions" name="Sessions" fill="#8b5cf6" radius={[4,4,0,0]} />
             </BarChart>
           </ResponsiveContainer>
+          </div>
         </div>
 
-        <div className="card">
+        <div className="card min-w-0">
           <p className="text-xs text-gray-500 uppercase tracking-wide mb-4">Avg Cool Time (min)</p>
-          <ResponsiveContainer width="100%" height={180}>
+          <div className="w-full min-h-[160px] h-[clamp(148px,36vw,200px)]">
+          <ResponsiveContainer width="100%" height="100%">
             <LineChart data={daily} margin={{ left: 0, right: 10, top: 4, bottom: 0 }}>
               <CartesianGrid strokeDasharray="3 3" stroke="#1f2937" />
               <XAxis dataKey="date" tick={{ fill: '#6b7280', fontSize: 11 }} tickFormatter={d => d?.slice(5)} />
@@ -236,6 +243,7 @@ export default function Analytics() {
               />
             </LineChart>
           </ResponsiveContainer>
+          </div>
         </div>
       </div>
 

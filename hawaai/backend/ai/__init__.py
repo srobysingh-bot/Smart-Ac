@@ -1,6 +1,13 @@
 """Optional AI layer: Ollama (local) or OpenAI-compatible HTTP API (soft HVAC overrides)."""
 
-from .ai_cache import get_cached, mark_fetch_done, set_validated, should_run_ai, throttle_cache_use_log
+from .ai_cache import (
+    get_cached,
+    mark_ai_infer_scheduled,
+    mark_fetch_done,
+    set_validated,
+    should_run_ai,
+    throttle_cache_use_log,
+)
 from .ai_validator import validate_ai_payload
 from .ai_worker import apply_ai_fan, fetch_ai_in_background, get_ai_status
 
@@ -9,6 +16,7 @@ __all__ = [
     "fetch_ai_in_background",
     "get_ai_status",
     "get_cached",
+    "mark_ai_infer_scheduled",
     "mark_fetch_done",
     "set_validated",
     "should_run_ai",

@@ -350,6 +350,9 @@ async def apply_effective_target(
     current_target:   Optional[float],
     ac_on:            bool,
     manual_override:  bool,
+    *,
+    min_interval_seconds: Optional[int] = None,
+    meaningful_delta_deg: Optional[float] = None,
 ) -> str:
     """
     Safely push the smart-adjusted effective target temperature to the
@@ -380,6 +383,7 @@ async def apply_effective_target(
         return "no_climate_entity"
 
     if manual_override:
+        logger.info("[HawaAI] apply_effective_target skip: manual override active")
         return "manual_override"
 
     if not ac_on:
@@ -389,25 +393,49 @@ async def apply_effective_target(
         return "no_current_target"
 
     try:
-        current_f  = float(current_target)
+        current_f   = float(current_target)
         effective_f = round(float(effective_target), 1)
     except (TypeError, ValueError):
         return "parse_error"
 
-    # Dead-band: skip if delta < 0.5°C to avoid hunting / noise
-    if abs(current_f - effective_f) < 0.5:
+    delta_ok = meaningful_delta_deg if meaningful_delta_deg is not None else 0.5
+    if abs(current_f - effective_f) < float(delta_ok):
+        logger.info(
+            "[HawaAI] apply_effective_target skip: no meaningful change "
+            "(|%.1f−%.1f| < %.1f°C)",
+            current_f,
+            effective_f,
+            float(delta_ok),
+        )
         return "within_deadband"
 
-    # Rate limiter: minimum 180 s between commands
+    interval = (
+        float(min_interval_seconds)
+        if min_interval_seconds is not None
+        else float(_APPLY_TARGET_COOLDOWN)
+    )
     now = datetime.now(timezone.utc)
     if st["last_apply_target_time"] is not None:
         secs = (now - st["last_apply_target_time"]).total_seconds()
-        if secs < _APPLY_TARGET_COOLDOWN:
-            logger.debug(
-                "[HawaAI] apply_effective_target: cooldown %.0fs / %ds",
-                secs, _APPLY_TARGET_COOLDOWN,
+        if secs < interval:
+            logger.info(
+                "[HawaAI] apply_effective_target skip: cooldown (%.0fs < %.0fs)",
+                secs,
+                interval,
             )
             return f"cooldown_{int(secs)}s"
+
+    last_ap = st.get("last_applied_target")
+    if last_ap is not None:
+        try:
+            if abs(float(last_ap) - effective_f) < 1e-3:
+                logger.info(
+                    "[HawaAI] apply_effective_target skip: duplicate command (%.1f°C)",
+                    effective_f,
+                )
+                return "duplicate_command"
+        except (TypeError, ValueError):
+            pass
 
     # ── Send command via HA climate service ───────────────────────────────────
     try:

@@ -181,17 +181,17 @@ export default function SessionHistory() {
   const totalPages = Math.ceil(total / PAGE_SIZE)
 
   return (
-    <div className="p-6 space-y-4">
-      <div className="flex items-center justify-between">
+    <div className="container-app px-4 sm:px-6 py-4 sm:py-6 pb-24 md:pb-12 space-y-4 min-w-0">
+      <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
         <h1 className="text-xl font-bold">Session History</h1>
-        <span className="text-sm text-gray-500">{activeRoomId ? `${total} sessions (this room)` : 'Select a room'}</span>
+        <span className="text-sm text-gray-500 shrink-0">{activeRoomId ? `${total} sessions (this room)` : 'Select a room'}</span>
       </div>
 
-      <div className="card flex flex-wrap items-center gap-3">
-        <div>
+      <div className="card flex flex-col sm:flex-row flex-wrap items-stretch gap-3">
+        <div className="flex-1 min-w-0">
           <label className="text-xs text-gray-500 block mb-1">Room</label>
           <select
-            className="bg-gray-800 border border-blue-500/40 rounded-lg px-3 py-2 text-sm text-gray-100"
+            className="w-full sm:max-w-xs min-h-[44px] bg-gray-800 border border-blue-500/40 rounded-lg px-3 py-2 text-sm text-gray-100"
             value={activeRoomId || ''}
             onChange={e => {
               const id = e.target.value
@@ -208,7 +208,7 @@ export default function SessionHistory() {
       </div>
 
       {/* Filters */}
-      <div className="card flex flex-wrap items-end gap-4">
+      <div className="card flex flex-col md:flex-row md:flex-wrap md:items-end gap-4">
         <div>
           <label className="text-xs text-gray-500 block mb-1">From</label>
           <input
@@ -229,11 +229,11 @@ export default function SessionHistory() {
         </div>
         <button
           onClick={() => { setDateFrom(''); setDateTo(''); setPage(0) }}
-          className="px-3 py-2 text-sm text-gray-400 hover:text-gray-200 border border-gray-700 rounded-lg hover:border-gray-600 transition-colors"
+          className="min-h-[44px] sm:min-h-[40px] px-4 py-2 text-sm text-gray-400 hover:text-gray-200 border border-gray-700 rounded-lg hover:border-gray-600 transition-colors tap-highlight-none w-full sm:w-auto"
         >
           Clear
         </button>
-        <div className="ml-auto">
+        <div className="md:ml-auto w-full md:w-auto">
           <FilterBar active={filter} onChange={f => { setFilter(f); setShowInvalid(false); setPage(0) }} />
         </div>
       </div>

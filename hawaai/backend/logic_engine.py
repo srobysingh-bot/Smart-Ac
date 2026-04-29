@@ -31,8 +31,8 @@ Cooldown (60 s after any climate command):
 
 import logging
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
-from typing import Dict, List, Optional
+from datetime import datetime, timedelta, timezone
+from typing import Dict, List, Optional, Tuple
 
 from . import ac_adapter, config_manager, database, ha_client, session_logger, smart_cooling, weather_api
 from . import room_registry
@@ -46,6 +46,10 @@ from .ai import (
 )
 from .ai.ai_validator import AI_MAX_T, AI_MIN_T
 from .utils import parse_presence
+from .temperature_schedule import (
+    apply_ai_bounded_adjustment,
+    resolve_base_target_temp,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -63,6 +67,14 @@ class RoomRuntime:
     watts_samples: List[float] = field(default_factory=list)
     last_command_time: Optional[datetime] = None
     last_command: str = ""
+    last_schedule_slot: Optional[str] = None
+    # HA setpoint sampled previous tick — detect intentional user knob changes vs drift
+    prev_ha_setpoint_seen: Optional[float] = None
+    manual_override_until: Optional[datetime] = None
+    manual_override_temp: Optional[float] = None
+    last_sent_command_key: Optional[str] = None
+    compressor_on_since: Optional[datetime] = None
+    compressor_off_since: Optional[datetime] = None
 
 
 _runtime_by_room: Dict[str, RoomRuntime] = {}
@@ -82,6 +94,182 @@ _WATTS_COMPRESSOR: float = 500.0   # watts above this → compressor running (AC
 _WATTS_FAN_ONLY:   float = 50.0    # watts between FAN_ONLY and COMPRESSOR → IDLE (fan only)
 
 
+def _seconds_since_last_command(st: RoomRuntime, now: datetime) -> float:
+    if st.last_command_time is None:
+        return float("inf")
+    return (now - st.last_command_time).total_seconds()
+
+
+def _manual_override_resolve(
+    room_id: str,
+    cfg: dict,
+    climate_data: dict,
+    indoor_temp: Optional[float],
+    now: datetime,
+    engine_planned_target: float,
+) -> Tuple[bool, float]:
+    """
+    Lock HA setpoint to user intent for a bounded time while it diverges from the
+    engine-planned target. Skips schedule/AI adjustments while active.
+
+    Activation only when HA setpoint *changes from the previous tick* (avoids startup
+    spurious locks and expiry → immediate re-lock while HA still stale).
+    """
+    st = _rt(room_id)
+    dur_min = float(cfg.get("manual_override_duration_minutes", 30))
+    detect = float(cfg.get("manual_override_detect_delta_deg", 0.5))
+    exit_near = float(cfg.get("manual_override_exit_within_deg", 0.5))
+
+    raw_ct = climate_data.get("target_temp") if climate_data else None
+    ct: Optional[float] = None
+    if raw_ct is not None:
+        try:
+            ct = float(raw_ct)
+        except (TypeError, ValueError):
+            ct = None
+
+    if st.manual_override_until is not None and now >= st.manual_override_until:
+        logger.info(
+            "[HawaAI][%s] Timed manual override expired",
+            room_id,
+        )
+        st.manual_override_until = None
+        st.manual_override_temp = None
+
+    if (
+        st.manual_override_until is not None
+        and now < st.manual_override_until
+        and st.manual_override_temp is not None
+        and indoor_temp is not None
+    ):
+        if abs(float(indoor_temp) - float(st.manual_override_temp)) <= exit_near:
+            logger.info(
+                "[HawaAI][%s] Skip: manual override active — exited (near target)",
+                room_id,
+            )
+            st.manual_override_until = None
+            st.manual_override_temp = None
+
+    if (
+        st.manual_override_until is not None
+        and now < st.manual_override_until
+        and st.manual_override_temp is not None
+    ):
+        if ct is not None:
+            st.prev_ha_setpoint_seen = ct
+        return True, float(st.manual_override_temp)
+
+    if ct is None:
+        return False, engine_planned_target
+
+    prev = st.prev_ha_setpoint_seen
+    if prev is None:
+        st.prev_ha_setpoint_seen = ct
+        return False, engine_planned_target
+
+    ha_changed = abs(ct - prev) >= 0.09
+    st.prev_ha_setpoint_seen = ct
+
+    if ha_changed and abs(ct - engine_planned_target) >= detect:
+        st.manual_override_temp = ct
+        st.manual_override_until = now + timedelta(minutes=dur_min)
+        logger.info(
+            "[HawaAI][%s] manual override lock — user %.1f°C vs engine %.1f°C for %dm",
+            room_id,
+            ct,
+            engine_planned_target,
+            int(dur_min),
+        )
+        return True, float(ct)
+
+    return False, engine_planned_target
+
+
+def _fingerprint_turn_on(temp: float) -> str:
+    return f"on:{round(float(temp), 1)}"
+
+
+def _fingerprint_turn_off() -> str:
+    return "off"
+
+
+def _gate_turn_ac_on(
+    room_id: str,
+    cfg: dict,
+    target: float,
+    now: datetime,
+) -> bool:
+    st = _rt(room_id)
+    min_iv = float(cfg.get("min_command_interval_seconds", 150))
+
+    secs = _seconds_since_last_command(st, now)
+    if secs < min_iv:
+        logger.info(
+            "[HawaAI][%s] Skip ON: cooldown (%.0fs < %.0fs)",
+            room_id, secs, min_iv,
+        )
+        return False
+
+    fp = _fingerprint_turn_on(target)
+    if st.last_sent_command_key == fp:
+        logger.info(
+            "[HawaAI][%s] Skip ON: duplicate command (%s)",
+            room_id,
+            fp,
+        )
+        return False
+
+    min_off = float(cfg.get("compressor_min_off_seconds", 180))
+    if st.compressor_off_since is not None:
+        off_elapsed = (now - st.compressor_off_since).total_seconds()
+        if off_elapsed < min_off:
+            logger.info(
+                "[HawaAI][%s] Skip ON: compressor min OFF (%.0fs < %.0fs)",
+                room_id,
+                off_elapsed,
+                min_off,
+            )
+            return False
+
+    return True
+
+
+def _gate_turn_ac_off(room_id: str, cfg: dict, now: datetime) -> bool:
+    st = _rt(room_id)
+    min_iv = float(cfg.get("min_command_interval_seconds", 150))
+
+    secs = _seconds_since_last_command(st, now)
+    if secs < min_iv:
+        logger.info(
+            "[HawaAI][%s] Skip OFF: cooldown (%.0fs < %.0fs)",
+            room_id, secs, min_iv,
+        )
+        return False
+
+    fp = _fingerprint_turn_off()
+    if st.last_sent_command_key == fp:
+        logger.info(
+            "[HawaAI][%s] Skip OFF: duplicate command (%s)",
+            room_id,
+            fp,
+        )
+        return False
+
+    min_on = float(cfg.get("compressor_min_on_seconds", 300))
+    if st.compressor_on_since is not None:
+        on_elapsed = (now - st.compressor_on_since).total_seconds()
+        if on_elapsed < min_on:
+            logger.info(
+                "[HawaAI][%s] Skip OFF: compressor min ON (%.0fs < %.0fs)",
+                room_id,
+                on_elapsed,
+                min_on,
+            )
+            return False
+
+    return True
+
+
 async def _maybe_record_ai_user_adjustment(
     room_id: str,
     cfg: dict,
@@ -93,6 +281,8 @@ async def _maybe_record_ai_user_adjustment(
     label the pending ai_decisions row for ML (user override heuristic).
     """
     if not bool(cfg.get("ai_enabled", False)):
+        return
+    if str(cfg.get("temperature_mode") or "manual") != "schedule_ai":
         return
     pend = ai_cache.get_pending_ml_label(room_id)
     if not pend or not climate_data:
@@ -162,6 +352,44 @@ def compute_effective_target(
     if outdoor_temp <= 40:
         return target_temp
     return target_temp - 1.0
+
+
+def bounded_effective_from_ai_cache(
+    room_id: str,
+    cfg: dict,
+    effective_after_weather: float,
+    is_occupied: bool,
+) -> Tuple[float, bool]:
+    """
+    Effective control target after optional ±1 °C bounded AI read from cache.
+    Does not invoke the model (cache may be stale until async fetch completes).
+    Returns (final_target, adjustment_applied).
+    """
+    if (cfg.get("temperature_mode") or "manual") != "schedule_ai":
+        return effective_after_weather, False
+    if not cfg.get("ai_enabled"):
+        return effective_after_weather, False
+    if not is_occupied:
+        return effective_after_weather, False
+
+    rec = get_cached(room_id)
+    if not rec or rec.get("action") in (None, "none"):
+        return effective_after_weather, False
+    try:
+        ai_t = float(rec.get("target_temp", effective_after_weather))
+    except (TypeError, ValueError):
+        return effective_after_weather, False
+    if not (AI_MIN_T <= ai_t <= AI_MAX_T):
+        return effective_after_weather, False
+
+    bounded = apply_ai_bounded_adjustment(effective_after_weather, ai_t)
+    changed = abs(bounded - effective_after_weather) >= 0.01
+    if changed:
+        logger.debug(
+            "[AI][%s] Bounded effective %.2f°C → %.2f°C (model %.2f°C)",
+            room_id, effective_after_weather, bounded, ai_t,
+        )
+    return bounded, changed
 
 
 async def tick(room_id: str) -> None:
@@ -282,35 +510,36 @@ async def tick(room_id: str) -> None:
         logger.info("[HawaAI] Manual override active — skipping logic")
         return
 
-    target_temp     = float(cfg.get("target_temp", 24))
-    hysteresis      = float(cfg.get("hysteresis", 1.5))
+    base_temp, slot_label = resolve_base_target_temp(cfg)
+    temperature_mode_str = (cfg.get("temperature_mode") or "manual")
+
+    control_half    = float(cfg.get("control_hysteresis_half_deg", 0.5))
     vacancy_timeout = int(cfg.get("vacancy_timeout_minutes", 5)) * 60
     use_presence    = cfg.get("use_presence", True)
-    smart_adj       = smart_temp_adjustment_enabled(cfg)
+    smart_curve     = smart_temp_adjustment_enabled(cfg) and bool(cfg.get("use_outdoor_temp", True))
 
     # Weather — needed for smart adjustment and snapshot
     weather      = await weather_api.get_cached()
     outdoor_temp = weather.get("temp") if weather else None
 
-    # ── Smart Temperature Adjustment (base; optional AI may soft-override below) ─
-    base_effective = compute_effective_target(target_temp, outdoor_temp, smart_adj)
-    if smart_adj:
+    # ── Outdoor-aware effective target (schedule or manual base → weather curve) ─
+    effective_after_weather = compute_effective_target(base_temp, outdoor_temp, smart_curve)
+    if smart_curve:
         if outdoor_temp is None:
             logger.info(
-                "[HawaAI] Smart adj: enabled — no outdoor temp yet → effective=%.1f°C (config)",
-                base_effective,
+                "[HawaAI] Smart adj: enabled — no outdoor temp yet → effective=%.1f°C (base)",
+                effective_after_weather,
             )
-        elif base_effective != target_temp:
+        elif effective_after_weather != base_temp:
             logger.info(
-                "[HawaAI] Smart adj: outdoor=%.1f°C → effective %.1f°C (config=%.1f°C)",
-                outdoor_temp, base_effective, target_temp,
+                "[HawaAI] Smart adj: outdoor=%.1f°C → effective %.1f°C (base=%.1f°C)",
+                outdoor_temp, effective_after_weather, base_temp,
             )
         else:
             logger.info(
                 "[HawaAI] Smart adj: outdoor=%.1f°C → effective unchanged at %.1f°C",
-                outdoor_temp, base_effective,
+                outdoor_temp, effective_after_weather,
             )
-    effective_target = base_effective
 
     indoor_humidity: Optional[float] = None
     ih_entity = (cfg.get("indoor_humidity_entity") or "").strip()
@@ -420,27 +649,82 @@ async def tick(room_id: str) -> None:
     )
     logger.info(
         "[HawaAI][%s] TICK | indoor=%.1f°C | outdoor=%s | presence=%s | ac=%s "
-        "[src=%s] | target=%.1f°C (eff=%.1f°C)",
+        "[src=%s] | mode=%s slot=%s | base=%.1f°C (weather_eff=%.1f°C)",
         room_id,
         indoor_temp,
         f"{outdoor_temp:.1f}°C" if outdoor_temp is not None else "—",
         "occupied" if is_occupied else "vacant",
         ac_state_label, power_source,
-        target_temp, base_effective,
+        temperature_mode_str, slot_label,
+        base_temp, effective_after_weather,
     )
 
-    # STEP 7 — Cooldown gate
+    # STEP 7 — cooldown (log only; control skip happens after vacancy + telemetry snapshot)
     if in_cooldown:
         logger.info(
             "[HawaAI][%s] Cooldown active — %.0fs / %ds since '%s' command — "
-            "skipping control logic this tick",
+            "skipping IR control later this tick",
             room_id,
             secs_since_cmd, _COOLDOWN_SECS, st.last_command,
         )
 
-    # STEP 8 — Write monitoring snapshot
     outdoor_humidity = weather.get("humidity") if weather else None
-    ai_rec = get_cached(room_id) if cfg.get("ai_enabled", False) else None
+
+    rst = _rt(room_id)
+    if rst.last_schedule_slot != slot_label:
+        if rst.last_schedule_slot is not None:
+            logger.info(
+                "[HawaAI][%s] Schedule slot boundary: %s → %s",
+                room_id, rst.last_schedule_slot, slot_label,
+            )
+        rst.last_schedule_slot = slot_label
+
+    planned_final, ai_adjust_applied = bounded_effective_from_ai_cache(
+        room_id, cfg, effective_after_weather, is_occupied,
+    )
+    manual_override_active, effective_target = _manual_override_resolve(
+        room_id, cfg, climate_data or {}, indoor_temp, now, planned_final,
+    )
+    if manual_override_active:
+        ai_adjust_applied = False
+
+    use_ai_layer = (
+        bool(cfg.get("ai_enabled", False))
+        and is_occupied
+        and temperature_mode_str == "schedule_ai"
+        and not manual_override_active
+    )
+
+    if use_ai_layer:
+        if not in_cooldown and should_run_ai(
+            room_id, cfg, is_occupied, indoor_temp,
+            control_base_temp=base_temp,
+        ):
+            fetch_ai_in_background(
+                room_id,
+                cfg,
+                indoor_temp,
+                base_temp,
+                effective_after_weather,
+                outdoor_temp,
+                is_occupied,
+            )
+        rec = get_cached(room_id)
+        if rec and throttle_cache_use_log(room_id):
+            logger.debug("[AI][%s] Cached used", room_id)
+
+    schedule_slot_snap: Optional[str] = (
+        slot_label if temperature_mode_str != "manual" else None
+    )
+
+    ai_rec = (
+        get_cached(room_id)
+        if (
+            cfg.get("ai_enabled", False)
+            and (cfg.get("temperature_mode") or "manual") == "schedule_ai"
+        )
+        else None
+    )
     sp = None
     fm = None
     if climate_data:
@@ -465,37 +749,48 @@ async def tick(room_id: str) -> None:
         except (TypeError, ValueError):
             pass
 
-    await session_logger.add_snapshot(
-        room_id,
-        session_logger.current_session_id(room_id),
-        {
-            "timestamp":       now.isoformat(),
-            "indoor_temp":   indoor_temp,
-            "outdoor_temp":  outdoor_temp,
-            "outdoor_humidity": outdoor_humidity,
-            "indoor_humidity": indoor_humidity,
-            "ac_state":      ac_on,
-            "watt_draw":     energy_watts,
-            "presence":      is_occupied,
-            "setpoint":      sp,
-            "fan_mode":      fm,
-            "energy_kwh":    energy_kwh_reading,
-            "ai_target_temp": ai_tgt,
-            "ai_fan_mode": ai_fan,
-            "ai_confidence": ai_conf,
-        },
-    )
-
-    await _maybe_record_ai_user_adjustment(room_id, cfg, climate_data or {}, now)
-
-    # Collect a watts reading for this tick (used for energy calculation at session end).
-    if session_logger.current_session_id(room_id) and energy_watts_valid:
-        st.watts_samples.append(energy_watts)
+    async def _emit_snapshot(presence_val: bool) -> None:
+        eff_final, ai_adj = bounded_effective_from_ai_cache(
+            room_id, cfg, effective_after_weather, presence_val,
+        )
+        if manual_override_active and _rt(room_id).manual_override_temp is not None:
+            eff_final = float(_rt(room_id).manual_override_temp)
+            ai_adj = False
+        await session_logger.add_snapshot(
+            room_id,
+            session_logger.current_session_id(room_id),
+            {
+                "timestamp":               now.isoformat(),
+                "indoor_temp":            indoor_temp,
+                "outdoor_temp":           outdoor_temp,
+                "outdoor_humidity":       outdoor_humidity,
+                "indoor_humidity":        indoor_humidity,
+                "ac_state":               ac_on,
+                "watt_draw":              energy_watts,
+                "presence":               presence_val,
+                "setpoint":               sp,
+                "fan_mode":               fm,
+                "energy_kwh":             energy_kwh_reading,
+                "ai_target_temp":          ai_tgt,
+                "ai_fan_mode":             ai_fan,
+                "ai_confidence":           ai_conf,
+                "schedule_slot":          schedule_slot_snap,
+                "schedule_base_temp":      base_temp,
+                "effective_after_weather": effective_after_weather,
+                "effective_final_temp":    eff_final,
+                "ai_adjust_applied":       1 if ai_adj else 0,
+            },
+        )
 
     if in_cooldown:
-        return  # skip STEP 9 and STEP 10 during cooldown
+        await _emit_snapshot(is_occupied)
+        if not manual_override_active:
+            await _maybe_record_ai_user_adjustment(room_id, cfg, climate_data or {}, now)
+        if session_logger.current_session_id(room_id) and energy_watts_valid:
+            st.watts_samples.append(energy_watts)
+        return  # no vacancy / AC commands during IR cooldown window
 
-    # STEP 9 — VACANCY LOGIC
+    # STEP 9 — vacancy (snapshot before returning so telemetry continues)
     if use_presence and not is_occupied:
         if st.vacant_since is None:
             st.vacant_since = now
@@ -508,73 +803,85 @@ async def tick(room_id: str) -> None:
             vacancy_duration, vacancy_timeout, "ON" if ac_on else "OFF",
         )
 
+        await _emit_snapshot(False)
+
+        if not manual_override_active:
+            await _maybe_record_ai_user_adjustment(room_id, cfg, climate_data or {}, now)
+
+        if session_logger.current_session_id(room_id) and energy_watts_valid:
+            st.watts_samples.append(energy_watts)
+
         if ac_on and vacancy_duration >= vacancy_timeout:
             logger.info(
                 "[HawaAI][%s] Vacancy timeout reached (%.0fs) — turning AC OFF",
                 room_id,
                 vacancy_duration,
             )
-            await _turn_ac_off(room_id, cfg, indoor_temp, reason="vacant")
+            await _turn_ac_off(room_id, cfg, indoor_temp, reason="vacant", now=now)
 
-        return  # never run temp logic while vacant
+        return
 
     # Room occupied (or presence disabled) — reset vacancy timer
     st.vacant_since = None
 
-    # AI soft override (non-blocking fetch; cached setpoint + fan, occupied only)
-    if cfg.get("ai_enabled", False) and is_occupied:
-        if should_run_ai(room_id, cfg, is_occupied, indoor_temp):
-            fetch_ai_in_background(
-                room_id,
-                cfg, indoor_temp, target_temp, base_effective, outdoor_temp, is_occupied,
-            )
-        rec = get_cached(room_id)
-        if rec and throttle_cache_use_log(room_id):
-            logger.debug("[AI][%s] Cached used", room_id)
-        if rec and is_occupied and rec.get("action") and rec.get("action") != "none":
-            try:
-                ai_t = float(rec.get("target_temp", effective_target))
-                if AI_MIN_T <= ai_t <= AI_MAX_T:
-                    new_eff = min(effective_target, ai_t)
-                    if new_eff < effective_target - 0.01:
-                        logger.debug(
-                            "[AI] Target adjusted (safe clamp) %.1f°C → %.1f°C (AI suggested %.1f°C)",
-                            effective_target, new_eff, ai_t,
-                        )
-                    effective_target = new_eff
-            except (TypeError, ValueError):
-                pass
+    await _emit_snapshot(True)
 
-    # STEP 10 — TEMPERATURE LOGIC
-    upper = effective_target + hysteresis   # turn ON  above this
-    lower = effective_target - hysteresis   # turn OFF below this
+    if not manual_override_active:
+        await _maybe_record_ai_user_adjustment(room_id, cfg, climate_data or {}, now)
+
+    if session_logger.current_session_id(room_id) and energy_watts_valid:
+        st.watts_samples.append(energy_watts)
+
+    if manual_override_active:
+        logger.info(
+            "[HawaAI][%s] Skip: manual override active — control at %.1f°C (schedule/AI bypassed)",
+            room_id,
+            effective_target,
+        )
+
+    # STEP 10 — hysteresis ±control_half °C around effective target (user lock included)
+    upper = effective_target + control_half   # turn ON  above this
+    lower = effective_target - control_half   # turn OFF below this
 
     if indoor_temp > upper and not ac_on:
         logger.info("[HawaAI][%s] Too warm (%.1f°C > %.1f°C) — turning AC ON", room_id, indoor_temp, upper)
-        await _turn_ac_on(room_id, cfg, indoor_temp, effective_target)
+        await _turn_ac_on(room_id, cfg, indoor_temp, effective_target, now=now)
 
     elif indoor_temp <= lower and ac_on:
         logger.info("[HawaAI][%s] Room cooled (%.1f°C ≤ %.1f°C) — turning AC OFF", room_id, indoor_temp, lower)
         session_logger.mark_cooled(room_id)
-        await _turn_ac_off(room_id, cfg, indoor_temp, reason="cooled")
+        await _turn_ac_off(room_id, cfg, indoor_temp, reason="cooled", now=now)
 
     elif indoor_temp <= effective_target and ac_on:
         session_logger.mark_cooled(room_id)
 
-    if smart_adj and climate_entity and ac_on:
+    if smart_curve and climate_entity and ac_on:
+        interval = int(cfg.get("min_command_interval_seconds", 150))
+        meaningful = float(cfg.get("meaningful_setpoint_delta_deg", 0.5))
         await smart_cooling.apply_effective_target(
             room_id,
             climate_entity   = climate_entity,
             effective_target = effective_target,
             current_target   = climate_data.get("target_temp"),
             ac_on            = ac_on,
-            manual_override  = False,
+            manual_override  = cfg.get("manual_override", False) or manual_override_active,
+            min_interval_seconds = interval,
+            meaningful_delta_deg = meaningful,
         )
 
-    _rec = get_cached(room_id) if cfg.get("ai_enabled", False) else None
+    _rec = (
+        get_cached(room_id)
+        if (
+            cfg.get("ai_enabled", False)
+            and (cfg.get("temperature_mode") or "manual") == "schedule_ai"
+        )
+        else None
+    )
     _use_ai_fan = (
-        _rec
+        not manual_override_active
+        and _rec
         and is_occupied
+        and temperature_mode_str == "schedule_ai"
         and _rec.get("action") not in (None, "none")
         and _rec.get("fan_mode")
     )
@@ -593,7 +900,7 @@ async def tick(room_id: str) -> None:
             ac_on           = ac_on,
             ac_idle         = ac_idle,
             is_occupied     = is_occupied,
-            manual_override = cfg.get("manual_override", False),
+            manual_override = cfg.get("manual_override", False) or manual_override_active,
             climate_entity  = climate_entity,
             enabled         = True,
         )
@@ -606,6 +913,7 @@ async def _turn_ac_on(
     cfg: dict,
     indoor_temp: float,
     effective_target: Optional[float] = None,
+    now: Optional[datetime] = None,
 ) -> None:
     """Turn AC ON for one room; updates RoomRuntime + per-room session."""
     st = _rt(room_id)
@@ -619,6 +927,10 @@ async def _turn_ac_on(
         return
 
     target = effective_target if effective_target is not None else float(cfg.get("target_temp", 24))
+
+    tnow = now if now is not None else datetime.now(timezone.utc)
+    if not _gate_turn_ac_on(room_id, cfg, target, tnow):
+        return
 
     success = await ac_adapter.turn_on(
         entity_id   = climate_entity,
@@ -644,10 +956,14 @@ async def _turn_ac_on(
     st.session_start_kwh = start_kwh
 
     st.ac_is_on = True
-    st.session_start_time = now = datetime.now(timezone.utc)
+    cmd_ts = datetime.now(timezone.utc)
+    st.session_start_time = cmd_ts
     st.session_start_temp = indoor_temp
-    st.last_command_time = now
+    st.last_command_time = cmd_ts
     st.last_command = "on"
+    st.last_sent_command_key = _fingerprint_turn_on(target)
+    st.compressor_on_since = cmd_ts
+    st.compressor_off_since = None
     st.watts_samples = []
 
     weather = await weather_api.get_cached()
@@ -656,7 +972,7 @@ async def _turn_ac_on(
         "indoor_temp_start":      indoor_temp,
         "outdoor_temp_start":     weather.get("temp") if weather else None,
         "outdoor_humidity_start": weather.get("humidity") if weather else None,
-        "target_temp":            cfg.get("target_temp"),
+        "target_temp":            target,
         "ac_brand":               cfg.get("ac_brand"),
         "ac_model":               cfg.get("ac_model"),
         "room_name":              cfg.get("room_name"),
@@ -748,15 +1064,23 @@ async def _close_session(room_id: str, cfg: dict, indoor_temp: float, reason: st
     smart_cooling.reset(room_id)
 
 
-async def _turn_ac_off(room_id: str, cfg: dict, indoor_temp: float, reason: str) -> None:
+async def _turn_ac_off(room_id: str, cfg: dict, indoor_temp: float, reason: str, now: Optional[datetime] = None) -> None:
     st = _rt(room_id)
     climate_entity = (cfg.get("climate_entity") or "").strip()
+
+    tnow = now if now is not None else datetime.now(timezone.utc)
+    if not _gate_turn_ac_off(room_id, cfg, tnow):
+        return
 
     await ac_adapter.turn_off(climate_entity)
 
     st.ac_is_on = False
-    st.last_command_time = datetime.now(timezone.utc)
+    cmd_ts = datetime.now(timezone.utc)
+    st.last_command_time = cmd_ts
     st.last_command = "off"
+    st.last_sent_command_key = _fingerprint_turn_off()
+    st.compressor_off_since = cmd_ts
+    st.compressor_on_since = None
 
     await _close_session(room_id, cfg, indoor_temp, reason)
 
@@ -768,14 +1092,23 @@ def get_runtime_state(room_id: str) -> dict:
     st = _rt(room_id)
     now = datetime.now(_tz.utc)
     secs_since_cmd = (now - st.last_command_time).total_seconds() if st.last_command_time else None
-    in_cooldown = (
-        secs_since_cmd is not None
-        and secs_since_cmd < _COOLDOWN_SECS
-    )
+
     sc = smart_cooling.get_state(room_id)
     base_cfg = config_manager.load_config()
     room_def = room_registry.get_room(base_cfg, room_id)
     merged = room_registry.merge_room_config(base_cfg, room_def) if room_def else base_cfg
+    min_iv = float(merged.get("min_command_interval_seconds", 150))
+
+    mo_until = st.manual_override_until.isoformat() if st.manual_override_until else None
+    mo_active = bool(
+        st.manual_override_until is not None
+        and now < st.manual_override_until
+        and st.manual_override_temp is not None
+    )
+    in_cooldown = (
+        secs_since_cmd is not None
+        and secs_since_cmd < _COOLDOWN_SECS
+    )
     _ce = get_cached(room_id) if merged.get("ai_enabled") else None
     return {
         "ac_is_on":              st.ac_is_on,
@@ -794,4 +1127,8 @@ def get_runtime_state(room_id: str) -> dict:
         "smart_mode":            sc["smart_mode"],
         "smart_fan_mode":        sc["smart_fan_mode"],
         "last_applied_target":   sc.get("last_applied_target"),
+        "manual_override_active": mo_active,
+        "manual_override_expires_at": mo_until if mo_active else None,
+        "manual_override_target_temp": st.manual_override_temp if mo_active else None,
+        "min_command_interval_seconds": int(min_iv),
     }

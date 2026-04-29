@@ -27,6 +27,7 @@ def _new_store() -> Dict[str, Any]:
         "_last_tick_occupied": None,
         "_next_fetch_at": boot + _STARTUP_BLOCK_S,
         "_last_cache_info_log": 0.0,
+        "_last_ai_invoke_mono": None,
     }
 
 
@@ -41,23 +42,55 @@ def _roll_next_interval() -> float:
     return time.monotonic() + _MIN_INTERVAL + random.random() * (_MAX_INTERVAL - _MIN_INTERVAL)
 
 
+def mark_ai_infer_scheduled(room_id: str, cfg: Dict[str, Any]) -> None:
+    """Record dispatch time — enforces minimum wall time between outbound AI calls."""
+    st = _s(room_id)
+    now_m = time.monotonic()
+    st["_last_ai_invoke_mono"] = now_m
+    try:
+        min_gap = float(cfg.get("ai_fetch_min_interval_seconds", 60) or 60)
+    except (TypeError, ValueError):
+        min_gap = 60.0
+    min_gap = max(10.0, min(min_gap, 3600.0))
+    nf = float(st.get("_next_fetch_at", 0.0))
+    st["_next_fetch_at"] = max(nf, now_m + min_gap)
+
+
 def should_run_ai(
     room_id: str,
     cfg: Dict[str, Any],
     is_occupied: bool,
     indoor_temp: float,
+    *,
+    control_base_temp: Optional[float] = None,
 ) -> bool:
     st = _s(room_id)
     if not bool(cfg.get("ai_enabled", False)) or not is_occupied:
         st["_last_tick_occupied"] = is_occupied
         return False
 
+    became_occupied = st["_last_tick_occupied"] is False and is_occupied
+
     now = time.monotonic()
+
+    try:
+        min_invoke = float(cfg.get("ai_fetch_min_interval_seconds", 60) or 60)
+    except (TypeError, ValueError):
+        min_invoke = 60.0
+    min_invoke = max(10.0, min(min_invoke, 3600.0))
+    last_inv = st.get("_last_ai_invoke_mono")
+    if not became_occupied and last_inv is not None and (now - float(last_inv)) < min_invoke:
+        logger.debug(
+            "[AI][%s] Skipped fetch: min interval (%.0fs since last invoke)",
+            room_id, min_invoke,
+        )
+        st["_last_tick_occupied"] = is_occupied
+        return False
+
     if now < st["_next_fetch_at"]:
         st["_last_tick_occupied"] = is_occupied
         return False
 
-    became_occupied = st["_last_tick_occupied"] is False and is_occupied
     st["_last_tick_occupied"] = is_occupied
 
     if st["_last_valid"] is None:
@@ -65,6 +98,23 @@ def should_run_ai(
 
     if st["_context_indoor"] is None:
         return True
+
+    if (
+        control_base_temp is not None
+        and not became_occupied
+    ):
+        try:
+            near_deg = float(cfg.get("ai_indoor_near_setpoint_deg", 0.5) or 0.5)
+            near_deg = max(0.05, min(near_deg, 5.0))
+            prox = abs(float(indoor_temp) - float(control_base_temp))
+            if prox < near_deg:
+                logger.debug(
+                    "[AI][%s] Skipped fetch: indoor %.2f°C within %.2f°C of schedule base %.2f°C",
+                    room_id, float(indoor_temp), near_deg, float(control_base_temp),
+                )
+                return False
+        except (TypeError, ValueError):
+            pass
 
     if became_occupied:
         return True
