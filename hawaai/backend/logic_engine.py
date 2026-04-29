@@ -124,6 +124,25 @@ def _bump_last_command_ir_cooldown(st: RoomRuntime, cmd_ts: datetime) -> None:
         st.last_command_time = cmd_ts
 
 
+def _vacancy_signals_ac_should_stop(
+    st: RoomRuntime,
+    *,
+    energy_watts_valid: bool,
+    energy_watts: float,
+) -> bool:
+    """Vacant-room rule uses runtime intent and/or live power draw (not climate entity)."""
+    if st.ac_is_on:
+        return True
+    if energy_watts_valid:
+        # Core rule: compressor over threshold…
+        if energy_watts > _WATTS_COMPRESSOR:
+            return True
+        # … or fan-only / idle band — still wasting energy while empty.
+        if energy_watts >= _WATTS_FAN_ONLY:
+            return True
+    return False
+
+
 def should_send_setpoint_command(
     st: RoomRuntime,
     new_temp: float,
@@ -894,15 +913,8 @@ async def tick(room_id: str) -> None:
             },
         )
 
-    if in_cooldown:
-        await _emit_snapshot(is_occupied)
-        if not manual_override_active:
-            await _maybe_record_ai_user_adjustment(room_id, cfg, climate_data or {}, now)
-        if session_logger.current_session_id(room_id) and energy_watts_valid:
-            st.watts_samples.append(energy_watts)
-        return  # no vacancy / AC commands during IR cooldown window
-
-    # STEP 9 — vacancy (snapshot before returning so telemetry continues)
+    # STEP 8 — Vacancy (hard rule): empty room must not keep AC drawing power.
+    # Runs BEFORE the IR cooldown early-return so vacancy is never blocked by cooldown.
     if use_presence and not is_occupied:
         if st.vacant_since is None:
             st.vacant_since = now
@@ -923,11 +935,16 @@ async def tick(room_id: str) -> None:
         if session_logger.current_session_id(room_id) and energy_watts_valid:
             st.watts_samples.append(energy_watts)
 
-        if ac_on and st.ac_is_on and vacancy_duration >= vacancy_timeout:
+        if (
+            vacancy_duration >= vacancy_timeout
+            and _vacancy_signals_ac_should_stop(st, energy_watts_valid=energy_watts_valid, energy_watts=energy_watts)
+        ):
             logger.info(
-                "[HawaAI][%s] Vacancy timeout reached (%.0fs) — turning AC OFF",
+                "[HawaAI][%s] Vacancy timer reached — calling forced OFF (runtime_on=%s watts=%.0f valid=%s)",
                 room_id,
-                vacancy_duration,
+                st.ac_is_on,
+                energy_watts,
+                energy_watts_valid,
             )
             await _turn_ac_off(
                 room_id, cfg, indoor_temp, reason="vacant", now=now, force=True,
@@ -938,6 +955,15 @@ async def tick(room_id: str) -> None:
     # Room occupied (or presence disabled) — reset vacancy timer
     st.vacant_since = None
 
+    if in_cooldown:
+        await _emit_snapshot(is_occupied)
+        if not manual_override_active:
+            await _maybe_record_ai_user_adjustment(room_id, cfg, climate_data or {}, now)
+        if session_logger.current_session_id(room_id) and energy_watts_valid:
+            st.watts_samples.append(energy_watts)
+        return  # IR cooldown — skip hysteresis / smart cooling control this tick
+
+    # STEP 10+ — occupied path
     await _emit_snapshot(True)
 
     if not manual_override_active:
@@ -1258,14 +1284,18 @@ async def _turn_ac_off(
     force: bool = False,
 ) -> None:
     st = _rt(room_id)
-    if not st.ac_is_on:
-        return
-
     climate_entity = (cfg.get("climate_entity") or "").strip()
 
     tnow = now if now is not None else datetime.now(timezone.utc)
-    if not _gate_turn_ac_off(room_id, cfg, tnow, force=force):
-        return
+
+    if not force:
+        if not st.ac_is_on:
+            return
+        if not _gate_turn_ac_off(room_id, cfg, tnow, force=False):
+            return
+    elif reason == "vacant":
+        # Hard policy: vacancy must not be skipped for duplicate/cooldown — still log once.
+        logger.info("[VACANCY] AC OFF forced")
 
     await ac_adapter.turn_off(climate_entity)
 
@@ -1275,7 +1305,11 @@ async def _turn_ac_off(
     st.ac_is_on = False
     st.last_ac_off_at = ts_off
     cmd_ts = datetime.now(timezone.utc)
-    _bump_last_command_ir_cooldown(st, cmd_ts)
+    if force:
+        # Forced vacancy/safety OFF always anchors IR cooldown window (explicit command intent).
+        st.last_command_time = cmd_ts
+    else:
+        _bump_last_command_ir_cooldown(st, cmd_ts)
     st.last_command = "off"
     st.last_sent_command_key = _fingerprint_turn_off()
     st.compressor_off_since = cmd_ts
