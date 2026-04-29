@@ -22,7 +22,8 @@ export function RoomDataProvider({ children }) {
   const loadGenRef = useRef(0)
   const wsConnectedRef = useRef(false)
 
-  const [state, setState] = useState({
+  // setRoomData replaces full slice; always pass a complete object (or updater).
+  const [state, setRoomData] = useState({
     status: null,
     snapshots: [],
     ai: null,
@@ -36,7 +37,7 @@ export function RoomDataProvider({ children }) {
 
   useEffect(() => {
     if (!activeRoomId) {
-      setState({
+      setRoomData({
         status: null,
         snapshots: [],
         ai: null,
@@ -54,7 +55,7 @@ export function RoomDataProvider({ children }) {
     const rid = activeRoomId
     let cancelled = false
     wsConnectedRef.current = false
-    setState((prev) => ({
+    setRoomData((prev) => ({
       status: null,
       snapshots: [],
       ai: null,
@@ -75,7 +76,7 @@ export function RoomDataProvider({ children }) {
           getSessionStats(rid),
         ])
         if (cancelled || gen !== loadGenRef.current) return
-        setState({
+        setRoomData({
           status,
           snapshots,
           ai,
@@ -89,7 +90,7 @@ export function RoomDataProvider({ children }) {
       } catch (err) {
         console.error('[HawaAI] Room load failed', err)
         if (cancelled || gen !== loadGenRef.current) return
-        setState({
+        setRoomData({
           status: null,
           snapshots: [],
           ai: null,
@@ -110,7 +111,7 @@ export function RoomDataProvider({ children }) {
       if (!msg || msg.type !== 'tick') return
       if (msg.room_id != null && msg.room_id !== rid) return
       wsConnectedRef.current = true
-      setState((prev) => {
+      setRoomData((prev) => {
         if (gen !== loadGenRef.current) return prev
         if (!prev.status) return prev
         return {
@@ -129,7 +130,7 @@ export function RoomDataProvider({ children }) {
       getStatus(rid)
         .then((s) => {
           if (cancelled || gen !== loadGenRef.current) return
-          setState((prev) => ({ ...prev, status: s }))
+          setRoomData((prev) => ({ ...prev, status: s }))
         })
         .catch(() => {})
     }, 15000)
@@ -138,7 +139,7 @@ export function RoomDataProvider({ children }) {
       getSnapshots(120, rid)
         .then((snaps) => {
           if (cancelled || gen !== loadGenRef.current) return
-          setState((prev) => ({ ...prev, snapshots: snaps }))
+          setRoomData((prev) => ({ ...prev, snapshots: snaps }))
         })
         .catch(() => {})
     }, 30000)
@@ -147,7 +148,7 @@ export function RoomDataProvider({ children }) {
       getAiStatus(rid)
         .then((ai) => {
           if (cancelled || gen !== loadGenRef.current) return
-          setState((prev) => ({ ...prev, ai }))
+          setRoomData((prev) => ({ ...prev, ai }))
         })
         .catch(() => {})
     }, 5000)

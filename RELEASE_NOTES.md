@@ -1,5 +1,9 @@
 # HawaAI add-on — release notes
 
+## 1.4.13
+
+- **Frontend:** `RoomDataContext` — clearer `setRoomData` naming; room reset stays a proper object/updater (`status` / `snapshots` / `ai` / `stats` plus loading + previous\* for soft load). Ensures reproducible addon builds cache no stale JSX.
+
 ## 1.4.12
 
 - **Runtime / telemetry:** Ensure a cooling **session exists before telemetry snapshots** (including HA startup when the AC is already ON), with a reconcile path before writing snapshots — avoids dropped ML/telemetry rows.
