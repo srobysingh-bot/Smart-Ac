@@ -274,6 +274,11 @@ def _enrich_session(row: Dict[str, Any]) -> Dict[str, Any]:
 # ─────────────────────────────────────────────────────────────────────────────
 
 async def insert_session_start(session: Dict[str, Any]) -> None:
+    rid = (session.get("room_id") or "").strip()
+    if not rid:
+        logger.error("[DB] insert_session_start rejected — missing room_id (session_id=%s)", session.get("session_id"))
+        raise ValueError("room_id is required for insert_session_start")
+    logger.info("[DB] insert session room_id=%s session_id=%s", rid, session.get("session_id"))
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(
             """
@@ -299,7 +304,7 @@ async def insert_session_start(session: Dict[str, Any]) -> None:
                 session.get("energy_start_kwh"),
                 session.get("day_of_week"),
                 session.get("hour_of_day"),
-                session.get("room_id") or "",
+                rid,
             ),
         )
         await db.commit()
@@ -533,6 +538,11 @@ async def compute_cooling_snapshot_metrics(session_id: str) -> Dict[str, Optiona
 # ─────────────────────────────────────────────────────────────────────────────
 
 async def insert_snapshot(snapshot: Dict[str, Any]) -> int:
+    rid = (snapshot.get("room_id") or "").strip()
+    if not rid:
+        logger.error("[DB] insert_snapshot rejected — missing room_id (session_id=%s)", snapshot.get("session_id"))
+        raise ValueError("room_id is required for insert_snapshot")
+    logger.info("[DB] insert snapshot room_id=%s session_id=%s", rid, snapshot.get("session_id"))
     w = snapshot.get("watt_draw")
     if w is None:
         w = snapshot.get("power_watts")
@@ -559,7 +569,7 @@ async def insert_snapshot(snapshot: Dict[str, Any]) -> int:
                 w,
                 w,
                 1 if snapshot.get("presence") else 0,
-                snapshot.get("room_id") or "",
+                rid,
                 snapshot.get("setpoint"),
                 snapshot.get("fan_mode"),
                 snapshot.get("energy_kwh"),
@@ -579,6 +589,11 @@ async def insert_snapshot(snapshot: Dict[str, Any]) -> int:
 
 async def insert_ai_decision(row: Dict[str, Any]) -> int:
     """Persist one AI model output for ML / audit. Returns new row id."""
+    rid = (row.get("room_id") or "").strip()
+    if not rid:
+        logger.error("[DB] insert_ai_decision rejected — missing room_id (session_id=%s)", row.get("session_id"))
+        raise ValueError("room_id is required for insert_ai_decision")
+    logger.info("[DB] insert ai_decision room_id=%s session_id=%s", rid, row.get("session_id"))
     async with aiosqlite.connect(DB_PATH) as db:
         cur = await db.execute(
             """
@@ -590,7 +605,7 @@ async def insert_ai_decision(row: Dict[str, Any]) -> int:
             """,
             (
                 row.get("ts"),
-                row.get("room_id") or "",
+                rid,
                 row.get("session_id"),
                 row.get("snapshot_id"),
                 row.get("target_temp"),

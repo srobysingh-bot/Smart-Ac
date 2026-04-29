@@ -617,10 +617,63 @@ function ClimateCard({ entityId }) {
   )
 }
 
+// ── Dashboard: missing room ───────────────────────────────────────────────────
+/** Shown when no room is selected (or none exist). Avoids ghost empty widgets. */
+function DashboardNeedsRoomGate({ rooms, onSelectRoom, onOpenSettings }) {
+  const multi = rooms && rooms.length > 1
+  if (!rooms || rooms.length === 0) {
+    return (
+      <div className="container-app px-4 sm:px-6 py-10 max-w-xl mx-auto">
+        <div className="rounded-xl border border-gray-700 bg-gray-900/80 p-6 sm:p-8 text-center shadow-lg">
+          <Wind size={40} className="mx-auto text-blue-400 mb-4" aria-hidden />
+          <h2 className="text-lg font-semibold text-white mb-2">No rooms yet</h2>
+          <p className="text-sm text-gray-400 mb-6 leading-relaxed">
+            The dashboard loads live data per room. Add a room in Settings, then pick it from the strip above.
+            Nothing is shown until a room is selected so data is never mixed between spaces.
+          </p>
+          <button
+            type="button"
+            onClick={onOpenSettings}
+            className="min-h-[44px] px-5 py-2.5 rounded-lg bg-blue-600 hover:bg-blue-500 text-white text-sm font-medium transition-colors w-full sm:w-auto"
+          >
+            Open Settings
+          </button>
+        </div>
+      </div>
+    )
+  }
+  return (
+    <div className="container-app px-4 sm:px-6 py-8 max-w-xl mx-auto">
+      <div className="rounded-xl border border-amber-700/60 bg-amber-950/30 p-6 sm:p-8 text-center">
+        <h2 className="text-lg font-semibold text-amber-100 mb-2">
+          {multi ? 'Select a room' : 'Choose this room'}
+        </h2>
+        <p className="text-sm text-amber-200/90 mb-6 leading-relaxed">
+          {multi
+            ? 'Pick a room from the strip above. All API calls include room_id — sessions, snapshots, and AI status stay isolated per room.'
+            : 'Select the room below to load telemetry. Your last choice is remembered in this browser.'}
+        </p>
+        <div className="flex flex-wrap justify-center gap-2">
+          {rooms.map((r) => (
+            <button
+              key={r.id}
+              type="button"
+              onClick={() => onSelectRoom(r.id)}
+              className="min-h-[44px] px-4 py-2 rounded-lg bg-gray-800 border border-gray-600 hover:border-blue-500 hover:bg-gray-700 text-gray-100 text-sm font-medium transition-colors"
+            >
+              {r.name || r.id}
+            </button>
+          ))}
+        </div>
+      </div>
+    </div>
+  )
+}
+
 // ── Page ──────────────────────────────────────────────────────────────────────
 export default function Dashboard() {
   const navigate = useNavigate()
-  const { activeRoomId, setActiveRoom, rooms, refreshRooms } = useRoom()
+  const { activeRoomId, setActiveRoom, rooms, refreshRooms, roomsLoading } = useRoom()
   const [status,    setStatus]    = useState(null)
   const [snapshots, setSnapshots] = useState([])
   const [stats,     setStats]     = useState(null)
@@ -677,6 +730,7 @@ export default function Dashboard() {
 
   const activeRoom = rooms.find(r => r.id === activeRoomId)
   const configIncomplete = Boolean(activeRoomId && status && status.config_complete === false)
+  const hasRoom = Boolean(activeRoomId)
 
   return (
     <div className="flex flex-col h-full min-w-0">
@@ -692,25 +746,32 @@ export default function Dashboard() {
           }
         })}
       />
-      <LiveStatusBar status={status} />
 
-      {!activeRoomId && rooms.length > 0 && (
-        <div className="container-app mx-4 sm:mx-auto mt-4 px-4 py-3 bg-gray-800/50 border border-gray-700 rounded-xl text-sm text-gray-300">
-          Select a room above to load dashboard data. Each room is isolated — APIs require an explicit room.
+      {!hasRoom && roomsLoading ? (
+        <div className="container-app px-4 py-12 text-center text-sm text-gray-500">
+          Loading rooms…
         </div>
-      )}
+      ) : !hasRoom ? (
+        <DashboardNeedsRoomGate
+          rooms={rooms}
+          onSelectRoom={setActiveRoom}
+          onOpenSettings={() => navigate({ pathname: '/settings' })}
+        />
+      ) : (
+        <>
+          <LiveStatusBar status={status} />
 
-      {configIncomplete && <ConfigWarning roomId={activeRoomId} />}
+          {configIncomplete && <ConfigWarning roomId={activeRoomId} />}
 
-      {activeRoomId && status && (
-        <div className="container-app px-4 sm:px-6 pb-2 shrink-0 min-w-0">
-          <TemperaturePlanCard status={status} />
-        </div>
-      )}
+          {activeRoomId && status && (
+            <div className="container-app px-4 sm:px-6 pb-2 shrink-0 min-w-0">
+              <TemperaturePlanCard status={status} />
+            </div>
+          )}
 
-      <div className="container-app flex-1 overflow-y-auto overflow-x-hidden px-4 sm:px-6 py-4 sm:py-6 pb-8 space-y-6 min-w-0">
-        {/* Cards — 1 col · 2 cols tablet · 3 lg · 4 xl */}
-        <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-4 min-w-0">
+          <div className="container-app flex-1 overflow-y-auto overflow-x-hidden px-4 sm:px-6 py-4 sm:py-6 pb-8 space-y-6 min-w-0">
+            {/* Cards — 1 col · 2 cols tablet · 3 lg · 4 xl */}
+            <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-4 min-w-0">
           <TempGauge
             indoor={status?.indoor_temp ?? status?.ac_current_temp}
             outdoor={status?.outdoor_temp}
@@ -810,6 +871,8 @@ export default function Dashboard() {
           <SessionTable limit={10} roomId={activeRoomId} />
         </div>
       </div>
+        </>
+      )}
     </div>
   )
 }

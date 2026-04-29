@@ -12,6 +12,13 @@
 const INGRESS_PATH = (typeof window !== 'undefined' && window.__INGRESS_PATH__) || ''
 const BASE = INGRESS_PATH + '/api'
 
+/** Non-empty trimmed room id, or rejects — all dashboard APIs must be room-scoped. */
+function roomParam(roomId, label = 'roomId') {
+  const s = roomId != null ? String(roomId).trim() : ''
+  if (!s) return Promise.reject(new Error(`${label} is required`))
+  return Promise.resolve(s)
+}
+
 async function request(path, options = {}) {
   const res = await fetch(`${BASE}${path}`, {
     headers: { 'Content-Type': 'application/json' },
@@ -27,37 +34,36 @@ async function request(path, options = {}) {
 }
 
 // ── Status ───────────────────────────────────────────────────────────────────
-export const getStatus = (roomId) => {
-  if (!roomId) return Promise.reject(new Error('roomId is required'))
-  return request(`/status?room_id=${encodeURIComponent(roomId)}`)
-}
+export const getStatus = (roomId) =>
+  roomParam(roomId).then((rid) => request(`/status?room_id=${encodeURIComponent(rid)}`))
 
 /** Cached outdoor weather — no room coupling (Settings preview). */
 export const getWeather = () => request('/weather')
 
 // ── Sessions ─────────────────────────────────────────────────────────────────
 export const getSessions = (params = {}) => {
-  if (!params.room_id) return Promise.reject(new Error('room_id is required'))
-  const q = new URLSearchParams(params).toString()
+  const rid = params.room_id != null ? String(params.room_id).trim() : ''
+  if (!rid) return Promise.reject(new Error('room_id is required'))
+  const q = new URLSearchParams({ ...params, room_id: rid }).toString()
   return request(`/sessions?${q}`)
 }
 
-export const getSessionStats = (roomId) => {
-  if (!roomId) return Promise.reject(new Error('roomId is required'))
-  return request(`/sessions/stats?room_id=${encodeURIComponent(roomId)}`)
-}
+export const getSessionStats = (roomId) =>
+  roomParam(roomId).then((rid) =>
+    request(`/sessions/stats?room_id=${encodeURIComponent(rid)}`),
+  )
 
 // ── Snapshots ────────────────────────────────────────────────────────────────
-export const getSnapshots = (minutes = 120, roomId) => {
-  if (!roomId) return Promise.reject(new Error('roomId is required'))
-  return request(`/snapshots?minutes=${minutes}&room_id=${encodeURIComponent(roomId)}`)
-}
+export const getSnapshots = (minutes = 120, roomId) =>
+  roomParam(roomId).then((rid) =>
+    request(`/snapshots?minutes=${minutes}&room_id=${encodeURIComponent(rid)}`),
+  )
 
 // ── Daily stats ───────────────────────────────────────────────────────────────
-export const getDailyStats = (days = 7, roomId) => {
-  if (!roomId) return Promise.reject(new Error('roomId is required'))
-  return request(`/daily?days=${days}&room_id=${encodeURIComponent(roomId)}`)
-}
+export const getDailyStats = (days = 7, roomId) =>
+  roomParam(roomId).then((rid) =>
+    request(`/daily?days=${days}&room_id=${encodeURIComponent(rid)}`),
+  )
 
 // ── Config ───────────────────────────────────────────────────────────────────
 export const getConfig   = () => request('/config')
@@ -74,17 +80,17 @@ export const updateAiConfig = (data) =>
 
 /** Last AI call lifecycle for a room (GET /api/ai/status). */
 export async function getAiStatus(roomId) {
-  if (!roomId) return Promise.reject(new Error('roomId is required'))
-  return request(`/ai/status?room_id=${encodeURIComponent(roomId)}`)
+  const rid = await roomParam(roomId)
+  return request(`/ai/status?room_id=${encodeURIComponent(rid)}`)
 }
 
 // ── Multi-room ───────────────────────────────────────────────────────────────
 export const getRooms = () => request('/rooms')
 
-export const getRoom = (roomId) => {
-  if (!roomId) return Promise.reject(new Error('roomId is required'))
-  return request(`/rooms/${encodeURIComponent(roomId)}`)
-}
+export const getRoom = (roomId) =>
+  roomParam(roomId).then((rid) =>
+    request(`/rooms/${encodeURIComponent(rid)}`),
+  )
 
 export const createRoom = (data) =>
   request('/rooms', { method: 'POST', body: JSON.stringify(data) })
@@ -138,15 +144,15 @@ export const getDevices = () => request('/devices')
 export const getDeviceEntities = (deviceId) => request(`/devices/${encodeURIComponent(deviceId)}/entities`)
 
 // ── Insights ─────────────────────────────────────────────────────────────────
-export const getInsights = (roomId) => {
-  if (!roomId) return Promise.reject(new Error('roomId is required'))
-  return request(`/insights?room_id=${encodeURIComponent(roomId)}`)
-}
+export const getInsights = (roomId) =>
+  roomParam(roomId).then((rid) =>
+    request(`/insights?room_id=${encodeURIComponent(rid)}`),
+  )
 
 // ── Export ───────────────────────────────────────────────────────────────────
 export async function downloadExport(format = 'csv', roomId) {
-  if (!roomId) throw new Error('roomId is required')
-  const res = await fetch(`${BASE}/export/${format}?room_id=${encodeURIComponent(roomId)}`)
+  const rid = await roomParam(roomId, 'roomId')
+  const res = await fetch(`${BASE}/export/${format}?room_id=${encodeURIComponent(rid)}`)
   if (!res.ok) throw new Error('Export failed')
   const blob = await res.blob()
   const cd   = res.headers.get('Content-Disposition') || ''
@@ -160,14 +166,15 @@ export async function downloadExport(format = 'csv', roomId) {
 
 /** Recent persisted AI outputs (ML / audit). */
 export async function getAiDecisions(roomId, limit = 50) {
-  if (!roomId) return Promise.reject(new Error('roomId is required'))
-  const q = new URLSearchParams({ room_id: roomId, limit: String(limit) }).toString()
+  const rid = await roomParam(roomId)
+  const q = new URLSearchParams({ room_id: rid, limit: String(limit) }).toString()
   return request(`/ai/decisions?${q}`)
 }
 
 // ── WebSocket live updates (per-room subscribe) ─────────────────────────────
 export function connectLive(roomId, onMessage, onError) {
-  if (!roomId) {
+  const rid = roomId != null ? String(roomId).trim() : ''
+  if (!rid) {
     if (onError) onError(new Error('roomId is required'))
     return { ws: null, close: () => {} }
   }
@@ -178,7 +185,7 @@ export function connectLive(roomId, onMessage, onError) {
 
   ws.onopen = () => {
     try {
-      ws.send(JSON.stringify({ type: 'subscribe', room_id: roomId }))
+      ws.send(JSON.stringify({ type: 'subscribe', room_id: rid }))
     } catch (e) {
       if (onError) onError(e)
     }

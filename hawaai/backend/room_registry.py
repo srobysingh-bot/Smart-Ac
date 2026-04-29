@@ -97,13 +97,6 @@ def get_room(cfg: Dict[str, Any], room_id: str) -> Optional[Dict[str, Any]]:
     return None
 
 
-def default_room_id(cfg: Dict[str, Any]) -> Optional[str]:
-    rooms = list_room_dicts(cfg)
-    if not rooms:
-        return None
-    return rooms[0]["id"]
-
-
 def merge_room_config(global_cfg: Dict[str, Any], room: Dict[str, Any]) -> Dict[str, Any]:
     """
     Per-room effective config: deep copy of global (excluding the `rooms` list) plus

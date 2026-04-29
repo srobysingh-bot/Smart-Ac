@@ -101,7 +101,14 @@ def init_ai_worker() -> None:
 
 def get_ai_status(room_id: str) -> Dict[str, Any]:
     """Snapshot of last AI provider call for one room."""
-    rid = (room_id or "default").strip() or "default"
+    rid = (room_id or "").strip()
+    if not rid:
+        st = dict(_default_ai_runtime())
+        st["circuit_open"] = False
+        st["circuit_seconds_remaining"] = None
+        st["api_consecutive_failures"] = 0
+        st["room_id"] = ""
+        return st
     st = dict(_mut_room_ai(rid))
     now_m = time.monotonic()
     with _circuit_lock:

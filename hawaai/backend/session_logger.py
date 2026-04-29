@@ -32,16 +32,24 @@ def _room(room_id: str) -> _RoomSession:
     return _rs[room_id]
 
 
+def _require_room(room_id: str) -> str:
+    rid = (room_id or "").strip()
+    if not rid:
+        raise ValueError("room_id is required")
+    return rid
+
+
 async def start_session(room_id: str, data: Dict[str, Any]) -> str:
     """Insert a session start record. Returns the new session_id (UUID)."""
-    s = _room(room_id)
+    rid = _require_room(room_id)
+    s = _room(rid)
 
     session_id = str(uuid.uuid4())
     now = datetime.now(timezone.utc)
 
     record = {
         "session_id": session_id,
-        "room_id": room_id,
+        "room_id": rid,
         "start_time": data.get("start_time", now.isoformat()),
         "indoor_temp_start": data.get("indoor_temp_start"),
         "outdoor_temp_start": data.get("outdoor_temp_start"),
@@ -66,7 +74,7 @@ async def start_session(room_id: str, data: Dict[str, Any]) -> str:
 
     logger.info(
         "[HawaAI] Session started [%s]: %s (%.1f°C indoor)",
-        room_id,
+        rid,
         session_id,
         data.get("indoor_temp_start") or 0,
     )
@@ -75,11 +83,16 @@ async def start_session(room_id: str, data: Dict[str, Any]) -> str:
 
 async def end_session(room_id: str, data: Dict[str, Any]) -> None:
     """Update the current open session with end data and compute analytics."""
-    s = _room(room_id)
+    try:
+        rid = _require_room(room_id)
+    except ValueError:
+        logger.error("[HawaAI] end_session rejected — missing room_id")
+        return
+    s = _room(rid)
     ANALYTICS_WARMUP_MINUTES = 5.0
 
     if not s.current_session_id:
-        logger.warning("[HawaAI] end_session[%s] called but no active session", room_id)
+        logger.warning("[HawaAI] end_session[%s] called but no active session", rid)
         return
 
     cool_minutes: Optional[float] = None
@@ -145,7 +158,7 @@ async def end_session(room_id: str, data: Dict[str, Any]) -> None:
             logger.info(
                 "[HawaAI] Analytics [%s] — cooling_rate=%.4f°C/min (%s) | efficiency=%s°C/kWh | "
                 "snap_t_target=%s min | snap_drop_rate=%s",
-                room_id,
+                rid,
                 cooling_rate,
                 cooling_type,
                 f"{efficiency:.2f}" if efficiency is not None else "N/A",
@@ -153,7 +166,7 @@ async def end_session(room_id: str, data: Dict[str, Any]) -> None:
                 tdrop,
             )
     except Exception as exc:
-        logger.warning("[HawaAI] Analytics calculation skipped [%s]: %s", room_id, exc)
+        logger.warning("[HawaAI] Analytics calculation skipped [%s]: %s", rid, exc)
         cooling_rate = cooling_type = efficiency = None
         time_to_target_minutes = None
         temp_drop_rate_snap = None
@@ -187,7 +200,7 @@ async def end_session(room_id: str, data: Dict[str, Any]) -> None:
     await database.update_session_end(s.current_session_id, end_data)
     logger.info(
         "[HawaAI] Session ended [%s]: %s | reason=%s",
-        room_id,
+        rid,
         s.current_session_id,
         data.get("reason_stopped"),
     )
@@ -199,16 +212,22 @@ async def end_session(room_id: str, data: Dict[str, Any]) -> None:
 
 
 def mark_cooled(room_id: str) -> None:
-    s = _room(room_id)
+    try:
+        rid = _require_room(room_id)
+    except ValueError:
+        logger.error("[HawaAI] mark_cooled rejected — missing room_id")
+        return
+    s = _room(rid)
     if s.cooled_at is None:
         s.cooled_at = datetime.now(timezone.utc)
 
 
 async def add_snapshot(room_id: str, session_id: Optional[str], data: Dict[str, Any]) -> int:
     """Insert a monitoring snapshot (called every tick while AC is on). Returns row id."""
+    rid = _require_room(room_id)
     snap = {
         "session_id": session_id,
-        "room_id": room_id,
+        "room_id": rid,
         "timestamp": data.get("timestamp", datetime.now(timezone.utc).isoformat()),
         "indoor_temp": data.get("indoor_temp"),
         "outdoor_temp": data.get("outdoor_temp"),
@@ -230,7 +249,7 @@ async def add_snapshot(room_id: str, session_id: Optional[str], data: Dict[str, 
         "ai_adjust_applied": data.get("ai_adjust_applied"),
     }
     row_id = await database.insert_snapshot(snap)
-    _last_snapshot_id[room_id] = row_id
+    _last_snapshot_id[rid] = row_id
     return row_id
 
 
@@ -243,14 +262,15 @@ async def ensure_snapshot_id_for_ai(room_id: str) -> int:
     Latest snapshot for the room, or insert a minimal row so ai_decisions.snapshot_id
     is always populated.
     """
-    sid = _last_snapshot_id.get(room_id)
+    rid = _require_room(room_id)
+    sid = _last_snapshot_id.get(rid)
     if sid is not None:
         return sid
     now = datetime.now(timezone.utc).isoformat()
     row_id = await database.insert_snapshot(
         {
-            "session_id": current_session_id(room_id),
-            "room_id": room_id,
+            "session_id": current_session_id(rid),
+            "room_id": rid,
             "timestamp": now,
             "indoor_temp": None,
             "outdoor_temp": None,
@@ -272,7 +292,7 @@ async def ensure_snapshot_id_for_ai(room_id: str) -> int:
             "ai_adjust_applied": None,
         },
     )
-    _last_snapshot_id[room_id] = row_id
+    _last_snapshot_id[rid] = row_id
     return row_id
 
 
@@ -293,8 +313,14 @@ async def get_snapshots(hours: int = 2, room_id: str = "") -> List[Dict]:
 
 
 def current_session_id(room_id: str) -> Optional[str]:
-    return _room(room_id).current_session_id
+    rid = (room_id or "").strip()
+    if not rid:
+        return None
+    return _room(rid).current_session_id
 
 
 def session_start_time(room_id: str) -> Optional[datetime]:
-    return _room(room_id).session_start_time
+    rid = (room_id or "").strip()
+    if not rid:
+        return None
+    return _room(rid).session_start_time

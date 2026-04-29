@@ -49,8 +49,12 @@ async def start() -> None:
         interval = int(cfg.get("logic_interval_seconds", 60))
 
         for room in room_registry.list_room_dicts(cfg):
-            rid = room.get("id") or ""
+            rid = (room.get("id") or "").strip()
             if not rid:
+                logger.error(
+                    "[ROOM] scheduler skipped room entry without id (name=%r)",
+                    room.get("name"),
+                )
                 continue
             try:
                 await logic_engine.tick(rid)

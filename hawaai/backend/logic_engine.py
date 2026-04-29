@@ -396,6 +396,12 @@ async def tick(room_id: str) -> None:
     """
     Single decision-loop iteration for one room.
     """
+    rid = (room_id or "").strip()
+    if not rid:
+        logger.error("[ROOM] tick rejected — missing room_id")
+        return
+    room_id = rid
+
     st = _rt(room_id)
     # STEP 1 — fresh config every tick (global + room merge)
     base_cfg = config_manager.load_config()
@@ -403,6 +409,7 @@ async def tick(room_id: str) -> None:
     if not room_def:
         logger.debug("[HawaAI] tick skipped — unknown room_id=%s", room_id)
         return
+    logger.info("[ROOM] tick room_id=%s", room_id)
     if not (str(room_def.get("climate_entity") or "")).strip():
         logger.debug("[HawaAI] tick skipped [%s] — no climate_entity", room_id)
         return

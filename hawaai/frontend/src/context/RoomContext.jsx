@@ -94,6 +94,45 @@ export function RoomProvider({ children }) {
     }
   }, [rooms, searchParams, setSearchParams])
 
+  // ── Persist / restore ─────────────────────────────────────────────────────
+  // Cross-tab: another tab updates localStorage → adopt valid room here.
+  useEffect(() => {
+    const onStorage = (e) => {
+      if (!e.key || e.key !== ROOM_STORAGE_KEY) return
+      const next = (e.newValue || '').trim()
+      if (!rooms.length) return
+      if (next && rooms.some((r) => r.id === next) && next !== activeRoomId) {
+        setActiveRoom(next)
+      }
+      if (!next && activeRoomId) {
+        setActiveRoom(null)
+      }
+    }
+    window.addEventListener('storage', onStorage)
+    return () => window.removeEventListener('storage', onStorage)
+  }, [rooms, activeRoomId, setActiveRoom])
+
+  // Tab visibility / BF cache: if localStorage has a valid room id and state mismatches, reconcile.
+  useEffect(() => {
+    const reconcile = () => {
+      if (document.visibilityState !== 'visible') return
+      if (!rooms.length) return
+      const saved =
+        typeof localStorage !== 'undefined'
+          ? (localStorage.getItem(ROOM_STORAGE_KEY) || '').trim()
+          : ''
+      if (!saved || !rooms.some((x) => x.id === saved)) return
+      if (activeRoomId === saved) return
+      setActiveRoom(saved)
+    }
+    document.addEventListener('visibilitychange', reconcile)
+    window.addEventListener('pageshow', reconcile)
+    return () => {
+      document.removeEventListener('visibilitychange', reconcile)
+      window.removeEventListener('pageshow', reconcile)
+    }
+  }, [rooms, activeRoomId, setActiveRoom])
+
   // Adopt room from query when it changes (browser back/forward, manual URL edit)
   useEffect(() => {
     if (!initRef.current || !rooms.length) return
