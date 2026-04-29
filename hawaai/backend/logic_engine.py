@@ -619,7 +619,6 @@ async def tick(room_id: str) -> None:
     base_temp, slot_label = resolve_base_target_temp(cfg)
     temperature_mode_str = (cfg.get("temperature_mode") or "manual")
 
-    control_half    = float(cfg.get("control_hysteresis_half_deg", 0.5))
     vacancy_timeout = int(cfg.get("vacancy_timeout_minutes", 5)) * 60
     use_presence    = cfg.get("use_presence", True)
     smart_curve     = smart_temp_adjustment_enabled(cfg) and bool(cfg.get("use_outdoor_temp", True))
@@ -955,6 +954,25 @@ async def tick(room_id: str) -> None:
     # Room occupied (or presence disabled) — reset vacancy timer
     st.vacant_since = None
 
+    et_eff = float(effective_target)
+    on_delta = float(cfg.get("thermostat_on_delta_deg", 0.7))
+    off_delta = float(cfg.get("thermostat_off_delta_deg", 0.3))
+    delta_temp = indoor_temp - et_eff
+
+    # STEP 9a — target reached: stop cooling (before IR cooldown; force OFF bypasses gate/bump rules)
+    if (
+        not manual_override_active
+        and (st.ac_is_on or ac_on)
+        and delta_temp <= -off_delta
+    ):
+        logger.info("[COOLING DONE] Turning AC OFF — indoor %.2f°C vs target %.2f°C", indoor_temp, et_eff)
+        session_logger.mark_cooled(room_id)
+        await _emit_snapshot(True)
+        await _turn_ac_off(
+            room_id, cfg, indoor_temp, reason="target_reached", now=now, force=True,
+        )
+        return
+
     if in_cooldown:
         await _emit_snapshot(is_occupied)
         if not manual_override_active:
@@ -979,20 +997,24 @@ async def tick(room_id: str) -> None:
             effective_target,
         )
 
-    # STEP 10 — hysteresis ±control_half °C around effective target (user lock included)
-    upper = effective_target + control_half   # turn ON  above this
-    lower = effective_target - control_half   # turn OFF below this
+    # STEP 10 — turn ON when clearly above band; OFF when satisfied is STEP 9a (ignore under manual HA lock)
+    upper = et_eff + on_delta
 
-    if indoor_temp > upper and not ac_on:
-        logger.info("[HawaAI][%s] Too warm (%.1f°C > %.1f°C) — turning AC ON", room_id, indoor_temp, upper)
+    if (
+        not manual_override_active
+        and indoor_temp > upper
+        and not ac_on
+    ):
+        logger.info(
+            "[HawaAI][%s] Too warm (%.1f°C > %.1f°C) — turning AC ON", room_id, indoor_temp, upper,
+        )
         await _turn_ac_on(room_id, cfg, indoor_temp, effective_target, now=now)
 
-    elif indoor_temp <= lower and ac_on and st.ac_is_on:
-        logger.info("[HawaAI][%s] Room cooled (%.1f°C ≤ %.1f°C) — turning AC OFF", room_id, indoor_temp, lower)
-        session_logger.mark_cooled(room_id)
-        await _turn_ac_off(room_id, cfg, indoor_temp, reason="cooled", now=now)
-
-    elif indoor_temp <= effective_target and ac_on:
+    elif (
+        not manual_override_active
+        and indoor_temp <= et_eff
+        and ac_on
+    ):
         session_logger.mark_cooled(room_id)
 
     if smart_curve and climate_entity and ac_on:
