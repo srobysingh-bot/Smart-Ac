@@ -1,5 +1,11 @@
 # HawaAI add-on — release notes
 
+## 1.4.0
+
+- **UI:** Fully responsive Dashboard and app shell — bottom navigation on phones, top navigation on tablets/desktop; grids and cards (`container-app`); charts use fluid heights; larger touch targets; no horizontal overflow.
+- **Control:** Manual setpoint lock when HA differs from schedule/AI intent (timed); command cooldown, duplicate suppression, ±0.5 °C hysteresis band, compressor min ON/OFF, meaningful setpoint deltas; logs skip reasons (`logic_engine`, `smart_cooling`, narrower Aerostate deadband).
+- **Scheduling:** Temperature schedule slots, modes (`manual` / `schedule` / `schedule_ai`), timezone-aware bases, bounded ±1 °C AI; Settings + `TemperaturePlanCard` telemetry.
+
 ## 1.3.3
 
 - **UX:** `RoomContext` — active room persists across Dashboard, Sessions, Analytics, and Settings (`localStorage` + `?room_id=` on all sidebar links).
