@@ -54,6 +54,7 @@ export function RoomDataProvider({ children }) {
     const rid = activeRoomId
     let cancelled = false
     wsConnectedRef.current = false
+    setState((prev) => ({
       status: null,
       snapshots: [],
       ai: null,
