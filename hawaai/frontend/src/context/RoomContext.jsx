@@ -171,33 +171,12 @@ export function RoomProvider({ children }) {
     if (rooms.some((r) => r.id === activeRoomId)) return
 
     const pick = rooms[0]?.id ?? null
-    setActiveRoomId(pick)
     if (pick) {
-      if (typeof localStorage !== 'undefined') {
-        localStorage.setItem(ROOM_STORAGE_KEY, pick)
-      }
-      setSearchParams(
-        (prev) => {
-          const next = new URLSearchParams(prev)
-          next.set('room_id', pick)
-          return next
-        },
-        { replace: true },
-      )
+      setActiveRoom(pick)
     } else {
-      if (typeof localStorage !== 'undefined') {
-        localStorage.removeItem(ROOM_STORAGE_KEY)
-      }
-      setSearchParams(
-        (prev) => {
-          const next = new URLSearchParams(prev)
-          next.delete('room_id')
-          return next
-        },
-        { replace: true },
-      )
+      setActiveRoom(null)
     }
-  }, [rooms, activeRoomId, setSearchParams])
+  }, [rooms, activeRoomId, setActiveRoom])
 
   // After tab change, re-attach ?room_id= if missing (HashRouter strips query on bare links)
   useEffect(() => {

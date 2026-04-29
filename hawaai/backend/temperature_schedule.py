@@ -21,21 +21,38 @@ logger = logging.getLogger(__name__)
 
 def validate_timezone_optional(raw: Any) -> str:
     """
-    Non-empty string must be a valid IANA timezone (e.g. Asia/Kolkata).
-    Invalid values are rejected and return "" so schedule code falls back to UTC.
+    Normalize to a valid IANA zone name. Empty string means “use downstream default (UTC / TZ)”.
+
+    Common mistakes (e.g. ``kolkata``) map to canonical names (``Asia/Kolkata``).
+    Unrecognized values fall back to ``Asia/Kolkata`` so schedules never silently use wrong local time from "".
     """
     s = str(raw or "").strip()
     if not s:
         return ""
+    upper = s.upper()
+    if upper == "UTC":
+        return "UTC"
+    aliases = {
+        "kolkata": "Asia/Kolkata",
+        "calcutta": "Asia/Kolkata",
+        "bombay": "Asia/Kolkata",
+        "mumbai": "Asia/Kolkata",
+        "delhi": "Asia/Kolkata",
+        "bangalore": "Asia/Kolkata",
+        "bengaluru": "Asia/Kolkata",
+    }
+    key = s.lower().replace(" ", "_")
+    if key in aliases:
+        return aliases[key]
     try:
         ZoneInfo(s)
+        return s
     except Exception:
         logger.error(
-            "[HawaAI] Invalid IANA timezone %r — ignoring. Use e.g. Asia/Kolkata, Europe/London, UTC.",
+            "[HawaAI] Invalid IANA timezone %r — using Asia/Kolkata. Use e.g. Asia/Kolkata, Europe/London, UTC.",
             s,
         )
-        return ""
-    return s
+        return "Asia/Kolkata"
 
 TemperatureMode = Literal["manual", "schedule", "schedule_ai"]
 

@@ -13,7 +13,7 @@ const INGRESS_PATH = (typeof window !== 'undefined' && window.__INGRESS_PATH__) 
 const BASE = INGRESS_PATH + '/api'
 
 /** Non-empty trimmed room id, or rejects — all dashboard APIs must be room-scoped. */
-function roomParam(roomId, label = 'roomId') {
+function roomParam(roomId, label = 'room_id') {
   const s = roomId != null ? String(roomId).trim() : ''
   if (!s) return Promise.reject(new Error(`${label} is required`))
   return Promise.resolve(s)
@@ -151,7 +151,7 @@ export const getInsights = (roomId) =>
 
 // ── Export ───────────────────────────────────────────────────────────────────
 export async function downloadExport(format = 'csv', roomId) {
-  const rid = await roomParam(roomId, 'roomId')
+  const rid = await roomParam(roomId)
   const res = await fetch(`${BASE}/export/${format}?room_id=${encodeURIComponent(rid)}`)
   if (!res.ok) throw new Error('Export failed')
   const blob = await res.blob()
@@ -171,42 +171,76 @@ export async function getAiDecisions(roomId, limit = 50) {
   return request(`/ai/decisions?${q}`)
 }
 
-// ── WebSocket live updates (per-room subscribe) ─────────────────────────────
+// ── WebSocket live updates (exactly one logical subscription per caller) ─────
+/**
+ * One socket per call; subscribe with room_id on connect. Reconnects unless close() was used.
+ * Messages for a different room_id are dropped (defense-in-depth — server is also room-scoped).
+ */
 export function connectLive(roomId, onMessage, onError) {
   const rid = roomId != null ? String(roomId).trim() : ''
   if (!rid) {
-    if (onError) onError(new Error('roomId is required'))
-    return { ws: null, close: () => {} }
+    if (onError) onError(new Error('room_id is required'))
+    return { close: () => {}, ws: null }
   }
-  let intentionalClose = false
-  const proto  = location.protocol === 'https:' ? 'wss' : 'ws'
-  const wsPath = INGRESS_PATH + '/ws'
-  const ws     = new WebSocket(`${proto}://${location.host}${wsPath}`)
 
-  ws.onopen = () => {
-    try {
-      ws.send(JSON.stringify({ type: 'subscribe', room_id: rid }))
-    } catch (e) {
-      if (onError) onError(e)
+  let ws = null
+  let closedManually = false
+
+  const proto = location.protocol === 'https:' ? 'wss' : 'ws'
+  const wsPath = INGRESS_PATH + '/ws'
+
+  function connect() {
+    if (closedManually) return
+    ws = new WebSocket(`${proto}://${location.host}${wsPath}`)
+
+    ws.onopen = () => {
+      try {
+        ws.send(JSON.stringify({ type: 'subscribe', room_id: rid }))
+      } catch (e) {
+        if (onError) onError(e)
+      }
+    }
+
+    ws.onmessage = (event) => {
+      let data
+      try {
+        data = JSON.parse(event.data)
+      } catch {
+        return
+      }
+      if (data.room_id != null && data.room_id !== rid) {
+        console.warn('[HawaAI] Ignoring WS payload for wrong room:', data.room_id, 'expected', rid)
+        return
+      }
+      try {
+        onMessage(data)
+      } catch (e) {
+        if (onError) onError(e)
+      }
+    }
+
+    ws.onerror = onError || (() => {})
+
+    ws.onclose = () => {
+      if (!closedManually) {
+        setTimeout(connect, 2000 + Math.random() * 1000)
+      }
     }
   }
-  ws.onmessage = (evt) => {
-    try { onMessage(JSON.parse(evt.data)) } catch {}
-  }
-  ws.onerror = onError || (() => {})
-  ws.onclose = () => {
-    if (intentionalClose) return
-    setTimeout(() => connectLive(roomId, onMessage, onError), 5000)
-  }
+
+  connect()
+
   return {
-    ws,
     close: () => {
-      intentionalClose = true
+      closedManually = true
       try {
-        ws.close()
+        ws?.close()
       } catch {
         /* ignore */
       }
+    },
+    get ws() {
+      return ws
     },
   }
 }

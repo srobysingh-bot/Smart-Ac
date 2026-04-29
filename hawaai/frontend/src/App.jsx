@@ -7,6 +7,7 @@ import {
   Wind,
 } from 'lucide-react'
 import { RoomProvider, useRoom } from './context/RoomContext.jsx'
+import { RoomDataProvider } from './context/RoomDataContext.jsx'
 import Dashboard      from './pages/Dashboard.jsx'
 import SessionHistory from './pages/SessionHistory.jsx'
 import Analytics      from './pages/Analytics.jsx'
@@ -62,7 +63,8 @@ export default function App() {
   return (
     <HashRouter>
       <RoomProvider>
-        <div className="flex flex-col min-h-[100dvh] h-[100dvh] max-h-[100dvh] overflow-hidden bg-gray-950 text-gray-100">
+        <RoomDataProvider>
+          <div className="flex flex-col min-h-[100dvh] h-[100dvh] max-h-[100dvh] overflow-hidden bg-gray-950 text-gray-100">
           {/* Desktop / tablet — top navigation */}
           <header className="hidden md:flex shrink-0 items-center gap-6 border-b border-gray-800 bg-gray-900/95 backdrop-blur-sm px-4 lg:px-6 py-3">
             <div className="flex items-center gap-2 shrink-0">
@@ -75,7 +77,7 @@ export default function App() {
               ))}
             </nav>
             <div className="hidden lg:block text-xs text-gray-600 shrink-0 whitespace-nowrap">
-              v1.4.3 · All data local
+              v1.4.4 · All data local
             </div>
           </header>
 
@@ -99,6 +101,7 @@ export default function App() {
             ))}
           </nav>
         </div>
+        </RoomDataProvider>
       </RoomProvider>
     </HashRouter>
   )

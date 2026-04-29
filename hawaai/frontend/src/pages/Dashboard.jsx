@@ -1,7 +1,8 @@
-import { useEffect, useRef, useState, useCallback } from 'react'
+import { useEffect, useState, useCallback } from 'react'
 import { useNavigate } from 'react-router-dom'
-import { getStatus, getSessionStats, getSnapshots, getClimateState, setClimateTemperature, setHvacMode, setFanMode, setSwingMode, getAiStatus, createRoom, connectLive } from '../api/smartcool.js'
+import { getClimateState, setClimateTemperature, setHvacMode, setFanMode, setSwingMode, createRoom } from '../api/smartcool.js'
 import { useRoom } from '../context/RoomContext.jsx'
+import { useRoomData } from '../context/RoomDataContext.jsx'
 import ACStatusCard    from '../components/ACStatusCard.jsx'
 import TempGauge       from '../components/TempGauge.jsx'
 import EnergyChart from '../components/EnergyChart.jsx'
@@ -25,22 +26,27 @@ function formatAiTime(iso) {
   }
 }
 
-function AiStatusCard({ roomId }) {
-  const [ai, setAi] = useState(null)
-  const load = useCallback(() => {
-    if (!roomId) {
-      setAi(null)
-      return
-    }
-    getAiStatus(roomId).then(setAi).catch(() => setAi(null))
-  }, [roomId])
+/** Dim previous room content while fetching the next room — avoids blank flash. */
+function SoftLoadingOverlay({ show, children }) {
+  if (!show) return children
+  return (
+    <div className="relative min-w-0 flex flex-col flex-1 min-h-0">
+      <div
+        className="pointer-events-none absolute inset-0 z-10 flex justify-center bg-gray-950/40 pt-6 sm:pt-8"
+        aria-busy="true"
+        aria-label="Loading room data"
+      >
+        <span className="inline-flex h-fit items-center gap-2 rounded-lg border border-gray-600 bg-gray-900/95 px-4 py-2 text-sm text-gray-100 shadow-lg">
+          <Loader size={18} className="animate-spin text-blue-400 shrink-0" aria-hidden />
+          Loading room…
+        </span>
+      </div>
+      <div className="min-h-0 min-w-0 flex flex-col opacity-[0.72]">{children}</div>
+    </div>
+  )
+}
 
-  useEffect(() => {
-    load()
-    const id = setInterval(load, 5_000)
-    return () => clearInterval(id)
-  }, [load])
-
+function AiStatusCard({ ai }) {
   const st = ai?.status ?? 'idle'
   const border =
     st === 'success'
@@ -674,63 +680,25 @@ function DashboardNeedsRoomGate({ rooms, onSelectRoom, onOpenSettings }) {
 export default function Dashboard() {
   const navigate = useNavigate()
   const { activeRoomId, setActiveRoom, rooms, refreshRooms, roomsLoading, roomsEmpty } = useRoom()
-  const [status,    setStatus]    = useState(null)
-  const [snapshots, setSnapshots] = useState([])
-  const [stats,     setStats]     = useState(null)
-  const pollRef = useRef(null)
-
-  const fetchStatus = useCallback(() => {
-    if (!activeRoomId) return
-    getStatus(activeRoomId)
-      .then(setStatus)
-      .catch(err => console.warn('[HawaAI] Status poll error:', err))
-  }, [activeRoomId])
-
-  useEffect(() => {
-    if (!activeRoomId) {
-      setStatus(null)
-      setStats(null)
-      setSnapshots([])
-      return
-    }
-    fetchStatus()
-    getSessionStats(activeRoomId).then(setStats).catch(console.error)
-    getSnapshots(120, activeRoomId).then(setSnapshots).catch(console.error)
-
-    pollRef.current = setInterval(fetchStatus, 5_000)
-    return () => clearInterval(pollRef.current)
-  }, [fetchStatus, activeRoomId])
-
-  useEffect(() => {
-    if (!activeRoomId) return
-    const { close } = connectLive(
-      activeRoomId,
-      (msg) => {
-        if (msg?.room_id && msg.room_id !== activeRoomId) return
-        if (msg?.type === 'tick') {
-          const { type: _t, ...rest } = msg
-          setStatus(prev => {
-            if (!prev || prev.room_id !== activeRoomId) return prev
-            return { ...prev, ...rest }
-          })
-        }
-      },
-      () => {},
-    )
-    return () => close()
-  }, [activeRoomId])
-
-  useEffect(() => {
-    if (!activeRoomId) return
-    const id = setInterval(() => {
-      getSnapshots(120, activeRoomId).then(setSnapshots).catch(console.error)
-    }, 30_000)
-    return () => clearInterval(id)
-  }, [activeRoomId])
+  const {
+    status,
+    snapshots,
+    stats,
+    ai,
+    loading: roomLoading,
+    loadError,
+    displayStatus,
+    displaySnapshots,
+    displayStats,
+    showSoftLoading,
+  } = useRoomData()
 
   const activeRoom = rooms.find(r => r.id === activeRoomId)
-  const configIncomplete = Boolean(activeRoomId && status && status.config_complete === false)
+  const configIncomplete = Boolean(
+    activeRoomId && status && status.config_complete === false && !showSoftLoading,
+  )
   const hasRoom = Boolean(activeRoomId)
+  const showDashboardBody = !loadError && (!roomLoading || showSoftLoading)
 
   return (
     <div className="flex flex-col h-full min-w-0">
@@ -765,7 +733,24 @@ export default function Dashboard() {
         />
       ) : (
         <>
-          <LiveStatusBar status={status} />
+          {roomLoading && !showSoftLoading && !loadError && (
+            <div className="container-app px-4 py-10 flex flex-col items-center justify-center gap-3 text-sm text-gray-500">
+              <Loader size={24} className="animate-spin text-blue-400" aria-hidden />
+              <span>Loading room data…</span>
+            </div>
+          )}
+
+          {!roomLoading && loadError && (
+            <div className="container-app px-4 py-10 text-center max-w-md mx-auto">
+              <p className="text-sm text-red-300 mb-2">Could not load this room.</p>
+              <p className="text-xs text-gray-500">Check the connection and try switching rooms or reopening the dashboard.</p>
+            </div>
+          )}
+
+          {showDashboardBody && (
+            <SoftLoadingOverlay show={showSoftLoading}>
+            <>
+          <LiveStatusBar status={displayStatus} />
 
           {configIncomplete && <ConfigWarning roomId={activeRoomId} />}
 
@@ -779,50 +764,50 @@ export default function Dashboard() {
             {/* Cards — 1 col · 2 cols tablet · 3 lg · 4 xl */}
             <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-4 min-w-0">
           <TempGauge
-            indoor={status?.indoor_temp ?? status?.ac_current_temp}
-            outdoor={status?.outdoor_temp}
-            target={status?.effective_target ?? status?.target_temp}
-            indoorFromAC={status?.indoor_temp == null && status?.ac_current_temp != null}
+            indoor={displayStatus?.indoor_temp ?? displayStatus?.ac_current_temp}
+            outdoor={displayStatus?.outdoor_temp}
+            target={displayStatus?.effective_target ?? displayStatus?.target_temp}
+            indoorFromAC={displayStatus?.indoor_temp == null && displayStatus?.ac_current_temp != null}
           />
           <ACStatusCard
-            acOn={status?.ac_on}
-            acIdle={status?.ac_idle ?? false}
-            sessionStart={status?.session_start || status?.runtime?.session_start}
-            runtime={status?.runtime}
-            wattDraw={status?.watt_draw}
-            sessionKwh={status?.session_kwh}
-            hasClimateEntity={!!(status?.climate_entity || status?.ac_entity)}
-            acCurrentTemp={status?.ac_current_temp}
-            acTargetTemp={status?.ac_target_temp}
-            acMode={status?.ac_mode}
-            acFanMode={status?.ac_fan_mode}
-            acSwingMode={status?.ac_swing_mode}
-            smartCoolingEnabled={status?.smart_cooling_enabled ?? false}
-            smartMode={status?.smart_mode}
-            smartFanMode={status?.smart_fan_mode}
-            smartDelta={status?.smart_delta}
+            acOn={displayStatus?.ac_on}
+            acIdle={displayStatus?.ac_idle ?? false}
+            sessionStart={displayStatus?.session_start || displayStatus?.runtime?.session_start}
+            runtime={displayStatus?.runtime}
+            wattDraw={displayStatus?.watt_draw}
+            sessionKwh={displayStatus?.session_kwh}
+            hasClimateEntity={!!(displayStatus?.climate_entity || displayStatus?.ac_entity)}
+            acCurrentTemp={displayStatus?.ac_current_temp}
+            acTargetTemp={displayStatus?.ac_target_temp}
+            acMode={displayStatus?.ac_mode}
+            acFanMode={displayStatus?.ac_fan_mode}
+            acSwingMode={displayStatus?.ac_swing_mode}
+            smartCoolingEnabled={displayStatus?.smart_cooling_enabled ?? false}
+            smartMode={displayStatus?.smart_mode}
+            smartFanMode={displayStatus?.smart_fan_mode}
+            smartDelta={displayStatus?.smart_delta}
           />
           <SmartAdjustmentCard
-            smartAdjustment={status?.smart_adjustment ?? status?.smart_temp_adjustment}
-            targetTemp={status?.target_temp}
-            effectiveTarget={status?.effective_target}
-            reason={status?.smart_adjustment_reason}
+            smartAdjustment={displayStatus?.smart_adjustment ?? displayStatus?.smart_temp_adjustment}
+            targetTemp={displayStatus?.target_temp}
+            effectiveTarget={displayStatus?.effective_target}
+            reason={displayStatus?.smart_adjustment_reason}
           />
           <div className="card flex flex-col gap-3">
             <p className="text-xs text-gray-500 uppercase tracking-wide">Energy Now</p>
             <div className="flex-1 flex flex-col justify-center items-center gap-1">
-              {status?.energy_watts != null ? (
+              {displayStatus?.energy_watts != null ? (
                 <>
                   <span className="text-4xl font-bold text-yellow-400">
-                    {status.energy_watts.toFixed(0)} W
+                    {displayStatus.energy_watts.toFixed(0)} W
                   </span>
                   <span className="text-xs text-gray-500">Room total consumption</span>
-                  {status.energy_kwh_total != null && (
+                  {displayStatus.energy_kwh_total != null && (
                     <span className="text-xs text-gray-400 mt-1">
-                      Meter: {status.energy_kwh_total.toFixed(2)} kWh
+                      Meter: {displayStatus.energy_kwh_total.toFixed(2)} kWh
                     </span>
                   )}
-                  {status.session_start
+                  {displayStatus.session_start
                     ? <span className="text-xs text-blue-400 mt-1">Session: tracking kWh…</span>
                     : <span className="text-xs text-gray-600">No active session</span>
                   }
@@ -839,16 +824,16 @@ export default function Dashboard() {
           </div>
         </div>
 
-        <AiStatusCard roomId={activeRoomId} />
-        <RoomHealthCard health={status?.health} />
+        <AiStatusCard ai={ai} />
+        <RoomHealthCard health={displayStatus?.health} />
 
         {/* Climate card — only shown when a climate entity is configured */}
-        {(status?.climate_entity || status?.ac_entity) && (
-          <ClimateCard entityId={status.climate_entity || status.ac_entity} />
+        {(displayStatus?.climate_entity || displayStatus?.ac_entity) && (
+          <ClimateCard entityId={displayStatus.climate_entity || displayStatus.ac_entity} />
         )}
 
         {/* Live session card — visible only when a session is active */}
-        <LiveSessionCard status={status} />
+        <LiveSessionCard status={displayStatus} />
 
         <AiDecisionsCard roomId={activeRoomId} />
 
@@ -860,23 +845,26 @@ export default function Dashboard() {
           <p className="text-xs text-gray-500 uppercase tracking-wide mb-4">
             Real-time · Last 2 hours
           </p>
-          {snapshots.length === 0 ? (
+          {displaySnapshots.length === 0 ? (
             <p className="text-sm text-gray-600 py-8 text-center">
               Waiting for telemetry — snapshots appear once the engine runs for this room
             </p>
           ) : (
-            <EnergyChart snapshots={snapshots} targetTemp={status?.target_temp} />
+            <EnergyChart snapshots={displaySnapshots} targetTemp={displayStatus?.target_temp} />
           )}
         </div>
 
         {/* Session table + today/ML stats */}
-        <StatsStrip stats={stats} roomName={activeRoom?.name} />
+        <StatsStrip stats={displayStats} roomName={activeRoom?.name} />
 
         <div className="card">
           <p className="text-xs text-gray-500 uppercase tracking-wide mb-4">Recent Sessions</p>
           <SessionTable limit={10} roomId={activeRoomId} />
         </div>
       </div>
+            </>
+            </SoftLoadingOverlay>
+          )}
         </>
       )}
     </div>

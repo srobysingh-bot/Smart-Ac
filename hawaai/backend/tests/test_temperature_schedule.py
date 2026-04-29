@@ -18,7 +18,22 @@ from temperature_schedule import (
     get_time_slot,
     normalize_temperature_mode,
     resolve_base_target_temp,
+    validate_timezone_optional,
 )
+
+
+class TestTimezoneValidation(unittest.TestCase):
+    def test_kolkata_alias(self):
+        self.assertEqual(validate_timezone_optional("kolkata"), "Asia/Kolkata")
+
+    def test_empty(self):
+        self.assertEqual(validate_timezone_optional(""), "")
+
+    def test_valid_iana_passthrough(self):
+        self.assertEqual(validate_timezone_optional("UTC"), "UTC")
+
+    def test_bad_string_falls_back_asia_kolkata(self):
+        self.assertEqual(validate_timezone_optional("not_a_real_zone_xyz"), "Asia/Kolkata")
 
 
 class TestTimeSlots(unittest.TestCase):
