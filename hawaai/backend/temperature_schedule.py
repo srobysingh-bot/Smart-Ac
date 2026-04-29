@@ -18,6 +18,25 @@ from zoneinfo import ZoneInfo
 
 logger = logging.getLogger(__name__)
 
+
+def validate_timezone_optional(raw: Any) -> str:
+    """
+    Non-empty string must be a valid IANA timezone (e.g. Asia/Kolkata).
+    Invalid values are rejected and return "" so schedule code falls back to UTC.
+    """
+    s = str(raw or "").strip()
+    if not s:
+        return ""
+    try:
+        ZoneInfo(s)
+    except Exception:
+        logger.error(
+            "[HawaAI] Invalid IANA timezone %r — ignoring. Use e.g. Asia/Kolkata, Europe/London, UTC.",
+            s,
+        )
+        return ""
+    return s
+
 TemperatureMode = Literal["manual", "schedule", "schedule_ai"]
 
 SCHEDULE_SLOTS = ("morning", "afternoon", "evening", "night")  # informational

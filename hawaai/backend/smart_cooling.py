@@ -409,40 +409,27 @@ async def apply_effective_target(
         )
         return "within_deadband"
 
-    interval = (
-        float(min_interval_seconds)
-        if min_interval_seconds is not None
-        else float(_APPLY_TARGET_COOLDOWN)
-    )
     now = datetime.now(timezone.utc)
-    if st["last_apply_target_time"] is not None:
-        secs = (now - st["last_apply_target_time"]).total_seconds()
-        if secs < interval:
-            logger.info(
-                "[HawaAI] apply_effective_target skip: cooldown (%.0fs < %.0fs)",
-                secs,
-                interval,
-            )
-            return f"cooldown_{int(secs)}s"
+    gate_cfg = {
+        "setpoint_min_delta_deg": float(meaningful_delta_deg if meaningful_delta_deg is not None else 0.7),
+        "setpoint_command_min_interval_seconds": float(
+            min_interval_seconds if min_interval_seconds is not None else _APPLY_TARGET_COOLDOWN
+        ),
+    }
+    from . import logic_engine as le
 
-    last_ap = st.get("last_applied_target")
-    if last_ap is not None:
-        try:
-            if abs(float(last_ap) - effective_f) < 1e-3:
-                logger.info(
-                    "[HawaAI] apply_effective_target skip: duplicate command (%.1f°C)",
-                    effective_f,
-                )
-                return "duplicate_command"
-        except (TypeError, ValueError):
-            pass
+    ok_gate, skip_msg = le.should_send_setpoint_command(le._rt(room_id), effective_f, now, gate_cfg)
+    if not ok_gate:
+        logger.info("[HawaAI] apply_effective_target skip: %s", skip_msg)
+        return "engine_gate_blocked"
 
     # ── Send command via HA climate service ───────────────────────────────────
     try:
         ok = await ha_client.set_climate_temperature(climate_entity, effective_f)
         if ok:
             st["last_apply_target_time"] = now
-            st["last_applied_target"]    = effective_f
+            st["last_applied_target"] = effective_f
+            le.record_setpoint_command(room_id, effective_f, now)
             logger.info(
                 "[HawaAI] Applied smart temp → %.1f°C  "
                 "(was %.1f°C on %s)",

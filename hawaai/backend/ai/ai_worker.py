@@ -48,11 +48,6 @@ _API_FAST_FAIL_SEC = 10.0
 _API_CIRCUIT_FAILURE_THRESHOLD = 3
 _API_CIRCUIT_OPEN_SEC = 120.0
 # Safe HVAC hint when API returns 200 but body is unusable (validated before cache).
-_API_CONSERVATIVE_DEFAULT: Dict[str, Any] = {
-    "target_temp": 24,
-    "fan_mode": "auto",
-    "confidence": 0.5,
-}
 _OLLAMA_GEN_OPTIONS: Dict[str, Any] = {
     "num_predict":  20,
     "temperature": 0.0,
@@ -531,44 +526,28 @@ async def _persist_ai_decision(
         )
         try:
             at = float(validated["target_temp"])
+            ai_cache.set_pending_ml_label(room_id, row_id, ts_utc, at)
         except (KeyError, TypeError, ValueError):
-            at = 24.0
-        ai_cache.set_pending_ml_label(room_id, row_id, ts_utc, at)
+            pass
     except Exception:
         logger.exception("[AI] ai_decisions insert failed")
 
 
-def _try_apply_api_conservative_defaults(
-    room_id: str,
-    is_occupied: bool,
-    indoor_temp: float,
-) -> Optional[Dict[str, Any]]:
-    """
-    When the API returns HTTP 200 but the model output is unusable, apply a
-    validated conservative hint so behavior stays deterministic. If validation
-    fails (e.g. occupancy edge), return None and let logic_engine run alone.
-    """
-    validated = ai_validator.validate_ai_payload(
-        dict(_API_CONSERVATIVE_DEFAULT),
-        is_occupied,
-    )
-    if not validated:
+def _reuse_last_valid_ai(room_id: str, reason: str, indoor_temp: float) -> Optional[Dict[str, Any]]:
+    """Invalid API/JSON: keep last validated output — never inject a default 24°C."""
+    prev = ai_cache.get_cached(room_id)
+    if prev is None:
         logger.warning(
-            "[AI] Conservative API default rejected by validator — logic_engine only",
+            "[AI][%s] %s — no previous valid AI cache; schedule/engine baseline only",
+            room_id,
+            reason,
         )
+        ai_cache.mark_fetch_done(room_id)
         return None
-    ai_cache.set_validated(room_id, validated, indoor_temp)
+    logger.warning("[AI][%s] %s — reusing last validated AI output", room_id, reason)
+    ai_cache.set_validated(room_id, prev, indoor_temp)
     ai_cache.mark_fetch_done(room_id)
-    try:
-        pj = json.dumps(validated, ensure_ascii=False, separators=(",", ":"))
-    except (TypeError, ValueError):
-        pj = str(validated)
-    logger.info("[AI] Parsed JSON: %s", pj)
-    logger.info(
-        "[AI] API output invalid — applied conservative default "
-        "(target_temp=24, fan_mode=auto, confidence=0.5)",
-    )
-    return validated
+    return prev
 
 
 async def run_ai_and_cache(
@@ -634,28 +613,46 @@ async def run_ai_and_cache(
         elapsed_ms = (time.perf_counter() - t_req) * 1000.0
         parsed = _parse_ollama_response_body(resp)
         if parsed is None:
-            _ai_status_set(
-                room_id,
-                status="error",
-                last_error="unparseable ollama output",
-                response_time=round(elapsed_ms, 2),
-            )
-            logger.info("[AI] Skipped")
-            logger.debug("[AI] Skipped reason: unparseable output")
-            ai_cache.mark_fetch_done(room_id)
+            reused = _reuse_last_valid_ai(room_id, "Ollama returned unparseable output", indoor_temp)
+            if reused:
+                _ai_status_set(
+                    room_id,
+                    status="success",
+                    response_time=round(elapsed_ms, 2),
+                    last_error=None,
+                )
+                await _persist_ai_decision(room_id, "ollama", model, reused, {"reused_prior": True})
+            else:
+                _ai_status_set(
+                    room_id,
+                    status="error",
+                    last_error="unparseable ollama output",
+                    response_time=round(elapsed_ms, 2),
+                )
+                logger.info("[AI] Skipped")
+                logger.debug("[AI] Skipped reason: unparseable output — no AI cache")
             return
 
         validated = ai_validator.validate_ai_payload(parsed, is_occupied)
         if not validated:
-            _ai_status_set(
-                room_id,
-                status="error",
-                last_error="ollama output validation failed",
-                response_time=round(elapsed_ms, 2),
-            )
-            logger.info("[AI] Skipped")
-            logger.debug("[AI] Skipped reason: validation failed")
-            ai_cache.mark_fetch_done(room_id)
+            reused = _reuse_last_valid_ai(room_id, "Ollama output validation failed", indoor_temp)
+            if reused:
+                _ai_status_set(
+                    room_id,
+                    status="success",
+                    response_time=round(elapsed_ms, 2),
+                    last_error=None,
+                )
+                await _persist_ai_decision(room_id, "ollama", model, reused, {"reused_prior": True})
+            else:
+                _ai_status_set(
+                    room_id,
+                    status="error",
+                    last_error="ollama output validation failed",
+                    response_time=round(elapsed_ms, 2),
+                )
+                logger.info("[AI] Skipped")
+                logger.debug("[AI] Skipped reason: validation failed — no AI cache")
             return
 
         ai_cache.set_validated(room_id, validated, indoor_temp)
@@ -785,10 +782,10 @@ async def run_ai_and_cache(
 
     parsed = _parse_api_chat_response(resp)
     if parsed is None:
-        cons = _try_apply_api_conservative_defaults(room_id, is_occupied, indoor_temp)
-        if cons:
+        reused = _reuse_last_valid_ai(room_id, "API chat message not valid JSON", indoor_temp)
+        if reused:
             await _persist_ai_decision(
-                room_id, "api", model_a, cons, dict(_API_CONSERVATIVE_DEFAULT),
+                room_id, "api", model_a, reused, {"reused_prior": True},
             )
             _api_circuit_register_success(room_id)
             _ai_status_set(
@@ -810,10 +807,10 @@ async def run_ai_and_cache(
 
     validated = ai_validator.validate_ai_payload(parsed, is_occupied)
     if not validated:
-        cons = _try_apply_api_conservative_defaults(room_id, is_occupied, indoor_temp)
-        if cons:
+        reused = _reuse_last_valid_ai(room_id, "API payload failed HVAC validation", indoor_temp)
+        if reused:
             await _persist_ai_decision(
-                room_id, "api", model_a, cons, dict(_API_CONSERVATIVE_DEFAULT),
+                room_id, "api", model_a, reused, {"reused_prior": True},
             )
             _api_circuit_register_success(room_id)
             _ai_status_set(

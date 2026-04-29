@@ -60,7 +60,7 @@ export function RoomProvider({ children }) {
     let pick = null
     if (isValid(urlId)) pick = urlId
     else if (isValid(lsRaw)) pick = lsRaw
-    else if (rooms.length === 1) pick = rooms[0].id
+    else if (rooms.length >= 1) pick = rooms[0].id
 
     setActiveRoomId(pick)
     if (pick) {

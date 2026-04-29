@@ -56,6 +56,12 @@ async def start() -> None:
                     room.get("name"),
                 )
                 continue
+            if rid.lower() == "default":
+                logger.error(
+                    "[ROOM] scheduler refusing tick — reserved invalid room id %r (fix rooms in config)",
+                    rid,
+                )
+                continue
             try:
                 await logic_engine.tick(rid)
             except Exception as e:

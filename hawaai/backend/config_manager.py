@@ -6,6 +6,7 @@ import os
 from typing import Any, Dict
 
 from . import room_registry
+from .temperature_schedule import validate_timezone_optional
 
 logger = logging.getLogger(__name__)
 
@@ -35,10 +36,12 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     # Control band: ON above target+half, OFF below target−half (°C each side)
     "control_hysteresis_half_deg": 0.5,
     "min_command_interval_seconds": 150,
-    "manual_override_duration_minutes": 30,
+    "manual_override_duration_minutes": 10,
     "manual_override_detect_delta_deg": 0.5,
     "manual_override_exit_within_deg": 0.5,
     "meaningful_setpoint_delta_deg": 0.5,
+    "setpoint_min_delta_deg": 0.7,
+    "setpoint_command_min_interval_seconds": 180,
     "compressor_min_on_seconds": 300,
     "compressor_min_off_seconds": 180,
     "vacancy_timeout_minutes": 5,
@@ -110,6 +113,7 @@ def _load_config_merged() -> Dict[str, Any]:
     # Merge: defaults < supervisor options < persisted UI config
     # Upgrade-safe: new keys (e.g. ai_enabled, ai_ollama_url) appear without wiping user data.
     merged: Dict[str, Any] = {**DEFAULT_CONFIG, **options, **saved}
+    merged["timezone"] = validate_timezone_optional(merged.get("timezone"))
 
     # Drop legacy Broadlink / IR keys — old JSON may still contain them; never used.
     for _k in _LEGACY_IR_KEYS:
@@ -165,6 +169,7 @@ def save_config(data: Dict[str, Any]) -> bool:
         data = {k: v for k, v in data.items() if k not in _LEGACY_IR_KEYS}
         current = load_config()
         current.update(data)
+        current["timezone"] = validate_timezone_optional(current.get("timezone"))
         _ace = (current.get("ac_entity") or current.get("climate_entity") or "").strip()
         current["ac_entity"] = _ace
         current["climate_entity"] = _ace

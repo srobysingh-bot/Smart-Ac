@@ -67,6 +67,9 @@ class RoomRuntime:
     watts_samples: List[float] = field(default_factory=list)
     last_command_time: Optional[datetime] = None
     last_command: str = ""
+    # Anti-spam: last temperature we commanded to the AC (setpoint) + wall time
+    last_applied_setpoint: Optional[float] = None
+    last_setpoint_command_at: Optional[datetime] = None
     last_schedule_slot: Optional[str] = None
     # HA setpoint sampled previous tick — detect intentional user knob changes vs drift
     prev_ha_setpoint_seen: Optional[float] = None
@@ -98,6 +101,58 @@ def _seconds_since_last_command(st: RoomRuntime, now: datetime) -> float:
     if st.last_command_time is None:
         return float("inf")
     return (now - st.last_command_time).total_seconds()
+
+
+def should_send_setpoint_command(
+    st: RoomRuntime,
+    new_temp: float,
+    now: datetime,
+    cfg: dict,
+) -> Tuple[bool, str]:
+    """
+    Avoid repeated IR / climate service spam: require both a meaningful delta from the
+    last applied setpoint and a minimum interval since last setpoint command.
+    """
+    dmin = float(cfg.get("setpoint_min_delta_deg", 0.7))
+    tmin = float(cfg.get("setpoint_command_min_interval_seconds", 180))
+    try:
+        nt = round(float(new_temp), 1)
+    except (TypeError, ValueError):
+        return False, "invalid_temp"
+
+    if st.last_applied_setpoint is None:
+        return True, "initial_setpoint"
+
+    if st.last_setpoint_command_at is not None:
+        secs = (now - st.last_setpoint_command_at).total_seconds()
+        if secs < tmin:
+            return False, (
+                f"blocked_setpoint_interval {secs:.0f}s<{tmin}s "
+                "(use last_applied_temp / last_command_ts gate)"
+            )
+    try:
+        last = float(st.last_applied_setpoint)
+    except (TypeError, ValueError):
+        return True, "recover_invalid_last_applied"
+
+    if abs(nt - round(last, 1)) < dmin:
+        return False, f"blocked_setpoint_delta |Δ|<{dmin}°C (last={last:.1f} new={nt:.1f})"
+    return True, "allowed"
+
+
+def record_setpoint_command(room_id: str, temp: float, ts: datetime) -> None:
+    st = _rt(room_id)
+    try:
+        st.last_applied_setpoint = round(float(temp), 1)
+    except (TypeError, ValueError):
+        st.last_applied_setpoint = None
+    st.last_setpoint_command_at = ts
+
+
+def clear_setpoint_command_tracking(room_id: str) -> None:
+    st = _rt(room_id)
+    st.last_applied_setpoint = None
+    st.last_setpoint_command_at = None
 
 
 def _manual_override_resolve(
@@ -694,6 +749,17 @@ async def tick(room_id: str) -> None:
     )
     if manual_override_active:
         ai_adjust_applied = False
+        try:
+            et_u = float(effective_target)
+            effective_after_weather = et_u
+            logger.info(
+                "[HawaAI][%s] User override window — HA setpoint %.1f°C drives control; "
+                "smart outdoor adjustment and AI clamp bypassed",
+                room_id,
+                et_u,
+            )
+        except (TypeError, ValueError):
+            pass
 
     use_ai_layer = (
         bool(cfg.get("ai_enabled", False))
@@ -863,8 +929,8 @@ async def tick(room_id: str) -> None:
         session_logger.mark_cooled(room_id)
 
     if smart_curve and climate_entity and ac_on:
-        interval = int(cfg.get("min_command_interval_seconds", 150))
-        meaningful = float(cfg.get("meaningful_setpoint_delta_deg", 0.5))
+        interval = int(cfg.get("setpoint_command_min_interval_seconds", 180))
+        meaningful = float(cfg.get("setpoint_min_delta_deg", 0.7))
         await smart_cooling.apply_effective_target(
             room_id,
             climate_entity   = climate_entity,
@@ -939,6 +1005,11 @@ async def _turn_ac_on(
     if not _gate_turn_ac_on(room_id, cfg, target, tnow):
         return
 
+    ok_sp, skip_sp = should_send_setpoint_command(st, target, tnow, cfg)
+    if not ok_sp:
+        logger.info("[HawaAI][%s] Skip AC ON command — %s", room_id, skip_sp)
+        return
+
     success = await ac_adapter.turn_on(
         entity_id   = climate_entity,
         temperature = target,
@@ -972,6 +1043,7 @@ async def _turn_ac_on(
     st.compressor_on_since = cmd_ts
     st.compressor_off_since = None
     st.watts_samples = []
+    record_setpoint_command(room_id, target, cmd_ts)
 
     weather = await weather_api.get_cached()
     await session_logger.start_session(room_id, {
@@ -1068,6 +1140,7 @@ async def _close_session(room_id: str, cfg: dict, indoor_temp: float, reason: st
     st.session_start_temp = None
     st.session_start_kwh = None
     st.watts_samples = []
+    clear_setpoint_command_tracking(room_id)
     smart_cooling.reset(room_id)
 
 
@@ -1080,6 +1153,8 @@ async def _turn_ac_off(room_id: str, cfg: dict, indoor_temp: float, reason: str,
         return
 
     await ac_adapter.turn_off(climate_entity)
+
+    clear_setpoint_command_tracking(room_id)
 
     st.ac_is_on = False
     cmd_ts = datetime.now(timezone.utc)
@@ -1117,6 +1192,9 @@ def get_runtime_state(room_id: str) -> dict:
         and secs_since_cmd < _COOLDOWN_SECS
     )
     _ce = get_cached(room_id) if merged.get("ai_enabled") else None
+    sp_secs = None
+    if st.last_setpoint_command_at is not None:
+        sp_secs = round((now - st.last_setpoint_command_at).total_seconds(), 1)
     return {
         "ac_is_on":              st.ac_is_on,
         "ai_enabled":            bool(merged.get("ai_enabled", False)),
@@ -1129,6 +1207,8 @@ def get_runtime_state(room_id: str) -> dict:
         "cooldown_active":       in_cooldown,
         "last_command":          st.last_command or None,
         "secs_since_cmd":        round(secs_since_cmd, 1) if secs_since_cmd is not None else None,
+        "last_applied_temp":     st.last_applied_setpoint,
+        "secs_since_setpoint_command": sp_secs,
         "watts_on_threshold":    _WATTS_COMPRESSOR,
         "watts_idle_threshold":  _WATTS_FAN_ONLY,
         "smart_mode":            sc["smart_mode"],

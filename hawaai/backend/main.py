@@ -115,7 +115,7 @@ async def lifespan(app: FastAPI):
     logger.info("[HawaAI] Add-on stopped")
 
 
-app = FastAPI(title="HawaAI API", version="1.4.1", lifespan=lifespan)
+app = FastAPI(title="HawaAI API", version="1.4.2", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -565,6 +565,8 @@ async def api_create_room(body: Dict[str, Any] = Body(...)):
     base = config_manager.load_config()
     rooms = [dict(r) for r in room_registry.list_room_dicts(base)]
     rid = (str(body.get("id") or "")).strip() or str(uuid.uuid4())[:12]
+    if rid.lower() == "default":
+        raise HTTPException(status_code=400, detail="room id 'default' is reserved — choose another id")
     if any(r.get("id") == rid for r in rooms):
         raise HTTPException(status_code=400, detail="room id already exists")
     name = (str(body.get("name") or "Room")).strip() or "Room"

@@ -15,8 +15,6 @@ from . import temperature_schedule
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_ROOM_ID = "default"
-
 # Keys copied from room dict onto merged config when non-empty (string fields).
 _ROOM_ENTITY_KEYS = (
     "presence_entity",
@@ -55,24 +53,35 @@ def ensure_migrated(cfg: Dict[str, Any]) -> None:
         cfg["rooms"] = []
         return
     name = (cfg.get("room_name") or "Living Room").strip() or "Living Room"
+    new_id = str(uuid.uuid4()).hex[:12]
     rooms.append(
         {
-            "id": DEFAULT_ROOM_ID,
+            "id": new_id,
             "name": name,
             "climate_entity": ce,
         }
     )
     cfg["rooms"] = rooms
-    logger.info("[HawaAI] Migrated single-room config → rooms[0] id=%s", DEFAULT_ROOM_ID)
+    logger.info("[HawaAI] Migrated single-room config → rooms[0] id=%s", new_id)
 
 
 def _normalize_room_list(rooms: List[Dict[str, Any]]) -> None:
     for r in rooms:
         if not isinstance(r, dict):
             continue
-        if not (r.get("id") or "").strip():
-            r["id"] = str(uuid.uuid4())[:12]
-        r["id"] = str(r["id"]).strip()
+        raw_id = str(r.get("id") or "").strip()
+        lower = raw_id.lower()
+        if lower == "default":
+            rid = str(uuid.uuid4()).hex[:12]
+            logger.error(
+                "[ROOM] Reserved room id 'default' renamed to %s — update bookmarks/dashboard ?room_id=",
+                rid,
+            )
+        elif not raw_id:
+            rid = str(uuid.uuid4()).hex[:12]
+        else:
+            rid = raw_id
+        r["id"] = rid
         r["name"] = (str(r.get("name") or "Room")).strip() or "Room"
         r["climate_entity"] = (str(r.get("climate_entity") or "")).strip()
 
