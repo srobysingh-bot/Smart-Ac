@@ -802,13 +802,17 @@ export default function Settings() {
         <Slider
           label="Target Temperature"
           value={cfg.target_temp ?? 24}
-          onChange={v => patch('target_temp', v)}
+          onChange={v => setCfg(prev => ({ ...prev, temperature_mode: 'manual', target_temp: v }))}
           min={16} max={30} step={1} unit="°C"
         />
         <p className="text-xs text-gray-500 -mt-3">
           {(cfg.temperature_mode || 'manual') === 'manual'
             ? 'Manual setpoint — AC compares indoor temp against this (± hysteresis) after outdoor smart adjustment.'
             : 'Baseline / fallback degrees — also fills new schedule defaults. In Schedule modes, timing uses rows below.'}
+          {' '}
+          {(cfg.temperature_mode || 'manual') !== 'manual' && (
+            <span className="text-amber-400/95">Moving this slider switches to Manual so this value drives control.</span>
+          )}
         </p>
 
         {/* Temperature schedule */}

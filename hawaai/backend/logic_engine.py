@@ -49,6 +49,7 @@ from .ai.ai_validator import AI_MAX_T, AI_MIN_T
 from .utils import parse_presence
 from .temperature_schedule import (
     apply_ai_bounded_adjustment,
+    log_target_resolve,
     resolve_base_target_temp,
 )
 
@@ -617,6 +618,7 @@ async def tick(room_id: str) -> None:
         return
 
     base_temp, slot_label = resolve_base_target_temp(cfg)
+    log_target_resolve(room_id, cfg, base_temp, slot_label)
     temperature_mode_str = (cfg.get("temperature_mode") or "manual")
 
     vacancy_timeout = int(cfg.get("vacancy_timeout_minutes", 5)) * 60

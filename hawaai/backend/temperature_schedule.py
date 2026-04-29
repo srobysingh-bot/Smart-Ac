@@ -185,6 +185,41 @@ def resolve_base_target_temp(
     return t, slot
 
 
+def log_target_resolve(room_id: str, cfg: Dict[str, Any], base_temp: float, slot_label: str) -> None:
+    """Debug: show how slider target vs scheduled slot fused into effective base for this tick."""
+    ensure_temperature_schedule_defaults(cfg)
+    mode = cfg["temperature_mode"]
+    ui = float(cfg.get("target_temp", 24) or 24)
+
+    if mode == "manual":
+        logger.debug(
+            "[TARGET RESOLVE] room=%s mode=manual ui=%.1f schedule=N/A effective_base=%.1f°C",
+            room_id,
+            ui,
+            base_temp,
+        )
+        return
+
+    sch = cfg.get("schedule") or {}
+    key = f"{slot_label}_temp" if slot_label and slot_label != "manual" else None
+    raw = sch.get(key) if key else None
+    try:
+        slot_val = float(raw) if raw is not None and str(raw).strip() != "" else None
+    except (TypeError, ValueError):
+        slot_val = None
+    slot_disp = f"{slot_val:.1f}" if slot_val is not None else f"∅ fallback {ui:.1f}"
+
+    logger.debug(
+        "[TARGET RESOLVE] room=%s mode=%s ui=%.1f schedule[%s]=%s → effective_base=%.1f°C",
+        room_id,
+        mode,
+        ui,
+        key or slot_label,
+        slot_disp,
+        base_temp,
+    )
+
+
 def apply_ai_bounded_adjustment(effective_after_weather: float, ai_target: Optional[float]) -> float:
     """
     Clamp model target to ± AI_SCHEDULE_MAX_DELTA_C °C around the weather-adjusted baseline.
