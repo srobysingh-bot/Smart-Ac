@@ -21,6 +21,7 @@ class _RoomSession:
     session_start_time: Optional[datetime] = None
     session_start_temp: Optional[float] = None
     cooled_at: Optional[datetime] = None
+    session_provisional: bool = False
 
 
 _rs: Dict[str, _RoomSession] = defaultdict(_RoomSession)
@@ -63,19 +64,30 @@ async def start_session(room_id: str, data: Dict[str, Any]) -> str:
         "energy_start_kwh": data.get("energy_kwh_start"),
         "day_of_week": now.weekday(),
         "hour_of_day": now.hour,
+        "provisional": int(1 if data.get("provisional") else 0),
+        "is_record_valid": int(data["is_record_valid"]) if data.get("is_record_valid") is not None else 1,
     }
 
     await database.insert_session_start(record)
 
     s.current_session_id = session_id
-    s.session_start_time = now
+    start_iso = str(record["start_time"])
+    try:
+        s.session_start_time = datetime.fromisoformat(start_iso.replace("Z", "+00:00"))
+    except ValueError:
+        try:
+            s.session_start_time = datetime.strptime(start_iso[:19], "%Y-%m-%dT%H:%M:%S").replace(tzinfo=timezone.utc)
+        except ValueError:
+            s.session_start_time = now
     s.session_start_temp = data.get("indoor_temp_start")
     s.cooled_at = None
+    s.session_provisional = bool(data.get("provisional"))
 
-    logger.info(
-        "[HawaAI] Session started [%s]: %s (%.1f°C indoor)",
+    logger.debug(
+        "[SESSION_START][db] [%s]: %s provisional=%s (%.1f°C indoor)",
         rid,
         session_id,
+        s.session_provisional,
         data.get("indoor_temp_start") or 0,
     )
     return session_id
@@ -196,19 +208,35 @@ async def end_session(room_id: str, data: Dict[str, Any]) -> None:
         "time_to_target_minutes": time_to_target_minutes,
         "temp_drop_rate": temp_drop_rate_snap,
     }
+    if data.get("is_record_valid") is not None:
+        end_data["is_record_valid"] = int(data["is_record_valid"])
 
     await database.update_session_end(s.current_session_id, end_data)
     logger.info(
-        "[HawaAI] Session ended [%s]: %s | reason=%s",
+        "[SESSION_END] [%s]: session=%s | reason=%s | record_valid_out=%s",
         rid,
         s.current_session_id,
         data.get("reason_stopped"),
+        end_data.get("is_record_valid", "unchanged"),
     )
 
     s.current_session_id = None
     s.session_start_time = None
     s.session_start_temp = None
     s.cooled_at = None
+    s.session_provisional = False
+
+
+async def upgrade_current_session_to_confirmed(room_id: str) -> None:
+    """Clear provisional flag in DB for the room's open session (same session_id)."""
+    rid = _require_room(room_id)
+    s = _room(rid)
+    if not s.current_session_id or not s.session_provisional:
+        return
+    sid = s.current_session_id
+    await database.clear_session_provisional_flag(sid)
+    s.session_provisional = False
+    logger.info("[SESSION_UPGRADE] [%s] session=%s → confirmed (provisional=0)", rid, sid)
 
 
 def mark_cooled(room_id: str) -> None:
@@ -327,6 +355,15 @@ def current_session_id(room_id: str) -> Optional[str]:
     if not rid:
         return None
     return _room(rid).current_session_id
+
+
+def current_session_is_provisional(room_id: str) -> bool:
+    """True if runtime shows an open session marked provisional."""
+    rid = (room_id or "").strip()
+    if not rid:
+        return False
+    s = _room(rid)
+    return bool(s.current_session_id and s.session_provisional)
 
 
 def session_start_time(room_id: str) -> Optional[datetime]:

@@ -90,6 +90,8 @@ class RoomRuntime:
     # Epoch seconds — last tick where power thresholds confirmed compressor ON / standby OFF.
     last_power_confirmed_on: Optional[float] = None
     last_power_confirmed_off: Optional[float] = None
+    # Wall time when compressor watts first crossed high threshold (debounce for session confirm)
+    compressor_watts_high_since: Optional[datetime] = None
 
     # ── Single source of truth — set once per tick, read everywhere ──
     effective_ac_on: bool = False
@@ -111,6 +113,13 @@ class RoomRuntime:
 
     # ── Startup recovery flag ──
     startup_state_loaded: bool = False
+
+    # Session lifecycle — idle | provisional | confirmed (ended → idle after DB close)
+    session_state: str = "idle"
+    # First tick we believe the room is actively being cooled (effective ON); used for vacancy grace
+    effective_on_since_ts: Optional[float] = None
+    # Last IR / control ON or OFF command applied (wall time, UTC)
+    last_decision_at: Optional[datetime] = None
 
 
 _runtime_by_room: Dict[str, RoomRuntime] = {}
@@ -154,6 +163,14 @@ _WATTS_FAN_ONLY:   float = 50.0    # watts between FAN_ONLY and COMPRESSOR → I
 
 # Probable manual-ON inference: occupy + hot vs target while watts have not risen yet (seconds)
 TRANSIENT_ON_WINDOW_SECS: float = 180.0
+MIN_SESSION_SECONDS: float = 30.0
+COMPRESSOR_STABLE_SECONDS: float = 10.0
+VACANCY_SESSION_GRACE_SECONDS: float = 120.0
+MIN_ON_TIME_SECONDS: float = 60.0
+DECISION_LOCK_SECONDS: float = 30.0
+MAX_PROVISIONAL_SECONDS: float = 180.0
+# Recent IR/compressor-command window: session may open after explicit ON before ac_is_on latches.
+_POST_ON_SESSION_INTENT_SECONDS: float = float(_COOLDOWN_SECS) + 120.0
 
 
 def _seconds_since_last_command(st: RoomRuntime, now: datetime) -> float:
@@ -232,6 +249,22 @@ def _resolve_control_decision(
         if st.vacant_since is not None:
             elapsed = (now - st.vacant_since).total_seconds()
             if elapsed >= vacancy_timeout and (ac_on or st.ac_is_on):
+                if st.effective_ac_on:
+                    now_ts = now.timestamp()
+                    on_age_secs = None
+                    if st.effective_on_since_ts is not None:
+                        on_age_secs = now_ts - float(st.effective_on_since_ts)
+                    elif st.last_ac_on_at is not None:
+                        on_age_secs = now_ts - float(st.last_ac_on_at)
+                    if on_age_secs is not None and on_age_secs < float(VACANCY_SESSION_GRACE_SECONDS):
+                        logger.info(
+                            "[VACANCY] Ignored for room=%s — cooling grace (%.0fs < %.0fs) "
+                            "(effective_on / last_on)",
+                            room_id,
+                            on_age_secs,
+                            VACANCY_SESSION_GRACE_SECONDS,
+                        )
+                        return ("hold_vacant", "safety_vacant", effective_target)
                 return ("off", "safety_vacant", effective_target)
         return ("hold_vacant", "safety_vacant", effective_target)
 
@@ -364,6 +397,23 @@ def record_user_api_command(room_id: str) -> None:
     st = _rt(room_id)
     st.last_user_command_time = datetime.now(timezone.utc)
     st.last_command_source = "user"
+
+
+def _session_creation_eligible(st: RoomRuntime, now: datetime) -> bool:
+    """
+    Opening a cooling session requires real AC intent/on state — NOT inferred-only effective_ac_on.
+    True when runtime believes the unit is ON, or we recently sent an IR/cool-down ON command.
+    """
+    if st.ac_is_on:
+        return True
+    if (
+        st.last_command == "on"
+        and st.last_command_source in ("user", "system")
+        and st.last_command_time is not None
+    ):
+        age = (now - st.last_command_time).total_seconds()
+        return age >= 0 and age <= _POST_ON_SESSION_INTENT_SECONDS
+    return False
 
 
 def _vacancy_signals_ac_should_stop(
@@ -942,6 +992,8 @@ async def tick(room_id: str) -> None:
             ac_on = True
             ac_idle = False
             st.last_power_confirmed_on = now.timestamp()
+            if st.compressor_watts_high_since is None:
+                st.compressor_watts_high_since = now
             if not st.ac_is_on:
                 logger.info(
                     "[HawaAI][%s] AC confirmed ON by power sensor (%.0f W > %.0f W threshold) "
@@ -953,9 +1005,11 @@ async def tick(room_id: str) -> None:
         elif energy_watts >= _WATTS_FAN_ONLY:
             ac_on = st.ac_is_on
             ac_idle = True
+            st.compressor_watts_high_since = None
         else:
             ac_on = False
             ac_idle = False
+            st.compressor_watts_high_since = None
             st.last_power_confirmed_off = now.timestamp()
             if st.ac_is_on:
                 logger.info(
@@ -976,29 +1030,10 @@ async def tick(room_id: str) -> None:
         ac_on = st.ac_is_on
         ac_idle = False
         power_source = "cooldown" if in_cooldown else "internal"
+        st.compressor_watts_high_since = None
 
     st.effective_ac_idle = ac_idle
     st.effective_power_source = power_source
-
-    await _ensure_session_if_compressor_running(
-        room_id,
-        cfg,
-        indoor_temp,
-        now,
-        energy_watts=energy_watts,
-        energy_watts_valid=energy_watts_valid,
-        in_cooldown=in_cooldown,
-    )
-
-    await _begin_cooling_session_if_absent(
-        room_id,
-        cfg,
-        indoor_temp,
-        now,
-        log_detail=(
-            "runtime AC on — ensure session for telemetry (startup or no power entity)"
-        ),
-    )
 
     secs_since_cmd = (
         (now - st.last_command_time).total_seconds()
@@ -1128,6 +1163,12 @@ async def tick(room_id: str) -> None:
     else:
         st.ac_state_source = "system"
 
+    if st.effective_ac_on:
+        if st.effective_on_since_ts is None:
+            st.effective_on_since_ts = now_ts
+    else:
+        st.effective_on_since_ts = None
+
     schedule_slot_snap: Optional[str] = (
         slot_label if temperature_mode_str != "manual" else None
     )
@@ -1178,10 +1219,36 @@ async def tick(room_id: str) -> None:
 
     occ_res = True if not use_presence else bool(is_occupied_bool)
 
+    # Drop stale API "user" marker so thermostat lock still works after authority expires.
+    if st.last_command_source == "user" and not _is_user_authority_active(st, cfg, now):
+        st.last_command_source = "system"
+
     action, source, tgt = _resolve_control_decision(
         room_id, cfg, indoor_temp, et_eff,
         occ_res, ac_on, now,
     )
+    user_bypass_decision_lock = (
+        _is_user_authority_active(st, cfg, now) or st.last_command_source == "user"
+    )
+    if (
+        action in ("on", "off")
+        and not str(source).startswith("safety")
+        and not user_bypass_decision_lock
+    ):
+        lda = st.last_decision_at
+        if lda is not None:
+            elapsed_ld = (now - lda).total_seconds()
+            if elapsed_ld < float(DECISION_LOCK_SECONDS):
+                logger.info(
+                    "[DECISION_LOCK][%s] HOLD — %.1fs since last decision (< %.0fs); "
+                    "blocking action=%s source=%s",
+                    room_id,
+                    elapsed_ld,
+                    DECISION_LOCK_SECONDS,
+                    action,
+                    source,
+                )
+                action, source = "hold", "decision_lock"
     st.effective_control_source = source
 
     delta_audit = indoor_temp - et_eff
@@ -1278,6 +1345,17 @@ async def tick(room_id: str) -> None:
     if not manual_override_active:
         await _maybe_record_ai_user_adjustment(room_id, cfg, climate_data or {}, now)
 
+    await _maintain_session_lifecycle(
+        room_id,
+        cfg,
+        indoor_temp,
+        now,
+        et_eff,
+        energy_watts_valid=energy_watts_valid,
+        energy_watts=energy_watts,
+        in_cooldown=in_cooldown,
+    )
+
     if session_logger.current_session_id(room_id) and energy_watts_valid:
         st.watts_samples.append(energy_watts)
 
@@ -1288,18 +1366,10 @@ async def tick(room_id: str) -> None:
             effective_target,
         )
 
+    session_active = bool(st.effective_ac_on or st.ac_is_on)
     current_session = session_logger.current_session_id(room_id)
-    if not current_session:
-        await _begin_cooling_session_if_absent(
-            room_id,
-            cfg,
-            indoor_temp,
-            now,
-            log_detail="reconcile session before telemetry snapshot",
-        )
-        current_session = session_logger.current_session_id(room_id)
 
-    if current_session:
+    if current_session and session_active:
         ai_adj_snap = (
             manual_override_active
             or (
@@ -1340,34 +1410,86 @@ async def tick(room_id: str) -> None:
         }
         if _validate_snapshot(snap_full, room_id):
             await session_logger.add_snapshot(room_id, current_session, snapshot_inner)
-    else:
+    elif session_active and not current_session:
         logger.warning(
-            "[SNAPSHOT] Cannot write — still no session for room=%s (AC runtime may be inconsistent)",
+            "[SNAPSHOT] session_active but no session row for room=%s after ensure — skipping",
             room_id,
         )
 
 
-# ── Session bootstrap when compressor draws power without a prior IR ON ─────────
-
-async def _begin_cooling_session_if_absent(
+async def _maintain_session_lifecycle(
     room_id: str,
     cfg: dict,
     indoor_temp: float,
     now: datetime,
+    et_eff: float,
     *,
-    log_detail: str,
+    energy_watts_valid: bool,
+    energy_watts: float,
+    in_cooldown: bool,
+) -> None:
+    """Open provisional session on real AC ON / explicit ON intent; upgrade when compressor is stable."""
+    st = _rt(room_id)
+    sid_open = session_logger.current_session_id(room_id)
+    if sid_open and session_logger.current_session_is_provisional(room_id):
+        start_ref = st.session_start_time or session_logger.session_start_time(room_id)
+        if start_ref is not None:
+            prov_age = (now - start_ref).total_seconds()
+            if prov_age > float(MAX_PROVISIONAL_SECONDS):
+                logger.info(
+                    "[SESSION_PROVISIONAL_TIMEOUT] room=%s session=%s age=%.0fs (max %.0fs) — closing",
+                    room_id,
+                    sid_open,
+                    prov_age,
+                    MAX_PROVISIONAL_SECONDS,
+                )
+                await _close_session(room_id, cfg, indoor_temp, reason="provisional_timeout")
+                return
+
+    eligibility = _session_creation_eligible(st, now)
+
+    stable_power = (
+        energy_watts_valid
+        and not in_cooldown
+        and energy_watts > _WATTS_COMPRESSOR
+        and st.compressor_watts_high_since is not None
+        and (now - st.compressor_watts_high_since).total_seconds() >= float(COMPRESSOR_STABLE_SECONDS)
+    )
+    no_meter_confirm = False
+    if (not energy_watts_valid) or in_cooldown:
+        if st.ac_is_on and st.last_ac_on_at is not None:
+            since_ir = now.timestamp() - float(st.last_ac_on_at)
+            if since_ir >= float(COMPRESSOR_STABLE_SECONDS):
+                no_meter_confirm = True
+
+    if eligibility and session_logger.current_session_id(room_id) is None:
+        await _start_provisional_session(room_id, cfg, indoor_temp, now, et_eff)
+
+    if (
+        session_logger.current_session_id(room_id) is not None
+        and session_logger.current_session_is_provisional(room_id)
+        and (stable_power or no_meter_confirm)
+    ):
+        await session_logger.upgrade_current_session_to_confirmed(room_id)
+        st.session_state = "confirmed"
+
+
+async def _start_provisional_session(
+    room_id: str,
+    cfg: dict,
+    indoor_temp: float,
+    now: datetime,
+    et_eff: float,
 ) -> None:
     """
-    Open a DB session when the engine believes cooling is active but no row exists.
-    Used for: power-proven compressor, HA startup AC already ON, or telemetry path.
+    Start a DB session while expecting cooling before compressor watts confirm.
+    Same session_id is upgraded later when power is stable (provisional=0).
     """
     if session_logger.current_session_id(room_id) is not None:
         return
-    st = _rt(room_id)
-    if not st.ac_is_on:
-        return
 
-    target = float(cfg.get("target_temp", 24))
+    st = _rt(room_id)
+    target = float(et_eff)
     kwh_entity = (cfg.get("energy_kwh_entity") or "").strip()
     start_kwh = None
     if kwh_entity:
@@ -1378,57 +1500,36 @@ async def _begin_cooling_session_if_absent(
             start_kwh = None
 
     st.session_start_kwh = start_kwh
-    cmd_ts = now
-    st.session_start_time = cmd_ts
+    st.session_start_time = now
     st.session_start_temp = indoor_temp
-    st.compressor_on_since = cmd_ts
+    st.compressor_on_since = now
     st.compressor_off_since = None
     st.watts_samples = []
+    st.session_state = "provisional"
     weather = await weather_api.get_cached()
-    await session_logger.start_session(room_id, {
-        "start_time":             st.session_start_time.isoformat(),
-        "indoor_temp_start":      indoor_temp,
-        "outdoor_temp_start":     weather.get("temp") if weather else None,
-        "outdoor_humidity_start": weather.get("humidity") if weather else None,
-        "target_temp":            target,
-        "ac_brand":               cfg.get("ac_brand"),
-        "ac_model":               cfg.get("ac_model"),
-        "room_name":              cfg.get("room_name"),
-        "energy_kwh_start":       start_kwh,
-    })
-    logger.info(
-        "[HawaAI][%s] Session started (%s); indoor=%.1f°C | kWh meter=%s",
+
+    sid = await session_logger.start_session(
         room_id,
-        log_detail,
-        indoor_temp, start_kwh,
+        {
+            "start_time":             st.session_start_time.isoformat(),
+            "indoor_temp_start":      indoor_temp,
+            "outdoor_temp_start":     weather.get("temp") if weather else None,
+            "outdoor_humidity_start": weather.get("humidity") if weather else None,
+            "target_temp":            target,
+            "ac_brand":               cfg.get("ac_brand"),
+            "ac_model":               cfg.get("ac_model"),
+            "room_name":              cfg.get("room_name"),
+            "energy_kwh_start":       start_kwh,
+            "provisional":            True,
+            "is_record_valid":       1,
+        },
     )
-
-
-async def _ensure_session_if_compressor_running(
-    room_id: str,
-    cfg: dict,
-    indoor_temp: float,
-    now: datetime,
-    *,
-    energy_watts: float,
-    energy_watts_valid: bool,
-    in_cooldown: bool,
-) -> None:
-    """
-    External remotes turn the AC on without HawaAI sending IR — start DB session when
-    power proves the compressor is running but session_logger still has no row.
-    """
-    if in_cooldown or not energy_watts_valid:
-        return
-    if energy_watts <= _WATTS_COMPRESSOR:
-        return
-
-    await _begin_cooling_session_if_absent(
+    logger.info(
+        "[SESSION_START] room=%s session=%s provisional=1 indoor=%.1f°C target=%.1f°C",
         room_id,
-        cfg,
+        sid,
         indoor_temp,
-        now,
-        log_detail="compressor Watts > %.0f W" % _WATTS_COMPRESSOR,
+        target,
     )
 
 
@@ -1476,64 +1577,62 @@ async def _turn_ac_on(
         )
         return
 
-    kwh_entity = cfg.get("energy_kwh_entity", "")
-    start_kwh = None
-    if kwh_entity:
-        raw = await ha_client.get_state(kwh_entity)
-        try:
-            start_kwh = float(raw) if raw else None
-        except (ValueError, TypeError):
-            start_kwh = None
-    st.session_start_kwh = start_kwh
-
     st.ac_is_on = True
     st.last_ac_on_at = time.time()
     cmd_ts = datetime.now(timezone.utc)
-    st.session_start_time = cmd_ts
-    st.session_start_temp = indoor_temp
     _bump_last_command_ir_cooldown(st, cmd_ts)
     st.last_command = "on"
     st.last_sent_command_key = _fingerprint_turn_on(target)
-    st.compressor_on_since = cmd_ts
+    st.compressor_on_since = None
     st.compressor_off_since = None
-    st.watts_samples = []
     record_setpoint_command(room_id, target, cmd_ts)
-
-    weather = await weather_api.get_cached()
-    await session_logger.start_session(room_id, {
-        "start_time":             st.session_start_time.isoformat(),
-        "indoor_temp_start":      indoor_temp,
-        "outdoor_temp_start":     weather.get("temp") if weather else None,
-        "outdoor_humidity_start": weather.get("humidity") if weather else None,
-        "target_temp":            target,
-        "ac_brand":               cfg.get("ac_brand"),
-        "ac_model":               cfg.get("ac_model"),
-        "room_name":              cfg.get("room_name"),
-        "energy_kwh_start":       start_kwh,
-    })
+    st.last_decision_at = cmd_ts
     logger.info(
-        "[HawaAI][%s] Session started — indoor=%.1f°C | kWh meter=%s",
+        "[HawaAI][%s] AC ON accepted; provisional session opens on next lifecycle sync",
         room_id,
-        indoor_temp, start_kwh,
     )
 
 
 async def _close_session(room_id: str, cfg: dict, indoor_temp: float, reason: str) -> None:
-    """Finalize session for one room."""
+    """Finalize session for one room; always closes DB row (short runs flagged is_record_valid=0)."""
     st = _rt(room_id)
-
-    if st.session_start_time is None:
+    open_sid = session_logger.current_session_id(room_id)
+    if open_sid is None:
         logger.debug("[HawaAI][%s] _close_session(%s) — no open session, skipping", room_id, reason)
         return
 
+    sl_start = session_logger.session_start_time(room_id)
+    start_ref = st.session_start_time or sl_start
     now = datetime.now(timezone.utc)
-    duration_secs = (now - st.session_start_time).total_seconds()
+    if start_ref is None:
+        logger.warning(
+            "[SESSION_END] room=%s session=%s — missing start anchor; using now",
+            room_id,
+            open_sid,
+        )
+        start_ref = now
+
+    duration_secs = max(0.0, (now - start_ref).total_seconds())
+    short_invalid = duration_secs < float(MIN_SESSION_SECONDS)
+    if short_invalid:
+        logger.info(
+            "[SESSION_INVALID] room=%s session=%s duration=%.2fs (< %.0fs)",
+            room_id,
+            open_sid,
+            duration_secs,
+            MIN_SESSION_SECONDS,
+        )
+
     cool_minutes = duration_secs / 60.0
 
     logger.info(
-        "[HawaAI][%s] [SESSION END] reason=%s | duration=%.0fs (%.1f min)",
+        "[SESSION_END] room=%s session=%s reason=%s | duration=%.0fs (%.2f min) short_invalid=%s",
         room_id,
-        reason, duration_secs, cool_minutes,
+        open_sid,
+        reason,
+        duration_secs,
+        cool_minutes,
+        short_invalid,
     )
 
     if st.watts_samples:
@@ -1588,12 +1687,14 @@ async def _close_session(room_id: str, cfg: dict, indoor_temp: float, reason: st
         "avg_watts":             round(avg_watts, 1) if avg_watts else None,
         "peak_watts":            round(peak_watts, 1) if peak_watts is not None else None,
         "user_override":         1 if reason in ("power_off", "manual", "manual_off") else 0,
+        "is_record_valid":       0 if short_invalid else 1,
     })
 
     st.session_start_time = None
     st.session_start_temp = None
     st.session_start_kwh = None
     st.watts_samples = []
+    st.session_state = "idle"
     clear_setpoint_command_tracking(room_id)
     smart_cooling.reset(room_id)
 
@@ -1611,6 +1712,18 @@ async def _turn_ac_off(
     climate_entity = (cfg.get("climate_entity") or "").strip()
 
     tnow = now if now is not None else datetime.now(timezone.utc)
+
+    if reason not in ("manual", "manual_off", "power_off"):
+        if st.last_ac_on_at is not None:
+            on_secs = tnow.timestamp() - float(st.last_ac_on_at)
+            if on_secs < MIN_ON_TIME_SECONDS:
+                logger.info(
+                    "[OFF BLOCKED][%s] Min runtime not reached (%.0fs < %.0fs)",
+                    room_id,
+                    on_secs,
+                    MIN_ON_TIME_SECONDS,
+                )
+                return
 
     if not force:
         if not st.ac_is_on:
@@ -1638,6 +1751,7 @@ async def _turn_ac_off(
     st.last_sent_command_key = _fingerprint_turn_off()
     st.compressor_off_since = cmd_ts
     st.compressor_on_since = None
+    st.last_decision_at = cmd_ts
 
     await _close_session(room_id, cfg, indoor_temp, reason)
 

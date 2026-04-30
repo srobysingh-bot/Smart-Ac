@@ -176,6 +176,8 @@ async def init_db() -> None:
             "ALTER TABLE snapshots ADD COLUMN target_temp REAL",
             "ALTER TABLE snapshots ADD COLUMN control_source TEXT",
             "ALTER TABLE snapshots ADD COLUMN hvac_mode TEXT",
+            "ALTER TABLE sessions ADD COLUMN provisional INTEGER DEFAULT 0",
+            "ALTER TABLE sessions ADD COLUMN is_record_valid INTEGER DEFAULT 1",
         ):
             try:
                 await db.execute(stmt)
@@ -296,8 +298,8 @@ async def insert_session_start(session: Dict[str, Any]) -> None:
                 (session_id, start_time, indoor_temp_start, outdoor_temp_start,
                  outdoor_humidity_start, target_temp, ac_entity_id, ac_brand,
                  ac_model, room_name, presence_trigger, energy_start_kwh,
-                 day_of_week, hour_of_day, room_id)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                 day_of_week, hour_of_day, room_id, provisional, is_record_valid)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             """,
             (
                 session["session_id"],
@@ -315,6 +317,8 @@ async def insert_session_start(session: Dict[str, Any]) -> None:
                 session.get("day_of_week"),
                 session.get("hour_of_day"),
                 rid,
+                int(session.get("provisional", 0) or 0),
+                int(session.get("is_record_valid", 1)),
             ),
         )
         await db.commit()
@@ -340,7 +344,8 @@ async def update_session_end(session_id: str, end_data: Dict[str, Any]) -> None:
                 energy_used          = ?,
                 user_override        = ?,
                 time_to_target_minutes = ?,
-                temp_drop_rate       = ?
+                temp_drop_rate       = ?,
+                is_record_valid      = COALESCE(?, is_record_valid)
             WHERE session_id = ?
             """,
             (
@@ -360,8 +365,19 @@ async def update_session_end(session_id: str, end_data: Dict[str, Any]) -> None:
                 end_data.get("user_override"),
                 end_data.get("time_to_target_minutes"),
                 end_data.get("temp_drop_rate"),
+                end_data.get("is_record_valid"),
                 session_id,
             ),
+        )
+        await db.commit()
+
+
+async def clear_session_provisional_flag(session_id: str) -> None:
+    """Mark session as compressor-confirmed (no longer provisional in DB)."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "UPDATE sessions SET provisional = 0 WHERE session_id = ?",
+            (session_id,),
         )
         await db.commit()
 
