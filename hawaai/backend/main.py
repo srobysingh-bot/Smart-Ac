@@ -45,7 +45,7 @@ from fastapi import Body, FastAPI, HTTPException, Query, Request, WebSocket, Web
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, HTMLResponse, Response
 
-from . import config_manager, database, logic_engine, room_registry, scheduler, session_logger, weather_api
+from . import config_manager, database, ha_entity_events, logic_engine, room_registry, scheduler, session_logger, weather_api
 from . import ha_client
 from .ac_controller import get_brands
 from .ai import get_cached
@@ -162,6 +162,7 @@ async def lifespan(app: FastAPI):
     except Exception:
         logger.exception("[AI] AI worker startup hook failed — continuing without AI bootstrap")
     asyncio.create_task(scheduler.start())
+    asyncio.create_task(ha_entity_events.run_forever())
     asyncio.create_task(_broadcast_loop())
     logger.info("[HawaAI] Add-on started")
     yield
@@ -169,7 +170,7 @@ async def lifespan(app: FastAPI):
     logger.info("[HawaAI] Add-on stopped")
 
 
-app = FastAPI(title="HawaAI API", version="1.4.20", lifespan=lifespan)
+app = FastAPI(title="HawaAI API", version="1.4.21", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,

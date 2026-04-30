@@ -130,6 +130,10 @@ class RoomRuntime:
     # Delayed actuation (thermostat intent → pending → _turn_ac_*)
     pending_action: Optional[str] = None  # "on" | "off"
     pending_since: Optional[float] = None  # epoch seconds (wall)
+    pending_delay_wakeup_task: Optional[asyncio.Task] = None
+    # Hybrid event triggers — last sampled values from HA WS (not authoritative for control)
+    last_event_presence_bool: Optional[bool] = None
+    last_event_probe_indoor_temp: Optional[float] = None
 
 
 _runtime_by_room: Dict[str, RoomRuntime] = {}
@@ -137,6 +141,122 @@ _runtime_by_room: Dict[str, RoomRuntime] = {}
 
 # Serialize tick vs stop_room per room (avoids double OFF / double session close with tick).
 _room_ops_locks: Dict[str, asyncio.Lock] = {}
+# Serialize scheduler tick vs event-triggered tick for same room (no overlapping decision loops).
+_room_tick_serial_locks: Dict[str, asyncio.Lock] = {}
+
+_TICK_TRIGGER_DEBOUNCE_SEC = 2.0
+_tick_trigger_last_mono_by_room: Dict[str, float] = {}
+
+
+def _room_tick_serial_lock(room_id_key: str) -> asyncio.Lock:
+    lk = _room_tick_serial_locks.get(room_id_key)
+    if lk is None:
+        lk = asyncio.Lock()
+        _room_tick_serial_locks[room_id_key] = lk
+    return lk
+
+
+def _cancel_pending_delay_wakeup_task(st: RoomRuntime) -> None:
+    """Cancel scheduled delay_elapsed wakeup; safe when pending clears early."""
+    t = st.pending_delay_wakeup_task
+    if t is not None and not t.done():
+        t.cancel()
+    st.pending_delay_wakeup_task = None
+
+
+def schedule_pending_completion_wakeup(
+    *,
+    rid_for_tick: str,
+    room_canon: str,
+    kind: str,
+    delay_seconds: float,
+) -> None:
+    """
+    Fire trigger_tick(delay_elapsed) after delay_seconds if pending_arm still matches.
+    Non-blocking — complements the periodic scheduler tick.
+    """
+    if delay_seconds <= 0 or kind not in ("on", "off"):
+        return
+    canon = normalize_room_id(room_canon)
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return
+
+    st = _rt(canon)
+
+    async def _alarm() -> None:
+        try:
+            await asyncio.sleep(float(delay_seconds))
+        except asyncio.CancelledError:
+            return
+        st2 = _rt(canon)
+        if kind == "on":
+            if st2.pending_action != "on":
+                return
+        else:
+            if st2.pending_action != "off":
+                return
+        trigger_tick(rid_for_tick, reason="delay_elapsed", skip_debounce=True)
+
+    _cancel_pending_delay_wakeup_task(st)
+    st.pending_delay_wakeup_task = loop.create_task(_alarm())
+
+
+def trigger_tick(
+    room_id_raw: str,
+    *,
+    reason: str,
+    skip_debounce: bool = False,
+) -> None:
+    """
+    Event-driven entry: schedules logic_engine.tick (non-blocking).
+    Scheduler remains the authoritative fallback every logic_interval_seconds.
+    """
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        logger.debug("[TICK_TRIGGER] skipped — no event loop (%s)", reason)
+        return
+
+    rq = (room_id_raw or "").strip()
+    if not rq:
+        return
+
+    canon = normalize_room_id(rq)
+    base_cfg = config_manager.load_config()
+    room_def = resolve_room_definition(base_cfg, rq)
+    if not room_def or room_def.get("disabled"):
+        return
+
+    mono = time.monotonic()
+    if not skip_debounce:
+        last_m = _tick_trigger_last_mono_by_room.get(canon, 0.0)
+        if mono - last_m < _TICK_TRIGGER_DEBOUNCE_SEC:
+            logger.debug(
+                "[TICK_TRIGGER][%s] debounced %.2fs<%s (%s)",
+                canon,
+                mono - last_m,
+                _TICK_TRIGGER_DEBOUNCE_SEC,
+                reason,
+            )
+            return
+        _tick_trigger_last_mono_by_room[canon] = mono
+
+    lk = _room_tick_serial_lock(canon)
+    if reason != "delay_elapsed" and lk.locked():
+        logger.debug("[TICK_TRIGGER][%s] skipped tick in flight (%s)", canon, reason)
+        return
+
+    logger.info("[TICK_TRIGGER][%s] reason=%s", canon, reason)
+    loop.create_task(_triggered_tick_runner(rq, canon))
+
+
+async def _triggered_tick_runner(rid_stored: str, canon_key: str) -> None:
+    try:
+        await tick(rid_stored)
+    except Exception:
+        logger.exception("[TICK_TRIGGER][%s] tick runner failed", canon_key)
 
 
 def _room_ops_lock(room_id_key: str) -> asyncio.Lock:
@@ -378,6 +498,7 @@ async def _load_startup_state(room_id: str, cfg: dict) -> None:
         st.possible_on_since = None
         st.pending_action = None
         st.pending_since = None
+        _cancel_pending_delay_wakeup_task(st)
 
 
 async def _get_ai_target_adjustment(
@@ -419,6 +540,34 @@ async def _get_ai_target_adjustment(
         return 0.0
 
 
+async def effective_target_for_temp_cross(
+    room_canon: str,
+    merged_cfg: dict,
+    *,
+    indoor_temp: float,
+) -> Optional[float]:
+    """
+    Band center aligned with thermostat math in ``_tick_impl`` before HA setpoint-lock:
+    schedule slot → outdoor curve → ``eff_aw`` + clamped AI delta from cache (schedule_ai).
+
+    Omitting `_manual_override_resolve` here avoids mutating `prev_ha_setpoint_seen` from
+    the WebSocket path; if a user knob lock is active, the periodic tick still reconciles bands.
+
+    Returns None when ``manual_override`` (global skip flag) matches tick early-return.
+    """
+    if merged_cfg.get("manual_override", False):
+        return None
+    base_temp, _slot = resolve_base_target_temp(merged_cfg)
+    weather = await weather_api.get_cached()
+    outdoor_temp = weather.get("temp") if weather else None
+    smart_curve = smart_temp_adjustment_enabled(merged_cfg) and bool(
+        merged_cfg.get("use_outdoor_temp", True)
+    )
+    eff_aw = compute_effective_target(base_temp, outdoor_temp, smart_curve)
+    ai_delta = await _get_ai_target_adjustment(room_canon, indoor_temp, eff_aw, merged_cfg)
+    return float(eff_aw + ai_delta)
+
+
 def _nonnegative_delay_seconds(cfg: dict, key: str) -> float:
     try:
         v = float(cfg.get(key, 0))
@@ -432,12 +581,18 @@ def _sync_pending_for_action(st: RoomRuntime, decision_action: str) -> None:
     Hard-reset pending when decision no longer matches scheduled actuation.
     - decision not in (on, off) → clear
     - decision != pending_action → clear
+
+    Always cancels ``pending_delay_wakeup_task`` before clearing pending so stale
+    ``delay_elapsed`` triggers cannot fire after the thermostat intent changed.
     """
     if decision_action not in ("on", "off"):
+        if st.pending_action is not None:
+            _cancel_pending_delay_wakeup_task(st)
         st.pending_action = None
         st.pending_since = None
         return
     if st.pending_action is not None and st.pending_action != decision_action:
+        _cancel_pending_delay_wakeup_task(st)
         st.pending_action = None
         st.pending_since = None
 
@@ -456,11 +611,13 @@ def _clear_pending_when_physically_satisfied(
     """
     if st.pending_action == "on":
         if confirmed_ac_on or manual_override_active:
+            _cancel_pending_delay_wakeup_task(st)
             st.pending_action = None
             st.pending_since = None
             return
     elif st.pending_action == "off":
         if not physical_ac_on:
+            _cancel_pending_delay_wakeup_task(st)
             st.pending_action = None
             st.pending_since = None
 
@@ -511,6 +668,7 @@ def record_user_api_command(room_id: str) -> None:
     st.last_command_source = "user"
     st.pending_action = None
     st.pending_since = None
+    _cancel_pending_delay_wakeup_task(st)
 
 
 def _session_creation_eligible(st: RoomRuntime, now: datetime) -> bool:
@@ -928,8 +1086,9 @@ async def tick(room_id: str) -> None:
         return
 
     canon = normalize_room_id(rid_raw)
-    async with _room_ops_lock(canon):
-        await _tick_impl(rid_raw, canon)
+    async with _room_tick_serial_lock(canon):
+        async with _room_ops_lock(canon):
+            await _tick_impl(rid_raw, canon)
 
 
 async def _tick_impl(rid_raw: str, room_id: str) -> None:
@@ -1412,9 +1571,10 @@ async def _tick_impl(rid_raw: str, room_id: str) -> None:
             await _turn_ac_on(room_id, cfg, indoor_temp, et_eff, now=now)
             st.pending_action = None
             st.pending_since = None
+            _cancel_pending_delay_wakeup_task(st)
         else:
             await _handle_delayed_on(
-                room_id, cfg, indoor_temp, et_eff, now, st,
+                rid_raw, room_id, cfg, indoor_temp, et_eff, now, st,
                 confirmed_ac_on=confirmed_ac_on,
             )
         st.last_command_source = "system"
@@ -1422,6 +1582,7 @@ async def _tick_impl(rid_raw: str, room_id: str) -> None:
     elif control_action == "off":
         # Vacancy / safety OFF must abandon any thermostat delayed-ON countdown immediately.
         if str(control_source).startswith("safety"):
+            _cancel_pending_delay_wakeup_task(st)
             st.pending_action = None
             st.pending_since = None
 
@@ -1435,9 +1596,10 @@ async def _tick_impl(rid_raw: str, room_id: str) -> None:
             )
             st.pending_action = None
             st.pending_since = None
+            _cancel_pending_delay_wakeup_task(st)
         else:
             await _handle_delayed_off(
-                room_id, cfg, indoor_temp, now, st,
+                rid_raw, room_id, cfg, indoor_temp, now, st,
                 reason=reason_off, force=force_off,
             )
         st.last_command_source = "system"
@@ -1707,7 +1869,8 @@ async def _start_provisional_session(
 # ── Delayed actuation (intent → pending timer → turn) ─────────────────────────
 
 async def _handle_delayed_on(
-    room_id: str,
+    rid_stored: str,
+    room_canon: str,
     cfg: dict,
     indoor_temp: float,
     et_eff: float,
@@ -1722,8 +1885,9 @@ async def _handle_delayed_on(
     if confirmed_ac_on:
         logger.debug(
             "[DELAY_ON][%s] compressor ON confirmed (power or HA/command) — clearing pending_on",
-            room_id,
+            room_canon,
         )
+        _cancel_pending_delay_wakeup_task(st)
         st.pending_action = None
         st.pending_since = None
         return
@@ -1732,12 +1896,13 @@ async def _handle_delayed_on(
         if _decision_lock_blocks_delayed_emit(st, now):
             logger.info(
                 "[DECISION_LOCK][%s] immediate ON deferred — %.0fs lock since last IR",
-                room_id,
+                room_canon,
                 DECISION_LOCK_SECONDS,
             )
             return
-        logger.info("[DELAY_ON][%s] TRIGGER _turn_ac_on (delay=0) physical=false", room_id)
-        await _turn_ac_on(room_id, cfg, indoor_temp, et_eff, now=now)
+        logger.info("[DELAY_ON][%s] TRIGGER _turn_ac_on (delay=0) physical=false", room_canon)
+        await _turn_ac_on(room_canon, cfg, indoor_temp, et_eff, now=now)
+        _cancel_pending_delay_wakeup_task(st)
         st.pending_action = None
         st.pending_since = None
         return
@@ -1747,22 +1912,28 @@ async def _handle_delayed_on(
         st.pending_since = ts
         logger.info(
             "[DELAY_ON][%s] ARM pending_on pending_since=%.3f delay_s=%.0f",
-            room_id,
+            room_canon,
             st.pending_since,
             delay,
+        )
+        schedule_pending_completion_wakeup(
+            rid_for_tick=rid_stored,
+            room_canon=room_canon,
+            kind="on",
+            delay_seconds=delay,
         )
         return
 
     # Never reset pending_since on subsequent ticks — only repaired if missing/corrupt.
     if st.pending_since is None:
         st.pending_since = ts
-        logger.warning("[DELAY_ON][%s] repaired missing pending_since=%.3f", room_id, st.pending_since)
+        logger.warning("[DELAY_ON][%s] repaired missing pending_since=%.3f", room_canon, st.pending_since)
         return
 
     elapsed = ts - float(st.pending_since)
     logger.debug(
         "[DELAY_ON][%s] wait pending_since=%.3f elapsed=%.2fs delay=%.0fs",
-        room_id,
+        room_canon,
         st.pending_since,
         elapsed,
         delay,
@@ -1771,7 +1942,7 @@ async def _handle_delayed_on(
         if _decision_lock_blocks_delayed_emit(st, now):
             logger.info(
                 "[DECISION_LOCK][%s] delayed ON held — lock active elapsed=%.1fs pending_since=%.3f",
-                room_id,
+                room_canon,
                 elapsed,
                 st.pending_since,
             )
@@ -1779,18 +1950,20 @@ async def _handle_delayed_on(
         logger.info(
             "[DELAY_ON][%s] TRIGGER _turn_ac_on (elapsed>=%.0fs) pending_since=%.3f elapsed=%.2fs "
             "(single emit)",
-            room_id,
+            room_canon,
             delay,
             st.pending_since,
             elapsed,
         )
-        await _turn_ac_on(room_id, cfg, indoor_temp, et_eff, now=now)
+        await _turn_ac_on(room_canon, cfg, indoor_temp, et_eff, now=now)
+        _cancel_pending_delay_wakeup_task(st)
         st.pending_action = None
         st.pending_since = None
 
 
 async def _handle_delayed_off(
-    room_id: str,
+    rid_stored: str,
+    room_canon: str,
     cfg: dict,
     indoor_temp: float,
     now: datetime,
@@ -1803,6 +1976,7 @@ async def _handle_delayed_off(
     ts = time.time()
 
     if not st.physical_ac_on:
+        _cancel_pending_delay_wakeup_task(st)
         st.pending_action = None
         st.pending_since = None
         return
@@ -1811,14 +1985,15 @@ async def _handle_delayed_off(
         if _decision_lock_blocks_delayed_emit(st, now):
             logger.info(
                 "[DECISION_LOCK][%s] immediate OFF deferred — %.0fs lock since last IR",
-                room_id,
+                room_canon,
                 DECISION_LOCK_SECONDS,
             )
             return
         if reason == "target_reached":
-            session_logger.mark_cooled(room_id)
-        logger.info("[DELAY_OFF][%s] TRIGGER _turn_ac_off (delay=0)", room_id)
-        await _turn_ac_off(room_id, cfg, indoor_temp, reason, now=now, force=force)
+            session_logger.mark_cooled(room_canon)
+        logger.info("[DELAY_OFF][%s] TRIGGER _turn_ac_off (delay=0)", room_canon)
+        await _turn_ac_off(room_canon, cfg, indoor_temp, reason, now=now, force=force)
+        _cancel_pending_delay_wakeup_task(st)
         st.pending_action = None
         st.pending_since = None
         return
@@ -1828,23 +2003,29 @@ async def _handle_delayed_off(
         st.pending_since = ts
         logger.info(
             "[DELAY_OFF][%s] ARM pending_off pending_since=%.3f delay_s=%.0f (reason=%s force=%s)",
-            room_id,
+            room_canon,
             st.pending_since,
             delay,
             reason,
             force,
         )
+        schedule_pending_completion_wakeup(
+            rid_for_tick=rid_stored,
+            room_canon=room_canon,
+            kind="off",
+            delay_seconds=delay,
+        )
         return
 
     if st.pending_since is None:
         st.pending_since = ts
-        logger.warning("[DELAY_OFF][%s] repaired missing pending_since=%.3f", room_id, st.pending_since)
+        logger.warning("[DELAY_OFF][%s] repaired missing pending_since=%.3f", room_canon, st.pending_since)
         return
 
     elapsed = ts - float(st.pending_since)
     logger.debug(
         "[DELAY_OFF][%s] wait pending_since=%.3f elapsed=%.2fs delay=%.0fs",
-        room_id,
+        room_canon,
         st.pending_since,
         elapsed,
         delay,
@@ -1853,22 +2034,23 @@ async def _handle_delayed_off(
         if _decision_lock_blocks_delayed_emit(st, now):
             logger.info(
                 "[DECISION_LOCK][%s] delayed OFF held — elapsed=%.1fs pending_since=%.3f",
-                room_id,
+                room_canon,
                 elapsed,
                 st.pending_since,
             )
             return
         if reason == "target_reached":
-            session_logger.mark_cooled(room_id)
+            session_logger.mark_cooled(room_canon)
         logger.info(
             "[DELAY_OFF][%s] TRIGGER _turn_ac_off elapsed=%.2fs delay=%.0fs pending_since=%.3f "
             "(single emit)",
-            room_id,
+            room_canon,
             elapsed,
             delay,
             st.pending_since,
         )
-        await _turn_ac_off(room_id, cfg, indoor_temp, reason, now=now, force=force)
+        await _turn_ac_off(room_canon, cfg, indoor_temp, reason, now=now, force=force)
+        _cancel_pending_delay_wakeup_task(st)
         st.pending_action = None
         st.pending_since = None
 
@@ -1988,6 +2170,7 @@ async def _stop_room_locked(room_id_raw: str, canon: str, shutdown_reason: str) 
     st = _runtime_by_room.get(canon)
     had_runtime = st is not None
     if st is not None:
+        _cancel_pending_delay_wakeup_task(st)
         st.pending_action = None
         st.pending_since = None
 
