@@ -165,6 +165,51 @@ class TestLogicEngineHardening(unittest.TestCase):
         st.last_decision_at = now - timedelta(seconds=int(logic_engine.DECISION_LOCK_SECONDS) + 5)
         self.assertFalse(logic_engine._decision_lock_blocks_delayed_emit(st, now))
 
+    def test_effective_mode_auto_clamps_delta_above_base(self):
+        cfg = {"effective_mode": "auto", "effective_max_delta_deg": 3.0}
+        self.assertAlmostEqual(
+            logic_engine.apply_effective_mode_engine_target(
+                room_id="r", base_temp=22.0, planned_with_ai=30.0, cfg=cfg, control_log=False,
+            ),
+            25.0,
+        )
+        self.assertAlmostEqual(
+            logic_engine.apply_effective_mode_engine_target(
+                room_id="r", base_temp=22.0, planned_with_ai=21.0, cfg=cfg, control_log=False,
+            ),
+            22.0,
+        )
+
+    def test_effective_mode_manual_respects_floor_and_ceiling(self):
+        cfg = {"effective_mode": "manual", "manual_effective_temp": 20.0, "effective_max_delta_deg": 3.0}
+        self.assertAlmostEqual(
+            logic_engine.apply_effective_mode_engine_target(
+                room_id="r", base_temp=22.0, planned_with_ai=25.0, cfg=cfg, control_log=False,
+            ),
+            22.0,
+        )
+        cfg["manual_effective_temp"] = 26.0
+        self.assertAlmostEqual(
+            logic_engine.apply_effective_mode_engine_target(
+                room_id="r", base_temp=22.0, planned_with_ai=23.0, cfg=cfg, control_log=False,
+            ),
+            25.0,
+        )
+
+    def test_effective_max_delta_deg_bounded_1_to_5(self):
+        self.assertAlmostEqual(logic_engine.effective_max_delta_deg({"effective_max_delta_deg": 99}), 5.0)
+        self.assertAlmostEqual(logic_engine.effective_max_delta_deg({"effective_max_delta_deg": 0.25}), 1.0)
+
+    def test_sync_effective_mode_transition_clears_pending(self):
+        st = logic_engine.RoomRuntime()
+        st.last_effective_mode = "auto"
+        st.pending_action = "on"
+        st.pending_since = 123.0
+        logic_engine.sync_effective_mode_transition(st, "room-x", {"effective_mode": "manual"})
+        self.assertIsNone(st.pending_action)
+        self.assertIsNone(st.pending_since)
+        self.assertEqual(st.last_effective_mode, "manual")
+
 
 if __name__ == "__main__":
     unittest.main()

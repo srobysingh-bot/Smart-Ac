@@ -130,17 +130,24 @@ export function RoomDataProvider({ children }) {
       setRoomData((prev) => {
         if (gen !== loadGenRef.current) return prev
         if (!prev.status) return prev
+        const { type: _tickType, ...tickFields } = msg
         return {
           ...prev,
           status: {
             ...prev.status,
-            ...msg,
+            ...tickFields,
             effective_ac_on:
-              msg.effective_ac_on ?? prev.status.effective_ac_on,
-            physical_ac_on: msg.physical_ac_on ?? msg.ac_is_on ?? prev.status.physical_ac_on,
-            ac_is_on: msg.ac_is_on ?? prev.status.ac_is_on,
-            ac_state: msg.ac_state ?? prev.status.ac_state,
-            ac_state_source: msg.ac_state_source ?? prev.status.ac_state_source,
+              tickFields.effective_ac_on ?? prev.status.effective_ac_on,
+            physical_ac_on:
+              tickFields.physical_ac_on ?? tickFields.ac_is_on ?? prev.status.physical_ac_on,
+            ac_is_on: tickFields.ac_is_on ?? prev.status.ac_is_on,
+            ac_state: tickFields.ac_state ?? prev.status.ac_state,
+            ac_state_source:
+              tickFields.ac_state_source ?? prev.status.ac_state_source,
+            pending_action: tickFields.pending_action ?? prev.status.pending_action,
+            pending_remaining_seconds:
+              tickFields.pending_remaining_seconds ?? prev.status.pending_remaining_seconds,
+            pending_since_ts: tickFields.pending_since_ts ?? prev.status.pending_since_ts,
           },
         }
       })

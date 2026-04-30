@@ -9,6 +9,11 @@ const MODE_LABEL = {
   schedule_ai: 'Schedule + AI',
 }
 
+const COMFORT_MODE_LABEL = {
+  auto: 'Auto',
+  manual: 'Manual',
+}
+
 const SLOT_LABEL = {
   manual: '—',
   morning: 'Morning',
@@ -34,6 +39,8 @@ export default function TemperaturePlanCard({ status }) {
   const effective = status.effective_target
   const aiOn = !!(status.ai_enabled && mode === 'schedule_ai')
   const aiApplied = !!status.ai_adjust_applied && aiOn
+  const comfortMode = status.effective_mode || 'auto'
+  const maxComfortDelta = status.effective_max_delta_deg
 
   const slotKey = slot ? (SLOT_LABEL[slot] ?? slot) : '—'
 
@@ -93,7 +100,32 @@ export default function TemperaturePlanCard({ status }) {
               </span>
             )}
           </span>
-          <span className="text-[10px] text-gray-600">
+          <div className="mt-2 rounded-lg border border-emerald-900/50 bg-black/20 px-3 py-2 grid grid-cols-2 gap-x-3 gap-y-1 text-[11px] text-gray-400">
+            <span>Schedule base</span>
+            <span className="font-mono text-emerald-100/90 text-right">{base != null ? `${Number(base).toFixed(1)}°C` : '—'}</span>
+            <span>Comfort mode</span>
+            <span className="font-mono text-gray-200 text-right">
+              {COMFORT_MODE_LABEL[comfortMode] ?? comfortMode}
+            </span>
+            <span>Max Δ above base</span>
+            <span className="font-mono text-gray-200 text-right">
+              {maxComfortDelta != null && Number.isFinite(Number(maxComfortDelta)) ? `${Number(maxComfortDelta)}°C` : '3°C'}
+            </span>
+            <span className="text-emerald-200/95">Effective</span>
+            <span className="font-mono text-emerald-200 text-right font-semibold">
+              {effective != null ? `${Number(effective).toFixed(1)}°C` : '—'}
+            </span>
+            <span>Manual setpoint</span>
+            <span className="font-mono text-gray-200 text-right">
+              {(comfortMode === 'manual' && status.manual_effective_temp != null)
+                ? `${Number(status.manual_effective_temp).toFixed(1)}°C`
+                : '—'}
+            </span>
+            <span className="col-span-2 text-[10px] text-gray-600 pt-1 border-t border-gray-800/80 mt-1">
+              Engine compares indoor temp to <strong className="text-gray-400">effective</strong> ± hysteresis; band is [base … base+max Δ] (auto caps weather+AI uplift).
+            </span>
+          </div>
+          <span className="text-[10px] text-gray-600 block mt-2">
             {aiApplied
               ? 'Schedule + weather + small bounded model nudge (max ±1°C).'
               : aiOn

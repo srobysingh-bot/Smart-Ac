@@ -41,7 +41,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional, Tuple
 
-from . import ac_adapter, config_manager, database, ha_client, session_logger, smart_cooling, weather_api
+from . import ac_adapter, config_manager, database, ha_client, live_broadcast, session_logger, smart_cooling, weather_api
 from . import room_registry
 from .ai import (
     apply_ai_fan,
@@ -134,6 +134,8 @@ class RoomRuntime:
     # Hybrid event triggers — last sampled values from HA WS (not authoritative for control)
     last_event_presence_bool: Optional[bool] = None
     last_event_probe_indoor_temp: Optional[float] = None
+    # Last applied comfort-mode (effective_mode) — detects config changes to clear stale delays.
+    last_effective_mode: Optional[str] = None
 
 
 _runtime_by_room: Dict[str, RoomRuntime] = {}
@@ -547,8 +549,10 @@ async def effective_target_for_temp_cross(
     indoor_temp: float,
 ) -> Optional[float]:
     """
-    Band center aligned with thermostat math in ``_tick_impl`` before HA setpoint-lock:
-    schedule slot → outdoor curve → ``eff_aw`` + clamped AI delta from cache (schedule_ai).
+    Band center aligned with thermostat math in ``_tick_impl`` after effective-mode
+    band clamp and before HA setpoint-lock:
+
+    schedule slot → outdoor curve → ``eff_aw`` + AI delta → ``apply_effective_mode_engine_target``.
 
     Omitting `_manual_override_resolve` here avoids mutating `prev_ha_setpoint_seen` from
     the WebSocket path; if a user knob lock is active, the periodic tick still reconciles bands.
@@ -565,7 +569,115 @@ async def effective_target_for_temp_cross(
     )
     eff_aw = compute_effective_target(base_temp, outdoor_temp, smart_curve)
     ai_delta = await _get_ai_target_adjustment(room_canon, indoor_temp, eff_aw, merged_cfg)
-    return float(eff_aw + ai_delta)
+    planned_raw = float(eff_aw + ai_delta)
+    return apply_effective_mode_engine_target(
+        room_id=room_canon,
+        base_temp=float(base_temp),
+        planned_with_ai=planned_raw,
+        cfg=merged_cfg,
+        control_log=False,
+    )
+
+
+_EFF_DELTA_MIN = 1.0
+_EFF_DELTA_MAX = 5.0
+
+
+def effective_max_delta_deg(cfg: dict) -> float:
+    """Max °C above schedule base for auto combined adjustment and manual ceiling (default 3, clamp 1–5)."""
+    try:
+        return max(_EFF_DELTA_MIN, min(float(cfg.get("effective_max_delta_deg", 3.0)), _EFF_DELTA_MAX))
+    except (TypeError, ValueError):
+        return 3.0
+
+
+def apply_effective_mode_engine_target(
+    *,
+    room_id: str,
+    base_temp: float,
+    planned_with_ai: float,
+    cfg: dict,
+    control_log: bool = True,
+) -> float:
+    """
+    Band-limited engine target before HA setpoint lock.
+
+    * auto: ``planned_with_ai`` may sit below ``base_temp`` when weather pulls the curve down
+      or AI delta is negative. We intentionally do not model “cool below schedule base” in this band:
+      ``delta_lift = planned_with_ai - base`` then clamp ``delta_lift = max(0, min(delta_lift, max_up))``.
+    * manual: ``manual_effective_temp`` when set, else same as auto; clamped to [base, base+max_delta].
+
+    Thermostat ON/OFF still uses ``effective_target`` vs indoor temp + hysteresis (unchanged).
+    """
+    base_b = float(base_temp)
+    max_up = effective_max_delta_deg(cfg)
+    mode = str(cfg.get("effective_mode") or "auto").strip().lower()
+    if mode not in ("auto", "manual"):
+        mode = "auto"
+
+    raw_manual = cfg.get("manual_effective_temp")
+    used_manual_value: Optional[float] = None
+
+    def _auto_lift_from_pipeline(raw_eff: float) -> float:
+        """Explicit band: discard sub-base pipeline output; cap uplift at max_delta."""
+        raw_effective = float(raw_eff)
+        delta_lift = raw_effective - base_b
+        delta_lift = max(0.0, min(delta_lift, max_up))
+        return base_b + delta_lift
+
+    if mode == "manual" and raw_manual is not None:
+        try:
+            mv = float(raw_manual)
+        except (TypeError, ValueError):
+            et = _auto_lift_from_pipeline(planned_with_ai)
+            log_mode = "manual_invalid_fallback_auto"
+        else:
+            used_manual_value = mv
+            et = max(base_b, min(mv, base_b + max_up))
+            log_mode = "manual"
+    else:
+        et = _auto_lift_from_pipeline(planned_with_ai)
+        log_mode = "auto" if mode == "auto" else "manual_unset_auto"
+
+    if control_log:
+        if log_mode == "manual" and used_manual_value is not None:
+            logger.info(
+                "[CONTROL][%s] mode=manual base=%.1f manual=%.1f effective=%.1f max_delta=%.1f",
+                room_id,
+                base_b,
+                used_manual_value,
+                et,
+                max_up,
+            )
+        else:
+            logger.info(
+                "[CONTROL][%s] mode=%s base=%.1f planned_raw=%.1f effective=%.1f max_delta=%.1f",
+                room_id,
+                log_mode,
+                base_b,
+                planned_with_ai,
+                et,
+                max_up,
+            )
+    return float(et)
+
+
+def sync_effective_mode_transition(st: RoomRuntime, room_id: str, cfg: dict) -> None:
+    """When ``effective_mode`` changes in config, abandon in-flight ON/OFF delays (stale intent)."""
+    cur = str(cfg.get("effective_mode") or "auto").strip().lower()
+    if cur not in ("auto", "manual"):
+        cur = "auto"
+    if st.last_effective_mode is not None and st.last_effective_mode != cur:
+        logger.info(
+            "[CONTROL][%s] effective_mode %s → %s — clearing pending_action / pending_since",
+            room_id,
+            st.last_effective_mode,
+            cur,
+        )
+        _cancel_pending_delay_wakeup_task(st)
+        st.pending_action = None
+        st.pending_since = None
+    st.last_effective_mode = cur
 
 
 def _nonnegative_delay_seconds(cfg: dict, key: str) -> float:
@@ -674,7 +786,9 @@ def record_user_api_command(room_id: str) -> None:
 def _session_creation_eligible(st: RoomRuntime, now: datetime) -> bool:
     """
     Opening a cooling session requires real AC intent/on state — NOT inferred-only effective_ac_on.
-    True when runtime believes the unit is ON, or we recently sent an IR/cool-down ON command.
+
+    ``effective_target`` / comfort mode does not gate eligibility; compressor power, ``ac_is_on``,
+    and recent commanded ON do.
     """
     if st.ac_is_on:
         return True
@@ -1089,6 +1203,7 @@ async def tick(room_id: str) -> None:
     async with _room_tick_serial_lock(canon):
         async with _room_ops_lock(canon):
             await _tick_impl(rid_raw, canon)
+    await live_broadcast.broadcast_room_update(canon)
 
 
 async def _tick_impl(rid_raw: str, room_id: str) -> None:
@@ -1110,6 +1225,8 @@ async def _tick_impl(rid_raw: str, room_id: str) -> None:
         logger.debug("[HawaAI] tick skipped [%s] — no climate_entity", room_id)
         return
     cfg = room_registry.merge_room_config(base_cfg, room_def)
+
+    sync_effective_mode_transition(st, room_id, cfg)
 
     _ae = bool(cfg.get("ai_enabled", False))
     if st.last_ai_enabled is not None and _ae != st.last_ai_enabled:
@@ -1388,9 +1505,16 @@ async def _tick_impl(rid_raw: str, room_id: str) -> None:
 
     ai_delta = await _get_ai_target_adjustment(room_id, indoor_temp, eff_aw, cfg)
     planned_with_ai = eff_aw + ai_delta
+    engine_target = apply_effective_mode_engine_target(
+        room_id=room_id,
+        base_temp=float(base_temp),
+        planned_with_ai=float(planned_with_ai),
+        cfg=cfg,
+        control_log=True,
+    )
 
     manual_override_active, effective_target = _manual_override_resolve(
-        room_id, cfg, climate_data or {}, indoor_temp, now, planned_with_ai,
+        room_id, cfg, climate_data or {}, indoor_temp, now, engine_target,
     )
     if manual_override_active:
         try:
@@ -1756,7 +1880,12 @@ async def _maintain_session_lifecycle(
     confirmed_ac_on: bool,
     inferred_only_physical: bool,
 ) -> None:
-    """Open provisional session on confirmed AC ON; never during inferred-only or pending_ON."""
+    """
+    Open provisional session on confirmed compressor / command ON; never inferred-only pending path.
+
+    Gating uses ``confirmed_ac_on`` / ``_session_creation_eligible`` (power + ``ac_is_on`` / IR),
+    not thermostat ``effective_target`` alone — switching comfort effective_mode does not start sessions by itself.
+    """
     st = _rt(room_id)
     sid_open = session_logger.current_session_id(room_id)
     if sid_open and session_logger.current_session_is_provisional(room_id):
@@ -2448,4 +2577,7 @@ def get_runtime_state(room_id: str) -> dict:
         "pending_action":             st.pending_action,
         "pending_since_ts":           st.pending_since,
         "pending_remaining_seconds":  pending_remaining,
+        "effective_mode":             str(merged.get("effective_mode") or "auto"),
+        "manual_effective_temp":      merged.get("manual_effective_temp"),
+        "effective_max_delta_deg":    effective_max_delta_deg(merged),
     }

@@ -12,6 +12,11 @@
 const INGRESS_PATH = (typeof window !== 'undefined' && window.__INGRESS_PATH__) || ''
 const BASE = INGRESS_PATH + '/api'
 
+/** Match backend `normalize_room_id` (trim + lowercase) — WS payloads use canonical room_id. */
+function normalizeRoomKey(id) {
+  return id != null ? String(id).trim().toLowerCase() : ''
+}
+
 /** Non-empty trimmed room id, or rejects — all dashboard APIs must be room-scoped. */
 function roomParam(roomId, label = 'room_id') {
   const s = roomId != null ? String(roomId).trim() : ''
@@ -220,7 +225,10 @@ export function connectLive(roomId, onMessage, onError) {
       } catch {
         return
       }
-      if (data.room_id != null && data.room_id !== rid) {
+      if (
+        data.room_id != null &&
+        normalizeRoomKey(data.room_id) !== normalizeRoomKey(rid)
+      ) {
         console.warn('[HawaAI] Ignoring WS payload for wrong room:', data.room_id, 'expected', rid)
         return
       }

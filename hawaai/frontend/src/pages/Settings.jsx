@@ -194,6 +194,7 @@ const ROOM_SETTINGS_KEYS = [
   'smart_temp_adjustment', 'smart_cooling_enabled', 'manual_override',
   'ac_brand', 'ac_model', 'weather_provider', 'weather_api_key', 'weather_city',
   'temperature_mode', 'timezone', 'schedule',
+  'effective_mode', 'manual_effective_temp', 'effective_max_delta_deg',
 ]
 
 const SCHEDULE_SLOT_ROWS = [
@@ -348,6 +349,9 @@ export default function Settings() {
       const settings = {}
       for (const k of ROOM_SETTINGS_KEYS) {
         if (cfg[k] !== undefined) settings[k] = cfg[k]
+      }
+      if ((cfg.effective_mode || 'auto') === 'auto') {
+        settings.manual_effective_temp = null
       }
       if (!settings.weather_api_key) delete settings.weather_api_key
 
@@ -918,6 +922,85 @@ export default function Settings() {
             <span className="text-amber-400/95">Moving this slider switches to Manual so this value drives control.</span>
           )}
         </p>
+
+        <div className="border border-gray-800 rounded-xl p-4 space-y-4">
+          <p className="text-xs font-semibold uppercase tracking-widest text-gray-400">
+            Effective control target
+          </p>
+          <p className="text-xs text-gray-500 -mt-2 leading-relaxed">
+            Thermostat decisions still use <strong className="text-gray-400">indoor temp vs effective ± hysteresis</strong>
+            — unchanged. Here you choose how that <strong className="text-gray-400">effective</strong> point is set from
+            today&apos;s <strong className="text-gray-400">schedule base</strong> (same row as the Temperature Schedule
+            preview). <strong className="text-gray-400">Auto</strong> adds weather + AI nudges but never more than Max Δ
+            above base. <strong className="text-gray-400">Manual</strong> fixes effective in [base … base+Max Δ].
+          </p>
+          <div>
+            <Label>Comfort mode</Label>
+            <select
+              className="w-full bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm text-gray-100 focus:outline-none focus:border-blue-500"
+              value={cfg.effective_mode || 'auto'}
+              onChange={(e) => {
+                const v = e.target.value
+                if (v === 'manual') {
+                  const base = previewBaseDegC(cfg)
+                  setCfg((prev) => ({
+                    ...prev,
+                    effective_mode: v,
+                    manual_effective_temp:
+                      prev.manual_effective_temp != null && prev.manual_effective_temp !== ''
+                        ? Number(prev.manual_effective_temp)
+                        : base,
+                  }))
+                } else {
+                  setCfg((prev) => ({ ...prev, effective_mode: v, manual_effective_temp: null }))
+                }
+              }}
+            >
+              <option value="auto">Auto (weather + AI, capped)</option>
+              <option value="manual">Manual (fixed °C vs base band)</option>
+            </select>
+          </div>
+          <Slider
+            label="Max °C above schedule base"
+            value={cfg.effective_max_delta_deg ?? 3}
+            onChange={(v) => patch('effective_max_delta_deg', v)}
+            min={1}
+            max={5}
+            step={0.5}
+            unit="°C"
+          />
+          {(() => {
+            const base = previewBaseDegC(cfg)
+            const md = Number(cfg.effective_max_delta_deg ?? 3)
+            const hi = base + md
+            if ((cfg.effective_mode || 'auto') !== 'manual') return null
+            let cur =
+              cfg.manual_effective_temp != null && cfg.manual_effective_temp !== ''
+                ? Number(cfg.manual_effective_temp)
+                : base
+            if (!Number.isFinite(cur)) cur = base
+            cur = Math.min(Math.max(cur, base), hi)
+            return (
+              <Slider
+                label="Manual effective temperature"
+                value={cur}
+                onChange={(v) => {
+                  const x = Math.min(Math.max(Number(v), base), hi)
+                  patch('manual_effective_temp', x)
+                }}
+                min={base}
+                max={hi}
+                step={0.5}
+                unit="°C"
+              />
+            )
+          })()}
+          <p className="text-xs text-gray-500">
+            Preview schedule base ≈{' '}
+            <span className="font-mono text-blue-300">{previewBaseDegC(cfg).toFixed(1)}°C</span>
+            {' '}(server resolves the active slot on save and every tick.)
+          </p>
+        </div>
 
         {/* Temperature schedule */}
         <div className="border border-gray-800 rounded-xl p-4 space-y-4">

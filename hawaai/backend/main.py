@@ -24,7 +24,7 @@ Routes:
   GET  /api/export/csv      Download session CSV (?room_id= required)
   GET  /api/export/json     Download session JSON (?room_id= required)
   GET  /api/export/ml_snapshots Clean ML snapshot rows (?room_id= required)
-  WS   /ws                  Live push per subscribed room_id every 5 s
+  WS   /ws                  Live push per room (5 s sweep + immediate after each logic tick)
 """
 
 import asyncio
@@ -45,7 +45,7 @@ from fastapi import Body, FastAPI, HTTPException, Query, Request, WebSocket, Web
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, HTMLResponse, Response
 
-from . import config_manager, database, ha_entity_events, logic_engine, room_registry, scheduler, session_logger, weather_api
+from . import config_manager, database, ha_entity_events, live_broadcast, logic_engine, room_registry, scheduler, session_logger, weather_api
 from . import ha_client
 from .ac_controller import get_brands
 from .ai import get_cached
@@ -161,6 +161,7 @@ async def lifespan(app: FastAPI):
         init_ai_worker()
     except Exception:
         logger.exception("[AI] AI worker startup hook failed — continuing without AI bootstrap")
+    live_broadcast.register_room_broadcast(_broadcast_to_room_subscribers)
     asyncio.create_task(scheduler.start())
     asyncio.create_task(ha_entity_events.run_forever())
     asyncio.create_task(_broadcast_loop())
@@ -170,7 +171,7 @@ async def lifespan(app: FastAPI):
     logger.info("[HawaAI] Add-on stopped")
 
 
-app = FastAPI(title="HawaAI API", version="1.4.21", lifespan=lifespan)
+app = FastAPI(title="HawaAI API", version="1.4.22", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -528,6 +529,9 @@ async def _dashboard_status_payload(rid: str) -> Dict[str, Any]:
         "target_temp": base_target,
         "schedule_base_temp": base_target,
         "effective_target": effective_target,
+        "effective_mode": str(cfg.get("effective_mode") or "auto"),
+        "manual_effective_temp": cfg.get("manual_effective_temp"),
+        "effective_max_delta_deg": logic_engine.effective_max_delta_deg(cfg),
         "effective_after_weather": effective_after_weather,
         "temperature_mode": tm,
         "schedule_slot": schedule_slot,
@@ -637,6 +641,64 @@ async def api_create_room(body: Dict[str, Any] = Body(...)):
     return room_registry.public_room_view(row)
 
 
+def _sanitize_effective_target_room_settings(
+    base_cfg: Dict[str, Any],
+    room_row: Dict[str, Any],
+    incoming_settings: Dict[str, Any],
+) -> None:
+    """
+    Clamp effective_mode / manual_effective_temp / effective_max_delta_deg on save.
+
+    Uses schedule-resolved base + merged settings preview (same model as runtime tick).
+    Mutates ``incoming_settings`` for those keys.
+    """
+    touch_keys = frozenset(
+        {"effective_mode", "manual_effective_temp", "effective_max_delta_deg"}
+    )
+    if not isinstance(incoming_settings, dict):
+        return
+    if not any(k in incoming_settings for k in touch_keys):
+        return
+
+    if "effective_mode" in incoming_settings and incoming_settings["effective_mode"] is not None:
+        em = str(incoming_settings["effective_mode"]).strip().lower()
+        incoming_settings["effective_mode"] = em if em in ("auto", "manual") else "auto"
+
+    if "effective_max_delta_deg" in incoming_settings and incoming_settings["effective_max_delta_deg"] is not None:
+        try:
+            raw_md = float(incoming_settings["effective_max_delta_deg"])
+            incoming_settings["effective_max_delta_deg"] = logic_engine.effective_max_delta_deg(
+                {"effective_max_delta_deg": raw_md}
+            )
+        except (TypeError, ValueError):
+            incoming_settings.pop("effective_max_delta_deg", None)
+
+    orig_s = dict(room_row.get("settings") or {})
+    proposed = dict(orig_s)
+    for kk, vv in incoming_settings.items():
+        if vv is None:
+            proposed.pop(kk, None)
+        else:
+            proposed[kk] = vv
+    draft = dict(room_row)
+    draft["settings"] = proposed
+    try:
+        merged_eff = room_registry.merge_room_config(base_cfg, draft)
+        base_t, _ = resolve_base_target_temp(merged_eff)
+        max_d = logic_engine.effective_max_delta_deg(merged_eff)
+    except Exception:
+        return
+
+    if "manual_effective_temp" in incoming_settings and incoming_settings["manual_effective_temp"] is not None:
+        try:
+            mv = float(incoming_settings["manual_effective_temp"])
+            incoming_settings["manual_effective_temp"] = max(
+                float(base_t), min(mv, float(base_t) + float(max_d))
+            )
+        except (TypeError, ValueError):
+            incoming_settings.pop("manual_effective_temp", None)
+
+
 @app.put("/api/rooms/{room_id}")
 async def api_update_room(room_id: str, body: Dict[str, Any] = Body(...)):
     rid = _require_room_query(room_id)
@@ -668,8 +730,10 @@ async def api_update_room(room_id: str, body: Dict[str, Any] = Body(...)):
     if "settings" in body:
         inc = body["settings"]
         if isinstance(inc, dict):
+            inc_applied = dict(inc)
+            _sanitize_effective_target_room_settings(base, r, inc_applied)
             cur_s = dict(r.get("settings") or {})
-            for sk, sv in inc.items():
+            for sk, sv in inc_applied.items():
                 if sk in ("weather_api_key", "ai_api_key") and sv in (None, "", "***"):
                     continue
                 if sv is None:
@@ -1152,6 +1216,72 @@ async def export_ml_snapshots(room_id: str = Query(..., min_length=1), limit: in
 
 # ── WebSocket ─────────────────────────────────────────────────────────────────
 
+
+def _encode_room_tick_ws_payload_json(rid_canon: str) -> Optional[str]:
+    """
+    Compact live tick JSON for one room (runtime + schedule slot context).
+    Mirrors get_runtime_state and must include pending / AC display fields for the dashboard.
+    """
+    rk = (rid_canon or "").strip().lower()
+    if not rk:
+        return None
+    try:
+        base = config_manager.load_config()
+        room_def = logic_engine.resolve_room_definition(base, rk)
+        if not room_def:
+            return json.dumps({"type": "error", "room_id": rk, "detail": "unknown_room"})
+        merged = room_registry.merge_room_config(base, room_def)
+        runtime = logic_engine.get_runtime_state(rk)
+        sched_bt, sched_slot = resolve_base_target_temp(merged)
+        return json.dumps(
+            {
+                "type": "tick",
+                **runtime,
+                "control_source": runtime.get("control_source", "none"),
+                "target_temp": sched_bt,
+                "schedule_slot": sched_slot,
+                "temperature_mode": merged.get("temperature_mode") or "manual",
+                "room_id": rk,
+            },
+            default=str,
+        )
+    except Exception:
+        logger.debug("[WS] encode tick payload failed rid=%s", rk, exc_info=True)
+        return None
+
+
+async def _push_ws_payload_to_room_clients(rid_canon: str, payload: str) -> None:
+    rk = (rid_canon or "").strip().lower()
+    async with _ws_lock:
+        clients = list(_ws_by_room.get(rk, []))
+    if not clients:
+        return
+    dead: List[WebSocket] = []
+    for ws in clients:
+        try:
+            await ws.send_text(payload)
+        except Exception:
+            dead.append(ws)
+    if not dead:
+        return
+    async with _ws_lock:
+        bucket = _ws_by_room.get(rk)
+        if not bucket:
+            return
+        for ws in dead:
+            try:
+                bucket.remove(ws)
+            except ValueError:
+                pass
+
+
+async def _broadcast_to_room_subscribers(rid_canon: str) -> None:
+    payload = _encode_room_tick_ws_payload_json(rid_canon)
+    if not payload:
+        return
+    await _push_ws_payload_to_room_clients(rid_canon, payload)
+
+
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
     await websocket.accept()
@@ -1201,7 +1331,7 @@ async def websocket_endpoint(websocket: WebSocket):
 
 
 async def _broadcast_loop():
-    """Push compact runtime ticks only to WebSocket clients subscribed to each room_id."""
+    """Fallback sweep: push tick envelope every 5s (event ticks also broadcast immediately)."""
     while True:
         await asyncio.sleep(5)
         async with _ws_lock:
@@ -1209,47 +1339,10 @@ async def _broadcast_loop():
         for rid, clients in snapshot:
             if not clients:
                 continue
-            try:
-                base = config_manager.load_config()
-                room_def = logic_engine.resolve_room_definition(base, rid)
-                if not room_def:
-                    payload = json.dumps({"type": "error", "room_id": rid, "detail": "unknown_room"})
-                else:
-                    merged = room_registry.merge_room_config(base, room_def)
-                    runtime = logic_engine.get_runtime_state(rid)
-                    sched_bt, sched_slot = resolve_base_target_temp(merged)
-                    payload = json.dumps(
-                        {
-                            "type": "tick",
-                            **runtime,
-                            "control_source": runtime.get("control_source", "none"),
-                            "target_temp": sched_bt,
-                            "schedule_slot": sched_slot,
-                            "temperature_mode": merged.get("temperature_mode") or "manual",
-                            "room_id": rid,
-                        },
-                        default=str,
-                    )
-            except Exception:
+            payload = _encode_room_tick_ws_payload_json(rid)
+            if not payload:
                 continue
-
-            dead: List[WebSocket] = []
-            for ws in clients:
-                try:
-                    await ws.send_text(payload)
-                except Exception:
-                    dead.append(ws)
-            if not dead:
-                continue
-            async with _ws_lock:
-                bucket = _ws_by_room.get(rid)
-                if not bucket:
-                    continue
-                for ws in dead:
-                    try:
-                        bucket.remove(ws)
-                    except ValueError:
-                        pass
+            await _push_ws_payload_to_room_clients(rid, payload)
 
 
 # ── Serve React frontend ──────────────────────────────────────────────────────
