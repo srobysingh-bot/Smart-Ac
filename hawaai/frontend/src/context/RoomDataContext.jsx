@@ -120,6 +120,7 @@ export function RoomDataProvider({ children }) {
             ...prev.status,
             ...msg,
             effective_ac_on: msg.effective_ac_on ?? msg.ac_is_on ?? prev.status.effective_ac_on,
+            ac_state_source: msg.ac_state_source ?? prev.status.ac_state_source,
           },
         }
       })

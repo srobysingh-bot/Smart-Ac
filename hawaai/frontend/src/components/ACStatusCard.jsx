@@ -1,8 +1,8 @@
 /**
  * ACStatusCard — displays current AC state and session info.
  *
- * State source (v1.1.17+):
- *   acOn   → /api/status.ac_on   (watts > 500 W when power sensor available)
+ * State source:
+ *   acOn   → effective_ac_on (power + internal + transient inference); falls back to ac_on
  *   acIdle → /api/status.ac_idle (watts 50–500 W: fan running, compressor off)
  *
  * Three possible states:
@@ -13,7 +13,7 @@
  * Climate entity is used ONLY for display (temp, mode, fan, swing).
  */
 import { useEffect, useState } from 'react'
-import { Wind, Timer, Zap, Thermometer, Gauge } from 'lucide-react'
+import { Wind, Timer, Zap, Thermometer, Gauge, Brain, SlidersHorizontal } from 'lucide-react'
 
 function elapsed(startIso) {
   if (!startIso) return null
@@ -61,6 +61,38 @@ function SmartModeBadge({ mode, fanMode, delta }) {
   )
 }
 
+function StateSourceHint({ source, acOn }) {
+  if (!acOn || !source) return null
+  const cfg = {
+    power: {
+      Icon: Zap,
+      label: 'Power confirmed',
+      cls: 'text-yellow-400/90',
+    },
+    inferred: {
+      Icon: Brain,
+      label: 'Estimated',
+      cls: 'text-purple-400/90',
+    },
+    system: {
+      Icon: SlidersHorizontal,
+      label: 'System controlled',
+      cls: 'text-gray-500',
+    },
+  }[source]
+  if (!cfg) return null
+  const { Icon, label, cls } = cfg
+  return (
+    <span
+      className={`inline-flex items-center gap-1 text-[10px] uppercase tracking-wide ${cls}`}
+      title={label}
+    >
+      <Icon size={11} aria-hidden />
+      {label}
+    </span>
+  )
+}
+
 function StateChip({ acOn, acIdle }) {
   if (acOn && !acIdle) {
     return (
@@ -99,6 +131,7 @@ function formatEpochLine(epochSec, label) {
 export default function ACStatusCard({
   acOn,
   acIdle = false,
+  acStateSource,
   sessionStart,
   runtime,
   wattDraw,
@@ -135,9 +168,12 @@ export default function ACStatusCard({
   return (
     <div className="card flex flex-col gap-3">
       {/* Header row */}
-      <div className="flex items-center justify-between">
+      <div className="flex items-center justify-between flex-wrap gap-2">
         <p className="text-xs text-gray-500 uppercase tracking-wide">AC Status</p>
-        <StateChip acOn={acOn} acIdle={acIdle} />
+        <div className="flex flex-col items-end gap-1">
+          <StateChip acOn={acOn} acIdle={acIdle} />
+          <StateSourceHint source={acStateSource} acOn={acOn} />
+        </div>
       </div>
 
       {/* Smart cooling mode badge — shown only when feature is enabled and AC is active */}

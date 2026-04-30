@@ -389,7 +389,10 @@ async def _dashboard_status_payload(rid: str) -> Dict[str, Any]:
     energy_kwh   = safe_float(energy_kwh_raw)
 
     runtime = logic_engine.get_runtime_state(rid)
-    ac_on = bool(runtime.get("ac_is_on", False))
+    effective_ac_on = bool(
+        runtime.get("effective_ac_on", runtime.get("ac_is_on", False))
+    )
+    ac_on_compat = effective_ac_on
     ac_idle = bool(runtime.get("ac_idle", False))
     power_source = str(runtime.get("power_source", "internal"))
     cooldown_active = bool(runtime.get("cooldown_active", False))
@@ -457,8 +460,9 @@ async def _dashboard_status_payload(rid: str) -> Dict[str, Any]:
         "ai_enabled":       bool(cfg.get("ai_enabled", False)),
         "ai_cached":        bool(runtime.get("ai_cached")),
         # ── Core state ────────────────────────────────────────────────────────
-        "ac_on":             ac_on,
-        "effective_ac_on":   ac_on,
+        "ac_on":             ac_on_compat,
+        "effective_ac_on":   effective_ac_on,
+        "ac_state_source":  runtime.get("ac_state_source", "system"),
         "ac_idle":          ac_idle,       # fan running, compressor off (50–500 W)
         "power_source":     power_source,  # "watts" | "watts_idle" | "cooldown" | "internal"
         "indoor_temp":      indoor_temp,
@@ -1107,7 +1111,6 @@ async def _broadcast_loop():
                         {
                             "type": "tick",
                             **runtime,
-                            "effective_ac_on": runtime.get("ac_is_on", False),
                             "control_source": runtime.get("control_source", "none"),
                             "target_temp": sched_bt,
                             "schedule_slot": sched_slot,

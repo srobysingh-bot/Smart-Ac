@@ -95,6 +95,10 @@ class RoomRuntime:
     effective_ac_on: bool = False
     effective_ac_idle: bool = False
     effective_power_source: str = "init"       # "watts" | "cooldown" | "internal"
+    # Manual remote likely ON — wall power not high yet (epoch timestamp, UTC)
+    possible_on_since: Optional[float] = None
+    # Confidence for UI overlay: watts path vs transient inference vs cooldown/internal
+    ac_state_source: str = "system"
     effective_control_source: str = "none"     # safety_vacant | manual | schedule | thermostat | ai | cooldown | none
     effective_target_temp: float = 24.0
 
@@ -147,6 +151,9 @@ _COOLDOWN_SECS: int = 60
 # Power-based state thresholds
 _WATTS_COMPRESSOR: float = 500.0   # watts above this → compressor running (AC ON)
 _WATTS_FAN_ONLY:   float = 50.0    # watts between FAN_ONLY and COMPRESSOR → IDLE (fan only)
+
+# Probable manual-ON inference: occupy + hot vs target while watts have not risen yet (seconds)
+TRANSIENT_ON_WINDOW_SECS: float = 180.0
 
 
 def _seconds_since_last_command(st: RoomRuntime, now: datetime) -> float:
@@ -310,6 +317,7 @@ async def _load_startup_state(room_id: str, cfg: dict) -> None:
         logger.warning("[HawaAI] Could not load startup state for room=%s: %s", room_id, e)
     finally:
         st.startup_state_loaded = True
+        st.possible_on_since = None
 
 
 async def _get_ai_target_adjustment(
@@ -969,7 +977,6 @@ async def tick(room_id: str) -> None:
         ac_idle = False
         power_source = "cooldown" if in_cooldown else "internal"
 
-    st.effective_ac_on = ac_on
     st.effective_ac_idle = ac_idle
     st.effective_power_source = power_source
 
@@ -1080,6 +1087,46 @@ async def tick(room_id: str) -> None:
 
     et_eff = float(effective_target)
     st.effective_target_temp = et_eff
+
+    now_ts = now.timestamp()
+    power_high = energy_watts_valid and not in_cooldown and energy_watts > _WATTS_COMPRESSOR
+    power_low = energy_watts_valid and not in_cooldown and energy_watts < _WATTS_FAN_ONLY
+
+    probable_on = (
+        bool(is_occupied_bool)
+        and indoor_temp > et_eff + 1.5
+        and not ac_on
+    )
+    if probable_on:
+        if st.possible_on_since is None:
+            st.possible_on_since = now_ts
+    else:
+        st.possible_on_since = None
+
+    is_probably_on = (
+        st.possible_on_since is not None
+        and (now_ts - st.possible_on_since) < TRANSIENT_ON_WINDOW_SECS
+    )
+
+    if power_high:
+        st.possible_on_since = None
+    if power_low and not is_probably_on:
+        st.possible_on_since = None
+
+    st.effective_ac_on = bool(power_high or st.ac_is_on or is_probably_on)
+
+    if st.effective_ac_on:
+        inferred_only = is_probably_on and not power_high and not st.ac_is_on
+        if inferred_only:
+            st.ac_state_source = "inferred"
+        elif energy_watts_valid and not in_cooldown:
+            st.ac_state_source = "power"
+        else:
+            st.ac_state_source = "system"
+    elif energy_watts_valid and not in_cooldown:
+        st.ac_state_source = "power"
+    else:
+        st.ac_state_source = "system"
 
     schedule_slot_snap: Optional[str] = (
         slot_label if temperature_mode_str != "manual" else None
@@ -1626,8 +1673,10 @@ def get_runtime_state(room_id: str) -> dict:
         sp_secs = round((now - st.last_setpoint_command_at).total_seconds(), 1)
     return {
         "ac_is_on":              st.effective_ac_on,
+        "effective_ac_on":       st.effective_ac_on,
         "ac_idle":               st.effective_ac_idle,
         "power_source":          st.effective_power_source,
+        "ac_state_source":       st.ac_state_source,
         "control_source":        st.effective_control_source,
         "target_temp":           st.effective_target_temp,
         "last_command_source":   st.last_command_source,

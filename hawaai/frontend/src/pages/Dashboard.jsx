@@ -325,9 +325,10 @@ function LiveStatusBar({ status }) {
     indoor_temp, outdoor_temp, presence, ac_on, ac_idle, watt_draw,
     ac_current_temp, cooldown_active, last_command, secs_since_cmd, power_source,
     effective_ac_on,
+    ac_state_source,
   } = status || {}
 
-  const acCore = effective_ac_on != null ? Boolean(effective_ac_on) : Boolean(ac_on)
+  const acCore = Boolean(effective_ac_on ?? ac_on)
 
   const displayTemp = indoor_temp
   const tempFromAC  = status != null && indoor_temp == null && ac_current_temp != null
@@ -371,10 +372,25 @@ function LiveStatusBar({ status }) {
         <Zap size={15} className={acColor} />
         AC:{' '}
         <strong className={acColor}>{acLabel}</strong>
+        {ac_state_source === 'power' && acCore && (
+          <span className="text-xs text-yellow-400/90 ml-1" title="Watts crossed compressor threshold">
+            ⚡ confirmed
+          </span>
+        )}
+        {ac_state_source === 'inferred' && acCore && (
+          <span className="text-xs text-purple-400/90 ml-1" title="Room hotter than target with no watt spike yet">
+            🧠 est.
+          </span>
+        )}
+        {ac_state_source === 'system' && acCore && (
+          <span className="text-xs text-gray-500 ml-1" title="Cooldown or no power meter — trusting command state">
+            🎛 system
+          </span>
+        )}
         {watt_draw > 0 && (
           <span className="text-gray-400">· {Number(watt_draw).toFixed(0)} W</span>
         )}
-        {power_source === 'internal' && (
+        {power_source === 'internal' && !acCore && (
           <span className="text-xs text-gray-600 ml-1" title="No power sensor — state from IR command flag">
             (flag)
           </span>
@@ -773,8 +789,9 @@ export default function Dashboard() {
             indoorFromAC={displayStatus?.indoor_temp == null && displayStatus?.ac_current_temp != null}
           />
           <ACStatusCard
-            acOn={displayStatus?.effective_ac_on ?? displayStatus?.ac_on}
+            acOn={Boolean(displayStatus?.effective_ac_on ?? displayStatus?.ac_on)}
             acIdle={displayStatus?.ac_idle ?? false}
+            acStateSource={displayStatus?.ac_state_source}
             sessionStart={displayStatus?.session_start || displayStatus?.runtime?.session_start}
             runtime={displayStatus?.runtime}
             wattDraw={displayStatus?.watt_draw}

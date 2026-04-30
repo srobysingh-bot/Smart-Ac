@@ -67,13 +67,16 @@ export default function LiveSessionCard({ status }) {
     session_kwh,
     ac_on,
     ac_idle,
+    effective_ac_on,
   } = status || {}
+
+  const isOn = Boolean(effective_ac_on ?? ac_on)
 
   const startIso = session_start || runtime?.session_start
   const elapsed = useElapsed(startIso)
   const isActive = !!(
     (startIso || runtime?.active)
-    && (ac_on || ac_idle)
+    && (isOn || ac_idle)
   )
 
   if (!isActive) return null

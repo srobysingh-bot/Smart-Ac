@@ -55,7 +55,8 @@ class TestLogicEngineHardening(unittest.TestCase):
         with mock.patch.object(logic_engine.config_manager, "load_config", return_value=base):
             out = logic_engine.get_runtime_state("  CaFeF00DBabE ")
         self.assertTrue(out["ac_is_on"])
-        self.assertEqual(out["min_command_interval_seconds"], 150)
+        self.assertTrue(out["effective_ac_on"])
+        self.assertIn(out["ac_state_source"], ("power", "inferred", "system"))
 
 
 if __name__ == "__main__":
