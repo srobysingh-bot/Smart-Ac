@@ -70,7 +70,7 @@ export default function LiveSessionCard({ status }) {
     effective_ac_on,
   } = status || {}
 
-  const isOn = Boolean(effective_ac_on ?? ac_on)
+  const isOn = Boolean(status?.physical_ac_on ?? status?.ac_on ?? effective_ac_on)
 
   const startIso = session_start || runtime?.session_start
   const elapsed = useElapsed(startIso)

@@ -135,7 +135,11 @@ export function RoomDataProvider({ children }) {
           status: {
             ...prev.status,
             ...msg,
-            effective_ac_on: msg.effective_ac_on ?? msg.ac_is_on ?? prev.status.effective_ac_on,
+            effective_ac_on:
+              msg.effective_ac_on ?? prev.status.effective_ac_on,
+            physical_ac_on: msg.physical_ac_on ?? msg.ac_is_on ?? prev.status.physical_ac_on,
+            ac_is_on: msg.ac_is_on ?? prev.status.ac_is_on,
+            ac_state: msg.ac_state ?? prev.status.ac_state,
             ac_state_source: msg.ac_state_source ?? prev.status.ac_state_source,
           },
         }

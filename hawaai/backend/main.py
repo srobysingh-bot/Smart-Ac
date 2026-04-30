@@ -169,7 +169,7 @@ async def lifespan(app: FastAPI):
     logger.info("[HawaAI] Add-on stopped")
 
 
-app = FastAPI(title="HawaAI API", version="1.4.19", lifespan=lifespan)
+app = FastAPI(title="HawaAI API", version="1.4.20", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -413,10 +413,10 @@ async def _dashboard_status_payload(rid: str) -> Dict[str, Any]:
     energy_kwh   = safe_float(energy_kwh_raw)
 
     runtime = logic_engine.get_runtime_state(rid)
-    effective_ac_on = bool(
-        runtime.get("effective_ac_on", runtime.get("ac_is_on", False))
-    )
-    ac_on_compat = effective_ac_on
+    ac_state = str(runtime.get("ac_state") or "off")
+    physical_ac_on = bool(runtime.get("physical_ac_on", runtime.get("ac_is_on", False)))
+    effective_ac_on = bool(runtime.get("effective_ac_on", False))
+    ac_on_compat = physical_ac_on
     ac_idle = bool(runtime.get("ac_idle", False))
     power_source = str(runtime.get("power_source", "internal"))
     cooldown_active = bool(runtime.get("cooldown_active", False))
@@ -485,6 +485,8 @@ async def _dashboard_status_payload(rid: str) -> Dict[str, Any]:
         "ai_cached":        bool(runtime.get("ai_cached")),
         # ── Core state ────────────────────────────────────────────────────────
         "ac_on":             ac_on_compat,
+        "physical_ac_on":    physical_ac_on,
+        "ac_state":          ac_state,
         "effective_ac_on":   effective_ac_on,
         "ac_state_source":  runtime.get("ac_state_source", "system"),
         "ac_idle":          ac_idle,       # fan running, compressor off (50–500 W)

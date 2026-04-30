@@ -38,7 +38,9 @@ class TestLogicEngineHardening(unittest.TestCase):
         logic_engine._runtime_by_room.clear()
         st = logic_engine._rt(rid)
         st.ac_is_on = True
+        st.physical_ac_on = True
         st.effective_ac_on = True
+        st.ac_state = "on"
         st.effective_ac_idle = False
         st.effective_power_source = "internal"
         st.effective_control_source = "test"
@@ -56,7 +58,9 @@ class TestLogicEngineHardening(unittest.TestCase):
         with mock.patch.object(logic_engine.config_manager, "load_config", return_value=base):
             out = logic_engine.get_runtime_state("  CaFeF00DBabE ")
         self.assertTrue(out["ac_is_on"])
+        self.assertTrue(out["physical_ac_on"])
         self.assertTrue(out["effective_ac_on"])
+        self.assertEqual(out["ac_state"], "on")
         self.assertIn(out["ac_state_source"], ("power", "inferred", "system"))
 
     def test_sync_pending_clears_when_decision_not_on_off(self):
@@ -85,29 +89,69 @@ class TestLogicEngineHardening(unittest.TestCase):
     def test_clear_pending_on_satisfied_physically_or_override(self):
         st = logic_engine.RoomRuntime()
         st.pending_action = "on"
-        st.effective_ac_on = True
-        logic_engine._clear_pending_when_physically_satisfied(st, manual_override_active=False)
+        logic_engine._clear_pending_when_physically_satisfied(
+            st,
+            manual_override_active=False,
+            confirmed_ac_on=True,
+            physical_ac_on=True,
+        )
         self.assertIsNone(st.pending_action)
 
         st.pending_action = "on"
         st.pending_since = 2.0
-        st.effective_ac_on = False
-        logic_engine._clear_pending_when_physically_satisfied(st, manual_override_active=True)
+        logic_engine._clear_pending_when_physically_satisfied(
+            st,
+            manual_override_active=True,
+            confirmed_ac_on=False,
+            physical_ac_on=False,
+        )
         self.assertIsNone(st.pending_action)
 
+        # Inferred-only physical ON must NOT clear pending ON until power/IR/HA confirms.
         st.pending_action = "on"
         st.pending_since = 3.0
-        st.effective_ac_on = False
         st.ac_state_source = "inferred"
-        logic_engine._clear_pending_when_physically_satisfied(st, manual_override_active=False)
-        self.assertIsNone(st.pending_action)
+        logic_engine._clear_pending_when_physically_satisfied(
+            st,
+            manual_override_active=False,
+            confirmed_ac_on=False,
+            physical_ac_on=True,
+        )
+        self.assertEqual(st.pending_action, "on")
+        self.assertEqual(st.pending_since, 3.0)
 
     def test_clear_pending_off_when_already_off(self):
         st = logic_engine.RoomRuntime()
         st.pending_action = "off"
-        st.effective_ac_on = False
-        logic_engine._clear_pending_when_physically_satisfied(st, manual_override_active=False)
+        logic_engine._clear_pending_when_physically_satisfied(
+            st,
+            manual_override_active=False,
+            confirmed_ac_on=False,
+            physical_ac_on=False,
+        )
         self.assertIsNone(st.pending_action)
+
+    def test_sync_ac_display_pending_on_masks_effective(self):
+        st = logic_engine.RoomRuntime()
+        st.physical_ac_on = True
+        st.pending_action = "on"
+        st.pending_since = 1000.0
+        logic_engine._sync_ac_display_fields(st)
+        self.assertFalse(st.effective_ac_on)
+        self.assertEqual(st.ac_state, "pending_on")
+
+    def test_sync_ac_display_pending_off_vs_on(self):
+        st = logic_engine.RoomRuntime()
+        st.pending_action = "off"
+        st.physical_ac_on = True
+        logic_engine._sync_ac_display_fields(st)
+        self.assertTrue(st.effective_ac_on)
+        self.assertEqual(st.ac_state, "pending_off")
+
+        st.pending_action = None
+        st.physical_ac_on = True
+        logic_engine._sync_ac_display_fields(st)
+        self.assertEqual(st.ac_state, "on")
 
     def test_decision_lock_blocks_delayed_emit_inside_window(self):
         st = logic_engine.RoomRuntime()

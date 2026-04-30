@@ -1,9 +1,7 @@
 /**
  * ACStatusCard — displays current AC state and session info.
  *
- * State source:
- *   acOn   → effective_ac_on (power + internal + transient inference); falls back to ac_on
- *   acIdle → /api/status.ac_idle (watts 50–500 W: fan running, compressor off)
+ * State: `acPhase` from backend — off | pending_on | on | pending_off (with ac_idle for fan-only).
  *
  * Three possible states:
  *   ON   (green)  — compressor running, watts > 500 W
@@ -69,8 +67,8 @@ function formatDelayCountdown(totalSec) {
   return `${m}:${String(r).padStart(2, '0')}`
 }
 
-function StateSourceHint({ source, acOn }) {
-  if (!acOn || !source) return null
+function StateSourceHint({ source, show }) {
+  if (!show || !source) return null
   const cfg = {
     power: {
       Icon: Zap,
@@ -101,8 +99,16 @@ function StateSourceHint({ source, acOn }) {
   )
 }
 
-function StateChip({ acOn, acIdle }) {
-  if (acOn && !acIdle) {
+function StateChip({ acPhase = 'off', acIdle }) {
+  if (acPhase === 'pending_on') {
+    return (
+      <span className="chip bg-amber-900/50 text-amber-200">
+        <Timer size={12} /> Waiting to turn ON
+      </span>
+    )
+  }
+  const running = acPhase === 'on' || acPhase === 'pending_off'
+  if (running && !acIdle) {
     return (
       <span className="chip bg-green-900/50 text-green-300">
         <Wind size={12} /> Running
@@ -137,7 +143,7 @@ function formatEpochLine(epochSec, label) {
 }
 
 export default function ACStatusCard({
-  acOn,
+  acPhase = 'off',
   acIdle = false,
   acStateSource,
   sessionStart,
@@ -162,11 +168,12 @@ export default function ACStatusCard({
   hasClimateEntity,
 }) {
   const [timer, setTimer] = useState(null)
-  const acOnLine = formatEpochLine(lastAcOnAt, acOn && !acIdle ? 'Running since' : 'Last ON')
+  const runningCompress = acPhase === 'on' || acPhase === 'pending_off'
+  const acOnLine = formatEpochLine(lastAcOnAt, runningCompress && !acIdle ? 'Running since' : 'Last ON')
   const acOffLine = formatEpochLine(lastAcOffAt, 'Last OFF')
 
-  // Timer runs while AC is ON or IDLE (session is active)
-  const sessionActive = acOn || acIdle
+  // Timer runs while compressor is running (incl. pending OFF) or idle fan
+  const sessionActive = runningCompress || acIdle
 
   useEffect(() => {
     if (!sessionActive || !sessionStart) { setTimer(null); return }
@@ -182,7 +189,7 @@ export default function ACStatusCard({
       return
     }
     setAdjPendingRemain(Math.max(0, Number(pendingRemainSec)))
-  }, [pendingRemainSec, pendingAction])
+  }, [pendingRemainSec, pendingAction, acPhase])
 
   useEffect(() => {
     if (adjPendingRemain == null || adjPendingRemain <= 0 || !pendingAction) return undefined
@@ -190,10 +197,10 @@ export default function ACStatusCard({
       setAdjPendingRemain((r) => (r != null ? Math.max(0, r - 1) : r))
     }, 1000)
     return () => window.clearInterval(id)
-  }, [adjPendingRemain, pendingAction])
+  }, [adjPendingRemain, pendingAction, acPhase])
 
   const pendingLabel =
-    pendingAction === 'on'
+    pendingAction === 'on' || acPhase === 'pending_on'
       ? 'Waiting to turn ON'
       : pendingAction === 'off'
         ? 'Waiting to turn OFF'
@@ -205,8 +212,8 @@ export default function ACStatusCard({
       <div className="flex items-center justify-between flex-wrap gap-2">
         <p className="text-xs text-gray-500 uppercase tracking-wide">AC Status</p>
         <div className="flex flex-col items-end gap-1">
-          <StateChip acOn={acOn} acIdle={acIdle} />
-          <StateSourceHint source={acStateSource} acOn={acOn} />
+          <StateChip acPhase={acPhase} acIdle={acIdle} />
+          <StateSourceHint source={acStateSource} show={runningCompress && !acIdle} />
         </div>
       </div>
 
@@ -221,7 +228,7 @@ export default function ACStatusCard({
       )}
 
       {/* Smart cooling mode badge — shown only when feature is enabled and AC is active */}
-      {smartCoolingEnabled && (acOn || acIdle) && (
+      {smartCoolingEnabled && (runningCompress || acIdle) && (
         <SmartModeBadge
           mode={smartMode || 'hold'}
           fanMode={smartFanMode}
@@ -239,7 +246,7 @@ export default function ACStatusCard({
 
       {/* Timer / idle message / off message */}
       <div className="flex flex-col gap-2">
-        {acOn && !acIdle && timer ? (
+        {runningCompress && !acIdle && timer ? (
           <>
             <div className="flex items-center gap-2 text-sm text-gray-400">
               <Timer size={14} className="text-blue-400" />
@@ -265,7 +272,7 @@ export default function ACStatusCard({
               {wattDraw > 0 ? ` · ${Number(wattDraw).toFixed(0)} W` : ''}
             </span>
           </>
-        ) : (acOn || acIdle) && runtime?.active && runtime?.formatted && runtime.formatted !== '—' ? (
+        ) : (runningCompress || acIdle) && runtime?.active && runtime?.formatted && runtime.formatted !== '—' ? (
           <>
             <div className="flex items-center gap-2 text-sm text-gray-400">
               <Timer size={14} className="text-blue-400" />
@@ -278,7 +285,7 @@ export default function ACStatusCard({
           <span className="text-gray-600 text-sm">Not running</span>
         )}
 
-        {acOn && !acIdle && sessionKwh > 0 && (
+        {runningCompress && !acIdle && sessionKwh > 0 && (
           <div className="flex items-center gap-1.5 text-sm text-yellow-400">
             <Zap size={13} />
             {Number(sessionKwh).toFixed(3)} kWh this session
@@ -286,7 +293,7 @@ export default function ACStatusCard({
         )}
 
         {/* Live watt reading when compressor is running */}
-        {acOn && !acIdle && wattDraw > 0 && (
+        {runningCompress && !acIdle && wattDraw > 0 && (
           <div className="flex items-center gap-1.5 text-xs text-gray-400">
             <Zap size={11} className="text-yellow-400" />
             {Number(wattDraw).toFixed(0)} W
@@ -295,7 +302,7 @@ export default function ACStatusCard({
       </div>
 
       {/* Climate entity display data — shown when configured and AC active */}
-      {hasClimateEntity && (acOn || acIdle) && (
+      {hasClimateEntity && (runningCompress || acIdle) && (
         <div className="border-t border-gray-800 pt-3 grid grid-cols-2 gap-y-1.5 text-xs">
           {acCurrentTemp != null && (
             <>

@@ -326,20 +326,35 @@ function LiveStatusBar({ status }) {
     ac_current_temp, cooldown_active, last_command, secs_since_cmd, power_source,
     effective_ac_on,
     ac_state_source,
+    ac_state: acPhase,
+    physical_ac_on,
   } = status || {}
 
-  const acCore = Boolean(effective_ac_on ?? ac_on)
+  const physicalCore = Boolean(
+    physical_ac_on != null ? physical_ac_on : (ac_on ?? effective_ac_on)
+  )
 
   const displayTemp = indoor_temp
   const tempFromAC  = status != null && indoor_temp == null && ac_current_temp != null
 
-  // State display: ON (green) / IDLE (amber) / OFF (gray) — server-derived
-  const acColor  = acCore && !ac_idle ? 'text-green-400'
-                 : ac_idle           ? 'text-yellow-400'
-                 :                    'text-gray-500'
-  const acLabel  = acCore && !ac_idle ? 'ON'
-                 : ac_idle           ? 'IDLE'
-                 :                    'OFF'
+  // State display — prefer explicit ac_phase; pending_on never shows as green ON
+  const phase = acPhase || 'off'
+  const acColor =
+    phase === 'pending_on'
+      ? 'text-amber-400'
+      : physicalCore && !ac_idle
+        ? 'text-green-400'
+        : ac_idle
+          ? 'text-yellow-400'
+          : 'text-gray-500'
+  const acLabel =
+    phase === 'pending_on'
+      ? 'WAIT ON'
+      : physicalCore && !ac_idle
+        ? 'ON'
+        : ac_idle
+          ? 'IDLE'
+          : 'OFF'
 
   return (
     <nav
@@ -372,17 +387,17 @@ function LiveStatusBar({ status }) {
         <Zap size={15} className={acColor} />
         AC:{' '}
         <strong className={acColor}>{acLabel}</strong>
-        {ac_state_source === 'power' && acCore && (
+        {ac_state_source === 'power' && physicalCore && (
           <span className="text-xs text-yellow-400/90 ml-1" title="Watts crossed compressor threshold">
             ⚡ confirmed
           </span>
         )}
-        {ac_state_source === 'inferred' && acCore && (
+        {ac_state_source === 'inferred' && physicalCore && (
           <span className="text-xs text-purple-400/90 ml-1" title="Room hotter than target with no watt spike yet">
             🧠 est.
           </span>
         )}
-        {ac_state_source === 'system' && acCore && (
+        {ac_state_source === 'system' && physicalCore && (
           <span className="text-xs text-gray-500 ml-1" title="Cooldown or no power meter — trusting command state">
             🎛 system
           </span>
@@ -390,7 +405,7 @@ function LiveStatusBar({ status }) {
         {watt_draw > 0 && (
           <span className="text-gray-400">· {Number(watt_draw).toFixed(0)} W</span>
         )}
-        {power_source === 'internal' && !acCore && (
+        {power_source === 'internal' && !physicalCore && phase !== 'pending_on' && (
           <span className="text-xs text-gray-600 ml-1" title="No power sensor — state from IR command flag">
             (flag)
           </span>
@@ -789,7 +804,7 @@ export default function Dashboard() {
             indoorFromAC={displayStatus?.indoor_temp == null && displayStatus?.ac_current_temp != null}
           />
           <ACStatusCard
-            acOn={Boolean(displayStatus?.effective_ac_on ?? displayStatus?.ac_on)}
+            acPhase={displayStatus?.ac_state || 'off'}
             acIdle={displayStatus?.ac_idle ?? false}
             acStateSource={displayStatus?.ac_state_source}
             sessionStart={displayStatus?.session_start || displayStatus?.runtime?.session_start}

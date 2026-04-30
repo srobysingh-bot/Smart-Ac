@@ -95,7 +95,12 @@ class RoomRuntime:
     compressor_watts_high_since: Optional[datetime] = None
 
     # ── Single source of truth — set once per tick, read everywhere ──
+    # Physical compressor / HA / inferred truth (never masked by pending ON).
+    physical_ac_on: bool = False
+    # UI / masked: False while pending_action == "on" even if physical is True.
     effective_ac_on: bool = False
+    # Display phase: off | pending_on | on | pending_off
+    ac_state: str = "off"
     effective_ac_idle: bool = False
     effective_power_source: str = "init"       # "watts" | "cooldown" | "internal"
     # Manual remote likely ON — wall power not high yet (epoch timestamp, UTC)
@@ -265,7 +270,7 @@ def _resolve_control_decision(
         if st.vacant_since is not None:
             elapsed = (now - st.vacant_since).total_seconds()
             if elapsed >= vacancy_timeout and (ac_on or st.ac_is_on):
-                if st.effective_ac_on:
+                if st.physical_ac_on:
                     now_ts = now.timestamp()
                     on_age_secs = None
                     if st.effective_on_since_ts is not None:
@@ -350,17 +355,21 @@ async def _load_startup_state(room_id: str, cfg: dict) -> None:
 
         ha_state = (climate_data.get("state") or "off").lower()
         if ha_state == "cool":
+            st.physical_ac_on = True
             st.effective_ac_on = True
             st.ac_is_on = True
         elif ha_state in ("off", "unavailable", "unknown", ""):
+            st.physical_ac_on = False
             st.effective_ac_on = False
             st.ac_is_on = False
         else:
+            st.physical_ac_on = True
             st.effective_ac_on = True
             st.ac_is_on = True
+        st.ac_state = "on" if st.physical_ac_on else "off"
         logger.info(
             "[HawaAI] Startup state loaded for room=%s ac_on=%s ha_state=%s",
-            room_id, st.effective_ac_on, ha_state,
+            room_id, st.physical_ac_on, ha_state,
         )
     except Exception as e:
         logger.warning("[HawaAI] Could not load startup state for room=%s: %s", room_id, e)
@@ -437,29 +446,43 @@ def _clear_pending_when_physically_satisfied(
     st: RoomRuntime,
     *,
     manual_override_active: bool,
+    confirmed_ac_on: bool,
+    physical_ac_on: bool,
 ) -> None:
     """
-    Drop pending timers when runtime/HA already matches intent (before thermostat decision).
-    ON: effective_ac_on, manual override, or power/inferred ON path.
-    OFF: not effective_ac_on.
+    Drop stale pending timers once physical intent matches observation (before thermostat).
+    Pending ON clears only on confirmed compressor/HA/command — NOT inferred-only transient ON.
+    Pending OFF clears when full physical observation says compressor is OFF.
     """
     if st.pending_action == "on":
-        if st.effective_ac_on:
-            st.pending_action = None
-            st.pending_since = None
-            return
-        if manual_override_active:
-            st.pending_action = None
-            st.pending_since = None
-            return
-        if st.ac_state_source in ("power", "inferred"):
+        if confirmed_ac_on or manual_override_active:
             st.pending_action = None
             st.pending_since = None
             return
     elif st.pending_action == "off":
-        if not st.effective_ac_on:
+        if not physical_ac_on:
             st.pending_action = None
             st.pending_since = None
+
+
+def _sync_ac_display_fields(st: RoomRuntime) -> None:
+    """
+    Mask effective_ac_on during pending ON so UI matches intent; set ac_state phase.
+    Must run after actuation updated pending_action / physical_ac_on is current.
+    """
+    if st.pending_action == "on":
+        st.effective_ac_on = False
+    else:
+        st.effective_ac_on = st.physical_ac_on
+
+    if st.pending_action == "on":
+        st.ac_state = "pending_on"
+    elif st.pending_action == "off" and st.physical_ac_on:
+        st.ac_state = "pending_off"
+    elif st.physical_ac_on:
+        st.ac_state = "on"
+    else:
+        st.ac_state = "off"
 
 
 def _decision_lock_blocks_delayed_emit(st: RoomRuntime, now: datetime) -> bool:
@@ -1250,9 +1273,10 @@ async def _tick_impl(rid_raw: str, room_id: str) -> None:
     if power_low and not is_probably_on:
         st.possible_on_since = None
 
-    st.effective_ac_on = bool(power_high or st.ac_is_on or is_probably_on)
+    st.physical_ac_on = bool(power_high or st.ac_is_on or is_probably_on)
+    confirmed_ac_on = bool(power_high or st.ac_is_on)
 
-    if st.effective_ac_on:
+    if st.physical_ac_on:
         inferred_only = is_probably_on and not power_high and not st.ac_is_on
         if inferred_only:
             st.ac_state_source = "inferred"
@@ -1265,13 +1289,18 @@ async def _tick_impl(rid_raw: str, room_id: str) -> None:
     else:
         st.ac_state_source = "system"
 
-    if st.effective_ac_on:
+    if st.physical_ac_on:
         if st.effective_on_since_ts is None:
             st.effective_on_since_ts = now_ts
     else:
         st.effective_on_since_ts = None
 
-    _clear_pending_when_physically_satisfied(st, manual_override_active=manual_override_active)
+    _clear_pending_when_physically_satisfied(
+        st,
+        manual_override_active=manual_override_active,
+        confirmed_ac_on=confirmed_ac_on,
+        physical_ac_on=st.physical_ac_on,
+    )
 
     schedule_slot_snap: Optional[str] = (
         slot_label if temperature_mode_str != "manual" else None
@@ -1331,12 +1360,13 @@ async def _tick_impl(rid_raw: str, room_id: str) -> None:
         room_id, cfg, indoor_temp, et_eff,
         occ_res, ac_on, now,
     )
+    control_action, control_source = action, source
     user_bypass_decision_lock = (
         _is_user_authority_active(st, cfg, now) or st.last_command_source == "user"
     )
     if (
-        action in ("on", "off")
-        and not str(source).startswith("safety")
+        control_action in ("on", "off")
+        and not str(control_source).startswith("safety")
         and not user_bypass_decision_lock
     ):
         lda = st.last_decision_at
@@ -1349,14 +1379,14 @@ async def _tick_impl(rid_raw: str, room_id: str) -> None:
                     room_id,
                     elapsed_ld,
                     DECISION_LOCK_SECONDS,
-                    action,
-                    source,
+                    control_action,
+                    control_source,
                 )
                 action, source = "hold", "decision_lock"
     st.effective_control_source = source
 
-    _sync_pending_for_action(st, action)
-    bypass_actuation_delay = _delay_control_bypass(st, cfg, now, source)
+    _sync_pending_for_action(st, control_action)
+    bypass_actuation_delay = _delay_control_bypass(st, cfg, now, control_source)
 
     delta_audit = indoor_temp - et_eff
     in_cd_audit = _is_in_cooldown(st, now)
@@ -1377,20 +1407,28 @@ async def _tick_impl(rid_raw: str, room_id: str) -> None:
         ha_mode_tick or "—",
     )
 
-    if action == "on":
+    if control_action == "on":
         if bypass_actuation_delay:
             await _turn_ac_on(room_id, cfg, indoor_temp, et_eff, now=now)
             st.pending_action = None
             st.pending_since = None
         else:
-            await _handle_delayed_on(room_id, cfg, indoor_temp, et_eff, now, st)
+            await _handle_delayed_on(
+                room_id, cfg, indoor_temp, et_eff, now, st,
+                confirmed_ac_on=confirmed_ac_on,
+            )
         st.last_command_source = "system"
 
-    elif action == "off":
-        reason_off = "vacant" if "vacant" in source else "target_reached"
-        force_off = source.startswith("safety") or source == "thermostat_reached"
+    elif control_action == "off":
+        # Vacancy / safety OFF must abandon any thermostat delayed-ON countdown immediately.
+        if str(control_source).startswith("safety"):
+            st.pending_action = None
+            st.pending_since = None
+
+        reason_off = "vacant" if "vacant" in control_source else "target_reached"
+        force_off = control_source.startswith("safety") or control_source == "thermostat_reached"
         if bypass_actuation_delay:
-            if source == "thermostat_reached":
+            if control_source == "thermostat_reached":
                 session_logger.mark_cooled(room_id)
             await _turn_ac_off(
                 room_id, cfg, indoor_temp, reason_off, now=now, force=force_off,
@@ -1460,6 +1498,13 @@ async def _tick_impl(rid_raw: str, room_id: str) -> None:
     if not manual_override_active:
         await _maybe_record_ai_user_adjustment(room_id, cfg, climate_data or {}, now)
 
+    # After actuation: ac_is_on may have flipped this tick — session gate uses post-command truth.
+    ph_after = (
+        energy_watts_valid and not in_cooldown and energy_watts > _WATTS_COMPRESSOR
+    )
+    session_confirmed_ac_on = bool(ph_after or st.ac_is_on)
+    session_inferred_only = bool(st.physical_ac_on and not session_confirmed_ac_on)
+
     await _maintain_session_lifecycle(
         room_id,
         cfg,
@@ -1469,7 +1514,11 @@ async def _tick_impl(rid_raw: str, room_id: str) -> None:
         energy_watts_valid=energy_watts_valid,
         energy_watts=energy_watts,
         in_cooldown=in_cooldown,
+        confirmed_ac_on=session_confirmed_ac_on,
+        inferred_only_physical=session_inferred_only,
     )
+
+    _sync_ac_display_fields(st)
 
     if session_logger.current_session_id(room_id) and energy_watts_valid:
         st.watts_samples.append(energy_watts)
@@ -1481,7 +1530,7 @@ async def _tick_impl(rid_raw: str, room_id: str) -> None:
             effective_target,
         )
 
-    session_active = bool(st.effective_ac_on or st.ac_is_on)
+    session_active = bool(st.physical_ac_on or st.ac_is_on)
     current_session = session_logger.current_session_id(room_id)
 
     if current_session and session_active:
@@ -1500,7 +1549,7 @@ async def _tick_impl(rid_raw: str, room_id: str) -> None:
             "outdoor_temp": outdoor_temp,
             "outdoor_humidity": outdoor_humidity,
             "indoor_humidity": indoor_humidity,
-            "ac_state": st.effective_ac_on,
+            "ac_state": st.physical_ac_on,
             "watt_draw": energy_watts,
             "presence": bool(is_occupied_bool) if is_occupied_bool is not None else False,
             "setpoint": sp,
@@ -1542,8 +1591,10 @@ async def _maintain_session_lifecycle(
     energy_watts_valid: bool,
     energy_watts: float,
     in_cooldown: bool,
+    confirmed_ac_on: bool,
+    inferred_only_physical: bool,
 ) -> None:
-    """Open provisional session on real AC ON / explicit ON intent; upgrade when compressor is stable."""
+    """Open provisional session on confirmed AC ON; never during inferred-only or pending_ON."""
     st = _rt(room_id)
     sid_open = session_logger.current_session_id(room_id)
     if sid_open and session_logger.current_session_is_provisional(room_id):
@@ -1562,6 +1613,7 @@ async def _maintain_session_lifecycle(
                 return
 
     eligibility = _session_creation_eligible(st, now)
+    eligible_confirmed_session = eligibility and confirmed_ac_on and not inferred_only_physical
 
     stable_power = (
         energy_watts_valid
@@ -1577,7 +1629,7 @@ async def _maintain_session_lifecycle(
             if since_ir >= float(COMPRESSOR_STABLE_SECONDS):
                 no_meter_confirm = True
 
-    if eligibility and session_logger.current_session_id(room_id) is None:
+    if eligible_confirmed_session and session_logger.current_session_id(room_id) is None:
         await _start_provisional_session(room_id, cfg, indoor_temp, now, et_eff)
 
     if (
@@ -1661,11 +1713,17 @@ async def _handle_delayed_on(
     et_eff: float,
     now: datetime,
     st: RoomRuntime,
+    *,
+    confirmed_ac_on: bool,
 ) -> None:
     delay = _nonnegative_delay_seconds(cfg, "on_delay_seconds")
     ts = time.time()
 
-    if st.effective_ac_on:
+    if confirmed_ac_on:
+        logger.debug(
+            "[DELAY_ON][%s] compressor ON confirmed (power or HA/command) — clearing pending_on",
+            room_id,
+        )
         st.pending_action = None
         st.pending_since = None
         return
@@ -1678,6 +1736,7 @@ async def _handle_delayed_on(
                 DECISION_LOCK_SECONDS,
             )
             return
+        logger.info("[DELAY_ON][%s] TRIGGER _turn_ac_on (delay=0) physical=false", room_id)
         await _turn_ac_on(room_id, cfg, indoor_temp, et_eff, now=now)
         st.pending_action = None
         st.pending_since = None
@@ -1686,22 +1745,48 @@ async def _handle_delayed_on(
     if st.pending_action != "on":
         st.pending_action = "on"
         st.pending_since = ts
-        logger.info("[DELAY_ON][%s] started %.0fs timer", room_id, delay)
+        logger.info(
+            "[DELAY_ON][%s] ARM pending_on pending_since=%.3f delay_s=%.0f",
+            room_id,
+            st.pending_since,
+            delay,
+        )
         return
 
-    elapsed = ts - float(st.pending_since or ts)
+    # Never reset pending_since on subsequent ticks — only repaired if missing/corrupt.
+    if st.pending_since is None:
+        st.pending_since = ts
+        logger.warning("[DELAY_ON][%s] repaired missing pending_since=%.3f", room_id, st.pending_since)
+        return
+
+    elapsed = ts - float(st.pending_since)
+    logger.debug(
+        "[DELAY_ON][%s] wait pending_since=%.3f elapsed=%.2fs delay=%.0fs",
+        room_id,
+        st.pending_since,
+        elapsed,
+        delay,
+    )
     if elapsed >= delay:
         if _decision_lock_blocks_delayed_emit(st, now):
             logger.info(
-                "[DECISION_LOCK][%s] delayed ON held — lock active (elapsed=%.0fs)",
+                "[DECISION_LOCK][%s] delayed ON held — lock active elapsed=%.1fs pending_since=%.3f",
                 room_id,
                 elapsed,
+                st.pending_since,
             )
             return
+        logger.info(
+            "[DELAY_ON][%s] TRIGGER _turn_ac_on (elapsed>=%.0fs) pending_since=%.3f elapsed=%.2fs "
+            "(single emit)",
+            room_id,
+            delay,
+            st.pending_since,
+            elapsed,
+        )
         await _turn_ac_on(room_id, cfg, indoor_temp, et_eff, now=now)
         st.pending_action = None
         st.pending_since = None
-        logger.info("[DELAY_ON][%s] timer elapsed (%.0fs) — executing ON", room_id, elapsed)
 
 
 async def _handle_delayed_off(
@@ -1717,7 +1802,7 @@ async def _handle_delayed_off(
     delay = _nonnegative_delay_seconds(cfg, "off_delay_seconds")
     ts = time.time()
 
-    if not st.effective_ac_on:
+    if not st.physical_ac_on:
         st.pending_action = None
         st.pending_since = None
         return
@@ -1732,6 +1817,7 @@ async def _handle_delayed_off(
             return
         if reason == "target_reached":
             session_logger.mark_cooled(room_id)
+        logger.info("[DELAY_OFF][%s] TRIGGER _turn_ac_off (delay=0)", room_id)
         await _turn_ac_off(room_id, cfg, indoor_temp, reason, now=now, force=force)
         st.pending_action = None
         st.pending_since = None
@@ -1741,29 +1827,50 @@ async def _handle_delayed_off(
         st.pending_action = "off"
         st.pending_since = ts
         logger.info(
-            "[DELAY_OFF][%s] started %.0fs timer (reason=%s force=%s)",
+            "[DELAY_OFF][%s] ARM pending_off pending_since=%.3f delay_s=%.0f (reason=%s force=%s)",
             room_id,
+            st.pending_since,
             delay,
             reason,
             force,
         )
         return
 
-    elapsed = ts - float(st.pending_since or ts)
+    if st.pending_since is None:
+        st.pending_since = ts
+        logger.warning("[DELAY_OFF][%s] repaired missing pending_since=%.3f", room_id, st.pending_since)
+        return
+
+    elapsed = ts - float(st.pending_since)
+    logger.debug(
+        "[DELAY_OFF][%s] wait pending_since=%.3f elapsed=%.2fs delay=%.0fs",
+        room_id,
+        st.pending_since,
+        elapsed,
+        delay,
+    )
     if elapsed >= delay:
         if _decision_lock_blocks_delayed_emit(st, now):
             logger.info(
-                "[DECISION_LOCK][%s] delayed OFF held — lock active (elapsed=%.0fs)",
+                "[DECISION_LOCK][%s] delayed OFF held — elapsed=%.1fs pending_since=%.3f",
                 room_id,
                 elapsed,
+                st.pending_since,
             )
             return
         if reason == "target_reached":
             session_logger.mark_cooled(room_id)
+        logger.info(
+            "[DELAY_OFF][%s] TRIGGER _turn_ac_off elapsed=%.2fs delay=%.0fs pending_since=%.3f "
+            "(single emit)",
+            room_id,
+            elapsed,
+            delay,
+            st.pending_since,
+        )
         await _turn_ac_off(room_id, cfg, indoor_temp, reason, now=now, force=force)
         st.pending_action = None
         st.pending_since = None
-        logger.info("[DELAY_OFF][%s] timer elapsed (%.0fs) — executing OFF", room_id, elapsed)
 
 
 # ── Turn AC ON ────────────────────────────────────────────────────────────────
@@ -1790,10 +1897,11 @@ async def _turn_ac_on(
 
     tnow = now if now is not None else datetime.now(timezone.utc)
 
-    # Avoid redundant IR/power when watts or transient inference already shows compressor intent.
-    if st.effective_ac_on and st.ac_state_source in ("power", "inferred"):
+    # Avoid redundant IR when compressor is already observed ON from power or HA/command —
+    # never skip based on inferred-only transient ON.
+    if st.physical_ac_on and st.ac_state_source != "inferred":
         logger.info(
-            "[HawaAI][%s] Skip AC ON command — effective ON confirmed via %s",
+            "[HawaAI][%s] Skip AC ON command — ON already confirmed (%s)",
             room_id,
             st.ac_state_source,
         )
@@ -1893,7 +2001,7 @@ async def _stop_room_locked(room_id_raw: str, canon: str, shutdown_reason: str) 
 
     indoor = await _indoor_temp_for_shutdown(cfg)
 
-    want_hw_off = bool(st and (st.ac_is_on or st.effective_ac_on))
+    want_hw_off = bool(st and (st.ac_is_on or st.physical_ac_on))
     if want_hw_off:
         await _turn_ac_off(canon, cfg, indoor, shutdown_reason, force=True)
 
@@ -2117,8 +2225,10 @@ def get_runtime_state(room_id: str) -> dict:
             rem = pend_delay - (time.time() - float(st.pending_since))
             pending_remaining = max(0.0, round(rem, 1))
     return {
-        "ac_is_on":              st.effective_ac_on,
+        "ac_is_on":              st.physical_ac_on,
+        "physical_ac_on":        st.physical_ac_on,
         "effective_ac_on":       st.effective_ac_on,
+        "ac_state":              st.ac_state,
         "ac_idle":               st.effective_ac_idle,
         "power_source":          st.effective_power_source,
         "ac_state_source":       st.ac_state_source,
