@@ -112,6 +112,30 @@ def _require_room_query(room_id_raw: str) -> str:
     return rid
 
 
+def _resolve_stored_room_id(cfg: dict, room_id_raw: str) -> Optional[str]:
+    """Return persisted `rooms[].id` for this path/query (case-insensitive match), or None."""
+    rq = (room_id_raw or "").strip()
+    if not rq:
+        return None
+    nq = logic_engine.normalize_room_id(rq)
+    for r in room_registry.list_room_dicts(cfg):
+        rid = str(r.get("id") or "").strip()
+        if rid and (rid == rq or logic_engine.normalize_room_id(rid) == nq):
+            return rid
+    return None
+
+
+async def _disconnect_room_websockets(rid_canon: str) -> None:
+    """Close subscriber sockets when a room is removed from configuration."""
+    async with _ws_lock:
+        bucket = _ws_by_room.pop(rid_canon, None)
+    if not bucket:
+        return
+    for ws in list(bucket):
+        try:
+            await ws.close(code=4404)
+        except Exception:
+            pass
 
 
 @asynccontextmanager
@@ -145,12 +169,12 @@ async def lifespan(app: FastAPI):
     logger.info("[HawaAI] Add-on stopped")
 
 
-app = FastAPI(title="HawaAI API", version="1.4.13", lifespan=lifespan)
+app = FastAPI(title="HawaAI API", version="1.4.19", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
     allow_headers=["*"],
 )
 
@@ -488,6 +512,11 @@ async def _dashboard_status_payload(rid: str) -> Dict[str, Any]:
         "last_power_confirmed_off": runtime.get("last_power_confirmed_off"),
         "control_source":           runtime.get("control_source", "none"),
         "last_command_source":      runtime.get("last_command_source", "system"),
+        "on_delay_seconds":         runtime.get("on_delay_seconds", 0),
+        "off_delay_seconds":        runtime.get("off_delay_seconds", 0),
+        "pending_action":           runtime.get("pending_action"),
+        "pending_since_ts":         runtime.get("pending_since_ts"),
+        "pending_remaining_seconds": runtime.get("pending_remaining_seconds"),
         # ── Config ────────────────────────────────────────────────────────────
         "manual_override":  cfg.get("manual_override", False),
         "config_complete":  bool(
@@ -661,23 +690,102 @@ async def api_update_room(room_id: str, body: Dict[str, Any] = Body(...)):
             r["ai_config"] = cur_ai
         elif ac is None:
             r.pop("ai_config", None)
+    if "disabled" in body and body["disabled"] is not None:
+        r["disabled"] = bool(body["disabled"])
     rooms[idx] = r
     if not config_manager.save_config({"rooms": rooms}):
         raise HTTPException(status_code=500, detail="failed to save rooms")
     return room_registry.public_room_view(r)
 
 
-@app.delete("/api/rooms/{room_id}")
-async def api_delete_room(room_id: str):
-    rid = _require_room_query(room_id)
+@app.post("/api/rooms/{room_id}/disable")
+async def api_disable_room(room_id: str):
+    """Pause automation; keep room in config and DB history."""
+    rq = _require_room_query(room_id)
     base = config_manager.load_config()
-    rooms = [dict(r) for r in room_registry.list_room_dicts(base)]
-    new_rooms = [r for r in rooms if r.get("id") != rid]
-    if len(new_rooms) == len(rooms):
+    stored = _resolve_stored_room_id(base, rq)
+    if not stored:
         raise HTTPException(status_code=404, detail="room not found")
+    rooms = [dict(r) for r in room_registry.list_room_dicts(base)]
+    idx = next((i for i, re in enumerate(rooms) if re.get("id") == stored), None)
+    if idx is None:
+        raise HTTPException(status_code=404, detail="room not found")
+    if rooms[idx].get("disabled"):
+        rid_canon = logic_engine.normalize_room_id(stored)
+        return {
+            "status": "already_disabled",
+            "room_id": stored,
+            "room_id_canonical": rid_canon,
+        }
+    rooms[idx]["disabled"] = True
+    if not config_manager.save_config({"rooms": rooms}):
+        raise HTTPException(status_code=500, detail="failed to save rooms")
+    await logic_engine.stop_room(stored, shutdown_reason="room_disabled")
+    rid_canon = logic_engine.normalize_room_id(stored)
+    return {"status": "disabled", "room_id": stored, "room_id_canonical": rid_canon}
+
+
+@app.post("/api/rooms/{room_id}/enable")
+async def api_enable_room(room_id: str):
+    """Resume scheduler ticks for this room."""
+    rq = _require_room_query(room_id)
+    base = config_manager.load_config()
+    stored = _resolve_stored_room_id(base, rq)
+    if not stored:
+        raise HTTPException(status_code=404, detail="room not found")
+    rooms = [dict(r) for r in room_registry.list_room_dicts(base)]
+    idx = next((i for i, re in enumerate(rooms) if re.get("id") == stored), None)
+    if idx is None:
+        raise HTTPException(status_code=404, detail="room not found")
+    if not rooms[idx].get("disabled"):
+        rid_canon = logic_engine.normalize_room_id(stored)
+        return {
+            "status": "already_enabled",
+            "room_id": stored,
+            "room_id_canonical": rid_canon,
+        }
+    rooms[idx]["disabled"] = False
+    if not config_manager.save_config({"rooms": rooms}):
+        raise HTTPException(status_code=500, detail="failed to save rooms")
+    rid_canon = logic_engine.normalize_room_id(stored)
+    return {"status": "enabled", "room_id": stored, "room_id_canonical": rid_canon}
+
+
+@app.delete("/api/rooms/{room_id}")
+async def api_delete_room(room_id: str, purge: bool = Query(False)):
+    """
+    Remove room from configuration after a safe stop.
+    When purge=true, delete sessions/snapshots/AI rows for this room (irreversible).
+    """
+    rq = _require_room_query(room_id)
+    base = config_manager.load_config()
+    stored = _resolve_stored_room_id(base, rq)
+    if not stored:
+        return {"status": "already_deleted", "purged": bool(purge)}
+    rooms = [dict(r) for r in room_registry.list_room_dicts(base)]
+    idx = next((i for i, re in enumerate(rooms) if re.get("id") == stored), None)
+    if idx is None:
+        return {"status": "already_deleted", "purged": bool(purge)}
+
+    rid_canon = logic_engine.normalize_room_id(stored)
+
+    rooms[idx]["disabled"] = True
+    if not config_manager.save_config({"rooms": rooms}):
+        raise HTTPException(status_code=500, detail="failed to save rooms")
+
+    await logic_engine.stop_room(stored, shutdown_reason="room_deleted")
+
+    if purge:
+        await database.delete_room_data(stored)
+
+    new_rooms = [r for r in rooms if r.get("id") != stored]
     if not config_manager.save_config({"rooms": new_rooms}):
         raise HTTPException(status_code=500, detail="failed to save rooms")
-    return {"ok": True}
+
+    session_logger.clear_room_buffers(stored)
+    await _disconnect_room_websockets(rid_canon)
+
+    return {"status": "deleted", "purged": bool(purge), "room_id": stored}
 
 
 @app.get("/api/rooms/{room_id}/status")

@@ -798,6 +798,8 @@ export default function Dashboard() {
             sessionKwh={displayStatus?.session_kwh}
             lastAcOnAt={displayStatus?.last_ac_on_at}
             lastAcOffAt={displayStatus?.last_ac_off_at}
+            pendingAction={displayStatus?.pending_action}
+            pendingRemainSec={displayStatus?.pending_remaining_seconds}
             hasClimateEntity={!!(displayStatus?.climate_entity || displayStatus?.ac_entity)}
             acCurrentTemp={displayStatus?.ac_current_temp}
             acTargetTemp={displayStatus?.ac_target_temp}

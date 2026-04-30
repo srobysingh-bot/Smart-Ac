@@ -1,5 +1,6 @@
 import {
   createContext,
+  useCallback,
   useContext,
   useEffect,
   useMemo,
@@ -34,6 +35,21 @@ export function RoomDataProvider({ children }) {
     previousSnapshots: [],
     previousStats: null,
   })
+
+  const resetRoomData = useCallback(() => {
+    loadGenRef.current += 1
+    setRoomData({
+      status: null,
+      snapshots: [],
+      ai: null,
+      stats: null,
+      loading: false,
+      loadError: null,
+      previousStatus: null,
+      previousSnapshots: [],
+      previousStats: null,
+    })
+  }, [])
 
   useEffect(() => {
     if (!activeRoomId) {
@@ -174,6 +190,7 @@ export function RoomDataProvider({ children }) {
     const showSoftLoading = Boolean(loading && previousStatus)
 
     return {
+      resetRoomData,
       ...rest,
       status,
       snapshots,
@@ -186,7 +203,7 @@ export function RoomDataProvider({ children }) {
       displayStats,
       showSoftLoading,
     }
-  }, [state, activeRoomId])
+  }, [state, activeRoomId, resetRoomData])
 
   return <RoomDataContext.Provider value={value}>{children}</RoomDataContext.Provider>
 }

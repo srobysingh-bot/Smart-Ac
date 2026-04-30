@@ -101,8 +101,20 @@ export const updateRoom = (roomId, data) =>
     body: JSON.stringify(data),
   })
 
-export const deleteRoom = (roomId) =>
-  request(`/rooms/${encodeURIComponent(roomId)}`, { method: 'DELETE' })
+export const deleteRoom = (roomId, { purge = false } = {}) => {
+  const q = purge ? '?purge=true' : ''
+  return request(`/rooms/${encodeURIComponent(roomId)}${q}`, { method: 'DELETE' })
+}
+
+export const disableRoom = roomId =>
+  roomParam(roomId).then(rid =>
+    request(`/rooms/${encodeURIComponent(rid)}/disable`, { method: 'POST' }),
+  )
+
+export const enableRoom = roomId =>
+  roomParam(roomId).then(rid =>
+    request(`/rooms/${encodeURIComponent(rid)}/enable`, { method: 'POST' }),
+  )
 export const getBrands = () => request('/brands')
 
 // ── HA Entities ──────────────────────────────────────────────────────────────

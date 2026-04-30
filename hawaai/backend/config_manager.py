@@ -47,6 +47,8 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "setpoint_command_min_interval_seconds": 180,
     "compressor_min_on_seconds": 300,
     "compressor_min_off_seconds": 180,
+    "on_delay_seconds": 0,
+    "off_delay_seconds": 0,
     "vacancy_timeout_minutes": 5,
     "thermostat_on_delta_deg": 0.7,
     "thermostat_off_delta_deg": 0.3,

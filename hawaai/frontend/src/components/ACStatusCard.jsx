@@ -61,6 +61,14 @@ function SmartModeBadge({ mode, fanMode, delta }) {
   )
 }
 
+function formatDelayCountdown(totalSec) {
+  if (totalSec == null || !Number.isFinite(Number(totalSec))) return '—'
+  const s = Math.max(0, Math.ceil(Number(totalSec)))
+  const m = Math.floor(s / 60)
+  const r = s % 60
+  return `${m}:${String(r).padStart(2, '0')}`
+}
+
 function StateSourceHint({ source, acOn }) {
   if (!acOn || !source) return null
   const cfg = {
@@ -138,6 +146,8 @@ export default function ACStatusCard({
   sessionKwh,
   lastAcOnAt,
   lastAcOffAt,
+  pendingAction,
+  pendingRemainSec,
   // Smart cooling (read-only display)
   smartCoolingEnabled = false,
   smartMode,
@@ -165,6 +175,30 @@ export default function ACStatusCard({
     return () => clearInterval(id)
   }, [sessionActive, sessionStart])
 
+  const [adjPendingRemain, setAdjPendingRemain] = useState(null)
+  useEffect(() => {
+    if (pendingRemainSec == null || !Number.isFinite(Number(pendingRemainSec))) {
+      setAdjPendingRemain(null)
+      return
+    }
+    setAdjPendingRemain(Math.max(0, Number(pendingRemainSec)))
+  }, [pendingRemainSec, pendingAction])
+
+  useEffect(() => {
+    if (adjPendingRemain == null || adjPendingRemain <= 0 || !pendingAction) return undefined
+    const id = window.setInterval(() => {
+      setAdjPendingRemain((r) => (r != null ? Math.max(0, r - 1) : r))
+    }, 1000)
+    return () => window.clearInterval(id)
+  }, [adjPendingRemain, pendingAction])
+
+  const pendingLabel =
+    pendingAction === 'on'
+      ? 'Waiting to turn ON'
+      : pendingAction === 'off'
+        ? 'Waiting to turn OFF'
+        : null
+
   return (
     <div className="card flex flex-col gap-3">
       {/* Header row */}
@@ -175,6 +209,16 @@ export default function ACStatusCard({
           <StateSourceHint source={acStateSource} acOn={acOn} />
         </div>
       </div>
+
+      {pendingLabel && adjPendingRemain != null && (
+        <div className="rounded-lg border border-amber-700/45 bg-amber-950/25 px-3 py-2 text-sm">
+          <p className="text-amber-200/95 font-medium">{pendingLabel}</p>
+          <p className="text-xs text-gray-400 mt-0.5 font-mono">
+            <Timer size={12} className="inline mr-1 text-amber-400 align-text-bottom" aria-hidden />
+            {formatDelayCountdown(adjPendingRemain)} remaining
+          </p>
+        </div>
+      )}
 
       {/* Smart cooling mode badge — shown only when feature is enabled and AC is active */}
       {smartCoolingEnabled && (acOn || acIdle) && (

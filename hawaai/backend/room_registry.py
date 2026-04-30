@@ -113,11 +113,13 @@ def _normalize_room_list(rooms: List[Dict[str, Any]]) -> None:
             r["id"] = rid
             r["name"] = (str(r.get("name") or "Room")).strip() or "Room"
             r["climate_entity"] = (str(r.get("climate_entity") or "")).strip()
+            r["disabled"] = bool(r.get("disabled", False))
         except Exception:
             logger.exception("[ROOM] failed to normalize room entry — assigning new id")
             r["id"] = _new_room_id()
             r["name"] = (str(r.get("name") or "Room")).strip() or "Room"
             r["climate_entity"] = (str(r.get("climate_entity") or "")).strip()
+            r["disabled"] = bool(r.get("disabled", False))
 
 
 def list_room_dicts(cfg: Dict[str, Any]) -> List[Dict[str, Any]]:

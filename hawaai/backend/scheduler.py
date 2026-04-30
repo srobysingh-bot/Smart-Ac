@@ -63,6 +63,8 @@ async def start() -> None:
                 )
                 continue
             try:
+                if room.get("disabled"):
+                    continue
                 await logic_engine.tick(logic_engine.normalize_room_id(rid))
             except Exception as e:
                 logger.error("[HawaAI] Logic tick error [%s]: %s", rid, e, exc_info=True)

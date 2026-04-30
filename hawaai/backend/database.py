@@ -1053,3 +1053,22 @@ async def get_ml_stats(room_id: str) -> Dict[str, Any]:
                     "data_completeness": round(row[2] or 0, 1),
                 }
     return {"total_sessions": 0, "avg_cool_time": 0.0, "data_completeness": 0.0}
+
+
+async def delete_room_data(room_id: str) -> None:
+    """Remove all persisted analytics rows for one room (sessions, snapshots, AI audit)."""
+    rid = (room_id or "").strip().lower()
+    if not rid:
+        return
+    match = "LOWER(TRIM(COALESCE(room_id, ''))) = ?"
+    async with aiosqlite.connect(DB_PATH) as conn:
+        try:
+            await conn.execute("BEGIN IMMEDIATE")
+            await conn.execute(f"DELETE FROM snapshots WHERE {match}", (rid,))
+            await conn.execute(f"DELETE FROM ai_decisions WHERE {match}", (rid,))
+            await conn.execute(f"DELETE FROM sessions WHERE {match}", (rid,))
+            await conn.commit()
+        except Exception:
+            await conn.rollback()
+            raise
+    logger.warning("[DB] Purged all data for room_id=%s", rid)

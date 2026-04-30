@@ -6,9 +6,13 @@ import {
   getDeviceEntities,
   getWeather,
   updateRoom,
+  disableRoom,
+  enableRoom,
+  deleteRoom,
 } from '../api/smartcool.js'
 import { useRoom } from '../context/RoomContext.jsx'
-import { Save, RefreshCw, AlertCircle, CheckCircle2, Eye, EyeOff } from 'lucide-react'
+import { useRoomData } from '../context/RoomDataContext.jsx'
+import { Save, RefreshCw, AlertCircle, CheckCircle2, Eye, EyeOff, Trash2 } from 'lucide-react'
 
 // ── Reusable field components ─────────────────────────────────────────────────
 
@@ -185,6 +189,7 @@ const CURRENCY_OPTIONS = [
 /** Persisted under each room's `settings` in config (non-entity fields). */
 const ROOM_SETTINGS_KEYS = [
   'target_temp', 'hysteresis', 'vacancy_timeout_minutes', 'logic_interval_seconds',
+  'on_delay_seconds', 'off_delay_seconds',
   'energy_tariff_per_kwh', 'currency', 'use_presence', 'use_outdoor_temp',
   'smart_temp_adjustment', 'smart_cooling_enabled', 'manual_override',
   'ac_brand', 'ac_model', 'weather_provider', 'weather_api_key', 'weather_city',
@@ -238,6 +243,7 @@ const AI_CONFIG_KEYS = [
 // ── Main Settings page (room-scoped: GET/PUT /api/rooms/{room_id}) ─────────────
 export default function Settings() {
   const { activeRoomId: roomId, setActiveRoom, rooms: roomsList, refreshRooms } = useRoom()
+  const { resetRoomData } = useRoomData()
 
   const [cfg,        setCfg]        = useState({})
   const [entities,   setEntities]   = useState([])
@@ -248,6 +254,10 @@ export default function Settings() {
   const [saveMsg,    setSaveMsg]    = useState('')
   const [loading,    setLoading]    = useState(true)
   const [outdoorTemp, setOutdoorTemp] = useState(null)
+  const [roomDisabled, setRoomDisabled] = useState(false)
+  const [deleteModalOpen, setDeleteModalOpen] = useState(false)
+  const [deletePurgeAnalytics, setDeletePurgeAnalytics] = useState(false)
+  const [roomActionBusy, setRoomActionBusy] = useState(false)
 
   // Per-dropdown search state (each search is independent)
   const [presenceSearch,    setPresenceSearch]    = useState('')
@@ -276,6 +286,7 @@ export default function Settings() {
     if (!roomId) {
       setCfg({})
       setRoomTitle('')
+      setRoomDisabled(false)
       setLoading(false)
       return
     }
@@ -298,6 +309,7 @@ export default function Settings() {
         if (c.ai_api_key === '***') c.ai_api_key = ''
         setCfg(c)
         setRoomTitle(detail.room?.name || roomId)
+        setRoomDisabled(Boolean(detail.room?.disabled))
         setEntities(e)
         setAllDevices(devs)
       })
@@ -364,6 +376,7 @@ export default function Settings() {
       if (c.ai_api_key === '***') c.ai_api_key = ''
       setCfg(c)
       setRoomTitle(detail.room?.name || roomId)
+      setRoomDisabled(Boolean(detail.room?.disabled))
       refreshRooms().catch(() => {})
     } catch (err) {
       console.error('Save failed:', err)
@@ -372,6 +385,59 @@ export default function Settings() {
     } finally {
       setSaving(false)
       setTimeout(() => setSaveStatus(null), 4000)
+    }
+  }
+
+  const toggleAutomationPaused = async () => {
+    if (!roomId || roomActionBusy) return
+    setRoomActionBusy(true)
+    setSaveStatus(null)
+    try {
+      if (roomDisabled) {
+        await enableRoom(roomId)
+        setRoomDisabled(false)
+      } else {
+        await disableRoom(roomId)
+        setRoomDisabled(true)
+      }
+      await refreshRooms()
+      const detail = await getRoom(roomId).catch(() => null)
+      if (detail?.room) setRoomDisabled(Boolean(detail.room.disabled))
+    } catch (err) {
+      console.error(err)
+      setSaveStatus('error')
+      setSaveMsg(err?.message || 'Could not update automation state')
+      setTimeout(() => setSaveStatus(null), 4000)
+    } finally {
+      setRoomActionBusy(false)
+    }
+  }
+
+  const openDeleteRoomModal = () => {
+    setDeletePurgeAnalytics(false)
+    setDeleteModalOpen(true)
+  }
+
+  const executeRemoveRoom = async () => {
+    if (!roomId || roomActionBusy) return
+    setRoomActionBusy(true)
+    try {
+      await deleteRoom(roomId, { purge: deletePurgeAnalytics })
+      setDeleteModalOpen(false)
+      resetRoomData()
+      const list = await refreshRooms()
+      const activeStillValid = Array.isArray(list) && list.some((x) => x.id === roomId)
+      if (!activeStillValid) {
+        if (list?.length && list[0]?.id) setActiveRoom(list[0].id)
+        else setActiveRoom(null)
+      }
+    } catch (err) {
+      console.error(err)
+      setSaveStatus('error')
+      setSaveMsg(err?.message || 'Failed to remove room')
+      setTimeout(() => setSaveStatus(null), 5000)
+    } finally {
+      setRoomActionBusy(false)
     }
   }
 
@@ -474,7 +540,9 @@ export default function Settings() {
             >
               <option value="">Choose a room…</option>
               {roomsList.map(r => (
-                <option key={r.id} value={r.id}>{r.name || r.id}</option>
+                <option key={r.id} value={r.id}>
+                  {r.name || r.id}{r.disabled ? ' (paused)' : ''}
+                </option>
               ))}
             </select>
           </div>
@@ -525,11 +593,47 @@ export default function Settings() {
             }}
           >
             {roomsList.map(r => (
-              <option key={r.id} value={r.id}>{r.name || r.id}</option>
+              <option key={r.id} value={r.id}>
+                {r.name || r.id}{r.disabled ? ' (paused)' : ''}
+              </option>
             ))}
           </select>
+          <button
+            type="button"
+            title="Remove this room from HawaAI"
+            disabled={roomActionBusy}
+            onClick={openDeleteRoomModal}
+            className="p-2 rounded-lg bg-gray-800 border border-red-900/40 text-red-400 hover:bg-red-950/30 hover:border-red-700 disabled:opacity-40"
+          >
+            <Trash2 size={18} />
+          </button>
           <span className="text-[11px] text-gray-600 font-mono truncate max-w-[200px]" title={roomId}>
             id: {roomId}
+          </span>
+        </div>
+
+        {roomDisabled && (
+          <div className="flex items-center gap-2 px-3 py-2 rounded-lg bg-amber-900/20 border border-amber-700/50 text-sm text-amber-200/95">
+            <AlertCircle size={16} className="shrink-0" />
+            Automation is paused for this room — ticks are off; settings and history stay on disk.
+          </div>
+        )}
+
+        <div className="flex flex-wrap items-center gap-3">
+          <button
+            type="button"
+            disabled={roomActionBusy}
+            onClick={() => void toggleAutomationPaused()}
+            className={`text-sm font-medium px-4 py-2 rounded-lg border transition-colors disabled:opacity-45 ${
+              roomDisabled
+                ? 'bg-emerald-900/30 border-emerald-700 text-emerald-200 hover:bg-emerald-900/50'
+                : 'bg-gray-800 border-amber-700/50 text-amber-200 hover:bg-amber-950/30'
+            }`}
+          >
+            {roomDisabled ? 'Resume automation' : 'Pause automation'}
+          </button>
+          <span className="text-xs text-gray-600 max-w-[220px] leading-snug">
+            Pause is the safe default — no scheduler ticks, data kept. Use the trash icon only to remove the room from configuration.
           </span>
         </div>
       </div>
@@ -904,6 +1008,32 @@ export default function Settings() {
           Larger band = fewer AC cycles. E.g. target 24°C + 1.5° band: ON at 25.5°C, OFF at 22.5°C.
         </p>
 
+        <div className="border border-gray-800 rounded-xl p-4 space-y-4">
+          <p className="text-xs font-semibold uppercase tracking-widest text-gray-400">Control timing</p>
+          <p className="text-xs text-gray-500 -mt-2">
+            After the thermostat decides ON or OFF, HawaAI waits this long before sending the climate command.
+            Safety (vacancy) and user commands skip the delay. Values are stored in seconds; shown in minutes.
+          </p>
+          <Slider
+            label="Turn ON delay"
+            value={(Number(cfg.on_delay_seconds) || 0) / 60}
+            onChange={v => patch('on_delay_seconds', Math.round(v * 60))}
+            min={0}
+            max={10}
+            step={0.25}
+            unit=" min"
+          />
+          <Slider
+            label="Turn OFF delay"
+            value={(Number(cfg.off_delay_seconds) || 0) / 60}
+            onChange={v => patch('off_delay_seconds', Math.round(v * 60))}
+            min={0}
+            max={10}
+            step={0.25}
+            unit=" min"
+          />
+        </div>
+
         <Slider
           label="Vacancy Timeout"
           value={cfg.vacancy_timeout_minutes ?? 5}
@@ -1145,6 +1275,75 @@ export default function Settings() {
           </select>
         </div>
       </div>
+
+      {deleteModalOpen && (
+        <div
+          className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4"
+          role="presentation"
+          aria-hidden={!deleteModalOpen}
+          onClick={() => { if (!roomActionBusy) setDeleteModalOpen(false) }}
+        >
+          <div
+            role="dialog"
+            aria-labelledby="del-room-title"
+            className="bg-gray-900 border border-gray-700 rounded-xl p-5 max-w-md w-full shadow-xl space-y-4"
+            onClick={e => e.stopPropagation()}
+          >
+            <h2 id="del-room-title" className="text-lg font-semibold text-gray-100">
+              Delete room?
+            </h2>
+            <p className="text-sm text-gray-400 leading-relaxed">
+              The AC will turn off safely if HawaAI was controlling it. The room is disabled first so the scheduler stops.
+            </p>
+
+            <div className="space-y-2 text-sm">
+              <label className="flex gap-3 items-start cursor-pointer">
+                <input
+                  type="radio"
+                  className="mt-1 shrink-0 accent-blue-500"
+                  checked={!deletePurgeAnalytics}
+                  onChange={() => setDeletePurgeAnalytics(false)}
+                />
+                <span>
+                  <span className="text-gray-100 font-medium">Keep history</span>
+                  <span className="text-gray-500"> (recommended) — sessions and snapshots stay for analytics.</span>
+                </span>
+              </label>
+              <label className="flex gap-3 items-start cursor-pointer">
+                <input
+                  type="radio"
+                  className="mt-1 shrink-0 accent-red-600"
+                  checked={deletePurgeAnalytics}
+                  onChange={() => setDeletePurgeAnalytics(true)}
+                />
+                <span>
+                  <span className="text-red-400 font-medium">Delete all data</span>
+                  <span className="text-gray-500"> — sessions, snapshots, and AI audit rows for this room are removed permanently.</span>
+                </span>
+              </label>
+            </div>
+
+            <div className="flex flex-wrap justify-end gap-2 pt-2">
+              <button
+                type="button"
+                disabled={roomActionBusy}
+                onClick={() => setDeleteModalOpen(false)}
+                className="px-4 py-2 rounded-lg bg-gray-800 border border-gray-600 text-sm text-gray-200 hover:bg-gray-800/80"
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                disabled={roomActionBusy}
+                onClick={() => void executeRemoveRoom()}
+                className="px-4 py-2 rounded-lg bg-red-700 hover:bg-red-600 text-white text-sm font-medium disabled:opacity-45"
+              >
+                Delete
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
 
     </div>
   )

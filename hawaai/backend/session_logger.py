@@ -334,6 +334,18 @@ async def ensure_snapshot_id_for_ai(room_id: str) -> int:
     return row_id
 
 
+def has_open_session(room_id: str) -> bool:
+    """True if logger still tracks an open SQLite session for this room (raw or lower-cased key)."""
+    raw = (room_id or "").strip()
+    if not raw:
+        return False
+    for key in {raw, raw.lower()}:
+        s = _rs.get(key)
+        if s is not None and s.current_session_id:
+            return True
+    return False
+
+
 async def get_sessions(room_id: str, limit: int = 50, offset: int = 0) -> List[Dict]:
     return await database.get_sessions(room_id, limit, offset)
 
@@ -371,3 +383,13 @@ def session_start_time(room_id: str) -> Optional[datetime]:
     if not rid:
         return None
     return _room(rid).session_start_time
+
+
+def clear_room_buffers(room_id: str) -> None:
+    """Drop in-memory session/snapshot trackers after a room is removed or purged."""
+    raw = (room_id or "").strip()
+    if not raw:
+        return
+    for k in {raw, raw.lower()}:
+        _rs.pop(k, None)
+        _last_snapshot_id.pop(k, None)
