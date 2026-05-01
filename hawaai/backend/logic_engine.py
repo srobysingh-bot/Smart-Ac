@@ -43,6 +43,7 @@ from typing import Dict, List, Optional, Tuple
 
 from . import ac_adapter, config_manager, database, ha_client, live_broadcast, session_logger, smart_cooling, weather_api
 from . import room_registry
+from .room_log_store import room_log_store
 from .ai import (
     apply_ai_fan,
     ai_cache,
@@ -60,6 +61,16 @@ from .temperature_schedule import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def log_with_room(level: str, room_id: str, msg: str, *args) -> None:
+    log_fn = getattr(logger, level, logger.info)
+    log_fn(msg, *args)
+    try:
+        rendered = msg % args if args else msg
+        room_log_store.append(room_id, rendered, level=level)
+    except Exception:
+        pass
 
 @dataclass
 class RoomRuntime:
@@ -462,7 +473,9 @@ def _resolve_control_decision(
                     elif st.last_ac_on_at is not None:
                         on_age_secs = now_ts - float(st.last_ac_on_at)
                     if on_age_secs is not None and on_age_secs < float(VACANCY_SESSION_GRACE_SECONDS):
-                        logger.info(
+                        log_with_room(
+                            "info",
+                            room_id,
                             "[VACANCY] Ignored for room=%s — cooling grace (%.0fs < %.0fs) "
                             "(effective_on / last_on)",
                             room_id,
@@ -701,7 +714,9 @@ def apply_effective_mode_engine_target(
 
     if control_log:
         if log_mode == "manual" and used_manual_value is not None:
-            logger.info(
+            log_with_room(
+                "info",
+                room_id,
                 "[CONTROL][%s] mode=manual base=%.1f manual=%.1f effective=%.1f max_delta=%.1f",
                 room_id,
                 base_b,
@@ -710,7 +725,9 @@ def apply_effective_mode_engine_target(
                 max_up,
             )
         else:
-            logger.info(
+            log_with_room(
+                "info",
+                room_id,
                 "[CONTROL][%s] mode=%s base=%.1f planned_raw=%.1f effective=%.1f max_delta=%.1f",
                 room_id,
                 log_mode,
@@ -728,7 +745,9 @@ def sync_effective_mode_transition(st: RoomRuntime, room_id: str, cfg: dict) -> 
     if cur not in ("auto", "manual"):
         cur = "auto"
     if st.last_effective_mode is not None and st.last_effective_mode != cur:
-        logger.info(
+        log_with_room(
+            "info",
+            room_id,
             "[CONTROL][%s] effective_mode %s → %s — clearing pending_action / pending_since",
             room_id,
             st.last_effective_mode,
@@ -1742,7 +1761,9 @@ async def _tick_impl(rid_raw: str, room_id: str) -> None:
     delta_audit = indoor_temp - et_eff
     in_cd_audit = _is_in_cooldown(st, now)
     ha_mode_tick = climate_data.get("mode") if climate_data else None
-    logger.info(
+    log_with_room(
+        "info",
+        room_id,
         "[TICK] room=%s action=%s source=%s indoor=%.2f°C target=%.2f°C delta=%+.2f°C "
         "power=%sW ir_cooldown_active=%s occupied=%s temp_mode=%s ha_mode=%s",
         room_id,
@@ -1955,7 +1976,9 @@ async def _maintain_session_lifecycle(
         if start_ref is not None:
             prov_age = (now - start_ref).total_seconds()
             if prov_age > float(MAX_PROVISIONAL_SECONDS):
-                logger.info(
+                log_with_room(
+                    "info",
+                    room_id,
                     "[SESSION_PROVISIONAL_TIMEOUT] room=%s session=%s age=%.0fs (max %.0fs) — closing",
                     room_id,
                     sid_open,
@@ -2048,7 +2071,9 @@ async def _start_provisional_session(
             "is_record_valid":       1,
         },
     )
-    logger.info(
+    log_with_room(
+        "info",
+        room_id,
         "[SESSION_START] room=%s session=%s provisional=1 indoor=%.1f°C target=%.1f°C",
         room_id,
         sid,
@@ -2074,7 +2099,9 @@ async def _handle_delayed_on(
     ts = time.time()
 
     if confirmed_ac_on:
-        logger.debug(
+        log_with_room(
+            "debug",
+            room_canon,
             "[DELAY_ON][%s] compressor ON confirmed (power or HA/command) — clearing pending_on",
             room_canon,
         )
@@ -2086,7 +2113,9 @@ async def _handle_delayed_on(
         st.pending_since = ts
         st.pending_on_emit_attempts = 0
         st.pending_on_next_retry_wall = None
-        logger.info(
+        log_with_room(
+            "info",
+            room_canon,
             "[DELAY_ON][%s] ARM pending_on pending_since=%.3f delay_s=%.0f",
             room_canon,
             st.pending_since,
@@ -2103,7 +2132,13 @@ async def _handle_delayed_on(
 
     if st.pending_since is None:
         st.pending_since = ts
-        logger.warning("[DELAY_ON][%s] repaired missing pending_since=%.3f", room_canon, st.pending_since)
+        log_with_room(
+            "warning",
+            room_canon,
+            "[DELAY_ON][%s] repaired missing pending_since=%.3f",
+            room_canon,
+            st.pending_since,
+        )
         return
 
     if delay > 0:
@@ -2119,7 +2154,9 @@ async def _handle_delayed_on(
             return
 
     if _decision_lock_blocks_delayed_emit(st, now):
-        logger.info(
+        log_with_room(
+            "info",
+            room_canon,
             "[DECISION_LOCK][%s] delayed ON held — lock active pending_since=%.3f — schedule retry wakeup",
             room_canon,
             st.pending_since,
@@ -2146,7 +2183,9 @@ async def _handle_delayed_on(
         return
 
     if st.pending_on_emit_attempts >= PENDING_ON_MAX_EMIT_ATTEMPTS:
-        logger.error(
+        log_with_room(
+            "error",
+            room_canon,
             "[DELAY_ON][%s] AC failed to turn ON after %d IR attempts — clearing pending_on",
             room_canon,
             PENDING_ON_MAX_EMIT_ATTEMPTS,
@@ -2156,7 +2195,9 @@ async def _handle_delayed_on(
 
     _cancel_pending_delay_wakeup_task(st)
     st.pending_on_emit_attempts += 1
-    logger.info(
+    log_with_room(
+        "info",
+        room_canon,
         "[DELAY_ON][%s] TRIGGER _turn_ac_on attempt=%d/%d pending_since=%.3f delay_s=%.0f",
         room_canon,
         st.pending_on_emit_attempts,
@@ -2416,7 +2457,9 @@ async def _close_session(room_id: str, cfg: dict, indoor_temp: float, reason: st
     start_ref = st.session_start_time or sl_start
     now = datetime.now(timezone.utc)
     if start_ref is None:
-        logger.warning(
+        log_with_room(
+            "warning",
+            room_id,
             "[SESSION_END] room=%s session=%s — missing start anchor; using now",
             room_id,
             open_sid,
@@ -2426,7 +2469,9 @@ async def _close_session(room_id: str, cfg: dict, indoor_temp: float, reason: st
     duration_secs = max(0.0, (now - start_ref).total_seconds())
     short_invalid = duration_secs < float(MIN_SESSION_SECONDS)
     if short_invalid:
-        logger.info(
+        log_with_room(
+            "info",
+            room_id,
             "[SESSION_INVALID] room=%s session=%s duration=%.2fs (< %.0fs)",
             room_id,
             open_sid,
@@ -2436,7 +2481,9 @@ async def _close_session(room_id: str, cfg: dict, indoor_temp: float, reason: st
 
     cool_minutes = duration_secs / 60.0
 
-    logger.info(
+    log_with_room(
+        "info",
+        room_id,
         "[SESSION_END] room=%s session=%s reason=%s | duration=%.0fs (%.2f min) short_invalid=%s",
         room_id,
         open_sid,
@@ -2549,7 +2596,7 @@ async def _turn_ac_off(
             return
     elif reason == "vacant":
         # Hard policy: vacancy must not be skipped for duplicate/cooldown — still log once.
-        logger.info("[VACANCY] AC OFF forced")
+        log_with_room("info", room_id, "[VACANCY] AC OFF forced")
 
     await ac_adapter.turn_off(climate_entity)
 

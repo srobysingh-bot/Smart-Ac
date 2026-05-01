@@ -97,6 +97,16 @@ export const getRoom = (roomId) =>
     request(`/rooms/${encodeURIComponent(rid)}`),
   )
 
+export const getRoomLogs = (roomId, limit = 200) =>
+  roomParam(roomId).then((rid) =>
+    request(`/rooms/${encodeURIComponent(rid)}/logs?limit=${Math.max(1, Math.min(500, Number(limit) || 200))}`),
+  )
+
+export const clearRoomLogs = (roomId) =>
+  roomParam(roomId).then((rid) =>
+    request(`/rooms/${encodeURIComponent(rid)}/logs`, { method: 'DELETE' }),
+  )
+
 export const createRoom = (data) =>
   request('/rooms', { method: 'POST', body: JSON.stringify(data) })
 

@@ -1,6 +1,6 @@
 import { useEffect, useState, useCallback } from 'react'
 import { useNavigate } from 'react-router-dom'
-import { getClimateState, setClimateTemperature, setHvacMode, setFanMode, setSwingMode, createRoom } from '../api/smartcool.js'
+import { getClimateState, setClimateTemperature, setHvacMode, setFanMode, setSwingMode, createRoom, getRoomLogs, clearRoomLogs } from '../api/smartcool.js'
 import { useRoom } from '../context/RoomContext.jsx'
 import { useRoomData } from '../context/RoomDataContext.jsx'
 import ACStatusCard    from '../components/ACStatusCard.jsx'
@@ -710,6 +710,144 @@ function DashboardNeedsRoomGate({ rooms, onSelectRoom, onOpenSettings }) {
   )
 }
 
+function RoomLogsCard({ activeRoomId, rooms }) {
+  const [roomFilter, setRoomFilter] = useState('active')
+  const [autoRefresh, setAutoRefresh] = useState(true)
+  const [logs, setLogs] = useState([])
+  const [busy, setBusy] = useState(false)
+  const [err, setErr] = useState('')
+
+  const selectedRoomId = roomFilter === 'active' ? (activeRoomId || '') : roomFilter
+
+  const dedupeAndSort = useCallback((items) => {
+    const seen = new Set()
+    const out = []
+    for (const log of items || []) {
+      const key = `${log.ts}-${log.message}`
+      if (!seen.has(key)) {
+        seen.add(key)
+        out.push(log)
+      }
+    }
+    out.sort((a, b) => (a?.ts || 0) - (b?.ts || 0))
+    return out
+  }, [])
+
+  const loadLogs = useCallback(async () => {
+    if (!activeRoomId) return
+    setBusy(true)
+    setErr('')
+    try {
+      if (selectedRoomId === 'all') {
+        const out = await Promise.all(
+          rooms.map(async (r) => {
+            const res = await getRoomLogs(r.id, 120)
+            return (res?.logs || []).map((it) => ({ ...it, room_id: r.id, room_name: r.name || r.id }))
+          }),
+        )
+        const merged = dedupeAndSort(out.flat())
+        setLogs(merged.slice(-250))
+      } else if (selectedRoomId) {
+        const res = await getRoomLogs(selectedRoomId, 250)
+        const roomName = rooms.find((r) => r.id === selectedRoomId)?.name || selectedRoomId
+        const oneRoom = (res?.logs || []).map((it) => ({ ...it, room_id: selectedRoomId, room_name: roomName }))
+        setLogs(dedupeAndSort(oneRoom))
+      } else {
+        setLogs([])
+      }
+    } catch (e) {
+      setErr(e?.message || 'Failed to fetch logs')
+    } finally {
+      setBusy(false)
+    }
+  }, [activeRoomId, rooms, selectedRoomId, dedupeAndSort])
+
+  useEffect(() => {
+    loadLogs()
+  }, [loadLogs])
+
+  useEffect(() => {
+    if (!autoRefresh) return
+    const t = setInterval(loadLogs, 3000)
+    return () => clearInterval(t)
+  }, [autoRefresh, loadLogs])
+
+  const onClear = async () => {
+    if (!selectedRoomId || selectedRoomId === 'all') return
+    setBusy(true)
+    setErr('')
+    try {
+      await clearRoomLogs(selectedRoomId)
+      await loadLogs()
+    } catch (e) {
+      setErr(e?.message || 'Failed to clear logs')
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  const fmtTime = (ts) => {
+    if (!ts) return '--:--:--'
+    const n = Number(ts)
+    // Backward compatibility: old entries may still be epoch-seconds.
+    const ms = n < 1e12 ? n * 1000 : n
+    return new Date(ms).toLocaleTimeString()
+  }
+
+  const levelClass = (level) => {
+    const lv = String(level || 'INFO').toUpperCase()
+    if (lv === 'ERROR') return 'text-red-300'
+    if (lv === 'WARNING' || lv === 'WARN') return 'text-yellow-300'
+    return 'text-gray-300'
+  }
+
+  return (
+    <div className="card">
+      <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3 mb-3">
+        <p className="text-xs text-gray-500 uppercase tracking-wide">Room Logs</p>
+        <div className="flex flex-wrap items-center gap-2">
+          <select
+            className="bg-gray-800 border border-gray-600 rounded px-2 py-1.5 text-xs"
+            value={roomFilter}
+            onChange={(e) => setRoomFilter(e.target.value)}
+          >
+            <option value="active">Active Room</option>
+            <option value="all">All Rooms</option>
+            {rooms.map((r) => (
+              <option key={r.id} value={r.id}>{r.name || r.id}</option>
+            ))}
+          </select>
+          <label className="text-xs text-gray-400 flex items-center gap-1">
+            <input type="checkbox" checked={autoRefresh} onChange={(e) => setAutoRefresh(e.target.checked)} />
+            Auto
+          </label>
+          <button
+            type="button"
+            onClick={onClear}
+            disabled={busy || !selectedRoomId || selectedRoomId === 'all'}
+            className="px-2 py-1.5 text-xs rounded bg-gray-800 border border-gray-600 disabled:opacity-40"
+          >
+            Clear
+          </button>
+        </div>
+      </div>
+      {err ? <p className="text-xs text-red-400 mb-2">{err}</p> : null}
+      <div className="max-h-64 overflow-auto rounded border border-gray-800 bg-gray-950/70 p-2 font-mono text-xs">
+        {busy && logs.length === 0 ? <p className="text-gray-500">Loading logs...</p> : null}
+        {!busy && logs.length === 0 ? <p className="text-gray-600">No room logs yet.</p> : null}
+        {logs.map((l, idx) => (
+          <div key={`${l.ts}-${idx}`} className={`${levelClass(l.level)} break-words`}>
+            <span className="text-gray-500">[{fmtTime(l.ts)}]</span>{' '}
+            {roomFilter === 'all' ? <span className="text-blue-300">[{l.room_name}] </span> : null}
+            <span className="text-gray-500">[{String(l.level || 'INFO').toUpperCase()}] </span>
+            <span>{l.message}</span>
+          </div>
+        ))}
+      </div>
+    </div>
+  )
+}
+
 // ── Page ──────────────────────────────────────────────────────────────────────
 export default function Dashboard() {
   const navigate = useNavigate()
@@ -865,6 +1003,7 @@ export default function Dashboard() {
 
         <AiStatusCard ai={ai} />
         <RoomHealthCard health={displayStatus?.health} />
+        <RoomLogsCard activeRoomId={activeRoomId} rooms={rooms} />
 
         {/* Climate card — only shown when a climate entity is configured */}
         {(displayStatus?.climate_entity || displayStatus?.ac_entity) && (

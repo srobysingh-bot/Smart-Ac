@@ -46,6 +46,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, HTMLResponse, Response
 
 from . import config_manager, database, ha_entity_events, live_broadcast, logic_engine, room_registry, scheduler, session_logger, weather_api
+from .room_log_store import room_log_store
 from . import ha_client
 from .ac_controller import get_brands
 from .ai import get_cached
@@ -56,6 +57,7 @@ from .utils import parse_presence
 # Room-scoped WebSocket subscribers: broadcast never crosses room_id boundaries.
 _ws_by_room: Dict[str, List[WebSocket]] = defaultdict(list)
 _ws_lock = asyncio.Lock()
+_ws_log_token_by_room: Dict[str, str] = {}
 
 _api_last_command: Dict[str, float] = defaultdict(float)
 _API_RATE_LIMIT_SECS = 10
@@ -143,6 +145,7 @@ async def lifespan(app: FastAPI):
     database.backup_db("startup")
     await database.init_db()
     cfg = config_manager.load_config()
+    room_log_store.set_max_lines_per_room(int(cfg.get("log_buffer_size", 300)))
     ac_ent = (cfg.get("ac_entity") or cfg.get("climate_entity") or "").strip() or "(not set)"
     smart_on = logic_engine.smart_temp_adjustment_enabled(cfg)
     logger.info(
@@ -171,7 +174,7 @@ async def lifespan(app: FastAPI):
     logger.info("[HawaAI] Add-on stopped")
 
 
-app = FastAPI(title="HawaAI API", version="1.4.23", lifespan=lifespan)
+app = FastAPI(title="HawaAI API", version="1.4.24", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -860,6 +863,23 @@ async def api_room_status(room_id: str):
     return await get_status(room_id=_require_room_query(room_id))
 
 
+@app.get("/api/rooms/{room_id}/logs")
+async def api_room_logs(
+    room_id: str,
+    limit: int = Query(200, ge=1, le=500),
+):
+    rid = logic_engine.normalize_room_id(_require_room_query(room_id))
+    return {"room_id": rid, "logs": room_log_store.get_logs(rid, limit)}
+
+
+@app.delete("/api/rooms/{room_id}/logs")
+async def api_room_logs_clear(room_id: str):
+    rid = logic_engine.normalize_room_id(_require_room_query(room_id))
+    room_log_store.clear(rid)
+    _ws_log_token_by_room.pop(rid, None)
+    return {"ok": True, "room_id": rid}
+
+
 @app.get("/api/rooms/{room_id}/ai/status")
 async def api_room_ai_status(room_id: str):
     return get_ai_status(_require_room_query(room_id))
@@ -1233,16 +1253,22 @@ def _encode_room_tick_ws_payload_json(rid_canon: str) -> Optional[str]:
         merged = room_registry.merge_room_config(base, room_def)
         runtime = logic_engine.get_runtime_state(rk)
         sched_bt, sched_slot = resolve_base_target_temp(merged)
+        payload: Dict[str, Any] = {
+            "type": "tick",
+            **runtime,
+            "control_source": runtime.get("control_source", "none"),
+            "target_temp": sched_bt,
+            "schedule_slot": sched_slot,
+            "temperature_mode": merged.get("temperature_mode") or "manual",
+            "room_id": rk,
+        }
+        latest = room_log_store.latest_key(rk)
+        prev = _ws_log_token_by_room.get(rk)
+        if latest and latest != prev:
+            payload["recent_logs"] = room_log_store.get_logs(rk, 20)
+            _ws_log_token_by_room[rk] = latest
         return json.dumps(
-            {
-                "type": "tick",
-                **runtime,
-                "control_source": runtime.get("control_source", "none"),
-                "target_temp": sched_bt,
-                "schedule_slot": sched_slot,
-                "temperature_mode": merged.get("temperature_mode") or "manual",
-                "room_id": rk,
-            },
+            payload,
             default=str,
         )
     except Exception:
