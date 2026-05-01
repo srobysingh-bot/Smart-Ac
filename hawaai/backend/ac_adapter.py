@@ -14,6 +14,7 @@ Rules:
   - Always logs at INFO level so every command is traceable.
 """
 
+import asyncio
 import logging
 from typing import Optional
 
@@ -35,14 +36,23 @@ async def turn_on(
     """
     Turn AC ON via the Aerostate climate entity.
 
-    Sequence:
-      1. Read current state — skip if already at desired state (spam prevention)
-      2. set_hvac_mode → hvac_mode   (if mode differs)
-      3. set_temperature → temperature  (if delta ≥ 0.5°C)
-      4. set_fan_mode → fan_mode        (if fan differs, and fan_mode is given)
+    Tuya IR requires an explicit power-on (hvac_mode) call; do not rely on
+    ``set_temperature`` to turn the unit on.
 
-    Returns True if all needed service calls succeeded (or were skipped as no-ops).
-    Returns False if any call failed; caller should NOT mark AC as ON.
+    Primary sequence:
+      1) climate.set_hvac_mode hvac_mode ("cool")
+      2) sleep 0.5s
+      3) climate.set_temperature (temperature + fan_mode)
+
+    Fallback sequence (when primary fails):
+      1) climate.set_hvac_mode off
+      2) sleep 1s
+      3) climate.set_hvac_mode hvac_mode ("cool")
+      4) sleep 0.5s
+      5) climate.set_temperature (temperature + fan_mode)
+
+    Returns True if a service call succeeded (or if it was a no-op due to current state).
+    Returns False if both primary and fallback calls failed.
     """
     if not entity_id:
         logger.error(
@@ -83,50 +93,102 @@ async def turn_on(
         return True
 
     logger.info(
-        "[HawaAI] Control → Aerostate | mode=%s | temp=%.1f°C | fan=%s",
-        hvac_mode, temperature, fan_mode,
+        "[AC_ADAPTER] Sending ON → entity=%s temp=%.1f fan=%s hvac=%s",
+        entity_id,
+        float(temperature),
+        (fan_mode or "auto"),
+        hvac_mode,
     )
 
-    ok = True
+    # Fan mode can break Tuya IR profiles if unsupported or wrong casing.
+    # Only include fan_mode when it appears supported by the entity.
+    use_fan: Optional[str] = None
+    try:
+        supported = state.get("fan_modes") or []
+        supported = [str(x) for x in supported if x is not None]
+        req = (fan_mode or "").strip()
+        if req:
+            if req in supported:
+                use_fan = req
+            else:
+                low_map = {str(x).strip().lower(): str(x) for x in supported if str(x).strip()}
+                if req.lower() in low_map:
+                    use_fan = low_map[req.lower()]
+    except Exception:
+        use_fan = None
 
-    # Step A — set HVAC mode (turns the unit on if it was off)
-    if current_mode != hvac_mode:
-        r = await ha_client.call_service("climate", "set_hvac_mode", {
+    payload_mode = {
+        "entity_id": entity_id,
+        "hvac_mode": hvac_mode,
+    }
+    payload_temp = {
+        "entity_id": entity_id,
+        "temperature": float(temperature),
+    }
+    if use_fan:
+        payload_temp["fan_mode"] = use_fan
+
+    ok_mode = await ha_client.call_service("climate", "set_hvac_mode", payload_mode)
+    # Tuya IR can be slow; allow the state machine time to accept mode change.
+    await asyncio.sleep(1.0)
+    ok_temp = await ha_client.call_service("climate", "set_temperature", payload_temp)
+    ok = bool(ok_mode and ok_temp)
+    if not ok:
+        logger.warning(
+            "[AC_ADAPTER] Primary ON call failed — trying Tuya fallback OFF→ON (entity=%s)",
+            entity_id,
+        )
+        off_ok = await ha_client.call_service("climate", "set_hvac_mode", {
             "entity_id": entity_id,
-            "hvac_mode": hvac_mode,
+            "hvac_mode": "off",
         })
-        if not r:
-            logger.error("[HawaAI] Aerostate set_hvac_mode=%s FAILED", hvac_mode)
-        ok = ok and r
+        if not off_ok:
+            logger.warning("[AC_ADAPTER] Fallback step OFF failed (entity=%s)", entity_id)
+        await asyncio.sleep(1)
+        cool_ok = await ha_client.call_service("climate", "set_hvac_mode", payload_mode)
+        if not cool_ok:
+            logger.warning("[AC_ADAPTER] Fallback step hvac_mode=%s failed (entity=%s)", hvac_mode, entity_id)
+        await asyncio.sleep(1.0)
+        ok_temp2 = await ha_client.call_service("climate", "set_temperature", payload_temp)
+        ok = bool(cool_ok and ok_temp2)
 
-    # Step B — set temperature setpoint
-    if not temp_ok:
-        r = await ha_client.set_climate_temperature(entity_id, temperature, mode=hvac_mode)
-        if not r:
-            logger.error("[HawaAI] Aerostate set_temperature=%.1f FAILED", temperature)
-        ok = ok and r
-
-    # Step C — set fan mode
-    if fan_mode and not fan_ok:
-        r = await ha_client.call_service("climate", "set_fan_mode", {
-            "entity_id": entity_id,
-            "fan_mode":  fan_mode,
-        })
-        if not r:
-            logger.error("[HawaAI] Aerostate set_fan_mode=%s FAILED", fan_mode)
-        ok = ok and r
+    # Post-send verification (best effort): HA may be optimistic for Tuya IR, but this can still
+    # catch cases where the mode didn't take at all. Returning False keeps logic_engine pending retries alive.
+    await asyncio.sleep(2.0)
+    full_after = await ha_client.get_entity_state_full(entity_id)
+    if full_after:
+        st_after = full_after.get("state")
+        attrs = full_after.get("attributes", {}) or {}
+        logger.info(
+            "[AC_ADAPTER] Post-call state → entity=%s hvac=%s temp=%s fan=%s",
+            entity_id,
+            st_after,
+            attrs.get("temperature"),
+            attrs.get("fan_mode"),
+        )
+        if str(st_after or "").strip().lower() != str(hvac_mode or "cool").strip().lower():
+            logger.warning(
+                "[AC_ADAPTER] ON verification mismatch — expected hvac=%s got=%s (entity=%s)",
+                hvac_mode,
+                st_after,
+                entity_id,
+            )
+            return False
 
     if ok:
         logger.info(
             "[HawaAI] Aerostate ON ✓ | mode=%s | temp=%.1f°C | fan=%s",
-            hvac_mode, temperature, fan_mode,
+            hvac_mode,
+            float(temperature),
+            use_fan or fan_mode,
         )
     else:
         logger.error(
             "[HawaAI] Aerostate ON FAILED | mode=%s | temp=%.1f°C | fan=%s",
-            hvac_mode, temperature, fan_mode,
+            hvac_mode,
+            float(temperature),
+            use_fan or fan_mode,
         )
-
     return ok
 
 
