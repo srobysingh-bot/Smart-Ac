@@ -63,9 +63,9 @@ export default function AiDecisionsCard({ roomId }) {
       )}
 
       {rows.length > 0 && (
-        <div className="overflow-x-auto max-h-72 overflow-y-auto text-sm">
+        <div className="overflow-x-auto text-sm">
           <table className="w-full text-left border-collapse">
-            <thead className="text-xs text-gray-500 sticky top-0 bg-gray-900/95">
+            <thead className="text-xs text-gray-500 bg-gray-900/95">
               <tr>
                 <th className="py-2 pr-3 font-medium">Time</th>
                 <th className="py-2 pr-3 font-medium">Target</th>

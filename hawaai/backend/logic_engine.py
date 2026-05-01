@@ -560,9 +560,14 @@ async def _load_startup_state(room_id: str, cfg: dict) -> None:
             st.effective_ac_on = False
             st.ac_is_on = False
         else:
-            st.physical_ac_on = True
-            st.effective_ac_on = True
-            st.ac_is_on = True
+            # Non-cooling modes (fan_only/heat/dry/auto/...) should not be treated as cooling ON.
+            st.physical_ac_on = False
+            st.effective_ac_on = False
+            st.ac_is_on = False
+            logger.info(
+                "[HawaAI] Startup: hvac_mode='%s' treated as OFF (not cooling)",
+                ha_state,
+            )
         st.ac_state = "on" if st.physical_ac_on else "off"
         logger.info(
             "[HawaAI] Startup state loaded for room=%s ac_on=%s ha_state=%s",
@@ -2190,6 +2195,13 @@ async def _handle_delayed_on(
             room_canon,
             PENDING_ON_MAX_EMIT_ATTEMPTS,
         )
+        # Optional visibility hook: surface failure in UI immediately.
+        st.ac_state = "on_failed"
+        st.last_command = "on_failed"
+        try:
+            await live_broadcast.broadcast_room_update(room_canon)
+        except Exception:
+            pass
         _clear_pending_command_state(st)
         return
 
@@ -2340,10 +2352,17 @@ async def _turn_ac_on(
     if not _gate_turn_ac_on(room_id, cfg, target, tnow):
         return False
 
-    ok_sp, skip_sp = should_send_setpoint_command(st, target, tnow, cfg)
-    if not ok_sp:
-        logger.info("[HawaAI][%s] Skip AC ON command — %s", room_id, skip_sp)
-        return False
+    # Setpoint anti-spam is ONLY for redundant setpoint updates while already cooling.
+    # It must never block an initial ON command (especially same-temp retries after a missed IR/HA send).
+    if st.physical_ac_on and st.ac_state_source != "inferred":
+        ok_sp, skip_sp = should_send_setpoint_command(st, target, tnow, cfg)
+        if not ok_sp:
+            logger.info(
+                "[HawaAI][%s] Skip redundant setpoint update (%s)",
+                room_id,
+                skip_sp,
+            )
+            return True
 
     success = await ac_adapter.turn_on(
         entity_id   = climate_entity,

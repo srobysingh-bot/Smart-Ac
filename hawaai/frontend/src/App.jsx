@@ -64,7 +64,7 @@ export default function App() {
     <HashRouter>
       <RoomProvider>
         <RoomDataProvider>
-          <div className="flex flex-col min-h-[100dvh] h-[100dvh] max-h-[100dvh] overflow-hidden bg-gray-950 text-gray-100">
+          <div className="flex flex-col min-h-[100dvh] bg-gray-950 text-gray-100">
           {/* Desktop / tablet — top navigation */}
           <header className="hidden md:flex shrink-0 items-center gap-6 border-b border-gray-800 bg-gray-900/95 backdrop-blur-sm px-4 lg:px-6 py-3">
             <div className="flex items-center gap-2 shrink-0">
@@ -82,7 +82,7 @@ export default function App() {
           </header>
 
           {/* Scrollable content — bottom padding clears fixed mobile nav */}
-          <main className="app-main-scroll flex-1 min-h-0 min-w-0 overflow-y-auto overflow-x-hidden pb-[calc(3.65rem+env(safe-area-inset-bottom,0px))] md:pb-0">
+          <main className="app-main-scroll flex-1 min-w-0 overflow-x-hidden pb-[calc(3.65rem+env(safe-area-inset-bottom,0px))] md:pb-0">
             <Routes>
               <Route path="/"          element={<Dashboard />} />
               <Route path="/history"   element={<SessionHistory />} />

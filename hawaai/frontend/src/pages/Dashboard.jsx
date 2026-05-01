@@ -832,7 +832,7 @@ function RoomLogsCard({ activeRoomId, rooms }) {
         </div>
       </div>
       {err ? <p className="text-xs text-red-400 mb-2">{err}</p> : null}
-      <div className="max-h-64 overflow-auto rounded border border-gray-800 bg-gray-950/70 p-2 font-mono text-xs">
+      <div className="rounded border border-gray-800 bg-gray-950/70 p-2 font-mono text-xs">
         {busy && logs.length === 0 ? <p className="text-gray-500">Loading logs...</p> : null}
         {!busy && logs.length === 0 ? <p className="text-gray-600">No room logs yet.</p> : null}
         {logs.map((l, idx) => (
@@ -873,7 +873,7 @@ export default function Dashboard() {
   const showDashboardBody = !loadError && (!roomLoading || showSoftLoading)
 
   return (
-    <div className="flex flex-col h-full min-w-0">
+    <div className="flex flex-col min-w-0">
       <RoomStrip
         rooms={rooms}
         activeId={activeRoomId}
@@ -932,7 +932,7 @@ export default function Dashboard() {
             </div>
           )}
 
-          <div className="container-app flex-1 overflow-y-auto overflow-x-hidden px-4 sm:px-6 py-4 sm:py-6 pb-8 space-y-6 min-w-0">
+          <div className="container-app overflow-x-hidden px-4 sm:px-6 py-4 sm:py-6 pb-8 space-y-6 min-w-0">
             {/* Cards — 1 col · 2 cols tablet · 3 lg · 4 xl */}
             <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-4 min-w-0">
           <TempGauge
