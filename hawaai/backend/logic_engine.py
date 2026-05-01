@@ -131,6 +131,12 @@ class RoomRuntime:
     pending_action: Optional[str] = None  # "on" | "off"
     pending_since: Optional[float] = None  # epoch seconds (wall)
     pending_delay_wakeup_task: Optional[asyncio.Task] = None
+    # Chained wakeups after delayed ON emit until compressor confirms ON.
+    pending_on_retry_wakeup_task: Optional[asyncio.Task] = None
+    # Absolute wall (epoch) when the next pending-ON emit may run; avoids drift vs periodic ticks.
+    pending_on_next_retry_wall: Optional[float] = None
+    # ON IR attempts in this pending cycle (including first emit); capped before spam.
+    pending_on_emit_attempts: int = 0
     # Hybrid event triggers — last sampled values from HA WS (not authoritative for control)
     last_event_presence_bool: Optional[bool] = None
     last_event_probe_indoor_temp: Optional[float] = None
@@ -164,6 +170,58 @@ def _cancel_pending_delay_wakeup_task(st: RoomRuntime) -> None:
     if t is not None and not t.done():
         t.cancel()
     st.pending_delay_wakeup_task = None
+
+
+def _cancel_pending_on_retry_wakeup_task(st: RoomRuntime) -> None:
+    t = st.pending_on_retry_wakeup_task
+    if t is not None and not t.done():
+        t.cancel()
+    st.pending_on_retry_wakeup_task = None
+
+
+def _cancel_all_pending_wakeup_tasks(st: RoomRuntime) -> None:
+    _cancel_pending_delay_wakeup_task(st)
+    _cancel_pending_on_retry_wakeup_task(st)
+
+
+def _clear_pending_command_state(st: RoomRuntime) -> None:
+    """Cancel delay/retry alarms and reset pending_* (used when pending intent is abandoned)."""
+    _cancel_all_pending_wakeup_tasks(st)
+    st.pending_action = None
+    st.pending_since = None
+    st.pending_on_next_retry_wall = None
+    st.pending_on_emit_attempts = 0
+
+
+def schedule_pending_on_retry_wakeup(
+    *,
+    rid_for_tick: str,
+    room_canon: str,
+    retry_wall_ts: Optional[float] = None,
+) -> None:
+    """Sleep until ``retry_wall_ts`` (or now+RETRY) then trigger_tick(pending_on_retry) if still pending ON."""
+    canon = normalize_room_id(room_canon)
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return
+    st = _rt(canon)
+    wall = float(retry_wall_ts) if retry_wall_ts is not None else time.time() + PENDING_ON_RETRY_SECS
+    st.pending_on_next_retry_wall = wall
+    d = max(0.5, wall - time.time())
+
+    async def _alarm() -> None:
+        try:
+            await asyncio.sleep(d)
+        except asyncio.CancelledError:
+            return
+        st2 = _rt(canon)
+        if st2.pending_action != "on" or st2.physical_ac_on:
+            return
+        trigger_tick(rid_for_tick, reason="pending_on_retry", skip_debounce=True)
+
+    _cancel_pending_on_retry_wakeup_task(st)
+    st.pending_on_retry_wakeup_task = loop.create_task(_alarm())
 
 
 def schedule_pending_completion_wakeup(
@@ -201,7 +259,7 @@ def schedule_pending_completion_wakeup(
                 return
         trigger_tick(rid_for_tick, reason="delay_elapsed", skip_debounce=True)
 
-    _cancel_pending_delay_wakeup_task(st)
+    _cancel_all_pending_wakeup_tasks(st)
     st.pending_delay_wakeup_task = loop.create_task(_alarm())
 
 
@@ -246,7 +304,7 @@ def trigger_tick(
         _tick_trigger_last_mono_by_room[canon] = mono
 
     lk = _room_tick_serial_lock(canon)
-    if reason != "delay_elapsed" and lk.locked():
+    if reason not in ("delay_elapsed", "pending_on_retry") and lk.locked():
         logger.debug("[TICK_TRIGGER][%s] skipped tick in flight (%s)", canon, reason)
         return
 
@@ -299,6 +357,10 @@ def _rt(room_id: str) -> RoomRuntime:
 
 # Command cooldown — after any climate command, skip control logic for this window.
 _COOLDOWN_SECS: int = 60
+# Minimum wall time between delayed-path ON emits while pending ON and still physically OFF.
+PENDING_ON_RETRY_SECS: float = 10.0
+# First emit + 6 retries (~1 min at 10 s spacing) then abandon pending ON.
+PENDING_ON_MAX_EMIT_ATTEMPTS: int = 7
 
 # Power-based state thresholds
 _WATTS_COMPRESSOR: float = 500.0   # watts above this → compressor running (AC ON)
@@ -498,9 +560,7 @@ async def _load_startup_state(room_id: str, cfg: dict) -> None:
     finally:
         st.startup_state_loaded = True
         st.possible_on_since = None
-        st.pending_action = None
-        st.pending_since = None
-        _cancel_pending_delay_wakeup_task(st)
+        _clear_pending_command_state(st)
 
 
 async def _get_ai_target_adjustment(
@@ -674,9 +734,7 @@ def sync_effective_mode_transition(st: RoomRuntime, room_id: str, cfg: dict) -> 
             st.last_effective_mode,
             cur,
         )
-        _cancel_pending_delay_wakeup_task(st)
-        st.pending_action = None
-        st.pending_since = None
+        _clear_pending_command_state(st)
     st.last_effective_mode = cur
 
 
@@ -694,19 +752,14 @@ def _sync_pending_for_action(st: RoomRuntime, decision_action: str) -> None:
     - decision not in (on, off) → clear
     - decision != pending_action → clear
 
-    Always cancels ``pending_delay_wakeup_task`` before clearing pending so stale
-    ``delay_elapsed`` triggers cannot fire after the thermostat intent changed.
+    Always cancels delay / pending-ON retry wakeups before clearing pending so stale
+    ``delay_elapsed`` / ``pending_on_retry`` triggers cannot fire after intent changed.
     """
     if decision_action not in ("on", "off"):
-        if st.pending_action is not None:
-            _cancel_pending_delay_wakeup_task(st)
-        st.pending_action = None
-        st.pending_since = None
+        _clear_pending_command_state(st)
         return
     if st.pending_action is not None and st.pending_action != decision_action:
-        _cancel_pending_delay_wakeup_task(st)
-        st.pending_action = None
-        st.pending_since = None
+        _clear_pending_command_state(st)
 
 
 def _clear_pending_when_physically_satisfied(
@@ -723,15 +776,11 @@ def _clear_pending_when_physically_satisfied(
     """
     if st.pending_action == "on":
         if confirmed_ac_on or manual_override_active:
-            _cancel_pending_delay_wakeup_task(st)
-            st.pending_action = None
-            st.pending_since = None
+            _clear_pending_command_state(st)
             return
     elif st.pending_action == "off":
         if not physical_ac_on:
-            _cancel_pending_delay_wakeup_task(st)
-            st.pending_action = None
-            st.pending_since = None
+            _clear_pending_command_state(st)
 
 
 def _sync_ac_display_fields(st: RoomRuntime) -> None:
@@ -778,9 +827,7 @@ def record_user_api_command(room_id: str) -> None:
     st = _rt(room_id)
     st.last_user_command_time = datetime.now(timezone.utc)
     st.last_command_source = "user"
-    st.pending_action = None
-    st.pending_since = None
-    _cancel_pending_delay_wakeup_task(st)
+    _clear_pending_command_state(st)
 
 
 def _session_creation_eligible(st: RoomRuntime, now: datetime) -> bool:
@@ -973,35 +1020,56 @@ def _gate_turn_ac_on(
     now: datetime,
 ) -> bool:
     st = _rt(room_id)
-    # IR cooldown bypass: explicit user commands should be able to resume cooling.
-    if _is_in_cooldown(st, now) and not _is_user_authority_active(st, cfg, now):
-        secs = _seconds_since_last_command(st, now)
-        logger.info(
-            "[HawaAI][%s] Skip ON: global IR cooldown window (elapsed=%.0fs < %ds)",
-            room_id,
-            min(secs, float(_COOLDOWN_SECS)),
-            _COOLDOWN_SECS,
-        )
-        return False
-
-    min_iv = float(cfg.get("min_command_interval_seconds", 150))
-
-    secs = _seconds_since_last_command(st, now)
-    if secs < min_iv:
-        logger.info(
-            "[HawaAI][%s] Skip ON: cooldown (%.0fs < %.0fs)",
-            room_id, secs, min_iv,
-        )
-        return False
-
     fp = _fingerprint_turn_on(target)
-    if st.last_sent_command_key == fp:
+    duplicate_intent = st.last_sent_command_key == fp
+    resend_after_missed_ack = duplicate_intent and not st.physical_ac_on
+
+    # Dedup only when compressor is observed ON; same fingerprint + OFF → allow resend path.
+    if duplicate_intent and st.physical_ac_on:
         logger.info(
-            "[HawaAI][%s] Skip ON: duplicate command (%s)",
+            "[HawaAI][%s] Skip ON: duplicate fingerprint (%s) — physical ON observed",
             room_id,
             fp,
         )
         return False
+
+    # IR cooldown: bypass when resending same ON while still physically OFF (missed IR / HA drop).
+    if _is_in_cooldown(st, now) and not _is_user_authority_active(st, cfg, now):
+        if not resend_after_missed_ack:
+            secs = _seconds_since_last_command(st, now)
+            logger.info(
+                "[HawaAI][%s] Skip ON: global IR cooldown window (elapsed=%.0fs < %ds)",
+                room_id,
+                min(secs, float(_COOLDOWN_SECS)),
+                _COOLDOWN_SECS,
+            )
+            return False
+        logger.warning(
+            "[HawaAI][%s] Resend ON: duplicate fingerprint (%s) but physical OFF — bypass IR cooldown",
+            room_id,
+            fp,
+        )
+
+    min_iv = float(cfg.get("min_command_interval_seconds", 150))
+
+    secs = _seconds_since_last_command(st, now)
+    if secs < min_iv and not resend_after_missed_ack:
+        logger.info(
+            "[HawaAI][%s] Skip ON: cooldown (%.0fs < %.0fs)",
+            room_id,
+            secs,
+            min_iv,
+        )
+        return False
+    if secs < min_iv and resend_after_missed_ack:
+        logger.warning(
+            "[HawaAI][%s] Resend ON: duplicate fingerprint (%s) but physical OFF — "
+            "bypass min interval (elapsed=%.0fs < %.0fs)",
+            room_id,
+            fp,
+            secs,
+            min_iv,
+        )
 
     min_off = float(cfg.get("compressor_min_off_seconds", 180))
     if st.compressor_off_since is not None:
@@ -1693,9 +1761,7 @@ async def _tick_impl(rid_raw: str, room_id: str) -> None:
     if control_action == "on":
         if bypass_actuation_delay:
             await _turn_ac_on(room_id, cfg, indoor_temp, et_eff, now=now)
-            st.pending_action = None
-            st.pending_since = None
-            _cancel_pending_delay_wakeup_task(st)
+            _clear_pending_command_state(st)
         else:
             await _handle_delayed_on(
                 rid_raw, room_id, cfg, indoor_temp, et_eff, now, st,
@@ -1706,9 +1772,7 @@ async def _tick_impl(rid_raw: str, room_id: str) -> None:
     elif control_action == "off":
         # Vacancy / safety OFF must abandon any thermostat delayed-ON countdown immediately.
         if str(control_source).startswith("safety"):
-            _cancel_pending_delay_wakeup_task(st)
-            st.pending_action = None
-            st.pending_since = None
+            _clear_pending_command_state(st)
 
         reason_off = "vacant" if "vacant" in control_source else "target_reached"
         force_off = control_source.startswith("safety") or control_source == "thermostat_reached"
@@ -1718,9 +1782,7 @@ async def _tick_impl(rid_raw: str, room_id: str) -> None:
             await _turn_ac_off(
                 room_id, cfg, indoor_temp, reason_off, now=now, force=force_off,
             )
-            st.pending_action = None
-            st.pending_since = None
-            _cancel_pending_delay_wakeup_task(st)
+            _clear_pending_command_state(st)
         else:
             await _handle_delayed_off(
                 rid_raw, room_id, cfg, indoor_temp, now, st,
@@ -2016,78 +2078,100 @@ async def _handle_delayed_on(
             "[DELAY_ON][%s] compressor ON confirmed (power or HA/command) — clearing pending_on",
             room_canon,
         )
-        _cancel_pending_delay_wakeup_task(st)
-        st.pending_action = None
-        st.pending_since = None
-        return
-
-    if delay <= 0:
-        if _decision_lock_blocks_delayed_emit(st, now):
-            logger.info(
-                "[DECISION_LOCK][%s] immediate ON deferred — %.0fs lock since last IR",
-                room_canon,
-                DECISION_LOCK_SECONDS,
-            )
-            return
-        logger.info("[DELAY_ON][%s] TRIGGER _turn_ac_on (delay=0) physical=false", room_canon)
-        await _turn_ac_on(room_canon, cfg, indoor_temp, et_eff, now=now)
-        _cancel_pending_delay_wakeup_task(st)
-        st.pending_action = None
-        st.pending_since = None
+        _clear_pending_command_state(st)
         return
 
     if st.pending_action != "on":
         st.pending_action = "on"
         st.pending_since = ts
+        st.pending_on_emit_attempts = 0
+        st.pending_on_next_retry_wall = None
         logger.info(
             "[DELAY_ON][%s] ARM pending_on pending_since=%.3f delay_s=%.0f",
             room_canon,
             st.pending_since,
             delay,
         )
-        schedule_pending_completion_wakeup(
-            rid_for_tick=rid_stored,
-            room_canon=room_canon,
-            kind="on",
-            delay_seconds=delay,
-        )
-        return
+        if delay > 0:
+            schedule_pending_completion_wakeup(
+                rid_for_tick=rid_stored,
+                room_canon=room_canon,
+                kind="on",
+                delay_seconds=delay,
+            )
+            return
 
-    # Never reset pending_since on subsequent ticks — only repaired if missing/corrupt.
     if st.pending_since is None:
         st.pending_since = ts
         logger.warning("[DELAY_ON][%s] repaired missing pending_since=%.3f", room_canon, st.pending_since)
         return
 
-    elapsed = ts - float(st.pending_since)
-    logger.debug(
-        "[DELAY_ON][%s] wait pending_since=%.3f elapsed=%.2fs delay=%.0fs",
-        room_canon,
-        st.pending_since,
-        elapsed,
-        delay,
-    )
-    if elapsed >= delay:
-        if _decision_lock_blocks_delayed_emit(st, now):
-            logger.info(
-                "[DECISION_LOCK][%s] delayed ON held — lock active elapsed=%.1fs pending_since=%.3f",
-                room_canon,
-                elapsed,
-                st.pending_since,
-            )
-            return
-        logger.info(
-            "[DELAY_ON][%s] TRIGGER _turn_ac_on (elapsed>=%.0fs) pending_since=%.3f elapsed=%.2fs "
-            "(single emit)",
+    if delay > 0:
+        elapsed = ts - float(st.pending_since)
+        logger.debug(
+            "[DELAY_ON][%s] wait pending_since=%.3f elapsed=%.2fs delay=%.0fs",
             room_canon,
-            delay,
             st.pending_since,
             elapsed,
+            delay,
         )
-        await _turn_ac_on(room_canon, cfg, indoor_temp, et_eff, now=now)
-        _cancel_pending_delay_wakeup_task(st)
-        st.pending_action = None
-        st.pending_since = None
+        if elapsed < delay:
+            return
+
+    if _decision_lock_blocks_delayed_emit(st, now):
+        logger.info(
+            "[DECISION_LOCK][%s] delayed ON held — lock active pending_since=%.3f — schedule retry wakeup",
+            room_canon,
+            st.pending_since,
+        )
+        schedule_pending_on_retry_wakeup(
+            rid_for_tick=rid_stored,
+            room_canon=room_canon,
+            retry_wall_ts=ts + PENDING_ON_RETRY_SECS,
+        )
+        return
+
+    nwall = st.pending_on_next_retry_wall
+    if nwall is not None and ts < float(nwall):
+        logger.debug(
+            "[DELAY_ON][%s] ON emit before next_retry wall (%.2fs left) — reschedule wakeup",
+            room_canon,
+            float(nwall) - ts,
+        )
+        schedule_pending_on_retry_wakeup(
+            rid_for_tick=rid_stored,
+            room_canon=room_canon,
+            retry_wall_ts=float(nwall),
+        )
+        return
+
+    if st.pending_on_emit_attempts >= PENDING_ON_MAX_EMIT_ATTEMPTS:
+        logger.error(
+            "[DELAY_ON][%s] AC failed to turn ON after %d IR attempts — clearing pending_on",
+            room_canon,
+            PENDING_ON_MAX_EMIT_ATTEMPTS,
+        )
+        _clear_pending_command_state(st)
+        return
+
+    _cancel_pending_delay_wakeup_task(st)
+    st.pending_on_emit_attempts += 1
+    logger.info(
+        "[DELAY_ON][%s] TRIGGER _turn_ac_on attempt=%d/%d pending_since=%.3f delay_s=%.0f",
+        room_canon,
+        st.pending_on_emit_attempts,
+        PENDING_ON_MAX_EMIT_ATTEMPTS,
+        st.pending_since,
+        delay,
+    )
+    await _turn_ac_on(room_canon, cfg, indoor_temp, et_eff, now=now)
+    if st.pending_action != "on":
+        return
+    schedule_pending_on_retry_wakeup(
+        rid_for_tick=rid_stored,
+        room_canon=room_canon,
+        retry_wall_ts=time.time() + PENDING_ON_RETRY_SECS,
+    )
 
 
 async def _handle_delayed_off(
@@ -2105,9 +2189,7 @@ async def _handle_delayed_off(
     ts = time.time()
 
     if not st.physical_ac_on:
-        _cancel_pending_delay_wakeup_task(st)
-        st.pending_action = None
-        st.pending_since = None
+        _clear_pending_command_state(st)
         return
 
     if delay <= 0:
@@ -2122,9 +2204,7 @@ async def _handle_delayed_off(
             session_logger.mark_cooled(room_canon)
         logger.info("[DELAY_OFF][%s] TRIGGER _turn_ac_off (delay=0)", room_canon)
         await _turn_ac_off(room_canon, cfg, indoor_temp, reason, now=now, force=force)
-        _cancel_pending_delay_wakeup_task(st)
-        st.pending_action = None
-        st.pending_since = None
+        _clear_pending_command_state(st)
         return
 
     if st.pending_action != "off":
@@ -2179,9 +2259,7 @@ async def _handle_delayed_off(
             st.pending_since,
         )
         await _turn_ac_off(room_canon, cfg, indoor_temp, reason, now=now, force=force)
-        _cancel_pending_delay_wakeup_task(st)
-        st.pending_action = None
-        st.pending_since = None
+        _clear_pending_command_state(st)
 
 
 # ── Turn AC ON ────────────────────────────────────────────────────────────────
@@ -2192,8 +2270,8 @@ async def _turn_ac_on(
     indoor_temp: float,
     effective_target: Optional[float] = None,
     now: Optional[datetime] = None,
-) -> None:
-    """Turn AC ON for one room; updates RoomRuntime + per-room session."""
+) -> bool:
+    """Turn AC ON for one room; updates RoomRuntime + per-room session. Returns False if IR not sent."""
     st = _rt(room_id)
 
     climate_entity = (cfg.get("climate_entity") or "").strip()
@@ -2202,7 +2280,7 @@ async def _turn_ac_on(
             "[HawaAI][%s] AC ON FAILED — no climate entity configured.",
             room_id,
         )
-        return
+        return False
 
     target = effective_target if effective_target is not None else float(cfg.get("target_temp", 24))
 
@@ -2216,15 +2294,15 @@ async def _turn_ac_on(
             room_id,
             st.ac_state_source,
         )
-        return
+        return True
 
     if not _gate_turn_ac_on(room_id, cfg, target, tnow):
-        return
+        return False
 
     ok_sp, skip_sp = should_send_setpoint_command(st, target, tnow, cfg)
     if not ok_sp:
         logger.info("[HawaAI][%s] Skip AC ON command — %s", room_id, skip_sp)
-        return
+        return False
 
     success = await ac_adapter.turn_on(
         entity_id   = climate_entity,
@@ -2234,10 +2312,11 @@ async def _turn_ac_on(
     )
     if not success:
         logger.error(
-            "[HawaAI][%s] AC ON via Aerostate FAILED — not marking as ON, will retry next tick",
+            "[HawaAI][%s] AC ON via Aerostate FAILED — not marking as ON; "
+            "pending ON path will retry via wakeup if applicable",
             room_id,
         )
-        return
+        return False
 
     st.ac_is_on = True
     st.last_ac_on_at = time.time()
@@ -2253,6 +2332,7 @@ async def _turn_ac_on(
         "[HawaAI][%s] AC ON accepted; provisional session opens on next lifecycle sync",
         room_id,
     )
+    return True
 
 
 async def _indoor_temp_for_shutdown(cfg: dict) -> float:
@@ -2299,9 +2379,7 @@ async def _stop_room_locked(room_id_raw: str, canon: str, shutdown_reason: str) 
     st = _runtime_by_room.get(canon)
     had_runtime = st is not None
     if st is not None:
-        _cancel_pending_delay_wakeup_task(st)
-        st.pending_action = None
-        st.pending_since = None
+        _clear_pending_command_state(st)
 
     base_cfg = config_manager.load_config()
     room_def = resolve_room_definition(base_cfg, room_id_raw)
@@ -2577,6 +2655,14 @@ def get_runtime_state(room_id: str) -> dict:
         "pending_action":             st.pending_action,
         "pending_since_ts":           st.pending_since,
         "pending_remaining_seconds":  pending_remaining,
+        "retry_count": (
+            int(st.pending_on_emit_attempts) if st.pending_action == "on" else 0
+        ),
+        "next_retry_in": (
+            max(0.0, round(float(st.pending_on_next_retry_wall) - time.time(), 1))
+            if st.pending_action == "on" and st.pending_on_next_retry_wall is not None
+            else None
+        ),
         "effective_mode":             str(merged.get("effective_mode") or "auto"),
         "manual_effective_temp":      merged.get("manual_effective_temp"),
         "effective_max_delta_deg":    effective_max_delta_deg(merged),

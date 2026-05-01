@@ -210,6 +210,48 @@ class TestLogicEngineHardening(unittest.TestCase):
         self.assertIsNone(st.pending_since)
         self.assertEqual(st.last_effective_mode, "manual")
 
+    def test_gate_turn_ac_on_duplicate_physical_on_skips(self):
+        """Same fingerprint allowed only when compressor not observed ON — duplicate + ON skips."""
+        logic_engine._runtime_by_room.clear()
+        rid = "gate-dup-on"
+        st = logic_engine._rt(rid)
+        now = datetime.now(timezone.utc)
+        st.last_command_time = now - timedelta(seconds=400)
+        st.last_command = "on"
+        st.last_sent_command_key = logic_engine._fingerprint_turn_on(23.5)
+        st.physical_ac_on = True
+        st.compressor_off_since = None
+        cfg = {"min_command_interval_seconds": 150, "compressor_min_off_seconds": 0}
+        self.assertFalse(logic_engine._gate_turn_ac_on(rid, cfg, 23.5, now))
+
+    def test_gate_turn_ac_on_duplicate_physical_off_bypasses_min_interval(self):
+        """Missed ACK: fingerprint matches but physically OFF → still allow past min_command_interval."""
+        logic_engine._runtime_by_room.clear()
+        rid = "gate-dup-off"
+        st = logic_engine._rt(rid)
+        now = datetime.now(timezone.utc)
+        st.last_command_time = now - timedelta(seconds=70)
+        st.last_command = "on"
+        st.last_sent_command_key = logic_engine._fingerprint_turn_on(24.0)
+        st.physical_ac_on = False
+        st.compressor_off_since = None
+        cfg = {"min_command_interval_seconds": 150, "compressor_min_off_seconds": 0}
+        self.assertTrue(logic_engine._gate_turn_ac_on(rid, cfg, 24.0, now))
+
+    def test_gate_turn_ac_on_duplicate_physical_off_bypasses_ir_cooldown(self):
+        """Same fingerprint + physically OFF bypasses IR cooldown so missed commands can retry."""
+        logic_engine._runtime_by_room.clear()
+        rid = "gate-dup-ir-off"
+        st = logic_engine._rt(rid)
+        now = datetime.now(timezone.utc)
+        st.last_command_time = now - timedelta(seconds=15)
+        st.last_command = "on"
+        st.last_sent_command_key = logic_engine._fingerprint_turn_on(23.0)
+        st.physical_ac_on = False
+        st.compressor_off_since = None
+        cfg = {"min_command_interval_seconds": 150, "compressor_min_off_seconds": 0}
+        self.assertTrue(logic_engine._gate_turn_ac_on(rid, cfg, 23.0, now))
+
 
 if __name__ == "__main__":
     unittest.main()
