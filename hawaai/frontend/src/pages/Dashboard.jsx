@@ -340,7 +340,9 @@ function LiveStatusBar({ status }) {
   // State display — prefer explicit ac_phase; pending_on never shows as green ON
   const phase = acPhase || 'off'
   const acColor =
-    phase === 'pending_on'
+    phase === 'on_failed'
+      ? 'text-red-400'
+      : phase === 'pending_on'
       ? 'text-amber-400'
       : physicalCore && !ac_idle
         ? 'text-green-400'
@@ -348,7 +350,9 @@ function LiveStatusBar({ status }) {
           ? 'text-yellow-400'
           : 'text-gray-500'
   const acLabel =
-    phase === 'pending_on'
+    phase === 'on_failed'
+      ? 'ON FAIL'
+      : phase === 'pending_on'
       ? 'WAIT ON'
       : physicalCore && !ac_idle
         ? 'ON'
@@ -405,7 +409,7 @@ function LiveStatusBar({ status }) {
         {watt_draw > 0 && (
           <span className="text-gray-400">· {Number(watt_draw).toFixed(0)} W</span>
         )}
-        {power_source === 'internal' && !physicalCore && phase !== 'pending_on' && (
+        {power_source === 'internal' && !physicalCore && phase !== 'pending_on' && phase !== 'on_failed' && (
           <span className="text-xs text-gray-600 ml-1" title="No power sensor — state from IR command flag">
             (flag)
           </span>

@@ -252,6 +252,98 @@ class TestLogicEngineHardening(unittest.TestCase):
         cfg = {"min_command_interval_seconds": 150, "compressor_min_off_seconds": 0}
         self.assertTrue(logic_engine._gate_turn_ac_on(rid, cfg, 23.0, now))
 
+    def test_fp2_zone_gate_metrics_allow_fallback_and_block(self):
+        logic_engine._runtime_by_room.clear()
+        rid = "z-metrics"
+        st = logic_engine._rt(rid)
+        cfg = {"zone_entity_id": "binary_sensor.z", "zone_required_for_on": True}
+
+        st.zone_sensor_usable = False
+        allow0 = st.zone_allow_count
+        logic_engine._fp2_zone_apply_on_gate(rid, cfg, "on", "thermostat")
+        self.assertGreater(st.zone_allow_count, allow0)
+
+        st.zone_sensor_usable = True
+        st.zone_confirmed = False
+        block0 = st.zone_block_count
+        logic_engine._fp2_zone_apply_on_gate(rid, cfg, "on", "thermostat")
+        self.assertGreater(st.zone_block_count, block0)
+
+        st.zone_confirmed = True
+        allow1 = st.zone_allow_count
+        logic_engine._fp2_zone_apply_on_gate(rid, cfg, "on", "thermostat")
+        self.assertGreater(st.zone_allow_count, allow1)
+
+    def test_fp2_zone_gate_allows_when_not_required(self):
+        logic_engine._runtime_by_room.clear()
+        rid = "z-g1"
+        st = logic_engine._rt(rid)
+        st.zone_sensor_usable = True
+        st.zone_confirmed = False
+        cfg = {"zone_entity_id": "binary_sensor.z", "zone_required_for_on": False}
+        a, s, blocked = logic_engine._fp2_zone_apply_on_gate(rid, cfg, "on", "thermostat")
+        self.assertEqual((a, s, blocked), ("on", "thermostat", False))
+
+    def test_fp2_zone_gate_fallback_when_sensor_unusable(self):
+        logic_engine._runtime_by_room.clear()
+        rid = "z-g2"
+        st = logic_engine._rt(rid)
+        st.zone_sensor_usable = False
+        st.zone_confirmed = False
+        cfg = {
+            "zone_entity_id": "binary_sensor.z",
+            "zone_required_for_on": True,
+        }
+        a, s, blocked = logic_engine._fp2_zone_apply_on_gate(rid, cfg, "on", "thermostat")
+        self.assertEqual((a, s, blocked), ("on", "thermostat", False))
+
+    def test_fp2_zone_gate_blocks_until_confirmed(self):
+        logic_engine._runtime_by_room.clear()
+        rid = "z-g3"
+        st = logic_engine._rt(rid)
+        st.zone_sensor_usable = True
+        st.zone_confirmed = False
+        cfg = {
+            "zone_entity_id": "binary_sensor.z",
+            "zone_required_for_on": True,
+        }
+        a, s, blocked = logic_engine._fp2_zone_apply_on_gate(rid, cfg, "on", "thermostat")
+        self.assertEqual((a, s, blocked), ("hold", "zone_gate", True))
+        st.zone_confirmed = True
+        a2, s2, b2 = logic_engine._fp2_zone_apply_on_gate(rid, cfg, "on", "thermostat")
+        self.assertEqual((a2, s2, b2), ("on", "thermostat", False))
+
+    def test_fp2_zone_gate_never_changes_off(self):
+        logic_engine._runtime_by_room.clear()
+        rid = "z-g4"
+        st = logic_engine._rt(rid)
+        st.zone_sensor_usable = False
+        st.zone_confirmed = False
+        cfg = {"zone_entity_id": "binary_sensor.z", "zone_required_for_on": True}
+        a, s, blocked = logic_engine._fp2_zone_apply_on_gate(
+            rid, cfg, "off", "thermostat_reached",
+        )
+        self.assertEqual((a, s, blocked), ("off", "thermostat_reached", False))
+
+    def test_merge_room_config_zone_keys(self):
+        from backend import room_registry
+
+        g = {"rooms": [], "thermostat_on_delta_deg": 0.7}
+        room = {
+            "id": "r1",
+            "name": "X",
+            "climate_entity": "climate.x",
+            "zone_entity_id": "binary_sensor.z",
+            "zone_dwell_seconds": 45,
+            "zone_exit_grace_seconds": 10,
+            "zone_required_for_on": True,
+        }
+        m = room_registry.merge_room_config(g, room)
+        self.assertEqual(m["zone_entity_id"], "binary_sensor.z")
+        self.assertEqual(m["zone_dwell_seconds"], 45)
+        self.assertEqual(m["zone_exit_grace_seconds"], 10)
+        self.assertTrue(m["zone_required_for_on"])
+
 
 if __name__ == "__main__":
     unittest.main()

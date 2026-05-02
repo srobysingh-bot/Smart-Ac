@@ -174,6 +174,28 @@ def merge_room_config(global_cfg: Dict[str, Any], room: Dict[str, Any]) -> Dict[
             if v is None:
                 continue
             out[k] = copy.deepcopy(v) if isinstance(v, (dict, list)) else v
+    # Optional FP2 zone ON gate (room dict overrides merged settings).
+    ze = (str(room.get("zone_entity_id") or out.get("zone_entity_id") or "")).strip()
+    if ze:
+        out["zone_entity_id"] = ze
+    else:
+        out.pop("zone_entity_id", None)
+    try:
+        zd = int(room.get("zone_dwell_seconds", out.get("zone_dwell_seconds", 20)))
+    except (TypeError, ValueError):
+        zd = 20
+    out["zone_dwell_seconds"] = max(0, min(zd, 3600))
+    try:
+        zg = int(room.get("zone_exit_grace_seconds", out.get("zone_exit_grace_seconds", 4)))
+    except (TypeError, ValueError):
+        zg = 4
+    out["zone_exit_grace_seconds"] = max(0, min(zg, 120))
+    if "zone_required_for_on" in room:
+        out["zone_required_for_on"] = bool(room.get("zone_required_for_on"))
+    elif "zone_required_for_on" in out:
+        out["zone_required_for_on"] = bool(out.get("zone_required_for_on"))
+    else:
+        out["zone_required_for_on"] = False
     temperature_schedule.ensure_temperature_schedule_defaults(out)
     return out
 

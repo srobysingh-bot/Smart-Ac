@@ -110,7 +110,7 @@ class RoomRuntime:
     physical_ac_on: bool = False
     # UI / masked: False while pending_action == "on" even if physical is True.
     effective_ac_on: bool = False
-    # Display phase: off | pending_on | on | pending_off
+    # Display phase: off | pending_on | on | pending_off | on_failed
     ac_state: str = "off"
     effective_ac_idle: bool = False
     effective_power_source: str = "init"       # "watts" | "cooldown" | "internal"
@@ -142,12 +142,25 @@ class RoomRuntime:
     pending_action: Optional[str] = None  # "on" | "off"
     pending_since: Optional[float] = None  # epoch seconds (wall)
     pending_delay_wakeup_task: Optional[asyncio.Task] = None
-    # Chained wakeups after delayed ON emit until compressor confirms ON.
-    pending_on_retry_wakeup_task: Optional[asyncio.Task] = None
-    # Absolute wall (epoch) when the next pending-ON emit may run; avoids drift vs periodic ticks.
-    pending_on_next_retry_wall: Optional[float] = None
-    # ON IR attempts in this pending cycle (including first emit); capped before spam.
-    pending_on_emit_attempts: int = 0
+    # Single-shot delayed ON: after one IR emit in this pending cycle, wait for physical confirm
+    # (power / HA) or tick-level timeout — no automatic retry wakeups.
+    pending_on_ir_sent: bool = False
+    pending_on_ir_sent_at: Optional[datetime] = None
+    # Pending ON cleared early on soft power (below compressor threshold) — UI only, not sessions.
+    soft_start_ui: bool = False
+    # FP2 zone (optional): dwell + confirmation for ON-only gating; never used for OFF.
+    zone_present: bool = False
+    zone_entered_at: Optional[datetime] = None
+    zone_confirmed: bool = False
+    zone_dwell_passed: bool = False
+    zone_confidence: str = "low"  # low | medium | high — forward-compatible
+    # Last tick: HA zone entity returned a usable state (not missing/unavailable/unknown).
+    zone_sensor_usable: bool = False
+    # Last HA sample time while raw zone was "on" (usable reads only; exit-debounce anchor).
+    zone_last_raw_on_at: Optional[datetime] = None
+    zone_block_count: int = 0
+    zone_allow_count: int = 0
+    zone_log_sig: Optional[tuple] = None
     # Hybrid event triggers — last sampled values from HA WS (not authoritative for control)
     last_event_presence_bool: Optional[bool] = None
     last_event_probe_indoor_temp: Optional[float] = None
@@ -183,56 +196,17 @@ def _cancel_pending_delay_wakeup_task(st: RoomRuntime) -> None:
     st.pending_delay_wakeup_task = None
 
 
-def _cancel_pending_on_retry_wakeup_task(st: RoomRuntime) -> None:
-    t = st.pending_on_retry_wakeup_task
-    if t is not None and not t.done():
-        t.cancel()
-    st.pending_on_retry_wakeup_task = None
-
-
 def _cancel_all_pending_wakeup_tasks(st: RoomRuntime) -> None:
     _cancel_pending_delay_wakeup_task(st)
-    _cancel_pending_on_retry_wakeup_task(st)
 
 
 def _clear_pending_command_state(st: RoomRuntime) -> None:
-    """Cancel delay/retry alarms and reset pending_* (used when pending intent is abandoned)."""
+    """Cancel delay wakeup and reset pending_* (used when pending intent is abandoned)."""
     _cancel_all_pending_wakeup_tasks(st)
     st.pending_action = None
     st.pending_since = None
-    st.pending_on_next_retry_wall = None
-    st.pending_on_emit_attempts = 0
-
-
-def schedule_pending_on_retry_wakeup(
-    *,
-    rid_for_tick: str,
-    room_canon: str,
-    retry_wall_ts: Optional[float] = None,
-) -> None:
-    """Sleep until ``retry_wall_ts`` (or now+RETRY) then trigger_tick(pending_on_retry) if still pending ON."""
-    canon = normalize_room_id(room_canon)
-    try:
-        loop = asyncio.get_running_loop()
-    except RuntimeError:
-        return
-    st = _rt(canon)
-    wall = float(retry_wall_ts) if retry_wall_ts is not None else time.time() + PENDING_ON_RETRY_SECS
-    st.pending_on_next_retry_wall = wall
-    d = max(0.5, wall - time.time())
-
-    async def _alarm() -> None:
-        try:
-            await asyncio.sleep(d)
-        except asyncio.CancelledError:
-            return
-        st2 = _rt(canon)
-        if st2.pending_action != "on" or st2.physical_ac_on:
-            return
-        trigger_tick(rid_for_tick, reason="pending_on_retry", skip_debounce=True)
-
-    _cancel_pending_on_retry_wakeup_task(st)
-    st.pending_on_retry_wakeup_task = loop.create_task(_alarm())
+    st.pending_on_ir_sent = False
+    st.pending_on_ir_sent_at = None
 
 
 def schedule_pending_completion_wakeup(
@@ -270,7 +244,7 @@ def schedule_pending_completion_wakeup(
                 return
         trigger_tick(rid_for_tick, reason="delay_elapsed", skip_debounce=True)
 
-    _cancel_all_pending_wakeup_tasks(st)
+    _cancel_pending_delay_wakeup_task(st)
     st.pending_delay_wakeup_task = loop.create_task(_alarm())
 
 
@@ -315,7 +289,7 @@ def trigger_tick(
         _tick_trigger_last_mono_by_room[canon] = mono
 
     lk = _room_tick_serial_lock(canon)
-    if reason not in ("delay_elapsed", "pending_on_retry") and lk.locked():
+    if reason != "delay_elapsed" and lk.locked():
         logger.debug("[TICK_TRIGGER][%s] skipped tick in flight (%s)", canon, reason)
         return
 
@@ -368,14 +342,15 @@ def _rt(room_id: str) -> RoomRuntime:
 
 # Command cooldown — after any climate command, skip control logic for this window.
 _COOLDOWN_SECS: int = 60
-# Minimum wall time between delayed-path ON emits while pending ON and still physically OFF.
-PENDING_ON_RETRY_SECS: float = 10.0
-# First emit + 6 retries (~1 min at 10 s spacing) then abandon pending ON.
-PENDING_ON_MAX_EMIT_ATTEMPTS: int = 7
+# After first delayed-path ON IR in a pending cycle, wait this long for physical confirmation
+# (compressor watts / HA command) before surfacing on_failed and clearing pending.
+PENDING_ON_CONFIRM_TIMEOUT_SECS: float = 20.0
 
 # Power-based state thresholds
 _WATTS_COMPRESSOR: float = 500.0   # watts above this → compressor running (AC ON)
 _WATTS_FAN_ONLY:   float = 50.0    # watts between FAN_ONLY and COMPRESSOR → IDLE (fan only)
+# Soft-start draw after IR ON but before compressor crosses _WATTS_COMPRESSOR (tune per install).
+MIN_SOFT_ON_WATTS: float = 120.0
 
 # Probable manual-ON inference: occupy + hot vs target while watts have not risen yet (seconds)
 TRANSIENT_ON_WINDOW_SECS: float = 180.0
@@ -505,6 +480,135 @@ def _resolve_control_decision(
 
     # ── PRIORITY 5: Hold ─────────────────────────────────────────────────────────
     return ("hold", "thermostat", effective_target)
+
+
+async def _fp2_zone_sensor_tick(room_id: str, cfg: dict, now: datetime) -> None:
+    """
+    FP2 zone: exit-grace debounce, entry dwell, HA glitch preservation.
+    ``zone_confirmed`` := dwell_passed AND sensor_usable (extend confidence later).
+    """
+    st = _rt(room_id)
+    zone_e = (str(cfg.get("zone_entity_id") or "")).strip()
+    try:
+        dwell = int(cfg.get("zone_dwell_seconds", 20))
+    except (TypeError, ValueError):
+        dwell = 20
+    dwell = max(0, min(int(dwell), 3600))
+    try:
+        grace = int(cfg.get("zone_exit_grace_seconds", 4))
+    except (TypeError, ValueError):
+        grace = 4
+    grace = max(0, min(int(grace), 120))
+
+    if not zone_e:
+        st.zone_present = False
+        st.zone_entered_at = None
+        st.zone_confirmed = False
+        st.zone_dwell_passed = False
+        st.zone_sensor_usable = False
+        st.zone_last_raw_on_at = None
+        st.zone_confidence = "low"
+        st.zone_log_sig = None
+        return
+
+    raw = await ha_client.get_state(zone_e)
+    low = (raw or "").strip().lower()
+    usable = bool(raw is not None and low not in ("unknown", "unavailable", ""))
+    st.zone_sensor_usable = usable
+
+    if not usable:
+        # Keep debounced presence / dwell anchor across transient HA failures.
+        st.zone_confirmed = False
+        if st.zone_entered_at is not None:
+            st.zone_dwell_passed = (
+                (now - st.zone_entered_at).total_seconds() >= float(dwell)
+            ) and st.zone_present
+        else:
+            st.zone_dwell_passed = False
+        st.zone_confidence = "low"
+        return
+
+    raw_on = low == "on"
+    if raw_on:
+        st.zone_last_raw_on_at = now
+        debounced_present = True
+    else:
+        if st.zone_last_raw_on_at is None:
+            debounced_present = False
+        else:
+            debounced_present = (
+                (now - st.zone_last_raw_on_at).total_seconds() <= float(grace)
+            )
+
+    if not debounced_present:
+        st.zone_last_raw_on_at = None
+
+    st.zone_present = debounced_present
+
+    if not debounced_present:
+        st.zone_entered_at = None
+        st.zone_dwell_passed = False
+        st.zone_confirmed = False
+        st.zone_confidence = "low"
+        return
+
+    if st.zone_entered_at is None:
+        if raw_on:
+            # First stable ON sample: assume dwell may already be satisfied (user was in zone).
+            st.zone_entered_at = now - timedelta(seconds=float(dwell))
+            epoch_min = datetime(1970, 1, 1, tzinfo=timezone.utc)
+            if st.zone_entered_at < epoch_min:
+                st.zone_entered_at = epoch_min
+        else:
+            st.zone_entered_at = now
+
+    elapsed = (now - st.zone_entered_at).total_seconds()
+    dwell_passed = elapsed >= float(dwell)
+    st.zone_dwell_passed = dwell_passed
+    st.zone_confirmed = bool(dwell_passed and usable)
+    st.zone_confidence = "high" if dwell_passed else "medium"
+
+
+def _fp2_zone_apply_on_gate(
+    room_id: str,
+    cfg: dict,
+    action: str,
+    source: str,
+) -> Tuple[str, str, bool]:
+    """
+    ON-only: block thermostat ON until FP2 zone dwell confirms, when enabled.
+    Never blocks OFF, safety, cooldown, or user paths. Missing/unusable zone → allow (fallback).
+    Returns (action, source, zone_gate_blocked).
+    """
+    st = _rt(room_id)
+    if action != "on" or str(source) != "thermostat":
+        return action, source, False
+    zone_e = (str(cfg.get("zone_entity_id") or "")).strip()
+    required = bool(cfg.get("zone_required_for_on", False))
+    if not required or not zone_e:
+        return action, source, False
+    if not st.zone_sensor_usable:
+        st.zone_allow_count += 1
+        return action, source, False
+    if st.zone_confirmed:
+        st.zone_allow_count += 1
+        return action, source, False
+    st.zone_block_count += 1
+    return "hold", "zone_gate", True
+
+
+def _fp2_zone_log_snapshot(room_id: str, st: RoomRuntime, *, gating: str) -> None:
+    """[ZONE] lines when ``zone_entity_id`` is configured (caller logs only on state change)."""
+    log_with_room("info", room_id, "[ZONE] present=%s", st.zone_present)
+    log_with_room(
+        "info",
+        room_id,
+        "[ZONE] entered_at=%s",
+        st.zone_entered_at.isoformat() if st.zone_entered_at else "none",
+    )
+    log_with_room("info", room_id, "[ZONE] confirmed=%s", st.zone_confirmed)
+    log_with_room("info", room_id, "[ZONE] confidence=%s", st.zone_confidence)
+    log_with_room("info", room_id, "[ZONE] gating=%s", gating)
 
 
 _REQUIRED_SNAPSHOT_FIELDS = {
@@ -776,8 +880,8 @@ def _sync_pending_for_action(st: RoomRuntime, decision_action: str) -> None:
     - decision not in (on, off) → clear
     - decision != pending_action → clear
 
-    Always cancels delay / pending-ON retry wakeups before clearing pending so stale
-    ``delay_elapsed`` / ``pending_on_retry`` triggers cannot fire after intent changed.
+    Always cancels delay wakeup before clearing pending so stale ``delay_elapsed``
+    triggers cannot fire after intent changed.
     """
     if decision_action not in ("on", "off"):
         _clear_pending_command_state(st)
@@ -814,13 +918,23 @@ def _sync_ac_display_fields(st: RoomRuntime) -> None:
     """
     if st.pending_action == "on":
         st.effective_ac_on = False
-    else:
-        st.effective_ac_on = st.physical_ac_on
-
-    if st.pending_action == "on":
         st.ac_state = "pending_on"
-    elif st.pending_action == "off" and st.physical_ac_on:
+        return
+
+    if st.soft_start_ui and not st.physical_ac_on:
+        st.effective_ac_on = False
+        st.ac_state = "on"
+        return
+
+    if st.ac_state == "on_failed" and st.physical_ac_on:
+        st.ac_state = "on"
+
+    st.effective_ac_on = st.physical_ac_on
+
+    if st.pending_action == "off" and st.physical_ac_on:
         st.ac_state = "pending_off"
+    elif st.ac_state == "on_failed":
+        st.effective_ac_on = False
     elif st.physical_ac_on:
         st.ac_state = "on"
     else:
@@ -851,6 +965,7 @@ def record_user_api_command(room_id: str) -> None:
     st = _rt(room_id)
     st.last_user_command_time = datetime.now(timezone.utc)
     st.last_command_source = "user"
+    st.soft_start_ui = False
     _clear_pending_command_state(st)
 
 
@@ -1670,6 +1785,17 @@ async def _tick_impl(rid_raw: str, room_id: str) -> None:
     else:
         st.effective_on_since_ts = None
 
+    if st.ac_state == "on_failed":
+        st.soft_start_ui = False
+    if st.soft_start_ui:
+        if (
+            st.physical_ac_on
+            or confirmed_ac_on
+            or not energy_watts_valid
+            or energy_watts <= MIN_SOFT_ON_WATTS
+        ):
+            st.soft_start_ui = False
+
     _clear_pending_when_physically_satisfied(
         st,
         manual_override_active=manual_override_active,
@@ -1731,11 +1857,33 @@ async def _tick_impl(rid_raw: str, room_id: str) -> None:
     if st.last_command_source == "user" and not _is_user_authority_active(st, cfg, now):
         st.last_command_source = "system"
 
+    await _fp2_zone_sensor_tick(room_id, cfg, now)
+
     action, source, tgt = _resolve_control_decision(
         room_id, cfg, indoor_temp, et_eff,
         occ_res, ac_on, now,
     )
+    action, source, zone_gate_blocked = _fp2_zone_apply_on_gate(room_id, cfg, action, source)
     control_action, control_source = action, source
+
+    zone_e_log = (str(cfg.get("zone_entity_id") or "")).strip()
+    if zone_e_log:
+        zone_sig = (
+            st.zone_present,
+            st.zone_entered_at.isoformat() if st.zone_entered_at else None,
+            st.zone_confirmed,
+            st.zone_sensor_usable,
+            st.zone_confidence,
+            st.zone_dwell_passed,
+            "blocked" if zone_gate_blocked else "allowed",
+        )
+        if zone_sig != st.zone_log_sig:
+            _fp2_zone_log_snapshot(
+                room_id,
+                st,
+                gating="blocked" if zone_gate_blocked else "allowed",
+            )
+            st.zone_log_sig = zone_sig
     user_bypass_decision_lock = (
         _is_user_authority_active(st, cfg, now) or st.last_command_source == "user"
     )
@@ -1763,6 +1911,59 @@ async def _tick_impl(rid_raw: str, room_id: str) -> None:
     _sync_pending_for_action(st, control_action)
     bypass_actuation_delay = _delay_control_bypass(st, cfg, now, control_source)
 
+    if control_action != "on":
+        st.soft_start_ui = False
+
+    if st.ac_state == "on_failed" and control_action != "on":
+        st.ac_state = "on" if st.physical_ac_on else "off"
+
+    power_watts = energy_watts if energy_watts_valid else None
+    soft_on_detected = (
+        not st.physical_ac_on
+        and power_watts is not None
+        and power_watts > MIN_SOFT_ON_WATTS
+    )
+    if (
+        control_action == "on"
+        and st.pending_action == "on"
+        and st.pending_on_ir_sent
+        and soft_on_detected
+    ):
+        log_with_room(
+            "info",
+            room_id,
+            "[HawaAI][%s] Soft ON detected (power=%.0fW) — clearing pending early",
+            room_id,
+            float(power_watts),
+        )
+        _clear_pending_command_state(st)
+        st.soft_start_ui = True
+
+    if (
+        control_action == "on"
+        and st.pending_action == "on"
+        and st.pending_on_ir_sent
+        and st.pending_on_ir_sent_at is not None
+        and not st.physical_ac_on
+    ):
+        elapsed_ir = (now - st.pending_on_ir_sent_at).total_seconds()
+        if elapsed_ir >= float(PENDING_ON_CONFIRM_TIMEOUT_SECS):
+            st.soft_start_ui = False
+            log_with_room(
+                "error",
+                room_id,
+                "[HawaAI][%s] AC failed to turn ON — no physical confirmation within %.0fs after single IR emit",
+                room_id,
+                PENDING_ON_CONFIRM_TIMEOUT_SECS,
+            )
+            st.ac_state = "on_failed"
+            st.last_command = "on_failed"
+            try:
+                await live_broadcast.broadcast_room_update(room_id)
+            except Exception:
+                pass
+            _clear_pending_command_state(st)
+
     delta_audit = indoor_temp - et_eff
     in_cd_audit = _is_in_cooldown(st, now)
     ha_mode_tick = climate_data.get("mode") if climate_data else None
@@ -1788,12 +1989,20 @@ async def _tick_impl(rid_raw: str, room_id: str) -> None:
         if bypass_actuation_delay:
             await _turn_ac_on(room_id, cfg, indoor_temp, et_eff, now=now)
             _clear_pending_command_state(st)
+            st.last_command_source = "system"
+        elif st.ac_state == "on_failed" and not str(control_source).startswith("safety"):
+            log_with_room(
+                "info",
+                room_id,
+                "[DELAY_ON][%s] automated ON suppressed — ac_state=on_failed (await demand change / user)",
+                room_id,
+            )
         else:
             await _handle_delayed_on(
                 rid_raw, room_id, cfg, indoor_temp, et_eff, now, st,
                 confirmed_ac_on=confirmed_ac_on,
             )
-        st.last_command_source = "system"
+            st.last_command_source = "system"
 
     elif control_action == "off":
         # Vacancy / safety OFF must abandon any thermostat delayed-ON countdown immediately.
@@ -2116,8 +2325,8 @@ async def _handle_delayed_on(
     if st.pending_action != "on":
         st.pending_action = "on"
         st.pending_since = ts
-        st.pending_on_emit_attempts = 0
-        st.pending_on_next_retry_wall = None
+        st.pending_on_ir_sent = False
+        st.pending_on_ir_sent_at = None
         log_with_room(
             "info",
             room_canon,
@@ -2158,73 +2367,38 @@ async def _handle_delayed_on(
         if elapsed < delay:
             return
 
+    if st.pending_on_ir_sent:
+        return
+
     if _decision_lock_blocks_delayed_emit(st, now):
         log_with_room(
             "info",
             room_canon,
-            "[DECISION_LOCK][%s] delayed ON held — lock active pending_since=%.3f — schedule retry wakeup",
+            "[DECISION_LOCK][%s] delayed ON held — lock active pending_since=%.3f — wait for next tick",
             room_canon,
             st.pending_since,
         )
-        schedule_pending_on_retry_wakeup(
-            rid_for_tick=rid_stored,
-            room_canon=room_canon,
-            retry_wall_ts=ts + PENDING_ON_RETRY_SECS,
-        )
-        return
-
-    nwall = st.pending_on_next_retry_wall
-    if nwall is not None and ts < float(nwall):
-        logger.debug(
-            "[DELAY_ON][%s] ON emit before next_retry wall (%.2fs left) — reschedule wakeup",
-            room_canon,
-            float(nwall) - ts,
-        )
-        schedule_pending_on_retry_wakeup(
-            rid_for_tick=rid_stored,
-            room_canon=room_canon,
-            retry_wall_ts=float(nwall),
-        )
-        return
-
-    if st.pending_on_emit_attempts >= PENDING_ON_MAX_EMIT_ATTEMPTS:
-        log_with_room(
-            "error",
-            room_canon,
-            "[DELAY_ON][%s] AC failed to turn ON after %d IR attempts — clearing pending_on",
-            room_canon,
-            PENDING_ON_MAX_EMIT_ATTEMPTS,
-        )
-        # Optional visibility hook: surface failure in UI immediately.
-        st.ac_state = "on_failed"
-        st.last_command = "on_failed"
-        try:
-            await live_broadcast.broadcast_room_update(room_canon)
-        except Exception:
-            pass
-        _clear_pending_command_state(st)
         return
 
     _cancel_pending_delay_wakeup_task(st)
-    st.pending_on_emit_attempts += 1
     log_with_room(
         "info",
         room_canon,
-        "[DELAY_ON][%s] TRIGGER _turn_ac_on attempt=%d/%d pending_since=%.3f delay_s=%.0f",
+        "[DELAY_ON][%s] TRIGGER _turn_ac_on (single emit) pending_since=%.3f delay_s=%.0f",
         room_canon,
-        st.pending_on_emit_attempts,
-        PENDING_ON_MAX_EMIT_ATTEMPTS,
         st.pending_since,
         delay,
     )
-    await _turn_ac_on(room_canon, cfg, indoor_temp, et_eff, now=now)
+    pre_fp = st.last_sent_command_key
+    pre_on_at = st.last_ac_on_at
+    ok = await _turn_ac_on(room_canon, cfg, indoor_temp, et_eff, now=now)
     if st.pending_action != "on":
         return
-    schedule_pending_on_retry_wakeup(
-        rid_for_tick=rid_stored,
-        room_canon=room_canon,
-        retry_wall_ts=time.time() + PENDING_ON_RETRY_SECS,
-    )
+    dispatched = ok and (st.last_sent_command_key != pre_fp or st.last_ac_on_at != pre_on_at)
+    if not dispatched:
+        return
+    st.pending_on_ir_sent = True
+    st.pending_on_ir_sent_at = now
 
 
 async def _handle_delayed_off(
@@ -2326,6 +2500,21 @@ async def _turn_ac_on(
 ) -> bool:
     """Turn AC ON for one room; updates RoomRuntime + per-room session. Returns False if IR not sent."""
     st = _rt(room_id)
+    tnow = now if now is not None else datetime.now(timezone.utc)
+
+    # Delayed thermostat ON path: exactly one IR emit per pending cycle (see _handle_delayed_on).
+    # Further automated _turn_ac_on calls are suppressed until pending clears or user authority bypasses.
+    if (
+        st.pending_action == "on"
+        and st.pending_on_ir_sent
+        and not st.physical_ac_on
+        and not _is_user_authority_active(st, cfg, tnow)
+    ):
+        logger.info(
+            "[HawaAI][%s] Skip AC ON — delayed pending cycle already emitted IR; awaiting physical confirm",
+            room_id,
+        )
+        return False
 
     climate_entity = (cfg.get("climate_entity") or "").strip()
     if not climate_entity:
@@ -2336,8 +2525,6 @@ async def _turn_ac_on(
         return False
 
     target = effective_target if effective_target is not None else float(cfg.get("target_temp", 24))
-
-    tnow = now if now is not None else datetime.now(timezone.utc)
 
     # Avoid redundant IR when compressor is already observed ON from power or HA/command —
     # never skip based on inferred-only transient ON.
@@ -2373,7 +2560,7 @@ async def _turn_ac_on(
     if not success:
         logger.error(
             "[HawaAI][%s] AC ON via Aerostate FAILED — not marking as ON; "
-            "pending ON path will retry via wakeup if applicable",
+            "await physical confirmation or tick timeout (no automatic IR retry)",
             room_id,
         )
         return False
@@ -2680,6 +2867,16 @@ def get_runtime_state(room_id: str) -> dict:
         if pend_delay > 0:
             rem = pend_delay - (time.time() - float(st.pending_since))
             pending_remaining = max(0.0, round(rem, 1))
+    try:
+        zdwell = int(merged.get("zone_dwell_seconds", 20))
+    except (TypeError, ValueError):
+        zdwell = 20
+    zdwell = max(0, min(zdwell, 3600))
+    try:
+        zgrace = int(merged.get("zone_exit_grace_seconds", 4))
+    except (TypeError, ValueError):
+        zgrace = 4
+    zgrace = max(0, min(zgrace, 120))
     return {
         "ac_is_on":              st.physical_ac_on,
         "physical_ac_on":        st.physical_ac_on,
@@ -2721,14 +2918,25 @@ def get_runtime_state(room_id: str) -> dict:
         "pending_action":             st.pending_action,
         "pending_since_ts":           st.pending_since,
         "pending_remaining_seconds":  pending_remaining,
-        "retry_count": (
-            int(st.pending_on_emit_attempts) if st.pending_action == "on" else 0
+        "pending_on_ir_sent": bool(st.pending_on_ir_sent),
+        "pending_on_ir_sent_at": (
+            st.pending_on_ir_sent_at.isoformat() if st.pending_on_ir_sent_at else None
         ),
-        "next_retry_in": (
-            max(0.0, round(float(st.pending_on_next_retry_wall) - time.time(), 1))
-            if st.pending_action == "on" and st.pending_on_next_retry_wall is not None
-            else None
+        "pending_on_confirm_timeout_seconds": float(PENDING_ON_CONFIRM_TIMEOUT_SECS),
+        "zone_entity_id": (str(merged.get("zone_entity_id") or "").strip() or None),
+        "zone_dwell_seconds": zdwell,
+        "zone_exit_grace_seconds": zgrace,
+        "zone_required_for_on": bool(merged.get("zone_required_for_on", False)),
+        "zone_present": st.zone_present,
+        "zone_entered_at": (
+            st.zone_entered_at.isoformat() if st.zone_entered_at else None
         ),
+        "zone_confirmed": st.zone_confirmed,
+        "zone_dwell_passed": st.zone_dwell_passed,
+        "zone_confidence": st.zone_confidence,
+        "zone_sensor_usable": st.zone_sensor_usable,
+        "zone_block_count": int(st.zone_block_count),
+        "zone_allow_count": int(st.zone_allow_count),
         "effective_mode":             str(merged.get("effective_mode") or "auto"),
         "manual_effective_temp":      merged.get("manual_effective_temp"),
         "effective_max_delta_deg":    effective_max_delta_deg(merged),

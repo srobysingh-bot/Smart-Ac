@@ -1,7 +1,7 @@
 /**
  * ACStatusCard — displays current AC state and session info.
  *
- * State: `acPhase` from backend — off | pending_on | on | pending_off (with ac_idle for fan-only).
+ * State: `acPhase` from backend — off | pending_on | on | pending_off | on_failed (with ac_idle for fan-only).
  *
  * Three possible states:
  *   ON   (green)  — compressor running, watts > 500 W
@@ -104,6 +104,13 @@ function StateChip({ acPhase = 'off', acIdle }) {
     return (
       <span className="chip bg-amber-900/50 text-amber-200">
         <Timer size={12} /> Waiting to turn ON
+      </span>
+    )
+  }
+  if (acPhase === 'on_failed') {
+    return (
+      <span className="chip bg-red-950/55 text-red-200">
+        <Timer size={12} /> Failed to turn ON
       </span>
     )
   }
@@ -223,6 +230,16 @@ export default function ACStatusCard({
           <p className="text-xs text-gray-400 mt-0.5 font-mono">
             <Timer size={12} className="inline mr-1 text-amber-400 align-text-bottom" aria-hidden />
             {formatDelayCountdown(adjPendingRemain)} remaining
+          </p>
+        </div>
+      )}
+
+      {acPhase === 'on_failed' && (
+        <div className="rounded-lg border border-red-800/50 bg-red-950/30 px-3 py-2 text-sm">
+          <p className="text-red-100/95 font-medium">Failed to turn ON</p>
+          <p className="text-xs text-red-200/80 mt-0.5">
+            One ON command was sent without compressor/power confirmation. Automation waits for a new
+            trigger (temperature / schedule / user) before trying again.
           </p>
         </div>
       )}
