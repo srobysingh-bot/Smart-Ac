@@ -1,10 +1,11 @@
-import { useCallback, useEffect, useState } from 'react'
+import { useCallback, useEffect, useMemo, useState } from 'react'
 import {
   getRoom,
   getEntities,
   getDevices,
   getDeviceEntities,
   getWeather,
+  getStatus,
   updateRoom,
   disableRoom,
   enableRoom,
@@ -195,6 +196,7 @@ const ROOM_SETTINGS_KEYS = [
   'ac_brand', 'ac_model', 'weather_provider', 'weather_api_key', 'weather_city',
   'temperature_mode', 'timezone', 'schedule',
   'effective_mode', 'manual_effective_temp', 'effective_max_delta_deg',
+  'zone_entity_id', 'zone_required_for_on', 'zone_dwell_seconds',
 ]
 
 const SCHEDULE_SLOT_ROWS = [
@@ -223,6 +225,22 @@ function previewScheduleSlotKey(cfg) {
     /* keep local hour */
   }
   return { hour, key: slotKeyForHour24(hour) }
+}
+
+function zonePhaseDisplay(phase) {
+  switch (phase) {
+    case 'present':
+      return { emoji: '🟢', label: 'Present' }
+    case 'waiting':
+      return { emoji: '🟡', label: 'Waiting (dwell)' }
+    case 'absent':
+      return { emoji: '🔴', label: 'Not present' }
+    case 'unusable':
+      return { emoji: '🟡', label: 'Sensor issue' }
+    case 'inactive':
+    default:
+      return { emoji: '⚪', label: 'Not configured' }
+  }
 }
 
 function previewBaseDegC(cfg) {
@@ -262,6 +280,7 @@ export default function Settings() {
 
   // Per-dropdown search state (each search is independent)
   const [presenceSearch,    setPresenceSearch]    = useState('')
+  const [zoneSearch,        setZoneSearch]        = useState('')
   const [tempSearch,        setTempSearch]        = useState('')
   const [humiditySearch,   setHumiditySearch]    = useState('')
   const [climateSearch,     setClimateSearch]     = useState('')
@@ -277,11 +296,49 @@ export default function Settings() {
   const [entitiesError,   setEntitiesError]   = useState(null)   // string | null
   const [loadingEntities, setLoadingEntities] = useState(false)
 
+  /** FP2 zone UI: shown when a zone entity is set OR user enables advanced for this room. */
+  const [zonePanelAdvanced, setZonePanelAdvanced] = useState(false)
+  /** Live zone runtime from GET /api/status (dwell progress, phase). */
+  const [zoneLive, setZoneLive] = useState(null)
+
+  useEffect(() => {
+    setZonePanelAdvanced(false)
+  }, [roomId])
+
+  useEffect(() => {
+    if (String(cfg.zone_entity_id || '').trim()) {
+      setZonePanelAdvanced(true)
+    }
+  }, [cfg.zone_entity_id])
+
   useEffect(() => {
     getWeather()
       .then(w => setOutdoorTemp(w.outdoor_temp ?? null))
       .catch(() => {})
   }, [])
+
+  useEffect(() => {
+    if (!roomId || roomDisabled) {
+      setZoneLive(null)
+      return
+    }
+    let alive = true
+    const poll = () => {
+      getStatus(roomId)
+        .then(s => {
+          if (alive) setZoneLive(s.zone_status ?? null)
+        })
+        .catch(() => {
+          if (alive) setZoneLive(null)
+        })
+    }
+    poll()
+    const t = setInterval(poll, 2000)
+    return () => {
+      alive = false
+      clearInterval(t)
+    }
+  }, [roomId, roomDisabled])
 
   useEffect(() => {
     if (!roomId) {
@@ -354,6 +411,15 @@ export default function Settings() {
         settings.manual_effective_temp = null
       }
       if (!settings.weather_api_key) delete settings.weather_api_key
+
+      if (settings.zone_dwell_seconds != null && settings.zone_dwell_seconds !== '') {
+        const zd = Math.max(5, Math.min(300, Math.round(Number(settings.zone_dwell_seconds))))
+        settings.zone_dwell_seconds = zd
+      }
+      if (!String(settings.zone_entity_id || '').trim()) {
+        delete settings.zone_entity_id
+        settings.zone_required_for_on = false
+      }
 
       const ai_config = {}
       for (const k of AI_CONFIG_KEYS) {
@@ -515,6 +581,30 @@ export default function Settings() {
     setLoadingEntities(false)
   }
 
+  const hasZoneEntity = Boolean(String(cfg.zone_entity_id || '').trim())
+  const showZonePanel = zonePanelAdvanced || hasZoneEntity
+  const zoneDwellClamped = Math.min(
+    300,
+    Math.max(5, Math.round(Number(cfg.zone_dwell_seconds ?? 20)) || 20),
+  )
+  const zoneRequiredOn = Boolean(cfg.zone_required_for_on)
+  const zoneControlActive = hasZoneEntity || zoneRequiredOn
+
+  const zoneEntityMeta = useMemo(() => {
+    const id = String(cfg.zone_entity_id || '').trim()
+    if (!id) return null
+    return entities.find(e => e.entity_id === id) || null
+  }, [entities, cfg.zone_entity_id])
+
+  const zoneDcNorm =
+    zoneEntityMeta?.device_class != null && String(zoneEntityMeta.device_class).trim() !== ''
+      ? String(zoneEntityMeta.device_class).toLowerCase()
+      : null
+  const warnZoneGatingNoSensor = zoneRequiredOn && !hasZoneEntity
+  const warnZoneWrongDeviceClass =
+    Boolean(hasZoneEntity && zoneDcNorm && zoneDcNorm !== 'occupancy' && zoneDcNorm !== 'presence')
+  const hintZoneUnknownDeviceClass = Boolean(hasZoneEntity && !zoneDcNorm)
+
   if (loading && roomId) {
     return (
       <div className="flex items-center justify-center min-h-[40vh] text-gray-500 px-6">
@@ -561,8 +651,18 @@ export default function Settings() {
       {/* Header + room switcher + Save */}
       <div className="space-y-3">
         <div className="flex flex-wrap items-center justify-between gap-3">
-          <h1 className="text-xl font-bold">
-            Settings — <span className="text-blue-300">{roomTitle || roomId}</span>
+          <h1 className="text-xl font-bold flex flex-wrap items-center gap-2">
+            <span>
+              Settings — <span className="text-blue-300">{roomTitle || roomId}</span>
+            </span>
+            {zoneControlActive && (
+              <span
+                className="text-[11px] font-semibold uppercase tracking-wide px-2 py-0.5 rounded-md bg-blue-900/50 border border-blue-700/60 text-blue-200"
+                title="This room has zone entry options enabled or a zone sensor selected"
+              >
+                Zone control active
+              </span>
+            )}
           </h1>
           <div className="flex items-center gap-2">
             {saveStatus === 'ok' && (
@@ -706,6 +806,147 @@ export default function Settings() {
           search={presenceSearch}
           onSearchChange={setPresenceSearch}
         />
+        <p className="text-xs text-gray-500 -mt-2">
+          <span className="text-gray-400">Presence sensor</span> drives room occupancy and{' '}
+          <span className="text-amber-200/90">AC OFF / vacancy</span> behavior. It is separate from zone entry (below).
+        </p>
+
+        <p className="text-xs text-gray-500 border border-gray-800/90 rounded-lg px-3 py-2 bg-gray-900/35 leading-relaxed">
+          <span className="text-gray-400 font-medium">If using FP2:</span> use the sensor that reflects{' '}
+          <span className="text-gray-300">general room occupancy</span> for Presence above; use a{' '}
+          <span className="text-gray-300">specific zone</span> binary_sensor for Zone Control below (presence vs zone are different roles than old single-zone-only setups).
+        </p>
+
+        {/* FP2 zone entry — optional ON-only gate */}
+        {showZonePanel ? (
+          <div className="border border-blue-900/35 rounded-xl p-4 space-y-4 bg-blue-950/10">
+            <div className="flex flex-wrap items-start justify-between gap-2">
+              <div>
+                <p className="text-xs font-semibold uppercase tracking-widest text-blue-400">
+                  Zone Entry Control (Optional)
+                </p>
+                <p className="text-xs text-gray-500 mt-1 max-w-xl">
+                  <span className="text-gray-300">Zone sensor</span> validates entry for{' '}
+                  <span className="text-blue-300">AC ON</span> only.{' '}
+                  <span className="text-gray-400">AC OFF</span> still uses general presence above.
+                </p>
+              </div>
+              {!hasZoneEntity && (
+                <button
+                  type="button"
+                  onClick={() => setZonePanelAdvanced(false)}
+                  className="text-xs text-gray-500 hover:text-gray-300 shrink-0"
+                >
+                  Hide
+                </button>
+              )}
+            </div>
+
+            {!roomDisabled && hasZoneEntity && (
+              <div className="rounded-lg border border-blue-900/40 bg-blue-950/20 px-3 py-2 text-xs space-y-1">
+                <div className="flex flex-wrap items-center gap-2">
+                  <span className="text-gray-500 font-medium shrink-0">Zone status:</span>
+                  {zoneLive ? (
+                    <span className="text-gray-200">
+                      {zonePhaseDisplay(zoneLive.phase).emoji}{' '}
+                      {zonePhaseDisplay(zoneLive.phase).label}
+                    </span>
+                  ) : (
+                    <span className="text-gray-500">Waiting for live data…</span>
+                  )}
+                </div>
+                {zoneLive?.phase === 'waiting' && zoneLive.dwell_target_seconds != null && (
+                  <p className="text-gray-400">
+                    Dwell progress:{' '}
+                    <span className="text-blue-300 font-mono tabular-nums">
+                      {Math.min(
+                        Math.round(Number(zoneLive.dwell_elapsed_seconds) || 0),
+                        Number(zoneLive.dwell_target_seconds),
+                      )}
+                      {' / '}
+                      {zoneLive.dwell_target_seconds} sec
+                    </span>
+                  </p>
+                )}
+              </div>
+            )}
+
+            {warnZoneGatingNoSensor && (
+              <div className="flex items-start gap-2 text-xs text-amber-200/95 bg-amber-950/25 border border-amber-800/50 rounded-lg px-3 py-2">
+                <AlertCircle size={14} className="shrink-0 mt-0.5" />
+                Zone gating enabled but no zone sensor selected.
+              </div>
+            )}
+            {warnZoneWrongDeviceClass && (
+              <div className="flex items-start gap-2 text-xs text-amber-200/95 bg-amber-950/25 border border-amber-800/50 rounded-lg px-3 py-2">
+                <AlertCircle size={14} className="shrink-0 mt-0.5" />
+                <span>
+                  Selected entity may not behave like a presence sensor
+                  {zoneDcNorm ? ` (${zoneDcNorm}).` : '.'}
+                </span>
+              </div>
+            )}
+            {hintZoneUnknownDeviceClass && (
+              <p className="text-xs text-gray-500">
+                Home Assistant did not report <code className="text-gray-400">device_class</code> for this entity — prefer{' '}
+                <span className="text-gray-400">occupancy</span> or <span className="text-gray-400">presence</span>.
+              </p>
+            )}
+
+            <EntityDropdown
+              label="Zone Presence Sensor (FP2) (binary_sensor.*)"
+              value={cfg.zone_entity_id || ''}
+              onChange={v => patch('zone_entity_id', v)}
+              entities={byDomain('binary_sensor')}
+              search={zoneSearch}
+              onSearchChange={setZoneSearch}
+            />
+            <p className="text-xs text-gray-500 -mt-2">
+              Select the FP2 zone entity used to allow AC ON only after confirmed presence in that zone.
+            </p>
+
+            <Toggle
+              label="Require Zone Presence for AC ON"
+              description="When enabled, cooling ON is gated until zone dwell confirms. When disabled, zone is logged only."
+              checked={Boolean(cfg.zone_required_for_on)}
+              onChange={v => patch('zone_required_for_on', v)}
+            />
+
+            <Input
+              label="Zone Dwell Time (seconds)"
+              type="number"
+              min={5}
+              max={300}
+              step={1}
+              value={zoneDwellClamped}
+              onChange={v => patch('zone_dwell_seconds', v)}
+            />
+            <p className="text-xs text-gray-500 -mt-2">
+              How long the zone must stay active before ON is allowed (5–300). Default 20.
+            </p>
+          </div>
+        ) : (
+          <div className="space-y-2">
+            {warnZoneGatingNoSensor && (
+              <div className="flex items-start gap-2 text-xs text-amber-200/95 bg-amber-950/25 border border-amber-800/50 rounded-lg px-3 py-2">
+                <AlertCircle size={14} className="shrink-0 mt-0.5" />
+                Zone gating enabled but no zone sensor selected.
+              </div>
+            )}
+            <div className="flex flex-wrap items-center justify-between gap-2 rounded-lg border border-gray-800 bg-gray-900/40 px-3 py-2">
+              <p className="text-xs text-gray-500">
+                Optional: FP2 <span className="text-blue-300">zone entry</span> gating for AC ON (separate from presence).
+              </p>
+              <button
+                type="button"
+                onClick={() => setZonePanelAdvanced(true)}
+                className="text-xs font-medium text-blue-400 hover:text-blue-300 shrink-0"
+              >
+                Show zone controls
+              </button>
+            </div>
+          </div>
+        )}
 
         {/* Indoor temp */}
         <EntityDropdown

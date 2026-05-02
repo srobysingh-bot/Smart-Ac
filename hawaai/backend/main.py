@@ -174,7 +174,7 @@ async def lifespan(app: FastAPI):
     logger.info("[HawaAI] Add-on stopped")
 
 
-app = FastAPI(title="HawaAI API", version="1.4.27", lifespan=lifespan)
+app = FastAPI(title="HawaAI API", version="1.4.28", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -509,6 +509,12 @@ async def _dashboard_status_payload(rid: str) -> Dict[str, Any]:
         "session_id":       runtime.get("session_id"),
         "session_start":    runtime.get("session_start_time"),
         "runtime":          rt,
+        "zone_status": {
+            "phase": runtime.get("zone_ui_phase") or "inactive",
+            "dwell_target_seconds": runtime.get("zone_dwell_seconds"),
+            "dwell_elapsed_seconds": runtime.get("zone_dwell_elapsed_seconds"),
+            "dwell_remaining_seconds": runtime.get("zone_dwell_remaining_seconds"),
+        },
         # ── Engine diagnostics ────────────────────────────────────────────────
         "cooldown_active":  cooldown_active,
         "last_command":     runtime.get("last_command"),
@@ -644,6 +650,23 @@ async def api_create_room(body: Dict[str, Any] = Body(...)):
     return room_registry.public_room_view(row)
 
 
+def _sanitize_zone_room_settings(incoming_settings: Dict[str, Any]) -> None:
+    """Clamp ``zone_dwell_seconds`` server-side (never rely on UI-only validation)."""
+    if not isinstance(incoming_settings, dict):
+        return
+    if "zone_dwell_seconds" not in incoming_settings:
+        return
+    raw = incoming_settings.get("zone_dwell_seconds")
+    if raw is None:
+        return
+    try:
+        z = int(round(float(raw)))
+    except (TypeError, ValueError):
+        incoming_settings.pop("zone_dwell_seconds", None)
+        return
+    incoming_settings["zone_dwell_seconds"] = max(0, min(z, 3600))
+
+
 def _sanitize_effective_target_room_settings(
     base_cfg: Dict[str, Any],
     room_row: Dict[str, Any],
@@ -734,6 +757,7 @@ async def api_update_room(room_id: str, body: Dict[str, Any] = Body(...)):
         inc = body["settings"]
         if isinstance(inc, dict):
             inc_applied = dict(inc)
+            _sanitize_zone_room_settings(inc_applied)
             _sanitize_effective_target_room_settings(base, r, inc_applied)
             cur_s = dict(r.get("settings") or {})
             for sk, sv in inc_applied.items():
@@ -1103,11 +1127,14 @@ async def list_entities(filter: Optional[str] = None, domain: Optional[str] = No
         entity_domain = entity_id.split(".")[0] if "." in entity_id else ""
         if domain_filter and entity_domain != domain_filter:
             continue
+        attrs = e.get("attributes") or {}
+        dc = attrs.get("device_class")
         result.append({
             "entity_id": entity_id,
             "friendly_name": friendly_name,
             "domain": entity_domain,
             "state": e.get("state"),
+            "device_class": dc if dc is None else str(dc),
         })
     result.sort(key=lambda x: x["entity_id"])
     return result

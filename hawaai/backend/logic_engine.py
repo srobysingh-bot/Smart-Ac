@@ -2877,6 +2877,32 @@ def get_runtime_state(room_id: str) -> dict:
     except (TypeError, ValueError):
         zgrace = 4
     zgrace = max(0, min(zgrace, 120))
+
+    zone_e = str(merged.get("zone_entity_id") or "").strip()
+    zone_ui_phase = "inactive"
+    zone_dwell_elapsed_seconds: Optional[float] = None
+    zone_dwell_remaining_seconds: Optional[float] = None
+    if not zone_e:
+        zone_ui_phase = "inactive"
+    elif not st.zone_sensor_usable:
+        zone_ui_phase = "unusable"
+    elif st.zone_confirmed:
+        zone_ui_phase = "present"
+    elif st.zone_present and not st.zone_confirmed:
+        zone_ui_phase = "waiting"
+        if st.zone_entered_at is not None:
+            _elapsed = (now - st.zone_entered_at).total_seconds()
+        else:
+            _elapsed = 0.0
+        zone_dwell_elapsed_seconds = round(
+            min(max(0.0, _elapsed), float(zdwell)), 1
+        )
+        zone_dwell_remaining_seconds = round(
+            max(0.0, float(zdwell) - _elapsed), 1
+        )
+    else:
+        zone_ui_phase = "absent"
+
     return {
         "ac_is_on":              st.physical_ac_on,
         "physical_ac_on":        st.physical_ac_on,
@@ -2937,6 +2963,9 @@ def get_runtime_state(room_id: str) -> dict:
         "zone_sensor_usable": st.zone_sensor_usable,
         "zone_block_count": int(st.zone_block_count),
         "zone_allow_count": int(st.zone_allow_count),
+        "zone_ui_phase": zone_ui_phase,
+        "zone_dwell_elapsed_seconds": zone_dwell_elapsed_seconds,
+        "zone_dwell_remaining_seconds": zone_dwell_remaining_seconds,
         "effective_mode":             str(merged.get("effective_mode") or "auto"),
         "manual_effective_temp":      merged.get("manual_effective_temp"),
         "effective_max_delta_deg":    effective_max_delta_deg(merged),
