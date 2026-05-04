@@ -296,7 +296,9 @@ def trigger_tick(
         _tick_trigger_last_mono_by_room[canon] = mono
 
     lk = _room_tick_serial_lock(canon)
-    if reason != "delay_elapsed" and lk.locked():
+    if lk.locked():
+        # Drop all event-triggered ticks while a tick is already running.
+        # The scheduler tick is the fallback for any work skipped here.
         logger.debug("[TICK_TRIGGER][%s] skipped tick in flight (%s)", canon, reason)
         return
 
@@ -368,7 +370,7 @@ MIN_ON_TIME_SECONDS: float = 90.0
 RUNNING_OFF_BLOCK_SECS: float = 180.0
 VACANCY_CONFIRM_SECS: float = 60.0
 PRESENCE_STABILIZATION_SECS: float = 60.0
-DECISION_LOCK_SECONDS: float = 30.0
+DECISION_LOCK_SECONDS: float = 65.0
 MAX_PROVISIONAL_SECONDS: float = 180.0
 # Recent IR/compressor-command window: session may open after explicit ON before ac_is_on latches.
 _POST_ON_SESSION_INTENT_SECONDS: float = float(_COOLDOWN_SECS) + 120.0
@@ -2007,8 +2009,8 @@ async def _tick_presence_only_mode(
         room_id,
         cfg,
         indoor_temp,
-        et_eff,
         now,
+        et_eff,
         energy_watts_valid=energy_watts_valid,
         energy_watts=energy_watts,
         in_cooldown=in_cooldown,
