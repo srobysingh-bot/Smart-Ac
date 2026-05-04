@@ -1,5 +1,10 @@
 # HawaAI add-on — release notes
 
+## 1.4.40
+
+- **Control:** Added a 90s minimum ON-time OFF block using effective ON time or recent ON command time, so startup vacancy noise cannot force OFF while power is still ramping.
+- **Tests:** Added regression coverage for forced vacancy OFF being blocked during the minimum ON window.
+
 ## 1.4.39
 
 - **Runtime:** Fixed `_tick_impl` crash by initializing timezone-aware `now` before presence stabilization.

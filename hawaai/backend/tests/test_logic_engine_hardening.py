@@ -1006,6 +1006,29 @@ class TestLogicEngineHardening(unittest.TestCase):
         asyncio.run(run_case("broadlink"))
         asyncio.run(run_case("tuya"))
 
+    def test_turn_ac_off_blocks_for_minimum_on_time_after_on_command(self):
+        logic_engine._runtime_by_room.clear()
+        rid = "off-min-on"
+        st = logic_engine._rt(rid)
+        now = datetime.now(timezone.utc)
+        st.ac_is_on = True
+        st.last_command = "on"
+        st.last_command_time = now - timedelta(seconds=18)
+
+        async def run_case():
+            with mock.patch.object(logic_engine.ac_adapter, "turn_off", return_value=True) as turn_off:
+                await logic_engine._turn_ac_off(
+                    rid,
+                    {"climate_entity": "climate.test"},
+                    24.0,
+                    "vacant",
+                    now=now,
+                    force=True,
+                )
+            turn_off.assert_not_called()
+
+        asyncio.run(run_case())
+
     def test_fp2_zone_gate_metrics_allow_fallback_and_block(self):
         logic_engine._runtime_by_room.clear()
         rid = "z-metrics"

@@ -360,7 +360,7 @@ TRANSIENT_ON_WINDOW_SECS: float = 180.0
 MIN_SESSION_SECONDS: float = 30.0
 COMPRESSOR_STABLE_SECONDS: float = 10.0
 VACANCY_SESSION_GRACE_SECONDS: float = 120.0
-MIN_ON_TIME_SECONDS: float = 60.0
+MIN_ON_TIME_SECONDS: float = 90.0
 RUNNING_OFF_BLOCK_SECS: float = 180.0
 VACANCY_CONFIRM_SECS: float = 60.0
 PRESENCE_STABILIZATION_SECS: float = 60.0
@@ -3502,16 +3502,14 @@ async def _turn_ac_off(
         "room_disabled",
         "room_deleted",
     ):
-        if st.last_ac_on_at is not None:
-            on_secs = tnow.timestamp() - float(st.last_ac_on_at)
-            if on_secs < MIN_ON_TIME_SECONDS:
-                logger.info(
-                    "[OFF BLOCKED][%s] Min runtime not reached (%.0fs < %.0fs)",
-                    room_id,
-                    on_secs,
-                    MIN_ON_TIME_SECONDS,
-                )
-                return
+        on_secs = _seconds_since_effective_on_or_command(st, tnow)
+        if on_secs < MIN_ON_TIME_SECONDS:
+            logger.info(
+                "[CONTROL] Block OFF — minimum ON time active (%.1fs < %.0fs)",
+                on_secs,
+                MIN_ON_TIME_SECONDS,
+            )
+            return
 
     if not force:
         if not st.ac_is_on:
