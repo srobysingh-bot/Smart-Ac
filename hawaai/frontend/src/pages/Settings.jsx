@@ -189,7 +189,7 @@ const CURRENCY_OPTIONS = [
 
 /** Persisted under each room's `settings` in config (non-entity fields). */
 const ROOM_SETTINGS_KEYS = [
-  'control_mode', 'presence_only_on_dwell_seconds', 'presence_only_max_runtime_minutes',
+  'control_mode', 'ir_backend', 'presence_only_on_dwell_seconds', 'presence_only_max_runtime_minutes',
   'target_temp', 'hysteresis', 'vacancy_timeout_minutes', 'logic_interval_seconds',
   'on_delay_seconds', 'off_delay_seconds',
   'energy_tariff_per_kwh', 'currency', 'use_presence', 'use_outdoor_temp',
@@ -774,6 +774,21 @@ export default function Settings() {
             {' → '}
             <span className="text-gray-400">AC</span>
           </p>
+
+          <div>
+            <Label>IR backend profile</Label>
+            <select
+              className="w-full bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm text-gray-100 focus:outline-none focus:border-blue-500"
+              value={cfg.ir_backend || 'broadlink'}
+              onChange={e => patch('ir_backend', e.target.value)}
+            >
+              <option value="broadlink">Broadlink</option>
+              <option value="tuya">Tuya</option>
+            </select>
+            <p className="text-xs text-gray-500 mt-1">
+              Broadlink uses the existing single adapter path. Tuya uses staged mode, temperature, and supported fan commands.
+            </p>
+          </div>
 
           {/* Connection status badge */}
           {(cfg.ac_entity || cfg.climate_entity) ? (

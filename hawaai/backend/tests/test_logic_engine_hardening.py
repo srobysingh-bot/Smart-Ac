@@ -532,6 +532,232 @@ class TestLogicEngineHardening(unittest.TestCase):
         )
         self.assertEqual((action, source, target), ("on", "thermostat", 24.0))
 
+    def test_ir_backend_default_and_invalid_are_broadlink(self):
+        self.assertEqual(logic_engine.normalize_ir_backend({}), "broadlink")
+        self.assertEqual(logic_engine.normalize_ir_backend({"ir_backend": "bad"}), "broadlink")
+        self.assertEqual(logic_engine.normalize_ir_backend({"ir_backend": "tuya"}), "tuya")
+
+    def test_ir_backend_manual_overrides_auto_detection(self):
+        async def run_case():
+            with (
+                mock.patch.object(logic_engine.ha_client, "get_entity_state_full") as full,
+                mock.patch.object(logic_engine, "log_with_room"),
+            ):
+                backend = await logic_engine.resolve_ir_backend(
+                    "room-x",
+                    {"ir_backend": "broadlink"},
+                    "climate.tuya",
+                )
+            self.assertEqual(backend, "broadlink")
+            full.assert_not_called()
+
+        asyncio.run(run_case())
+
+    def test_ir_backend_auto_detects_then_falls_back(self):
+        async def run_case():
+            with (
+                mock.patch.object(
+                    logic_engine.ha_client,
+                    "get_entity_state_full",
+                    return_value={"attributes": {"integration": "tuya"}},
+                ),
+                mock.patch.object(logic_engine, "log_with_room"),
+            ):
+                detected = await logic_engine.resolve_ir_backend("room-x", {}, "climate.tuya")
+            with (
+                mock.patch.object(
+                    logic_engine.ha_client,
+                    "get_entity_state_full",
+                    return_value={"attributes": {}},
+                ),
+                mock.patch.object(logic_engine, "log_with_room"),
+            ):
+                fallback = await logic_engine.resolve_ir_backend("room-x", {}, "climate.unknown")
+            self.assertEqual(detected, "tuya")
+            self.assertEqual(fallback, "broadlink")
+
+        asyncio.run(run_case())
+
+    def test_turn_ac_on_broadlink_uses_existing_adapter_path(self):
+        logic_engine._runtime_by_room.clear()
+        rid = "ir-broadlink"
+        cfg = {
+            "climate_entity": "climate.broadlink",
+            "ir_backend": "broadlink",
+            "min_command_interval_seconds": 0,
+            "compressor_min_off_seconds": 0,
+        }
+
+        async def run_case():
+            with (
+                mock.patch.object(logic_engine.ac_adapter, "turn_on", return_value=True) as turn_on,
+                mock.patch.object(logic_engine, "_turn_ac_on_tuya") as turn_on_tuya,
+                mock.patch.object(logic_engine, "log_with_room"),
+            ):
+                ok = await logic_engine._turn_ac_on(rid, cfg, 27.0, 24.0)
+            self.assertTrue(ok)
+            turn_on.assert_awaited_once_with(
+                entity_id="climate.broadlink",
+                temperature=24.0,
+                fan_mode="auto",
+                hvac_mode="cool",
+            )
+            turn_on_tuya.assert_not_called()
+
+        asyncio.run(run_case())
+
+    def test_turn_ac_on_tuya_uses_staged_sequence_not_broadlink_adapter(self):
+        logic_engine._runtime_by_room.clear()
+        rid = "ir-tuya"
+        cfg = {
+            "climate_entity": "climate.tuya",
+            "ir_backend": "tuya",
+            "min_command_interval_seconds": 0,
+            "compressor_min_off_seconds": 0,
+        }
+        calls = []
+
+        async def fake_call_service(domain, service, payload):
+            calls.append((domain, service, dict(payload)))
+            return True
+
+        async def run_case():
+            with (
+                mock.patch.object(
+                    logic_engine.ha_client,
+                    "get_climate_state",
+                    return_value={"fan_modes": ["Auto", "Low"], "fan_mode": "Low"},
+                ),
+                mock.patch.object(logic_engine.ha_client, "call_service", side_effect=fake_call_service),
+                mock.patch.object(logic_engine.ac_adapter, "turn_on") as broadlink_turn_on,
+                mock.patch.object(logic_engine.asyncio, "sleep", new=mock.AsyncMock()),
+                mock.patch.object(logic_engine, "log_with_room"),
+            ):
+                ok = await logic_engine._turn_ac_on(rid, cfg, 27.0, 24.0)
+            self.assertTrue(ok)
+            broadlink_turn_on.assert_not_called()
+
+        asyncio.run(run_case())
+
+        self.assertEqual(
+            calls,
+            [
+                ("climate", "set_hvac_mode", {"entity_id": "climate.tuya", "hvac_mode": "cool"}),
+                ("climate", "set_temperature", {"entity_id": "climate.tuya", "temperature": 24.0}),
+                ("climate", "set_fan_mode", {"entity_id": "climate.tuya", "fan_mode": "Auto"}),
+            ],
+        )
+
+    def test_turn_ac_on_tuya_sends_supported_fan_case_insensitive(self):
+        calls = []
+
+        async def fake_call_service(domain, service, payload):
+            calls.append((domain, service, dict(payload)))
+            return True
+
+        async def run_case():
+            with (
+                mock.patch.object(
+                    logic_engine.ha_client,
+                    "get_climate_state",
+                    return_value={"fan_modes": ["Auto", "Low"], "fan_mode": "Low"},
+                ),
+                mock.patch.object(logic_engine.ha_client, "call_service", side_effect=fake_call_service),
+                mock.patch.object(logic_engine.asyncio, "sleep", new=mock.AsyncMock()),
+                mock.patch.object(logic_engine, "log_with_room"),
+            ):
+                ok = await logic_engine._turn_ac_on_tuya(
+                    "room-x", "climate.tuya", 24.0, fan_mode="auto",
+                )
+            self.assertTrue(ok)
+
+        asyncio.run(run_case())
+
+        self.assertIn(
+            ("climate", "set_fan_mode", {"entity_id": "climate.tuya", "fan_mode": "Auto"}),
+            calls,
+        )
+
+    def test_turn_ac_on_tuya_skips_unsupported_fan(self):
+        calls = []
+
+        async def fake_call_service(domain, service, payload):
+            calls.append((domain, service, dict(payload)))
+            return True
+
+        async def run_case():
+            with (
+                mock.patch.object(
+                    logic_engine.ha_client,
+                    "get_climate_state",
+                    return_value={"fan_modes": ["Low"], "fan_mode": "Low"},
+                ),
+                mock.patch.object(logic_engine.ha_client, "call_service", side_effect=fake_call_service),
+                mock.patch.object(logic_engine.asyncio, "sleep", new=mock.AsyncMock()),
+                mock.patch.object(logic_engine, "log_with_room"),
+            ):
+                ok = await logic_engine._turn_ac_on_tuya(
+                    "room-x", "climate.tuya", 24.0, fan_mode="auto",
+                )
+            self.assertTrue(ok)
+
+        asyncio.run(run_case())
+
+        self.assertFalse(any(service == "set_fan_mode" for _, service, _ in calls))
+
+    def test_pending_on_duplicate_guard_blocks_all_ir_backends(self):
+        logic_engine._runtime_by_room.clear()
+        rid = "ir-dup"
+        st = logic_engine._rt(rid)
+        st.pending_action = "on"
+        st.pending_on_ir_sent = True
+        st.pending_on_ir_sent_at = datetime.now(timezone.utc)
+        st.physical_ac_on = False
+
+        async def run_case():
+            with (
+                mock.patch.object(logic_engine.ac_adapter, "turn_on") as broadlink_turn_on,
+                mock.patch.object(logic_engine, "_turn_ac_on_tuya") as tuya_turn_on,
+            ):
+                ok_broadlink = await logic_engine._turn_ac_on(
+                    rid,
+                    {"climate_entity": "climate.b", "ir_backend": "broadlink"},
+                    27.0,
+                    24.0,
+                )
+                ok_tuya = await logic_engine._turn_ac_on(
+                    rid,
+                    {"climate_entity": "climate.t", "ir_backend": "tuya"},
+                    27.0,
+                    24.0,
+                )
+            self.assertFalse(ok_broadlink)
+            self.assertFalse(ok_tuya)
+            broadlink_turn_on.assert_not_called()
+            tuya_turn_on.assert_not_called()
+
+        asyncio.run(run_case())
+
+    def test_turn_ac_off_unchanged_for_ir_backends(self):
+        async def run_case(ir_backend):
+            logic_engine._runtime_by_room.clear()
+            rid = f"off-{ir_backend}"
+            st = logic_engine._rt(rid)
+            st.ac_is_on = True
+            st.last_ac_on_at = (datetime.now(timezone.utc) - timedelta(minutes=10)).timestamp()
+            with mock.patch.object(logic_engine.ac_adapter, "turn_off", return_value=True) as turn_off:
+                await logic_engine._turn_ac_off(
+                    rid,
+                    {"climate_entity": f"climate.{ir_backend}", "ir_backend": ir_backend},
+                    24.0,
+                    "manual",
+                    force=True,
+                )
+            turn_off.assert_awaited_once_with(f"climate.{ir_backend}")
+
+        asyncio.run(run_case("broadlink"))
+        asyncio.run(run_case("tuya"))
+
     def test_fp2_zone_gate_metrics_allow_fallback_and_block(self):
         logic_engine._runtime_by_room.clear()
         rid = "z-metrics"

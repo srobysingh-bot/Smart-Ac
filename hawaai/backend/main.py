@@ -271,7 +271,7 @@ async def lifespan(app: FastAPI):
     logger.info("[HawaAI] Add-on stopped")
 
 
-app = FastAPI(title="HawaAI API", version="1.4.33", lifespan=lifespan)
+app = FastAPI(title="HawaAI API", version="1.4.34", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -630,6 +630,7 @@ async def _dashboard_status_payload(rid: str) -> Dict[str, Any]:
         # ── Config ────────────────────────────────────────────────────────────
         "manual_override":  cfg.get("manual_override", False),
         "control_mode": logic_engine.normalize_control_mode(cfg),
+        "ir_backend": logic_engine.normalize_ir_backend(cfg),
         "config_complete":  bool(
             cfg.get("presence_entity")
             and (
@@ -776,6 +777,11 @@ def _sanitize_control_mode_room_settings(incoming_settings: Dict[str, Any]) -> N
         mode = str(incoming_settings.get("control_mode") or "thermostat").strip().lower()
         incoming_settings["control_mode"] = (
             mode if mode in ("thermostat", "presence_only") else "thermostat"
+        )
+    if "ir_backend" in incoming_settings:
+        backend = str(incoming_settings.get("ir_backend") or "broadlink").strip().lower()
+        incoming_settings["ir_backend"] = (
+            backend if backend in ("broadlink", "tuya") else "broadlink"
         )
     for key, default, lo, hi in (
         ("presence_only_on_dwell_seconds", 20.0, 0.0, 3600.0),
