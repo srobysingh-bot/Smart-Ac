@@ -209,8 +209,8 @@ def _enrich_session(row: Dict[str, Any]) -> Dict[str, Any]:
         criteria: duration >= 3 min, delta_temp >= 0.3 °C, session completed
 
     Normalised fields (not modified in DB):
-      energy_consumed_kwh — None→0, negative→0, spikes > 10 kWh → 0
-      cost_estimate       — None→0
+      energy_consumed_kwh — None stays None, negative→0, spikes > 10 kWh → None
+      cost_estimate       — None when energy is missing, otherwise non-negative float
     """
     s = dict(row)
 
@@ -249,33 +249,43 @@ def _enrich_session(row: Dict[str, Any]) -> Dict[str, Any]:
         s["delta_temp"] = None
 
     # ── Energy normalisation (API layer only) ─────────────────────────────────
+    energy_missing = s.get("energy_consumed_kwh") is None
     try:
-        e = float(s["energy_consumed_kwh"]) if s.get("energy_consumed_kwh") is not None else 0.0
-        e = max(0.0, e)
-        if e > 10.0:            # unrealistic spike — treat as missing data
-            logger.debug("Session %s: energy spike %.2f kWh clamped to 0", s.get("session_id"), e)
-            e = 0.0
-        s["energy_consumed_kwh"] = round(e, 4)
+        e = float(s["energy_consumed_kwh"]) if not energy_missing else None
+        if e is None:
+            s["energy_consumed_kwh"] = None
+        else:
+            e = max(0.0, e)
+            if e > 10.0:            # unrealistic spike — treat as missing data
+                logger.debug("Session %s: energy spike %.2f kWh treated as missing", s.get("session_id"), e)
+                e = None
+            s["energy_consumed_kwh"] = round(e, 4) if e is not None else None
     except (TypeError, ValueError):
-        s["energy_consumed_kwh"] = 0.0
+        s["energy_consumed_kwh"] = None
 
     # ── Cost normalisation ────────────────────────────────────────────────────
-    # Rule: cost MUST be 0 if energy is 0 (guards against stale DB rows where
-    # the kWh-meter calculation was wrong and produced a high cost with 0 energy).
     try:
-        cost_raw = round(float(s["cost_estimate"]), 2) if s.get("cost_estimate") is not None else 0.0
+        if s["energy_consumed_kwh"] is None:
+            cost_raw = None
+        else:
+            raw = s.get("cost_estimate")
+            cost_raw = round(max(0.0, float(raw)), 2) if raw is not None else 0.0
     except (TypeError, ValueError):
-        cost_raw = 0.0
-    s["cost_estimate"] = 0.0 if s["energy_consumed_kwh"] == 0.0 else cost_raw
+        cost_raw = None
+    s["cost_estimate"] = cost_raw
+
+    # Backward-compatible aliases for UI/export consumers.
+    s["energy_used"] = s["energy_consumed_kwh"]
 
     # ── Validity flag ─────────────────────────────────────────────────────────
+    energy_ok = s["energy_consumed_kwh"] is None or s["energy_consumed_kwh"] >= 0
     s["valid"] = bool(
         s.get("end_time") is not None          # session completed
         and duration_min is not None
         and duration_min >= 3.0                # at least 3 minutes
         and s["delta_temp"] is not None
         and s["delta_temp"] >= 0.3             # room cooled by at least 0.3 °C
-        and s["energy_consumed_kwh"] >= 0      # no negative energy
+        and energy_ok                          # no negative energy
     )
 
     return s

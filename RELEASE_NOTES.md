@@ -1,5 +1,10 @@
 # HawaAI add-on — release notes
 
+## 1.4.31
+
+- **UI:** Fixed room logs panel height at 300px with internal scrolling and bottom-aware auto-scroll. Sessions now show full datetimes, date grouping, Stored/Invalid badges, null-safe cost display, and clearer empty states.
+- **Control API:** Replaced user climate-command 429s with a short coalescing command queue. Rapid temperature changes are debounced in the UI and merged on the backend so only the latest command is sent.
+
 ## 1.4.30
 
 - **Control:** Protect the pending ON transition from premature OFF decisions. After the single ON emit, OFF is blocked until confirmation or the pending ON timeout, preventing `ON → OFF → ON` command thrashing while the compressor ramps up.

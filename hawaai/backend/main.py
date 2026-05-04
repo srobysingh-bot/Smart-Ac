@@ -60,17 +60,114 @@ _ws_lock = asyncio.Lock()
 _ws_log_token_by_room: Dict[str, str] = {}
 
 _api_last_command: Dict[str, float] = defaultdict(float)
-_API_RATE_LIMIT_SECS = 10
+_climate_command_state: Dict[str, Dict[str, Any]] = {}
+_climate_command_lock = asyncio.Lock()
+_CLIMATE_COMMAND_DEBOUNCE_SECS = 1.2
+_CLIMATE_DUPLICATE_WINDOW_SECS = 2.0
 
 
-def _check_api_rate_limit(room_id: str) -> bool:
-    """Returns True if the command is allowed. Returns False if too soon."""
-    mono = time.monotonic()
-    last = _api_last_command[room_id]
-    if mono - last < _API_RATE_LIMIT_SECS:
-        return False
-    _api_last_command[room_id] = mono
-    return True
+async def _enqueue_climate_command(
+    *,
+    room_id: Optional[str],
+    entity_id: str,
+    service: str,
+    payload: Dict[str, Any],
+) -> Dict[str, Any]:
+    """
+    Coalesce rapid UI climate commands so HA/Tuya receives only the latest payload.
+
+    Calls are grouped by room/entity/service. Multiple requests that arrive during the
+    debounce window all wait for one HA service call using the newest payload.
+    """
+    key_room = room_id or "_unscoped"
+    key = f"{key_room}:{entity_id}:{service}"
+    loop = asyncio.get_running_loop()
+    fut = loop.create_future()
+    fingerprint = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+
+    async with _climate_command_lock:
+        st = _climate_command_state.setdefault(
+            key,
+            {
+                "latest_payload": None,
+                "latest_fingerprint": None,
+                "updated_at": 0.0,
+                "waiters": [],
+                "task": None,
+                "last_sent_at": 0.0,
+                "last_sent_fingerprint": None,
+            },
+        )
+        now_mono = time.monotonic()
+        if (
+            st.get("last_sent_fingerprint") == fingerprint
+            and now_mono - float(st.get("last_sent_at") or 0.0) < _CLIMATE_DUPLICATE_WINDOW_SECS
+        ):
+            fut.set_result({"success": True, "deduped": True})
+            return await fut
+
+        st["latest_payload"] = dict(payload)
+        st["latest_fingerprint"] = fingerprint
+        st["updated_at"] = now_mono
+        st["waiters"].append(fut)
+        if st.get("task") is None or st["task"].done():
+            st["task"] = asyncio.create_task(_drain_climate_command(key, room_id, entity_id, service))
+
+    return await fut
+
+
+async def _drain_climate_command(
+    key: str,
+    room_id: Optional[str],
+    entity_id: str,
+    service: str,
+) -> None:
+    while True:
+        await asyncio.sleep(_CLIMATE_COMMAND_DEBOUNCE_SECS)
+        async with _climate_command_lock:
+            st = _climate_command_state.get(key)
+            if not st:
+                return
+            elapsed = time.monotonic() - float(st.get("updated_at") or 0.0)
+            if elapsed < _CLIMATE_COMMAND_DEBOUNCE_SECS:
+                continue
+            payload = dict(st.get("latest_payload") or {})
+            fingerprint = st.get("latest_fingerprint")
+            waiters = list(st.get("waiters") or [])
+            st["waiters"] = []
+            st["latest_payload"] = None
+            st["latest_fingerprint"] = None
+            st["task"] = None
+            duplicate = (
+                st.get("last_sent_fingerprint") == fingerprint
+                and time.monotonic() - float(st.get("last_sent_at") or 0.0) < _CLIMATE_DUPLICATE_WINDOW_SECS
+            )
+            if duplicate:
+                result = {"success": True, "deduped": True}
+                for waiter in waiters:
+                    if not waiter.done():
+                        waiter.set_result(result)
+                return
+
+        try:
+            ok = await ha_client.call_service("climate", service, payload)
+            if ok and room_id:
+                logic_engine.record_user_api_command(room_id)
+                _api_last_command[room_id] = time.monotonic()
+            result = {"success": ok, "queued": True}
+        except Exception as exc:
+            result = {"success": False, "error": str(exc)}
+
+        async with _climate_command_lock:
+            st = _climate_command_state.get(key)
+            if st is not None:
+                st["last_sent_at"] = time.monotonic()
+                st["last_sent_fingerprint"] = fingerprint
+
+        for waiter in waiters:
+            if not waiter.done():
+                waiter.set_result(result)
+        return
 
 
 def _room_id_for_climate_entity(entity_id: str) -> Optional[str]:
@@ -174,7 +271,7 @@ async def lifespan(app: FastAPI):
     logger.info("[HawaAI] Add-on stopped")
 
 
-app = FastAPI(title="HawaAI API", version="1.4.28", lifespan=lifespan)
+app = FastAPI(title="HawaAI API", version="1.4.31", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -1030,84 +1127,72 @@ async def get_climate_state(entity_id: str):
 async def climate_set_temperature(entity_id: str, data: Dict[str, Any] = Body(...)):
     """Set climate setpoint. Body: {"temperature": 24}"""
     rid_room = _room_id_for_climate_entity(entity_id)
-    if rid_room:
-        if not _check_api_rate_limit(rid_room):
-            raise HTTPException(
-                status_code=429,
-                detail="Command rate limit: wait 10 seconds between commands",
-            )
-        logic_engine.record_user_api_command(rid_room)
     temperature = data.get("temperature")
     if temperature is None:
         return {"success": False, "error": "temperature field required"}
-    ok = await ha_client.call_service("climate", "set_temperature", {
+    return await _enqueue_climate_command(
+        room_id=rid_room,
+        entity_id=entity_id,
+        service="set_temperature",
+        payload={
         "entity_id":   entity_id,
         "temperature": float(temperature),
-    })
-    return {"success": ok}
+        },
+    )
 
 
 @app.post("/api/climate/{entity_id:path}/set_hvac_mode")
 async def climate_set_hvac_mode(entity_id: str, data: Dict[str, Any] = Body(...)):
     """Set HVAC mode. Body: {"hvac_mode": "cool"}"""
     rid_room = _room_id_for_climate_entity(entity_id)
-    if rid_room:
-        if not _check_api_rate_limit(rid_room):
-            raise HTTPException(
-                status_code=429,
-                detail="Command rate limit: wait 10 seconds between commands",
-            )
-        logic_engine.record_user_api_command(rid_room)
     hvac_mode = data.get("hvac_mode")
     if not hvac_mode:
         return {"success": False, "error": "hvac_mode field required"}
-    ok = await ha_client.call_service("climate", "set_hvac_mode", {
-        "entity_id": entity_id,
-        "hvac_mode": hvac_mode,
-    })
-    return {"success": ok}
+    return await _enqueue_climate_command(
+        room_id=rid_room,
+        entity_id=entity_id,
+        service="set_hvac_mode",
+        payload={
+            "entity_id": entity_id,
+            "hvac_mode": hvac_mode,
+        },
+    )
 
 
 @app.post("/api/climate/{entity_id:path}/set_fan_mode")
 async def climate_set_fan_mode(entity_id: str, data: Dict[str, Any] = Body(...)):
     """Set fan mode. Body: {"fan_mode": "auto"}"""
     rid_room = _room_id_for_climate_entity(entity_id)
-    if rid_room:
-        if not _check_api_rate_limit(rid_room):
-            raise HTTPException(
-                status_code=429,
-                detail="Command rate limit: wait 10 seconds between commands",
-            )
-        logic_engine.record_user_api_command(rid_room)
     fan_mode = data.get("fan_mode")
     if not fan_mode:
         return {"success": False, "error": "fan_mode field required"}
-    ok = await ha_client.call_service("climate", "set_fan_mode", {
-        "entity_id": entity_id,
-        "fan_mode":  fan_mode,
-    })
-    return {"success": ok}
+    return await _enqueue_climate_command(
+        room_id=rid_room,
+        entity_id=entity_id,
+        service="set_fan_mode",
+        payload={
+            "entity_id": entity_id,
+            "fan_mode":  fan_mode,
+        },
+    )
 
 
 @app.post("/api/climate/{entity_id:path}/set_swing_mode")
 async def climate_set_swing_mode(entity_id: str, data: Dict[str, Any] = Body(...)):
     """Set swing mode. Body: {"swing_mode": "auto"}"""
     rid_room = _room_id_for_climate_entity(entity_id)
-    if rid_room:
-        if not _check_api_rate_limit(rid_room):
-            raise HTTPException(
-                status_code=429,
-                detail="Command rate limit: wait 10 seconds between commands",
-            )
-        logic_engine.record_user_api_command(rid_room)
     swing_mode = data.get("swing_mode")
     if not swing_mode:
         return {"success": False, "error": "swing_mode field required"}
-    ok = await ha_client.call_service("climate", "set_swing_mode", {
-        "entity_id":  entity_id,
-        "swing_mode": swing_mode,
-    })
-    return {"success": ok}
+    return await _enqueue_climate_command(
+        room_id=rid_room,
+        entity_id=entity_id,
+        service="set_swing_mode",
+        payload={
+            "entity_id":  entity_id,
+            "swing_mode": swing_mode,
+        },
+    )
 
 
 # ── HA ENTITIES (for Settings dropdowns) ─────────────────────────────────────

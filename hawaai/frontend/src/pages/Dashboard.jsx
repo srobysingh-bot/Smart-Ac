@@ -1,4 +1,4 @@
-import { useEffect, useState, useCallback } from 'react'
+import { useEffect, useRef, useState, useCallback } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { getClimateState, setClimateTemperature, setHvacMode, setFanMode, setSwingMode, createRoom, getRoomLogs, clearRoomLogs } from '../api/smartcool.js'
 import { useRoom } from '../context/RoomContext.jsx'
@@ -492,6 +492,8 @@ function ClimateCard({ entityId }) {
   const [climate,  setClimate]  = useState(null)
   const [error,    setError]    = useState(null)
   const [busy,     setBusy]     = useState(false)   // pending control command
+  const [pendingTemperature, setPendingTemperature] = useState(null)
+  const tempDebounceRef = useRef(null)
 
   const fetchClimate = useCallback(() => {
     getClimateState(entityId)
@@ -505,6 +507,13 @@ function ClimateCard({ entityId }) {
     const id = setInterval(fetchClimate, 8_000)
     return () => clearInterval(id)
   }, [fetchClimate])
+
+  useEffect(() => {
+    setPendingTemperature(null)
+    return () => {
+      if (tempDebounceRef.current) clearTimeout(tempDebounceRef.current)
+    }
+  }, [entityId])
 
   const sendCommand = async (fn) => {
     setBusy(true)
@@ -522,9 +531,15 @@ function ClimateCard({ entityId }) {
   const adjustTemp = (delta) => {
     if (!climate) return
     const step = climate.target_temp_step || 1
-    const next = Math.round(((climate.temperature ?? 24) + delta) / step) * step
+    const current = pendingTemperature ?? climate.temperature ?? 24
+    const next = Math.round((current + delta) / step) * step
     const clamped = Math.max(climate.min_temp ?? 16, Math.min(climate.max_temp ?? 30, next))
-    sendCommand(() => setClimateTemperature(entityId, clamped))
+    setPendingTemperature(clamped)
+    if (tempDebounceRef.current) clearTimeout(tempDebounceRef.current)
+    tempDebounceRef.current = setTimeout(() => {
+      sendCommand(() => setClimateTemperature(entityId, clamped))
+      tempDebounceRef.current = null
+    }, 800)
   }
 
   if (error) {
@@ -549,6 +564,7 @@ function ClimateCard({ entityId }) {
 
   const { hvac_mode, current_temperature, temperature, fan_mode, swing_mode,
           hvac_modes, fan_modes, swing_modes, friendly_name } = climate
+  const displayTemperature = pendingTemperature ?? temperature
 
   return (
     <div className="card space-y-4 min-w-0">
@@ -576,7 +592,7 @@ function ClimateCard({ entityId }) {
           <p className="text-xs text-gray-500">Setpoint</p>
           <div className="flex items-center gap-2">
             <button
-              disabled={busy || hvac_mode === 'off'}
+              disabled={hvac_mode === 'off'}
               onClick={() => adjustTemp(-1)}
               className="w-11 h-11 shrink-0 rounded-lg bg-gray-700 hover:bg-gray-600 disabled:opacity-40 flex items-center justify-center transition-colors tap-highlight-none"
               type="button"
@@ -584,10 +600,10 @@ function ClimateCard({ entityId }) {
               <Minus size={14} aria-hidden />
             </button>
             <span className="text-2xl font-bold w-14 text-center tabular-nums">
-              {temperature != null ? `${temperature}°` : '—'}
+              {displayTemperature != null ? `${displayTemperature}°` : '—'}
             </span>
             <button
-              disabled={busy || hvac_mode === 'off'}
+              disabled={hvac_mode === 'off'}
               onClick={() => adjustTemp(+1)}
               className="w-11 h-11 shrink-0 rounded-lg bg-gray-700 hover:bg-gray-600 disabled:opacity-40 flex items-center justify-center transition-colors tap-highlight-none"
               type="button"
@@ -720,6 +736,8 @@ function RoomLogsCard({ activeRoomId, rooms }) {
   const [logs, setLogs] = useState([])
   const [busy, setBusy] = useState(false)
   const [err, setErr] = useState('')
+  const logsRef = useRef(null)
+  const shouldAutoScrollRef = useRef(true)
 
   const selectedRoomId = roomFilter === 'active' ? (activeRoomId || '') : roomFilter
 
@@ -739,6 +757,8 @@ function RoomLogsCard({ activeRoomId, rooms }) {
 
   const loadLogs = useCallback(async () => {
     if (!activeRoomId) return
+    const el = logsRef.current
+    shouldAutoScrollRef.current = !el || el.scrollHeight - el.scrollTop - el.clientHeight < 50
     setBusy(true)
     setErr('')
     try {
@@ -765,6 +785,12 @@ function RoomLogsCard({ activeRoomId, rooms }) {
       setBusy(false)
     }
   }, [activeRoomId, rooms, selectedRoomId, dedupeAndSort])
+
+  useEffect(() => {
+    const el = logsRef.current
+    if (!el || !shouldAutoScrollRef.current) return
+    el.scrollTop = el.scrollHeight
+  }, [logs])
 
   useEffect(() => {
     loadLogs()
@@ -836,7 +862,14 @@ function RoomLogsCard({ activeRoomId, rooms }) {
         </div>
       </div>
       {err ? <p className="text-xs text-red-400 mb-2">{err}</p> : null}
-      <div className="rounded border border-gray-800 bg-gray-950/70 p-2 font-mono text-xs">
+      <div
+        ref={logsRef}
+        onScroll={(e) => {
+          const el = e.currentTarget
+          shouldAutoScrollRef.current = el.scrollHeight - el.scrollTop - el.clientHeight < 50
+        }}
+        className="h-[300px] max-h-[300px] overflow-y-auto overflow-x-hidden rounded border border-gray-800 bg-gray-950/70 p-2 font-mono text-xs"
+      >
         {busy && logs.length === 0 ? <p className="text-gray-500">Loading logs...</p> : null}
         {!busy && logs.length === 0 ? <p className="text-gray-600">No room logs yet.</p> : null}
         {logs.map((l, idx) => (
