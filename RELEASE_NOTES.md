@@ -1,10 +1,11 @@
 # HawaAI add-on — release notes
 
-## 1.4.34
+## 1.4.35
 
-- **IR:** Added per-room `ir_backend` profile with default `broadlink`. Broadlink rooms keep the existing adapter path; Tuya rooms use a staged `set_hvac_mode -> set_temperature -> supported set_fan_mode` ON sequence.
+- **IR:** Added per-room `ir_backend` profile with default `broadlink`. Broadlink rooms keep the existing adapter path; Tuya rooms send ON as one combined `set_temperature` payload (`temperature` + `hvac_mode`) with optional supported `set_fan_mode`.
+- **Control:** Added a 180s running-state OFF block while HA reports cooling, preventing unstable vacancy signals from shutting down a freshly running AC.
 - **UI:** Added an IR backend selector on each room's AC Control card.
-- **Tests:** Added regression coverage for Broadlink dispatch, Tuya staged ON, no Broadlink combined call for Tuya, duplicate pending ON guard, and unchanged OFF path.
+- **Tests:** Added regression coverage for Broadlink dispatch, Tuya combined ON, no Broadlink combined call for Tuya, duplicate pending ON guard, and unchanged OFF path.
 
 ## 1.4.33
 

@@ -406,6 +406,40 @@ class TestLogicEngineHardening(unittest.TestCase):
             any("safety_vacant" in str(call.args) for call in log_with_room.call_args_list)
         )
 
+    def test_running_state_off_block_protects_recent_cooling(self):
+        st = logic_engine.RoomRuntime()
+        now = datetime.now(timezone.utc)
+        st.last_ac_on_at = now.timestamp() - 30
+
+        with mock.patch.object(logic_engine, "log_with_room") as log_with_room:
+            action, source = logic_engine._apply_running_state_off_block(
+                "room-x", st, "off", "safety_vacant", now, "cool",
+            )
+
+        self.assertEqual((action, source), ("hold", "running_protection"))
+        self.assertTrue(
+            any("running protection" in str(call.args) for call in log_with_room.call_args_list)
+        )
+        self.assertTrue(
+            any("safety_vacant" in str(call.args) for call in log_with_room.call_args_list)
+        )
+
+    def test_running_state_off_block_requires_cool_and_recent_on(self):
+        st = logic_engine.RoomRuntime()
+        now = datetime.now(timezone.utc)
+        st.last_ac_on_at = now.timestamp() - 30
+
+        action, source = logic_engine._apply_running_state_off_block(
+            "room-x", st, "off", "safety_vacant", now, "off",
+        )
+        self.assertEqual((action, source), ("off", "safety_vacant"))
+
+        st.last_ac_on_at = now.timestamp() - logic_engine.RUNNING_OFF_BLOCK_SECS - 1
+        action, source = logic_engine._apply_running_state_off_block(
+            "room-x", st, "off", "safety_vacant", now, "cool",
+        )
+        self.assertEqual((action, source), ("off", "safety_vacant"))
+
     def test_pending_on_emit_hold_preserves_pending_cycle(self):
         st = logic_engine.RoomRuntime()
         st.pending_action = "on"
@@ -606,7 +640,7 @@ class TestLogicEngineHardening(unittest.TestCase):
 
         asyncio.run(run_case())
 
-    def test_turn_ac_on_tuya_uses_staged_sequence_not_broadlink_adapter(self):
+    def test_turn_ac_on_tuya_uses_combined_payload_not_broadlink_adapter(self):
         logic_engine._runtime_by_room.clear()
         rid = "ir-tuya"
         cfg = {
@@ -642,8 +676,11 @@ class TestLogicEngineHardening(unittest.TestCase):
         self.assertEqual(
             calls,
             [
-                ("climate", "set_hvac_mode", {"entity_id": "climate.tuya", "hvac_mode": "cool"}),
-                ("climate", "set_temperature", {"entity_id": "climate.tuya", "temperature": 24.0}),
+                ("climate", "set_temperature", {
+                    "entity_id": "climate.tuya",
+                    "temperature": 24.0,
+                    "hvac_mode": "cool",
+                }),
                 ("climate", "set_fan_mode", {"entity_id": "climate.tuya", "fan_mode": "Auto"}),
             ],
         )

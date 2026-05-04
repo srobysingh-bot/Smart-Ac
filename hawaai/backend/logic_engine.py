@@ -360,6 +360,7 @@ MIN_SESSION_SECONDS: float = 30.0
 COMPRESSOR_STABLE_SECONDS: float = 10.0
 VACANCY_SESSION_GRACE_SECONDS: float = 120.0
 MIN_ON_TIME_SECONDS: float = 60.0
+RUNNING_OFF_BLOCK_SECS: float = 180.0
 DECISION_LOCK_SECONDS: float = 30.0
 MAX_PROVISIONAL_SECONDS: float = 180.0
 # Recent IR/compressor-command window: session may open after explicit ON before ac_is_on latches.
@@ -1085,6 +1086,39 @@ def _apply_pending_on_off_block(
     return action, source
 
 
+def _apply_running_state_off_block(
+    room_id: str,
+    st: RoomRuntime,
+    action: str,
+    source: str,
+    now: datetime,
+    ha_mode: object,
+) -> Tuple[str, str]:
+    """
+    Block OFF if AC is already running and vacancy is unstable.
+    """
+    if action != "off":
+        return action, source
+
+    if str(ha_mode or "").strip().lower() != "cool":
+        return action, source
+
+    last_on = float(st.last_ac_on_at or 0.0)
+    time_since_on = now.timestamp() - last_on
+
+    if time_since_on < float(RUNNING_OFF_BLOCK_SECS):
+        log_with_room(
+            "info",
+            room_id,
+            "[CONTROL] Block OFF (%s) — running protection (%.1fs)",
+            source,
+            time_since_on,
+        )
+        return "hold", "running_protection"
+
+    return action, source
+
+
 def _pending_on_emit_hold_in_progress(st: RoomRuntime, action: str) -> bool:
     return action == "hold" and st.pending_action == "on" and st.pending_on_ir_sent
 
@@ -1727,6 +1761,14 @@ async def _tick_presence_only_mode(
     )
     action, source = _apply_pending_on_decision_lock(room_id, st, action, source)
     action, source = _apply_pending_on_off_block(room_id, st, action, source, now)
+    action, source = _apply_running_state_off_block(
+        room_id,
+        st,
+        action,
+        source,
+        now,
+        (climate_data or {}).get("mode"),
+    )
     control_action, control_source = action, source
 
     user_bypass_decision_lock = (
@@ -2328,6 +2370,14 @@ async def _tick_impl(rid_raw: str, room_id: str) -> None:
     action, source, zone_gate_blocked = _fp2_zone_apply_on_gate(room_id, cfg, action, source)
     action, source = _apply_pending_on_decision_lock(room_id, st, action, source)
     action, source = _apply_pending_on_off_block(room_id, st, action, source, now)
+    action, source = _apply_running_state_off_block(
+        room_id,
+        st,
+        action,
+        source,
+        now,
+        (climate_data or {}).get("mode"),
+    )
     control_action, control_source = action, source
 
     zone_e_log = (str(cfg.get("zone_entity_id") or "")).strip()
@@ -2993,36 +3043,28 @@ async def _turn_ac_on_tuya(
     supported_fan = _resolve_supported_fan_mode(fan_mode, state.get("fan_modes"))
     current_fan = str(state.get("fan_mode") or "").strip().lower()
 
-    payload_mode = {"entity_id": climate_entity, "hvac_mode": hvac_mode}
-    payload_temp = {"entity_id": climate_entity, "temperature": float(temperature)}
+    payload_temp = {
+        "entity_id": climate_entity,
+        "temperature": float(temperature),
+        "hvac_mode": hvac_mode,
+    }
 
-    log_with_room("info", room_id, "[IR][tuya] step=hvac_mode entity=%s mode=%s", climate_entity, hvac_mode)
-    ok_mode = await ha_client.call_service("climate", "set_hvac_mode", payload_mode)
-    await asyncio.sleep(1.0)
-
-    log_with_room("info", room_id, "[IR][tuya] step=set_temperature entity=%s temp=%.1f", climate_entity, float(temperature))
+    log_with_room(
+        "info",
+        room_id,
+        "[IR][tuya] step=set_temperature entity=%s temp=%.1f hvac=%s",
+        climate_entity,
+        float(temperature),
+        hvac_mode,
+    )
     ok_temp = await ha_client.call_service("climate", "set_temperature", payload_temp)
 
-    if not (ok_mode and ok_temp):
+    if not ok_temp:
         log_with_room(
             "warning",
             room_id,
-            "[IR][tuya] primary sequence failed — trying fallback off->cool->set_temperature",
+            "[IR][tuya] set_temperature full payload failed before fan step",
         )
-        await ha_client.call_service("climate", "set_hvac_mode", {
-            "entity_id": climate_entity,
-            "hvac_mode": "off",
-        })
-        await asyncio.sleep(1.0)
-        log_with_room("info", room_id, "[IR][tuya] step=hvac_mode entity=%s mode=%s", climate_entity, hvac_mode)
-        ok_mode = await ha_client.call_service("climate", "set_hvac_mode", payload_mode)
-        await asyncio.sleep(1.0)
-        log_with_room("info", room_id, "[IR][tuya] step=set_temperature entity=%s temp=%.1f", climate_entity, float(temperature))
-        ok_temp = await ha_client.call_service("climate", "set_temperature", payload_temp)
-
-    sequence_ok = bool(ok_mode and ok_temp)
-    if not sequence_ok:
-        log_with_room("warning", room_id, "[IR][tuya] sequence failed before fan step")
         return False
 
     if supported_fan:
@@ -3522,6 +3564,7 @@ def get_runtime_state(room_id: str) -> dict:
             st.pending_on_ir_sent_at.isoformat() if st.pending_on_ir_sent_at else None
         ),
         "pending_on_confirm_timeout_seconds": float(PENDING_ON_CONFIRM_TIMEOUT_SECS),
+        "running_off_block_seconds": float(RUNNING_OFF_BLOCK_SECS),
         "zone_entity_id": (str(merged.get("zone_entity_id") or "").strip() or None),
         "zone_dwell_seconds": zdwell,
         "zone_exit_grace_seconds": zgrace,
