@@ -578,6 +578,30 @@ class TestLogicEngineHardening(unittest.TestCase):
         self.assertIsNone(st.presence_only_present_since)
         self.assertTrue(log_with_room.called)
 
+    def test_presence_stabilization_ignores_false_spike(self):
+        st = logic_engine.RoomRuntime()
+        now = datetime.now(timezone.utc)
+
+        self.assertTrue(logic_engine._stabilize_presence(st, "on", now))
+        self.assertTrue(
+            logic_engine._stabilize_presence(st, "off", now + timedelta(seconds=30))
+        )
+        self.assertTrue(st.last_known_presence)
+
+    def test_presence_stabilization_allows_stable_vacancy_after_window(self):
+        st = logic_engine.RoomRuntime()
+        now = datetime.now(timezone.utc)
+
+        self.assertTrue(logic_engine._stabilize_presence(st, "on", now))
+        self.assertFalse(
+            logic_engine._stabilize_presence(
+                st,
+                "off",
+                now + timedelta(seconds=logic_engine.PRESENCE_STABILIZATION_SECS + 1),
+            )
+        )
+        self.assertFalse(st.last_known_presence)
+
     def test_presence_only_on_requires_confirmed_dwell_without_temp_sensor(self):
         st = logic_engine.RoomRuntime()
         now = datetime.now(timezone.utc)
@@ -619,7 +643,7 @@ class TestLogicEngineHardening(unittest.TestCase):
             ac_on=True,
             now=now,
         )
-        self.assertEqual((action, source, occupied), ("hold", "vacancy_debounce", False))
+        self.assertEqual((action, source, occupied), ("hold", "presence_only", True))
 
         action, source, occupied = logic_engine._resolve_presence_only_decision(
             "room-x",
@@ -629,7 +653,7 @@ class TestLogicEngineHardening(unittest.TestCase):
             ac_on=True,
             now=now + timedelta(seconds=61),
         )
-        self.assertEqual((action, source, occupied), ("off", "presence_vacant", False))
+        self.assertEqual((action, source, occupied), ("hold", "vacancy_debounce", False))
 
     def test_presence_only_max_runtime_failsafe_forces_off(self):
         st = logic_engine.RoomRuntime()

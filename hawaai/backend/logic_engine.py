@@ -127,6 +127,7 @@ class RoomRuntime:
 
     # Last trusted occupancy reading when presence sensor is flaky (None/unavailable).
     last_known_presence: Optional[bool] = None
+    presence_last_true_at: Optional[datetime] = None
     presence_only_present_since: Optional[datetime] = None
     presence_only_last_invalid_log_at: Optional[datetime] = None
 
@@ -362,6 +363,7 @@ VACANCY_SESSION_GRACE_SECONDS: float = 120.0
 MIN_ON_TIME_SECONDS: float = 60.0
 RUNNING_OFF_BLOCK_SECS: float = 180.0
 VACANCY_CONFIRM_SECS: float = 60.0
+PRESENCE_STABILIZATION_SECS: float = 60.0
 DECISION_LOCK_SECONDS: float = 30.0
 MAX_PROVISIONAL_SECONDS: float = 180.0
 # Recent IR/compressor-command window: session may open after explicit ON before ac_is_on latches.
@@ -574,6 +576,26 @@ def _presence_raw_invalid(raw: object) -> bool:
     return raw is None or str(raw).strip().lower() in ("unavailable", "unknown", "")
 
 
+def _stabilize_presence(st: RoomRuntime, presence_raw: object, now: datetime) -> bool:
+    raw_presence = parse_presence(presence_raw)
+
+    if raw_presence:
+        st.last_known_presence = True
+        st.presence_last_true_at = now
+        return True
+
+    if st.presence_last_true_at is None:
+        st.presence_last_true_at = now
+
+    elapsed = (now - st.presence_last_true_at).total_seconds()
+
+    if elapsed < float(PRESENCE_STABILIZATION_SECS):
+        return True
+
+    st.last_known_presence = False
+    return False
+
+
 def _presence_only_runtime_seconds(st: RoomRuntime, now: datetime) -> Optional[float]:
     if st.effective_on_since_ts is not None:
         return max(0.0, now.timestamp() - float(st.effective_on_since_ts))
@@ -612,8 +634,7 @@ def _resolve_presence_only_decision(
             st.presence_only_last_invalid_log_at = now
         return "hold", "presence_unavailable", False
 
-    occupied = parse_presence(presence_raw)
-    st.last_known_presence = occupied
+    occupied = _stabilize_presence(st, presence_raw, now)
     st.presence_only_last_invalid_log_at = None
 
     runtime = _presence_only_runtime_seconds(st, now)
@@ -2044,8 +2065,7 @@ async def _tick_impl(rid_raw: str, room_id: str) -> None:
                     "[HawaAI] Presence unknown (no stale) — assuming occupied=TRUE (safe)",
                 )
         else:
-            is_occupied_bool = parse_presence(presence_raw)
-            st.last_known_presence = is_occupied_bool
+            is_occupied_bool = _stabilize_presence(st, presence_raw, now)
     else:
         is_occupied_bool = True
 

@@ -1,5 +1,10 @@
 # HawaAI add-on — release notes
 
+## 1.4.38
+
+- **Presence:** Added a 60s stabilization layer so false vacancy spikes are held as occupied before control decisions see them.
+- **Tests:** Added regression coverage for ignored false spikes and stable vacancy after the stabilization window.
+
 ## 1.4.37
 
 - **Control:** Fan-only / idle power now counts as ON for physical control state, pending ON confirmation, and vacancy protection.
