@@ -378,6 +378,9 @@ class TestLogicEngineHardening(unittest.TestCase):
         self.assertTrue(
             any("Block OFF" in str(call.args) for call in log_with_room.call_args_list)
         )
+        self.assertTrue(
+            any("thermostat_reached" in str(call.args) for call in log_with_room.call_args_list)
+        )
 
         st.pending_on_ir_sent_at = now - timedelta(
             seconds=logic_engine.PENDING_ON_CONFIRM_TIMEOUT_SECS + 1
@@ -387,17 +390,21 @@ class TestLogicEngineHardening(unittest.TestCase):
         )
         self.assertEqual((action, source), ("off", "thermostat_reached"))
 
-    def test_pending_on_off_block_requires_ir_timestamp(self):
+    def test_pending_on_off_block_covers_vacancy_and_missing_ir_timestamp(self):
         st = logic_engine.RoomRuntime()
         st.pending_action = "on"
         st.pending_on_ir_sent = True
         st.pending_on_ir_sent_at = None
 
-        action, source = logic_engine._apply_pending_on_off_block(
-            "room-x", st, "off", "thermostat_reached", datetime.now(timezone.utc),
-        )
+        with mock.patch.object(logic_engine, "log_with_room") as log_with_room:
+            action, source = logic_engine._apply_pending_on_off_block(
+                "room-x", st, "off", "safety_vacant", datetime.now(timezone.utc),
+            )
 
-        self.assertEqual((action, source), ("off", "thermostat_reached"))
+        self.assertEqual((action, source), ("hold", "pending_on_protection"))
+        self.assertTrue(
+            any("safety_vacant" in str(call.args) for call in log_with_room.call_args_list)
+        )
 
     def test_pending_on_emit_hold_preserves_pending_cycle(self):
         st = logic_engine.RoomRuntime()

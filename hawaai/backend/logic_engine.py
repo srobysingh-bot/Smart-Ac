@@ -1027,14 +1027,18 @@ def _apply_pending_on_off_block(
         action == "off"
         and st.pending_action == "on"
         and st.pending_on_ir_sent
-        and st.pending_on_ir_sent_at is not None
     ):
-        elapsed = (now - st.pending_on_ir_sent_at).total_seconds()
+        elapsed = (
+            (now - st.pending_on_ir_sent_at).total_seconds()
+            if st.pending_on_ir_sent_at is not None
+            else 0.0
+        )
         if elapsed < float(PENDING_ON_CONFIRM_TIMEOUT_SECS):
             log_with_room(
                 "info",
                 room_id,
-                "[CONTROL] Block OFF — pending ON not yet confirmed (%.1fs)",
+                "[CONTROL] Block OFF (%s) — pending ON not yet confirmed (%.1fs)",
+                source,
                 elapsed,
             )
             return "hold", "pending_on_protection"

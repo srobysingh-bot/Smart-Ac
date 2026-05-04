@@ -1,5 +1,10 @@
 # HawaAI add-on — release notes
 
+## 1.4.33
+
+- **Control:** Block every OFF source during the pending ON confirmation window, including `safety_vacant`. The pending ON startup phase is now atomic even if presence briefly flips false while the AC is still confirming.
+- **Tests:** Added regression coverage for vacancy OFF protection during pending ON, including the conservative missing-timestamp case.
+
 ## 1.4.32
 
 - **Control:** Added `presence_only` room mode for rooms without indoor temperature sensors. In this mode HawaAI uses occupancy only, with confirmed-presence dwell before ON, vacancy grace before OFF, max runtime failsafe, and safe hold on unavailable presence.
