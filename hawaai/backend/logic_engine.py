@@ -128,6 +128,10 @@ class RoomRuntime:
     # Last trusted occupancy reading when presence sensor is flaky (None/unavailable).
     last_known_presence: Optional[bool] = None
     presence_last_true_at: Optional[datetime] = None
+    presence_last_false_at: Optional[datetime] = None
+    stable_occupied: bool = True
+    vacancy_confirmed_at: Optional[datetime] = None
+    last_confirmed_on_at: Optional[datetime] = None
     presence_only_present_since: Optional[datetime] = None
     presence_only_last_invalid_log_at: Optional[datetime] = None
 
@@ -462,6 +466,13 @@ def _resolve_control_decision(
             st.vacant_since = now
         elapsed = (now - st.vacant_since).total_seconds()
         if elapsed < float(VACANCY_CONFIRM_SECS):
+            log_with_room(
+                "info",
+                room_id,
+                "[CONTROL] Block OFF — vacancy not stable (%.1fs < %.0fs)",
+                elapsed,
+                VACANCY_CONFIRM_SECS,
+            )
             return ("hold", "vacancy_debounce", effective_target)
         if st.vacant_since is not None:
             if elapsed >= vacancy_timeout and (ac_on or st.ac_is_on):
@@ -470,8 +481,8 @@ def _resolve_control_decision(
                     log_with_room(
                         "info",
                         room_id,
-                        "[VACANCY] Ignored for room=%s — running protection (%.0fs < %.0fs)",
-                        room_id,
+                        "[CONTROL] Block OFF — post-ON protection (%s, %.1fs < %.0fs)",
+                        "safety_vacant",
                         on_age,
                         RUNNING_OFF_BLOCK_SECS,
                     )
@@ -490,6 +501,8 @@ def _resolve_control_decision(
                         return ("hold_vacant", "safety_vacant", effective_target)
                 return ("off", "safety_vacant", effective_target)
         return ("hold_vacant", "safety_vacant", effective_target)
+    if use_presence:
+        st.vacant_since = None
 
     # ── PRIORITY 2: User authority — overrides thermostat and cooldown ───────────
     if _is_user_authority_active(st, cfg, now):
@@ -576,24 +589,63 @@ def _presence_raw_invalid(raw: object) -> bool:
     return raw is None or str(raw).strip().lower() in ("unavailable", "unknown", "")
 
 
-def _stabilize_presence(st: RoomRuntime, presence_raw: object, now: datetime) -> bool:
+def _stabilize_presence(
+    st: RoomRuntime,
+    presence_raw: object,
+    now: datetime,
+    room_id: Optional[str] = None,
+) -> bool:
     raw_presence = parse_presence(presence_raw)
 
     if raw_presence:
+        if (
+            st.presence_last_true_at is None
+            or (
+                st.presence_last_false_at is not None
+                and st.presence_last_true_at < st.presence_last_false_at
+            )
+        ):
+            st.presence_last_true_at = now
+
+        if not st.stable_occupied:
+            elapsed_true = (now - st.presence_last_true_at).total_seconds()
+            if elapsed_true < float(PRESENCE_STABILIZATION_SECS):
+                st.last_known_presence = False
+                return False
+
+        st.stable_occupied = True
         st.last_known_presence = True
-        st.presence_last_true_at = now
-        return True
+        st.vacancy_confirmed_at = None
+        return st.stable_occupied
 
-    if st.presence_last_true_at is None:
-        st.presence_last_true_at = now
+    if (
+        st.presence_last_false_at is None
+        or (
+            st.presence_last_true_at is not None
+            and st.presence_last_false_at < st.presence_last_true_at
+        )
+    ):
+        st.presence_last_false_at = now
 
-    elapsed = (now - st.presence_last_true_at).total_seconds()
+    elapsed = (now - st.presence_last_false_at).total_seconds()
 
-    if elapsed < float(PRESENCE_STABILIZATION_SECS):
-        return True
+    if elapsed < float(VACANCY_CONFIRM_SECS):
+        if st.stable_occupied and room_id:
+            log_with_room(
+                "info",
+                room_id,
+                "[CONTROL] Block OFF — vacancy not stable (%.1fs < %.0fs)",
+                elapsed,
+                VACANCY_CONFIRM_SECS,
+            )
+        st.last_known_presence = st.stable_occupied
+        return st.stable_occupied
 
+    st.stable_occupied = False
     st.last_known_presence = False
-    return False
+    if st.vacancy_confirmed_at is None:
+        st.vacancy_confirmed_at = now
+    return st.stable_occupied
 
 
 def _presence_only_runtime_seconds(st: RoomRuntime, now: datetime) -> Optional[float]:
@@ -634,7 +686,7 @@ def _resolve_presence_only_decision(
             st.presence_only_last_invalid_log_at = now
         return "hold", "presence_unavailable", False
 
-    occupied = _stabilize_presence(st, presence_raw, now)
+    occupied = _stabilize_presence(st, presence_raw, now, room_id)
     st.presence_only_last_invalid_log_at = None
 
     runtime = _presence_only_runtime_seconds(st, now)
@@ -1096,6 +1148,8 @@ def _seconds_since_effective_on_or_command(st: RoomRuntime, now: datetime) -> fl
 
     if st.effective_on_since_ts is not None:
         return now_ts - float(st.effective_on_since_ts)
+    if st.last_confirmed_on_at is not None:
+        return (now - st.last_confirmed_on_at).total_seconds()
     if st.last_command_time is not None and st.last_command == "on":
         return (now - st.last_command_time).total_seconds()
     return float("inf")
@@ -1126,8 +1180,10 @@ def _apply_pending_on_off_block(
 ) -> Tuple[str, str]:
     if (
         action == "off"
-        and st.pending_action == "on"
-        and st.pending_on_ir_sent
+        and (
+            st.pending_action == "on"
+            or st.pending_on_ir_sent
+        )
     ):
         elapsed = (
             (now - st.pending_on_ir_sent_at).total_seconds()
@@ -1138,7 +1194,7 @@ def _apply_pending_on_off_block(
             log_with_room(
                 "info",
                 room_id,
-                "[CONTROL] Block OFF (%s) — pending ON not yet confirmed (%.1fs)",
+                "[CONTROL] Block OFF — pending ON protected (%s, %.1fs)",
                 source,
                 elapsed,
             )
@@ -1169,9 +1225,10 @@ def _apply_running_state_off_block(
         log_with_room(
             "info",
             room_id,
-            "[CONTROL] Block OFF (%s) — running protection (%.1fs)",
+            "[CONTROL] Block OFF — post-ON protection (%s, %.1fs < %.0fs)",
             source,
             time_since_on,
+            RUNNING_OFF_BLOCK_SECS,
         )
         return "hold", "running_protection"
 
@@ -1778,6 +1835,7 @@ async def _tick_presence_only_mode(
             if not st.ac_is_on:
                 st.ac_is_on = True
                 st.last_ac_on_at = now.timestamp()
+            st.last_confirmed_on_at = now
             st.ac_state_source = "power"
         elif energy_watts < _WATTS_FAN_ONLY:
             ac_on = False
@@ -1793,6 +1851,7 @@ async def _tick_presence_only_mode(
             if not st.ac_is_on:
                 st.ac_is_on = True
                 st.last_ac_on_at = now.timestamp()
+            st.last_confirmed_on_at = now
             st.ac_state_source = "power"
     else:
         ac_on = st.ac_is_on
@@ -2067,7 +2126,7 @@ async def _tick_impl(rid_raw: str, room_id: str) -> None:
                     "[HawaAI] Presence unknown (no stale) — assuming occupied=TRUE (safe)",
                 )
         else:
-            is_occupied_bool = _stabilize_presence(st, presence_raw, now)
+            is_occupied_bool = _stabilize_presence(st, presence_raw, now, room_id)
     else:
         is_occupied_bool = True
 
@@ -2178,6 +2237,7 @@ async def _tick_impl(rid_raw: str, room_id: str) -> None:
                 )
                 st.ac_is_on = True
                 st.last_ac_on_at = now.timestamp()
+            st.last_confirmed_on_at = now
         elif energy_watts >= _WATTS_FAN_ONLY:
             ac_on = True
             ac_idle = True
@@ -2190,6 +2250,7 @@ async def _tick_impl(rid_raw: str, room_id: str) -> None:
                 )
                 st.ac_is_on = True
                 st.last_ac_on_at = now.timestamp()
+            st.last_confirmed_on_at = now
         else:
             ac_on = False
             ac_idle = False
@@ -3284,8 +3345,9 @@ async def _turn_ac_on(
         return False
 
     st.ac_is_on = True
-    st.last_ac_on_at = time.time()
     cmd_ts = datetime.now(timezone.utc)
+    st.last_ac_on_at = cmd_ts.timestamp()
+    st.last_confirmed_on_at = cmd_ts
     _bump_last_command_ir_cooldown(st, cmd_ts)
     st.last_command = "on"
     st.last_sent_command_key = _fingerprint_turn_on(target)

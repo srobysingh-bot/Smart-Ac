@@ -554,7 +554,7 @@ class TestLogicEngineHardening(unittest.TestCase):
 
         self.assertEqual((action, source), ("hold", "running_protection"))
         self.assertTrue(
-            any("running protection" in str(call.args) for call in log_with_room.call_args_list)
+            any("post-ON protection" in str(call.args) for call in log_with_room.call_args_list)
         )
         self.assertTrue(
             any("safety_vacant" in str(call.args) for call in log_with_room.call_args_list)
@@ -640,6 +640,7 @@ class TestLogicEngineHardening(unittest.TestCase):
         now = datetime.now(timezone.utc)
 
         self.assertTrue(logic_engine._stabilize_presence(st, "on", now))
+        self.assertTrue(logic_engine._stabilize_presence(st, "off", now))
         self.assertFalse(
             logic_engine._stabilize_presence(
                 st,
@@ -648,6 +649,27 @@ class TestLogicEngineHardening(unittest.TestCase):
             )
         )
         self.assertFalse(st.last_known_presence)
+
+    def test_presence_state_machine_requires_stable_true_after_confirmed_vacancy(self):
+        st = logic_engine.RoomRuntime()
+        now = datetime.now(timezone.utc)
+
+        self.assertTrue(logic_engine._stabilize_presence(st, "off", now))
+        self.assertFalse(
+            logic_engine._stabilize_presence(
+                st,
+                "off",
+                now + timedelta(seconds=logic_engine.VACANCY_CONFIRM_SECS + 1),
+            )
+        )
+        self.assertFalse(logic_engine._stabilize_presence(st, "on", now + timedelta(seconds=70)))
+        self.assertTrue(
+            logic_engine._stabilize_presence(
+                st,
+                "on",
+                now + timedelta(seconds=70 + logic_engine.PRESENCE_STABILIZATION_SECS + 1),
+            )
+        )
 
     def test_presence_only_on_requires_confirmed_dwell_without_temp_sensor(self):
         st = logic_engine.RoomRuntime()
@@ -776,6 +798,73 @@ class TestLogicEngineHardening(unittest.TestCase):
         )
 
         self.assertEqual((action, source, target), ("hold", "vacancy_debounce", 24.0))
+
+    def test_brief_vacancy_flicker_after_on_does_not_reach_off(self):
+        logic_engine._runtime_by_room.clear()
+        now = datetime.now(timezone.utc)
+        st = logic_engine._rt("room-x")
+        st.ac_is_on = True
+        st.last_confirmed_on_at = now - timedelta(seconds=15)
+
+        self.assertTrue(logic_engine._stabilize_presence(st, "on", now - timedelta(seconds=20)))
+        stable = logic_engine._stabilize_presence(st, "off", now)
+
+        action, source, target = logic_engine._resolve_control_decision(
+            "room-x",
+            {"vacancy_timeout_minutes": 0},
+            indoor_temp=26.0,
+            effective_target=24.0,
+            is_occupied=stable,
+            ac_on=True,
+            now=now,
+        )
+
+        self.assertTrue(stable)
+        self.assertEqual((action, source, target), ("hold", "thermostat", 24.0))
+
+    def test_off_blocked_during_post_on_protection(self):
+        logic_engine._runtime_by_room.clear()
+        now = datetime.now(timezone.utc)
+        st = logic_engine._rt("room-x")
+        st.ac_is_on = True
+        st.vacant_since = now - timedelta(seconds=logic_engine.VACANCY_CONFIRM_SECS + 5)
+        st.vacancy_confirmed_at = st.vacant_since
+        st.stable_occupied = False
+        st.last_confirmed_on_at = now - timedelta(seconds=30)
+
+        action, source, target = logic_engine._resolve_control_decision(
+            "room-x",
+            {"vacancy_timeout_minutes": 0},
+            indoor_temp=26.0,
+            effective_target=24.0,
+            is_occupied=False,
+            ac_on=True,
+            now=now,
+        )
+
+        self.assertEqual((action, source, target), ("hold_vacant", "running_protection", 24.0))
+
+    def test_stable_vacancy_allows_off_after_post_on_protection(self):
+        logic_engine._runtime_by_room.clear()
+        now = datetime.now(timezone.utc)
+        st = logic_engine._rt("room-x")
+        st.ac_is_on = True
+        st.vacant_since = now - timedelta(seconds=logic_engine.VACANCY_CONFIRM_SECS + 5)
+        st.vacancy_confirmed_at = st.vacant_since
+        st.stable_occupied = False
+        st.last_confirmed_on_at = now - timedelta(seconds=logic_engine.RUNNING_OFF_BLOCK_SECS + 5)
+
+        action, source, target = logic_engine._resolve_control_decision(
+            "room-x",
+            {"vacancy_timeout_minutes": 0},
+            indoor_temp=26.0,
+            effective_target=24.0,
+            is_occupied=False,
+            ac_on=True,
+            now=now,
+        )
+
+        self.assertEqual((action, source, target), ("off", "safety_vacant", 24.0))
 
     def test_ir_backend_default_and_invalid_are_broadlink(self):
         self.assertEqual(logic_engine.normalize_ir_backend({}), "broadlink")

@@ -1,5 +1,11 @@
 # HawaAI add-on — release notes
 
+## 1.4.41
+
+- **Control:** Added explicit presence enter/exit hysteresis state with stable occupancy, confirmed vacancy, and confirmed ON anchors.
+- **Control:** Vacancy OFF now logs and holds for unstable vacancy, pending ON, and post-ON protection before allowing `safety_vacant`.
+- **Tests:** Added regression coverage for brief vacancy flicker after ON, post-ON OFF blocking, and stable vacancy eventually allowing OFF.
+
 ## 1.4.40
 
 - **Control:** Added a 90s minimum ON-time OFF block using effective ON time or recent ON command time, so startup vacancy noise cannot force OFF while power is still ramping.
