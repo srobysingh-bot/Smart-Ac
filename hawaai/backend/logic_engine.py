@@ -374,6 +374,18 @@ def _seconds_since_last_command(st: RoomRuntime, now: datetime) -> float:
     return (now - st.last_command_time).total_seconds()
 
 
+def _power_band_indicates_on(
+    energy_watts_valid: bool,
+    in_cooldown: bool,
+    energy_watts: float,
+) -> bool:
+    return bool(
+        energy_watts_valid
+        and not in_cooldown
+        and energy_watts >= _WATTS_FAN_ONLY
+    )
+
+
 def _bump_last_command_ir_cooldown(st: RoomRuntime, cmd_ts: datetime) -> None:
     """
     Always anchors cooldown to the most recent command.
@@ -444,8 +456,12 @@ def _resolve_control_decision(
 
     # ── PRIORITY 1: Safety — vacancy (may issue OFF even during global cooldown) ─
     if use_presence and not is_occupied:
+        if st.vacant_since is None:
+            st.vacant_since = now
+        elapsed = (now - st.vacant_since).total_seconds()
+        if elapsed < float(VACANCY_CONFIRM_SECS):
+            return ("hold", "vacancy_debounce", effective_target)
         if st.vacant_since is not None:
-            elapsed = (now - st.vacant_since).total_seconds()
             if elapsed >= vacancy_timeout and (ac_on or st.ac_is_on):
                 on_age = _seconds_since_effective_on_or_command(st, now)
                 if on_age < float(RUNNING_OFF_BLOCK_SECS):
@@ -631,8 +647,9 @@ def _resolve_presence_only_decision(
     if ac_on:
         if st.vacant_since is None:
             st.vacant_since = now
-            return "hold", "presence_vacancy_grace", occupied
         elapsed_vacant = (now - st.vacant_since).total_seconds()
+        if elapsed_vacant < float(VACANCY_CONFIRM_SECS):
+            return "hold", "vacancy_debounce", occupied
         vacancy_timeout = max(
             int(cfg.get("vacancy_timeout_minutes", 5)) * 60,
             float(VACANCY_CONFIRM_SECS),
@@ -1751,7 +1768,10 @@ async def _tick_presence_only_mode(
                     await _close_session(room_id, cfg, indoor_temp, reason="power_off")
             st.ac_state_source = "power"
         else:
-            ac_on = st.ac_is_on
+            ac_on = True
+            if not st.ac_is_on:
+                st.ac_is_on = True
+                st.last_ac_on_at = now.timestamp()
             st.ac_state_source = "power"
     else:
         ac_on = st.ac_is_on
@@ -2139,9 +2159,17 @@ async def _tick_impl(rid_raw: str, room_id: str) -> None:
                 st.ac_is_on = True
                 st.last_ac_on_at = now.timestamp()
         elif energy_watts >= _WATTS_FAN_ONLY:
-            ac_on = st.ac_is_on
+            ac_on = True
             ac_idle = True
             st.compressor_watts_high_since = None
+            if not st.ac_is_on:
+                logger.info(
+                    "[HawaAI][%s] AC treated ON by fan-only power (%.0f W >= %.0f W idle threshold) "
+                    "— syncing internal flag",
+                    room_id, energy_watts, _WATTS_FAN_ONLY,
+                )
+                st.ac_is_on = True
+                st.last_ac_on_at = now.timestamp()
         else:
             ac_on = False
             ac_idle = False
@@ -2268,6 +2296,9 @@ async def _tick_impl(rid_raw: str, room_id: str) -> None:
 
     now_ts = now.timestamp()
     power_high = energy_watts_valid and not in_cooldown and energy_watts > _WATTS_COMPRESSOR
+    power_idle = _power_band_indicates_on(
+        energy_watts_valid, in_cooldown, energy_watts,
+    ) and not power_high
     power_low = energy_watts_valid and not in_cooldown and energy_watts < _WATTS_FAN_ONLY
 
     probable_on = (
@@ -2291,8 +2322,8 @@ async def _tick_impl(rid_raw: str, room_id: str) -> None:
     if power_low and not is_probably_on:
         st.possible_on_since = None
 
-    st.physical_ac_on = bool(power_high or st.ac_is_on or is_probably_on)
-    confirmed_ac_on = bool(power_high or st.ac_is_on)
+    st.physical_ac_on = bool(power_high or power_idle or st.ac_is_on or is_probably_on)
+    confirmed_ac_on = bool(power_high or power_idle or st.ac_is_on)
 
     if st.physical_ac_on:
         inferred_only = is_probably_on and not power_high and not st.ac_is_on

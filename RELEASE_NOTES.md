@@ -1,5 +1,11 @@
 # HawaAI add-on — release notes
 
+## 1.4.37
+
+- **Control:** Fan-only / idle power now counts as ON for physical control state, pending ON confirmation, and vacancy protection.
+- **Presence:** Vacancy debounce now returns an explicit `vacancy_debounce` hold during the first 60s instead of allowing early OFF evaluation.
+- **Tests:** Added regression coverage for fan-only wattage being treated as ON.
+
 ## 1.4.36
 
 - **IR:** Added Tuya delayed-ON double emit: the first command wakes/syncs the IR climate state, and a second ON emit follows after 2s if physical power has not confirmed.

@@ -171,6 +171,29 @@ class TestLogicEngineHardening(unittest.TestCase):
         )
         self.assertIsNone(st.pending_action)
 
+    def test_power_band_treats_fan_only_as_on(self):
+        self.assertTrue(
+            logic_engine._power_band_indicates_on(
+                True,
+                False,
+                logic_engine._WATTS_FAN_ONLY + 109,
+            )
+        )
+        self.assertFalse(
+            logic_engine._power_band_indicates_on(
+                True,
+                False,
+                logic_engine._WATTS_FAN_ONLY - 1,
+            )
+        )
+        self.assertFalse(
+            logic_engine._power_band_indicates_on(
+                True,
+                True,
+                logic_engine._WATTS_FAN_ONLY + 109,
+            )
+        )
+
     def test_sync_ac_display_pending_on_masks_effective(self):
         st = logic_engine.RoomRuntime()
         st.physical_ac_on = True
@@ -596,7 +619,7 @@ class TestLogicEngineHardening(unittest.TestCase):
             ac_on=True,
             now=now,
         )
-        self.assertEqual((action, source, occupied), ("hold", "presence_vacancy_grace", False))
+        self.assertEqual((action, source, occupied), ("hold", "vacancy_debounce", False))
 
         action, source, occupied = logic_engine._resolve_presence_only_decision(
             "room-x",
@@ -681,7 +704,7 @@ class TestLogicEngineHardening(unittest.TestCase):
             now=now,
         )
 
-        self.assertEqual((action, source, target), ("hold_vacant", "safety_vacant", 24.0))
+        self.assertEqual((action, source, target), ("hold", "vacancy_debounce", 24.0))
 
     def test_ir_backend_default_and_invalid_are_broadlink(self):
         self.assertEqual(logic_engine.normalize_ir_backend({}), "broadlink")
