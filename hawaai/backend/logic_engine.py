@@ -361,6 +361,7 @@ COMPRESSOR_STABLE_SECONDS: float = 10.0
 VACANCY_SESSION_GRACE_SECONDS: float = 120.0
 MIN_ON_TIME_SECONDS: float = 60.0
 RUNNING_OFF_BLOCK_SECS: float = 180.0
+VACANCY_CONFIRM_SECS: float = 60.0
 DECISION_LOCK_SECONDS: float = 30.0
 MAX_PROVISIONAL_SECONDS: float = 180.0
 # Recent IR/compressor-command window: session may open after explicit ON before ac_is_on latches.
@@ -435,7 +436,10 @@ def _resolve_control_decision(
     st = _rt(room_id)
     on_delta = float(cfg.get("thermostat_on_delta_deg", 0.7))
     off_delta = float(cfg.get("thermostat_off_delta_deg", 0.3))
-    vacancy_timeout = int(cfg.get("vacancy_timeout_minutes", 5)) * 60
+    vacancy_timeout = max(
+        int(cfg.get("vacancy_timeout_minutes", 5)) * 60,
+        float(VACANCY_CONFIRM_SECS),
+    )
     use_presence = cfg.get("use_presence", True)
 
     # ── PRIORITY 1: Safety — vacancy (may issue OFF even during global cooldown) ─
@@ -443,21 +447,26 @@ def _resolve_control_decision(
         if st.vacant_since is not None:
             elapsed = (now - st.vacant_since).total_seconds()
             if elapsed >= vacancy_timeout and (ac_on or st.ac_is_on):
+                on_age = _seconds_since_effective_on_or_command(st, now)
+                if on_age < float(RUNNING_OFF_BLOCK_SECS):
+                    log_with_room(
+                        "info",
+                        room_id,
+                        "[VACANCY] Ignored for room=%s — running protection (%.0fs < %.0fs)",
+                        room_id,
+                        on_age,
+                        RUNNING_OFF_BLOCK_SECS,
+                    )
+                    return ("hold_vacant", "running_protection", effective_target)
                 if st.physical_ac_on:
-                    now_ts = now.timestamp()
-                    on_age_secs = None
-                    if st.effective_on_since_ts is not None:
-                        on_age_secs = now_ts - float(st.effective_on_since_ts)
-                    elif st.last_ac_on_at is not None:
-                        on_age_secs = now_ts - float(st.last_ac_on_at)
-                    if on_age_secs is not None and on_age_secs < float(VACANCY_SESSION_GRACE_SECONDS):
+                    if on_age < float(VACANCY_SESSION_GRACE_SECONDS):
                         log_with_room(
                             "info",
                             room_id,
                             "[VACANCY] Ignored for room=%s — cooling grace (%.0fs < %.0fs) "
                             "(effective_on / last_on)",
                             room_id,
-                            on_age_secs,
+                            on_age,
                             VACANCY_SESSION_GRACE_SECONDS,
                         )
                         return ("hold_vacant", "safety_vacant", effective_target)
@@ -624,7 +633,10 @@ def _resolve_presence_only_decision(
             st.vacant_since = now
             return "hold", "presence_vacancy_grace", occupied
         elapsed_vacant = (now - st.vacant_since).total_seconds()
-        vacancy_timeout = int(cfg.get("vacancy_timeout_minutes", 5)) * 60
+        vacancy_timeout = max(
+            int(cfg.get("vacancy_timeout_minutes", 5)) * 60,
+            float(VACANCY_CONFIRM_SECS),
+        )
         if elapsed_vacant < vacancy_timeout:
             return "hold", "presence_vacancy_grace", occupied
         return "off", "presence_vacant", occupied
@@ -1041,6 +1053,16 @@ def _sync_pending_for_action(st: RoomRuntime, decision_action: str) -> None:
         _clear_pending_command_state(st)
 
 
+def _seconds_since_effective_on_or_command(st: RoomRuntime, now: datetime) -> float:
+    now_ts = now.timestamp()
+
+    if st.effective_on_since_ts is not None:
+        return now_ts - float(st.effective_on_since_ts)
+    if st.last_command_time is not None and st.last_command == "on":
+        return (now - st.last_command_time).total_seconds()
+    return float("inf")
+
+
 def _apply_pending_on_decision_lock(
     room_id: str,
     st: RoomRuntime,
@@ -1103,8 +1125,7 @@ def _apply_running_state_off_block(
     if str(ha_mode or "").strip().lower() != "cool":
         return action, source
 
-    last_on = float(st.last_ac_on_at or 0.0)
-    time_since_on = now.timestamp() - last_on
+    time_since_on = _seconds_since_effective_on_or_command(st, now)
 
     if time_since_on < float(RUNNING_OFF_BLOCK_SECS):
         log_with_room(
@@ -2036,7 +2057,10 @@ async def _tick_impl(rid_raw: str, room_id: str) -> None:
     log_target_resolve(room_id, cfg, base_temp, slot_label)
     temperature_mode_str = (cfg.get("temperature_mode") or "manual")
 
-    vacancy_timeout = int(cfg.get("vacancy_timeout_minutes", 5)) * 60
+    vacancy_timeout = max(
+        int(cfg.get("vacancy_timeout_minutes", 5)) * 60,
+        float(VACANCY_CONFIRM_SECS),
+    )
     smart_curve = smart_temp_adjustment_enabled(cfg) and bool(cfg.get("use_outdoor_temp", True))
 
     weather = await weather_api.get_cached()
@@ -2811,6 +2835,31 @@ async def _start_provisional_session(
 
 # ── Delayed actuation (intent → pending timer → turn) ─────────────────────────
 
+async def _tuya_double_emit(room_id: str, cfg: dict, target: float, now: datetime) -> None:
+    await asyncio.sleep(2)
+
+    st = _rt(room_id)
+    if st.physical_ac_on:
+        return
+    if st.pending_action != "on":
+        return
+
+    log_with_room(
+        "warning",
+        room_id,
+        "[IR][tuya] retry ON (double emit)",
+    )
+
+    await _turn_ac_on(
+        room_id,
+        cfg,
+        None,
+        target,
+        now=datetime.now(timezone.utc),
+        allow_pending_on_emit=True,
+    )
+
+
 async def _handle_delayed_on(
     rid_stored: str,
     room_canon: str,
@@ -2911,7 +2960,10 @@ async def _handle_delayed_on(
     )
     st.pending_on_ir_sent = True
     st.pending_on_ir_sent_at = now
-    await _turn_ac_on(
+
+    climate_entity = (cfg.get("climate_entity") or "").strip()
+    ir_backend = await resolve_ir_backend(room_canon, cfg, climate_entity)
+    sent = await _turn_ac_on(
         room_canon,
         cfg,
         indoor_temp,
@@ -2919,6 +2971,8 @@ async def _handle_delayed_on(
         now=now,
         allow_pending_on_emit=True,
     )
+    if sent and ir_backend == "tuya" and st.pending_action == "on":
+        asyncio.create_task(_tuya_double_emit(room_canon, cfg, et_eff, now))
     if st.pending_action != "on":
         return
 

@@ -297,7 +297,7 @@ class TestLogicEngineHardening(unittest.TestCase):
         rid = "delay-on-once"
         st = logic_engine._rt(rid)
         now = datetime.now(timezone.utc)
-        cfg = {"on_delay_seconds": 0, "climate_entity": "climate.test"}
+        cfg = {"on_delay_seconds": 0, "climate_entity": "climate.test", "ir_backend": "broadlink"}
 
         async def fake_turn_on(*args, **kwargs):
             self.assertTrue(st.pending_on_ir_sent)
@@ -308,6 +308,7 @@ class TestLogicEngineHardening(unittest.TestCase):
         async def run_case():
             with (
                 mock.patch.object(logic_engine, "_turn_ac_on", side_effect=fake_turn_on) as turn_on,
+                mock.patch.object(logic_engine.asyncio, "create_task") as create_task,
                 mock.patch.object(logic_engine, "log_with_room") as log_with_room,
             ):
                 await logic_engine._handle_delayed_on(
@@ -331,10 +332,74 @@ class TestLogicEngineHardening(unittest.TestCase):
                     confirmed_ac_on=False,
                 )
                 self.assertEqual(turn_on.call_count, 1)
+                create_task.assert_not_called()
                 self.assertTrue(st.pending_on_ir_sent)
                 self.assertTrue(
                     any("Skip duplicate ON" in str(call.args) for call in log_with_room.call_args_list)
                 )
+
+        asyncio.run(run_case())
+
+    def test_delayed_on_tuya_schedules_double_emit_after_first_send(self):
+        logic_engine._runtime_by_room.clear()
+        rid = "delay-on-tuya"
+        st = logic_engine._rt(rid)
+        now = datetime.now(timezone.utc)
+        cfg = {"on_delay_seconds": 0, "climate_entity": "climate.tuya", "ir_backend": "tuya"}
+
+        async def fake_turn_on(*args, **kwargs):
+            return True
+
+        def fake_create_task(coro):
+            coro.close()
+            return mock.Mock()
+
+        async def run_case():
+            with (
+                mock.patch.object(logic_engine, "_turn_ac_on", side_effect=fake_turn_on) as turn_on,
+                mock.patch.object(logic_engine.asyncio, "create_task", side_effect=fake_create_task) as create_task,
+                mock.patch.object(logic_engine, "log_with_room"),
+            ):
+                await logic_engine._handle_delayed_on(
+                    rid,
+                    rid,
+                    cfg,
+                    indoor_temp=27.0,
+                    et_eff=24.0,
+                    now=now,
+                    st=st,
+                    confirmed_ac_on=False,
+                )
+            self.assertEqual(turn_on.call_count, 1)
+            create_task.assert_called_once()
+
+        asyncio.run(run_case())
+
+    def test_tuya_double_emit_retries_when_physical_off(self):
+        logic_engine._runtime_by_room.clear()
+        rid = "tuya-double"
+        st = logic_engine._rt(rid)
+        st.pending_action = "on"
+        st.physical_ac_on = False
+        now = datetime.now(timezone.utc)
+
+        async def run_case():
+            with (
+                mock.patch.object(logic_engine.asyncio, "sleep", new=mock.AsyncMock()),
+                mock.patch.object(logic_engine, "_turn_ac_on", return_value=True) as turn_on,
+                mock.patch.object(logic_engine, "log_with_room") as log_with_room,
+            ):
+                await logic_engine._tuya_double_emit(
+                    rid,
+                    {"climate_entity": "climate.tuya", "ir_backend": "tuya"},
+                    24.0,
+                    now,
+                )
+            turn_on.assert_awaited_once()
+            self.assertTrue(turn_on.await_args.kwargs.get("allow_pending_on_emit"))
+            self.assertTrue(
+                any("retry ON" in str(call.args) for call in log_with_room.call_args_list)
+            )
 
         asyncio.run(run_case())
 
@@ -409,7 +474,8 @@ class TestLogicEngineHardening(unittest.TestCase):
     def test_running_state_off_block_protects_recent_cooling(self):
         st = logic_engine.RoomRuntime()
         now = datetime.now(timezone.utc)
-        st.last_ac_on_at = now.timestamp() - 30
+        st.effective_on_since_ts = now.timestamp() - 30
+        st.last_ac_on_at = now.timestamp() - 3600
 
         with mock.patch.object(logic_engine, "log_with_room") as log_with_room:
             action, source = logic_engine._apply_running_state_off_block(
@@ -427,18 +493,29 @@ class TestLogicEngineHardening(unittest.TestCase):
     def test_running_state_off_block_requires_cool_and_recent_on(self):
         st = logic_engine.RoomRuntime()
         now = datetime.now(timezone.utc)
-        st.last_ac_on_at = now.timestamp() - 30
+        st.effective_on_since_ts = now.timestamp() - 30
 
         action, source = logic_engine._apply_running_state_off_block(
             "room-x", st, "off", "safety_vacant", now, "off",
         )
         self.assertEqual((action, source), ("off", "safety_vacant"))
 
-        st.last_ac_on_at = now.timestamp() - logic_engine.RUNNING_OFF_BLOCK_SECS - 1
+        st.effective_on_since_ts = now.timestamp() - logic_engine.RUNNING_OFF_BLOCK_SECS - 1
         action, source = logic_engine._apply_running_state_off_block(
             "room-x", st, "off", "safety_vacant", now, "cool",
         )
         self.assertEqual((action, source), ("off", "safety_vacant"))
+
+    def test_running_state_off_block_falls_back_to_recent_on_command(self):
+        st = logic_engine.RoomRuntime()
+        now = datetime.now(timezone.utc)
+        st.last_command = "on"
+        st.last_command_time = now - timedelta(seconds=15)
+
+        action, source = logic_engine._apply_running_state_off_block(
+            "room-x", st, "off", "safety_vacant", now, "cool",
+        )
+        self.assertEqual((action, source), ("hold", "running_protection"))
 
     def test_pending_on_emit_hold_preserves_pending_cycle(self):
         st = logic_engine.RoomRuntime()
@@ -565,6 +642,46 @@ class TestLogicEngineHardening(unittest.TestCase):
             now=now,
         )
         self.assertEqual((action, source, target), ("on", "thermostat", 24.0))
+
+    def test_vacancy_off_uses_running_protection_from_on_command(self):
+        logic_engine._runtime_by_room.clear()
+        now = datetime.now(timezone.utc)
+        st = logic_engine._rt("room-x")
+        st.vacant_since = now - timedelta(seconds=61)
+        st.ac_is_on = True
+        st.last_command = "on"
+        st.last_command_time = now - timedelta(seconds=30)
+
+        action, source, target = logic_engine._resolve_control_decision(
+            "room-x",
+            {"vacancy_timeout_minutes": 0},
+            indoor_temp=26.0,
+            effective_target=24.0,
+            is_occupied=False,
+            ac_on=False,
+            now=now,
+        )
+
+        self.assertEqual((action, source, target), ("hold_vacant", "running_protection", 24.0))
+
+    def test_vacancy_off_has_minimum_presence_exit_confirmation(self):
+        logic_engine._runtime_by_room.clear()
+        now = datetime.now(timezone.utc)
+        st = logic_engine._rt("room-x")
+        st.vacant_since = now - timedelta(seconds=30)
+        st.ac_is_on = True
+
+        action, source, target = logic_engine._resolve_control_decision(
+            "room-x",
+            {"vacancy_timeout_minutes": 0},
+            indoor_temp=26.0,
+            effective_target=24.0,
+            is_occupied=False,
+            ac_on=False,
+            now=now,
+        )
+
+        self.assertEqual((action, source, target), ("hold_vacant", "safety_vacant", 24.0))
 
     def test_ir_backend_default_and_invalid_are_broadlink(self):
         self.assertEqual(logic_engine.normalize_ir_backend({}), "broadlink")

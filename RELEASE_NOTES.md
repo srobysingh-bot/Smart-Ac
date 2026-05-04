@@ -1,5 +1,12 @@
 # HawaAI add-on — release notes
 
+## 1.4.36
+
+- **IR:** Added Tuya delayed-ON double emit: the first command wakes/syncs the IR climate state, and a second ON emit follows after 2s if physical power has not confirmed.
+- **Control:** Running OFF protection now uses `effective_on_since_ts` or recent ON command time, so Broadlink startup power delay still blocks unstable vacancy OFF.
+- **Presence:** Added a 60s minimum vacancy confirmation floor before vacancy OFF can fire.
+- **Tests:** Added regression coverage for Tuya double emit, ON-command-based running protection, and minimum vacancy confirmation.
+
 ## 1.4.35
 
 - **IR:** Added per-room `ir_backend` profile with default `broadlink`. Broadlink rooms keep the existing adapter path; Tuya rooms send ON as one combined `set_temperature` payload (`temperature` + `hvac_mode`) with optional supported `set_fan_mode`.
