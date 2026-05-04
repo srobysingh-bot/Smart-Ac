@@ -1,5 +1,6 @@
 """logic_engine: room id normalization, case-insensitive resolve, runtime state keys."""
 
+import asyncio
 import os
 import sys
 import unittest
@@ -89,6 +90,8 @@ class TestLogicEngineHardening(unittest.TestCase):
     def test_clear_pending_on_satisfied_physically_or_override(self):
         st = logic_engine.RoomRuntime()
         st.pending_action = "on"
+        st.pending_on_ir_sent = True
+        st.pending_on_ir_sent_at = datetime.now(timezone.utc)
         logic_engine._clear_pending_when_physically_satisfied(
             st,
             manual_override_active=False,
@@ -96,9 +99,13 @@ class TestLogicEngineHardening(unittest.TestCase):
             physical_ac_on=True,
         )
         self.assertIsNone(st.pending_action)
+        self.assertFalse(st.pending_on_ir_sent)
+        self.assertIsNone(st.pending_on_ir_sent_at)
 
         st.pending_action = "on"
         st.pending_since = 2.0
+        st.pending_on_ir_sent = True
+        st.pending_on_ir_sent_at = datetime.now(timezone.utc)
         logic_engine._clear_pending_when_physically_satisfied(
             st,
             manual_override_active=True,
@@ -106,6 +113,8 @@ class TestLogicEngineHardening(unittest.TestCase):
             physical_ac_on=False,
         )
         self.assertIsNone(st.pending_action)
+        self.assertFalse(st.pending_on_ir_sent)
+        self.assertIsNone(st.pending_on_ir_sent_at)
 
         # Inferred-only physical ON must NOT clear pending ON until power/IR/HA confirms.
         st.pending_action = "on"
@@ -119,6 +128,37 @@ class TestLogicEngineHardening(unittest.TestCase):
         )
         self.assertEqual(st.pending_action, "on")
         self.assertEqual(st.pending_since, 3.0)
+
+    def test_pending_on_timeout_clears_lock_state(self):
+        st = logic_engine.RoomRuntime()
+        now = datetime.now(timezone.utc)
+        st.pending_action = "on"
+        st.pending_since = now.timestamp() - 120
+        st.pending_on_ir_sent = True
+        st.pending_on_ir_sent_at = now - timedelta(
+            seconds=logic_engine.PENDING_ON_CONFIRM_TIMEOUT_SECS + 1
+        )
+        st.physical_ac_on = False
+        st.soft_start_ui = True
+
+        async def run_case():
+            with (
+                mock.patch.object(logic_engine.live_broadcast, "broadcast_room_update") as broadcast,
+                mock.patch.object(logic_engine, "log_with_room"),
+            ):
+                cleared = await logic_engine._clear_timed_out_pending_on("room-x", st, now)
+            self.assertTrue(cleared)
+            broadcast.assert_called_once_with("room-x")
+
+        asyncio.run(run_case())
+
+        self.assertEqual(st.ac_state, "on_failed")
+        self.assertEqual(st.last_command, "on_failed")
+        self.assertIsNone(st.pending_action)
+        self.assertIsNone(st.pending_since)
+        self.assertFalse(st.pending_on_ir_sent)
+        self.assertIsNone(st.pending_on_ir_sent_at)
+        self.assertFalse(st.soft_start_ui)
 
     def test_clear_pending_off_when_already_off(self):
         st = logic_engine.RoomRuntime()
@@ -251,6 +291,75 @@ class TestLogicEngineHardening(unittest.TestCase):
         st.compressor_off_since = None
         cfg = {"min_command_interval_seconds": 150, "compressor_min_off_seconds": 0}
         self.assertTrue(logic_engine._gate_turn_ac_on(rid, cfg, 23.0, now))
+
+    def test_delayed_on_single_emit_marks_before_send_and_skips_duplicate(self):
+        logic_engine._runtime_by_room.clear()
+        rid = "delay-on-once"
+        st = logic_engine._rt(rid)
+        now = datetime.now(timezone.utc)
+        cfg = {"on_delay_seconds": 0, "climate_entity": "climate.test"}
+
+        async def fake_turn_on(*args, **kwargs):
+            self.assertTrue(st.pending_on_ir_sent)
+            self.assertEqual(st.pending_on_ir_sent_at, now)
+            self.assertTrue(kwargs.get("allow_pending_on_emit"))
+            return True
+
+        async def run_case():
+            with (
+                mock.patch.object(logic_engine, "_turn_ac_on", side_effect=fake_turn_on) as turn_on,
+                mock.patch.object(logic_engine, "log_with_room") as log_with_room,
+            ):
+                await logic_engine._handle_delayed_on(
+                    rid,
+                    rid,
+                    cfg,
+                    indoor_temp=27.0,
+                    et_eff=24.0,
+                    now=now,
+                    st=st,
+                    confirmed_ac_on=False,
+                )
+                await logic_engine._handle_delayed_on(
+                    rid,
+                    rid,
+                    cfg,
+                    indoor_temp=27.0,
+                    et_eff=24.0,
+                    now=now + timedelta(seconds=5),
+                    st=st,
+                    confirmed_ac_on=False,
+                )
+                self.assertEqual(turn_on.call_count, 1)
+                self.assertTrue(st.pending_on_ir_sent)
+                self.assertTrue(
+                    any("Skip duplicate ON" in str(call.args) for call in log_with_room.call_args_list)
+                )
+
+        asyncio.run(run_case())
+
+    def test_pending_on_decision_lock_blocks_only_after_ir_sent(self):
+        st = logic_engine.RoomRuntime()
+        st.pending_action = "on"
+        st.pending_on_ir_sent = False
+
+        action, source = logic_engine._apply_pending_on_decision_lock(
+            "room-x", st, "on", "thermostat",
+        )
+        self.assertEqual((action, source), ("on", "thermostat"))
+        self.assertEqual(st.pending_action, "on")
+
+        st.pending_on_ir_sent = True
+        with mock.patch.object(logic_engine, "log_with_room") as log_with_room:
+            action, source = logic_engine._apply_pending_on_decision_lock(
+                "room-x", st, "on", "thermostat",
+            )
+
+        self.assertEqual((action, source), ("hold", "pending_on_lock"))
+        self.assertEqual(st.pending_action, "on")
+        self.assertTrue(
+            any("Skip ON" in str(call.args) for call in log_with_room.call_args_list)
+        )
 
     def test_fp2_zone_gate_metrics_allow_fallback_and_block(self):
         logic_engine._runtime_by_room.clear()

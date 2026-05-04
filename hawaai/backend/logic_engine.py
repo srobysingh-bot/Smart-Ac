@@ -890,6 +890,57 @@ def _sync_pending_for_action(st: RoomRuntime, decision_action: str) -> None:
         _clear_pending_command_state(st)
 
 
+def _apply_pending_on_decision_lock(
+    room_id: str,
+    st: RoomRuntime,
+    action: str,
+    source: str,
+) -> Tuple[str, str]:
+    if action == "on" and st.pending_action == "on" and st.pending_on_ir_sent:
+        log_with_room(
+            "info",
+            room_id,
+            "[CONTROL] Skip ON — already pending",
+        )
+        return "hold", "pending_on_lock"
+    return action, source
+
+
+async def _clear_timed_out_pending_on(
+    room_id: str,
+    st: RoomRuntime,
+    now: datetime,
+) -> bool:
+    if (
+        st.pending_action != "on"
+        or not st.pending_on_ir_sent
+        or st.pending_on_ir_sent_at is None
+        or st.physical_ac_on
+    ):
+        return False
+
+    elapsed_ir = (now - st.pending_on_ir_sent_at).total_seconds()
+    if elapsed_ir < float(PENDING_ON_CONFIRM_TIMEOUT_SECS):
+        return False
+
+    st.soft_start_ui = False
+    log_with_room(
+        "error",
+        room_id,
+        "[HawaAI][%s] AC failed to turn ON — no physical confirmation within %.0fs after single IR emit",
+        room_id,
+        PENDING_ON_CONFIRM_TIMEOUT_SECS,
+    )
+    st.ac_state = "on_failed"
+    st.last_command = "on_failed"
+    try:
+        await live_broadcast.broadcast_room_update(room_id)
+    except Exception:
+        pass
+    _clear_pending_command_state(st)
+    return True
+
+
 def _clear_pending_when_physically_satisfied(
     st: RoomRuntime,
     *,
@@ -1864,6 +1915,7 @@ async def _tick_impl(rid_raw: str, room_id: str) -> None:
         occ_res, ac_on, now,
     )
     action, source, zone_gate_blocked = _fp2_zone_apply_on_gate(room_id, cfg, action, source)
+    action, source = _apply_pending_on_decision_lock(room_id, st, action, source)
     control_action, control_source = action, source
 
     zone_e_log = (str(cfg.get("zone_entity_id") or "")).strip()
@@ -1908,13 +1960,18 @@ async def _tick_impl(rid_raw: str, room_id: str) -> None:
                 action, source = "hold", "decision_lock"
     st.effective_control_source = source
 
-    _sync_pending_for_action(st, control_action)
+    if control_source != "pending_on_lock":
+        _sync_pending_for_action(st, control_action)
     bypass_actuation_delay = _delay_control_bypass(st, cfg, now, control_source)
 
-    if control_action != "on":
+    if control_action != "on" and control_source != "pending_on_lock":
         st.soft_start_ui = False
 
-    if st.ac_state == "on_failed" and control_action != "on":
+    if (
+        st.ac_state == "on_failed"
+        and control_action != "on"
+        and control_source != "pending_on_lock"
+    ):
         st.ac_state = "on" if st.physical_ac_on else "off"
 
     power_watts = energy_watts if energy_watts_valid else None
@@ -1924,7 +1981,8 @@ async def _tick_impl(rid_raw: str, room_id: str) -> None:
         and power_watts > MIN_SOFT_ON_WATTS
     )
     if (
-        control_action == "on"
+        control_action in ("on", "hold")
+        and control_source in ("thermostat", "pending_on_lock")
         and st.pending_action == "on"
         and st.pending_on_ir_sent
         and soft_on_detected
@@ -1940,29 +1998,14 @@ async def _tick_impl(rid_raw: str, room_id: str) -> None:
         st.soft_start_ui = True
 
     if (
-        control_action == "on"
+        control_action in ("on", "hold")
+        and control_source in ("thermostat", "pending_on_lock")
         and st.pending_action == "on"
         and st.pending_on_ir_sent
         and st.pending_on_ir_sent_at is not None
         and not st.physical_ac_on
     ):
-        elapsed_ir = (now - st.pending_on_ir_sent_at).total_seconds()
-        if elapsed_ir >= float(PENDING_ON_CONFIRM_TIMEOUT_SECS):
-            st.soft_start_ui = False
-            log_with_room(
-                "error",
-                room_id,
-                "[HawaAI][%s] AC failed to turn ON — no physical confirmation within %.0fs after single IR emit",
-                room_id,
-                PENDING_ON_CONFIRM_TIMEOUT_SECS,
-            )
-            st.ac_state = "on_failed"
-            st.last_command = "on_failed"
-            try:
-                await live_broadcast.broadcast_room_update(room_id)
-            except Exception:
-                pass
-            _clear_pending_command_state(st)
+        await _clear_timed_out_pending_on(room_id, st, now)
 
     delta_audit = indoor_temp - et_eff
     in_cd_audit = _is_in_cooldown(st, now)
@@ -2368,6 +2411,13 @@ async def _handle_delayed_on(
             return
 
     if st.pending_on_ir_sent:
+        log_with_room(
+            "info",
+            room_canon,
+            "[DELAY_ON][%s] Skip duplicate ON — already sent at %s",
+            room_canon,
+            st.pending_on_ir_sent_at,
+        )
         return
 
     if _decision_lock_blocks_delayed_emit(st, now):
@@ -2389,16 +2439,18 @@ async def _handle_delayed_on(
         st.pending_since,
         delay,
     )
-    pre_fp = st.last_sent_command_key
-    pre_on_at = st.last_ac_on_at
-    ok = await _turn_ac_on(room_canon, cfg, indoor_temp, et_eff, now=now)
-    if st.pending_action != "on":
-        return
-    dispatched = ok and (st.last_sent_command_key != pre_fp or st.last_ac_on_at != pre_on_at)
-    if not dispatched:
-        return
     st.pending_on_ir_sent = True
     st.pending_on_ir_sent_at = now
+    await _turn_ac_on(
+        room_canon,
+        cfg,
+        indoor_temp,
+        et_eff,
+        now=now,
+        allow_pending_on_emit=True,
+    )
+    if st.pending_action != "on":
+        return
 
 
 async def _handle_delayed_off(
@@ -2497,6 +2549,8 @@ async def _turn_ac_on(
     indoor_temp: float,
     effective_target: Optional[float] = None,
     now: Optional[datetime] = None,
+    *,
+    allow_pending_on_emit: bool = False,
 ) -> bool:
     """Turn AC ON for one room; updates RoomRuntime + per-room session. Returns False if IR not sent."""
     st = _rt(room_id)
@@ -2507,6 +2561,7 @@ async def _turn_ac_on(
     if (
         st.pending_action == "on"
         and st.pending_on_ir_sent
+        and not allow_pending_on_emit
         and not st.physical_ac_on
         and not _is_user_authority_active(st, cfg, tnow)
     ):

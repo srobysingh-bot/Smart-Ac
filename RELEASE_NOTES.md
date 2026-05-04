@@ -1,5 +1,10 @@
 # HawaAI add-on — release notes
 
+## 1.4.29
+
+- **Control:** Prevent duplicate delayed ON commands while a pending ON is awaiting confirmation. The engine now locks repeated thermostat ON decisions after the single IR emit, preserves the pending cycle until power/HA confirmation or timeout, and clears the pending lock on confirmation, manual override, or `on_failed` timeout.
+- **Tests:** Added regression coverage for single-shot delayed ON, pending ON decision locking, timeout recovery, and pending state cleanup.
+
 ## 1.4.13
 
 - **Frontend:** `RoomDataContext` — clearer `setRoomData` naming; room reset stays a proper object/updater (`status` / `snapshots` / `ai` / `stats` plus loading + previous\* for soft load). Ensures reproducible addon builds cache no stale JSX.
