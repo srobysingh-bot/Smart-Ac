@@ -271,7 +271,7 @@ async def lifespan(app: FastAPI):
     logger.info("[HawaAI] Add-on stopped")
 
 
-app = FastAPI(title="HawaAI API", version="1.4.31", lifespan=lifespan)
+app = FastAPI(title="HawaAI API", version="1.4.32", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -629,8 +629,13 @@ async def _dashboard_status_payload(rid: str) -> Dict[str, Any]:
         "pending_remaining_seconds": runtime.get("pending_remaining_seconds"),
         # ── Config ────────────────────────────────────────────────────────────
         "manual_override":  cfg.get("manual_override", False),
+        "control_mode": logic_engine.normalize_control_mode(cfg),
         "config_complete":  bool(
-            cfg.get("presence_entity") and cfg.get("indoor_temp_entity")
+            cfg.get("presence_entity")
+            and (
+                cfg.get("indoor_temp_entity")
+                or logic_engine.normalize_control_mode(cfg) == "presence_only"
+            )
         ),
         "target_temp": base_target,
         "schedule_base_temp": base_target,
@@ -764,6 +769,26 @@ def _sanitize_zone_room_settings(incoming_settings: Dict[str, Any]) -> None:
     incoming_settings["zone_dwell_seconds"] = max(0, min(z, 3600))
 
 
+def _sanitize_control_mode_room_settings(incoming_settings: Dict[str, Any]) -> None:
+    if not isinstance(incoming_settings, dict):
+        return
+    if "control_mode" in incoming_settings:
+        mode = str(incoming_settings.get("control_mode") or "thermostat").strip().lower()
+        incoming_settings["control_mode"] = (
+            mode if mode in ("thermostat", "presence_only") else "thermostat"
+        )
+    for key, default, lo, hi in (
+        ("presence_only_on_dwell_seconds", 20.0, 0.0, 3600.0),
+        ("presence_only_max_runtime_minutes", 240.0, 1.0, 1440.0),
+    ):
+        if key not in incoming_settings or incoming_settings[key] is None:
+            continue
+        try:
+            incoming_settings[key] = max(lo, min(float(incoming_settings[key]), hi))
+        except (TypeError, ValueError):
+            incoming_settings[key] = default
+
+
 def _sanitize_effective_target_room_settings(
     base_cfg: Dict[str, Any],
     room_row: Dict[str, Any],
@@ -855,6 +880,7 @@ async def api_update_room(room_id: str, body: Dict[str, Any] = Body(...)):
         if isinstance(inc, dict):
             inc_applied = dict(inc)
             _sanitize_zone_room_settings(inc_applied)
+            _sanitize_control_mode_room_settings(inc_applied)
             _sanitize_effective_target_room_settings(base, r, inc_applied)
             cur_s = dict(r.get("settings") or {})
             for sk, sv in inc_applied.items():

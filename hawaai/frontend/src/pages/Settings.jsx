@@ -189,6 +189,7 @@ const CURRENCY_OPTIONS = [
 
 /** Persisted under each room's `settings` in config (non-entity fields). */
 const ROOM_SETTINGS_KEYS = [
+  'control_mode', 'presence_only_on_dwell_seconds', 'presence_only_max_runtime_minutes',
   'target_temp', 'hysteresis', 'vacancy_timeout_minutes', 'logic_interval_seconds',
   'on_delay_seconds', 'off_delay_seconds',
   'energy_tariff_per_kwh', 'currency', 'use_presence', 'use_outdoor_temp',
@@ -949,14 +950,16 @@ export default function Settings() {
         )}
 
         {/* Indoor temp */}
-        <EntityDropdown
-          label="Indoor Temperature Sensor (sensor.*)"
-          value={cfg.indoor_temp_entity}
-          onChange={v => patch('indoor_temp_entity', v)}
-          entities={allSensors}
-          search={tempSearch}
-          onSearchChange={setTempSearch}
-        />
+        {(cfg.control_mode || 'thermostat') !== 'presence_only' && (
+          <EntityDropdown
+            label="Indoor Temperature Sensor (sensor.*)"
+            value={cfg.indoor_temp_entity}
+            onChange={v => patch('indoor_temp_entity', v)}
+            entities={allSensors}
+            search={tempSearch}
+            onSearchChange={setTempSearch}
+          />
+        )}
 
         {/* Indoor humidity (optional, ML / comfort) */}
         <EntityDropdown
@@ -1148,6 +1151,52 @@ export default function Settings() {
           </p>
         </div>
 
+        <div className="border border-gray-800 rounded-xl p-4 space-y-4">
+          <p className="text-xs font-semibold uppercase tracking-widest text-gray-400">Control mode</p>
+          <div>
+            <Label>Mode</Label>
+            <select
+              className="w-full bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm text-gray-100 focus:outline-none focus:border-blue-500"
+              value={cfg.control_mode || 'thermostat'}
+              onChange={e => patch('control_mode', e.target.value)}
+            >
+              <option value="thermostat">Thermostat</option>
+              <option value="presence_only">Presence only</option>
+            </select>
+          </div>
+          {(cfg.control_mode || 'thermostat') === 'presence_only' && (
+            <p className="text-xs text-blue-200/90 bg-blue-950/25 border border-blue-900/40 rounded-lg px-3 py-2">
+              Presence-only mode is for rooms without a temperature sensor. AC follows occupancy only.
+            </p>
+          )}
+        </div>
+
+        {(cfg.control_mode || 'thermostat') === 'presence_only' && (
+          <div className="border border-gray-800 rounded-xl p-4 space-y-4">
+            <p className="text-xs font-semibold uppercase tracking-widest text-gray-400">Presence-only timing</p>
+            <Slider
+              label="Presence dwell before ON"
+              value={cfg.presence_only_on_dwell_seconds ?? 20}
+              onChange={v => patch('presence_only_on_dwell_seconds', v)}
+              min={0}
+              max={300}
+              step={5}
+              unit=" sec"
+            />
+            <Slider
+              label="Max runtime failsafe"
+              value={cfg.presence_only_max_runtime_minutes ?? 240}
+              onChange={v => patch('presence_only_max_runtime_minutes', v)}
+              min={15}
+              max={1440}
+              step={15}
+              unit=" min"
+            />
+          </div>
+        )}
+
+        {(cfg.control_mode || 'thermostat') !== 'presence_only' && (
+        <>
         <Slider
           label="Target Temperature"
           value={cfg.target_temp ?? 24}
@@ -1331,6 +1380,8 @@ export default function Settings() {
         <p className="text-xs text-gray-500 -mt-3">
           Larger band = fewer AC cycles. E.g. target 24°C + 1.5° band: ON at 25.5°C, OFF at 22.5°C.
         </p>
+        </>
+        )}
 
         <div className="border border-gray-800 rounded-xl p-4 space-y-4">
           <p className="text-xs font-semibold uppercase tracking-widest text-gray-400">Control timing</p>
@@ -1378,6 +1429,8 @@ export default function Settings() {
             checked={cfg.use_presence ?? true}
             onChange={v => patch('use_presence', v)}
           />
+          {(cfg.control_mode || 'thermostat') !== 'presence_only' && (
+          <>
           <Toggle
             label="Use Outside Temperature Logic"
             description="Skips cooling when outdoor temperature is already comfortable"
@@ -1477,6 +1530,8 @@ export default function Settings() {
               />
             </>
           )}
+          </>
+          )}
           <Toggle
             label="Manual Override"
             description="Disable all automation"
@@ -1487,7 +1542,7 @@ export default function Settings() {
         </div>
 
         {/* ── Smart Adjustment Preview ───────────────────────────────────── */}
-        {cfg.smart_temp_adjustment !== false && cfg.use_outdoor_temp !== false && (() => {
+        {(cfg.control_mode || 'thermostat') !== 'presence_only' && cfg.smart_temp_adjustment !== false && cfg.use_outdoor_temp !== false && (() => {
           const t = previewBaseDegC(cfg)
           const outdoor = outdoorTemp
           let adj = 0
@@ -1543,6 +1598,7 @@ export default function Settings() {
       </div>
 
       {/* Weather API */}
+      {(cfg.control_mode || 'thermostat') !== 'presence_only' && (
       <div className="card space-y-4">
         <SectionHeader>Outside Temperature API</SectionHeader>
         <div>
@@ -1573,6 +1629,7 @@ export default function Settings() {
           placeholder="e.g. Chennai  or  13.08,80.27"
         />
       </div>
+      )}
 
       {/* Billing */}
       <div className="card space-y-4">

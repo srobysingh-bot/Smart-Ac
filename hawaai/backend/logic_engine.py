@@ -127,6 +127,8 @@ class RoomRuntime:
 
     # Last trusted occupancy reading when presence sensor is flaky (None/unavailable).
     last_known_presence: Optional[bool] = None
+    presence_only_present_since: Optional[datetime] = None
+    presence_only_last_invalid_log_at: Optional[datetime] = None
 
     # ── Startup recovery flag ──
     startup_state_loaded: bool = False
@@ -480,6 +482,114 @@ def _resolve_control_decision(
 
     # ── PRIORITY 5: Hold ─────────────────────────────────────────────────────────
     return ("hold", "thermostat", effective_target)
+
+
+def normalize_control_mode(cfg: dict) -> str:
+    mode = str(cfg.get("control_mode") or "thermostat").strip().lower()
+    return mode if mode in ("thermostat", "presence_only") else "thermostat"
+
+
+def _presence_only_on_dwell_seconds(cfg: dict) -> float:
+    try:
+        return max(0.0, min(float(cfg.get("presence_only_on_dwell_seconds", 20)), 3600.0))
+    except (TypeError, ValueError):
+        return 20.0
+
+
+def _presence_only_max_runtime_seconds(cfg: dict) -> float:
+    try:
+        minutes = float(cfg.get("presence_only_max_runtime_minutes", 240))
+    except (TypeError, ValueError):
+        minutes = 240.0
+    return max(1.0, min(minutes, 24 * 60.0)) * 60.0
+
+
+def _presence_raw_invalid(raw: object) -> bool:
+    return raw is None or str(raw).strip().lower() in ("unavailable", "unknown", "")
+
+
+def _presence_only_runtime_seconds(st: RoomRuntime, now: datetime) -> Optional[float]:
+    if st.effective_on_since_ts is not None:
+        return max(0.0, now.timestamp() - float(st.effective_on_since_ts))
+    if st.last_ac_on_at is not None:
+        return max(0.0, now.timestamp() - float(st.last_ac_on_at))
+    if st.last_command == "on" and st.last_command_time is not None:
+        return max(0.0, (now - st.last_command_time).total_seconds())
+    return None
+
+
+def _resolve_presence_only_decision(
+    room_id: str,
+    cfg: dict,
+    st: RoomRuntime,
+    presence_raw: object,
+    ac_on: bool,
+    now: datetime,
+) -> Tuple[str, str, bool]:
+    """
+    Presence-only control: occupancy drives ON/OFF; temperature and AI are ignored.
+    Returns (action, source, occupied).
+    """
+    if _presence_raw_invalid(presence_raw):
+        st.presence_only_present_since = None
+        if (
+            st.presence_only_last_invalid_log_at is None
+            or (now - st.presence_only_last_invalid_log_at).total_seconds() >= 60
+        ):
+            log_with_room(
+                "warning",
+                room_id,
+                "[PRESENCE_ONLY][%s] Presence unavailable (%r) — holding current state",
+                room_id,
+                presence_raw,
+            )
+            st.presence_only_last_invalid_log_at = now
+        return "hold", "presence_unavailable", False
+
+    occupied = parse_presence(presence_raw)
+    st.last_known_presence = occupied
+    st.presence_only_last_invalid_log_at = None
+
+    runtime = _presence_only_runtime_seconds(st, now)
+    max_runtime = _presence_only_max_runtime_seconds(cfg)
+    if ac_on and runtime is not None and runtime >= max_runtime:
+        log_with_room(
+            "warning",
+            room_id,
+            "[PRESENCE_ONLY][%s] Max runtime exceeded %.0fs >= %.0fs — forcing OFF",
+            room_id,
+            runtime,
+            max_runtime,
+        )
+        return "off", "presence_max_runtime", occupied
+
+    if occupied:
+        st.vacant_since = None
+        if ac_on:
+            st.presence_only_present_since = now
+            return "hold", "presence_only", occupied
+        if st.presence_only_present_since is None:
+            st.presence_only_present_since = now
+            return "hold", "presence_dwell", occupied
+        elapsed = (now - st.presence_only_present_since).total_seconds()
+        dwell = _presence_only_on_dwell_seconds(cfg)
+        if elapsed < dwell:
+            return "hold", "presence_dwell", occupied
+        return "on", "presence_only", occupied
+
+    st.presence_only_present_since = None
+    if ac_on:
+        if st.vacant_since is None:
+            st.vacant_since = now
+            return "hold", "presence_vacancy_grace", occupied
+        elapsed_vacant = (now - st.vacant_since).total_seconds()
+        vacancy_timeout = int(cfg.get("vacancy_timeout_minutes", 5)) * 60
+        if elapsed_vacant < vacancy_timeout:
+            return "hold", "presence_vacancy_grace", occupied
+        return "off", "presence_vacant", occupied
+
+    st.vacant_since = None
+    return "hold", "presence_only", occupied
 
 
 async def _fp2_zone_sensor_tick(room_id: str, cfg: dict, now: datetime) -> None:
@@ -929,6 +1039,10 @@ def _apply_pending_on_off_block(
             )
             return "hold", "pending_on_protection"
     return action, source
+
+
+def _pending_on_emit_hold_in_progress(st: RoomRuntime, action: str) -> bool:
+    return action == "hold" and st.pending_action == "on" and st.pending_on_ir_sent
 
 
 async def _clear_timed_out_pending_on(
@@ -1489,6 +1603,214 @@ async def tick(room_id: str) -> None:
     await live_broadcast.broadcast_room_update(canon)
 
 
+async def _tick_presence_only_mode(
+    *,
+    rid_raw: str,
+    room_id: str,
+    cfg: dict,
+    climate_data: dict,
+    presence_raw: object,
+    indoor_temp: float,
+    now: datetime,
+    st: RoomRuntime,
+) -> None:
+    target = climate_data.get("target_temp") if climate_data else None
+    try:
+        et_eff = float(target if target is not None else cfg.get("target_temp", 24))
+    except (TypeError, ValueError):
+        et_eff = 24.0
+    st.effective_target_temp = et_eff
+
+    energy_power_entity = cfg.get("energy_power_entity", "")
+    energy_watts: float = 0.0
+    energy_watts_valid = False
+    if energy_power_entity:
+        energy_raw = await ha_client.get_state(energy_power_entity)
+        if energy_raw not in (None, "unavailable", "unknown", ""):
+            try:
+                energy_watts = float(energy_raw)
+                energy_watts_valid = True
+            except (ValueError, TypeError):
+                energy_watts = 0.0
+
+    in_cooldown = _is_in_cooldown(st, now)
+    if energy_watts_valid and not in_cooldown:
+        if energy_watts > _WATTS_COMPRESSOR:
+            ac_on = True
+            st.last_power_confirmed_on = now.timestamp()
+            if not st.ac_is_on:
+                st.ac_is_on = True
+                st.last_ac_on_at = now.timestamp()
+            st.ac_state_source = "power"
+        elif energy_watts < _WATTS_FAN_ONLY:
+            ac_on = False
+            st.last_power_confirmed_off = now.timestamp()
+            if st.ac_is_on:
+                st.ac_is_on = False
+                st.last_ac_off_at = now.timestamp()
+                if st.session_start_time is not None:
+                    await _close_session(room_id, cfg, indoor_temp, reason="power_off")
+            st.ac_state_source = "power"
+        else:
+            ac_on = st.ac_is_on
+            st.ac_state_source = "power"
+    else:
+        ac_on = st.ac_is_on
+        st.ac_state_source = "cooldown" if in_cooldown else "system"
+
+    st.physical_ac_on = bool(ac_on)
+    confirmed_ac_on = bool(ac_on)
+    if st.physical_ac_on:
+        if st.effective_on_since_ts is None:
+            st.effective_on_since_ts = now.timestamp()
+    else:
+        st.effective_on_since_ts = None
+
+    _clear_pending_when_physically_satisfied(
+        st,
+        manual_override_active=False,
+        confirmed_ac_on=confirmed_ac_on,
+        physical_ac_on=st.physical_ac_on,
+    )
+
+    action, source, occupied = _resolve_presence_only_decision(
+        room_id,
+        cfg,
+        st,
+        presence_raw,
+        st.physical_ac_on,
+        now,
+    )
+    action, source = _apply_pending_on_decision_lock(room_id, st, action, source)
+    action, source = _apply_pending_on_off_block(room_id, st, action, source, now)
+    control_action, control_source = action, source
+
+    user_bypass_decision_lock = (
+        _is_user_authority_active(st, cfg, now) or st.last_command_source == "user"
+    )
+    if (
+        control_action in ("on", "off")
+        and not str(control_source).startswith("safety")
+        and not user_bypass_decision_lock
+    ):
+        lda = st.last_decision_at
+        if lda is not None:
+            elapsed_ld = (now - lda).total_seconds()
+            if elapsed_ld < float(DECISION_LOCK_SECONDS):
+                action, source = "hold", "decision_lock"
+                control_action, control_source = action, source
+
+    st.effective_control_source = source
+    pending_on_hold_sources = ("pending_on_lock", "pending_on_protection")
+    preserve_pending_on_hold = _pending_on_emit_hold_in_progress(st, control_action)
+    if control_source not in pending_on_hold_sources and not preserve_pending_on_hold:
+        _sync_pending_for_action(st, control_action)
+
+    if (
+        control_action != "on"
+        and control_source not in pending_on_hold_sources
+        and not preserve_pending_on_hold
+    ):
+        st.soft_start_ui = False
+    if (
+        st.ac_state == "on_failed"
+        and control_action != "on"
+        and control_source not in pending_on_hold_sources
+    ):
+        st.ac_state = "on" if st.physical_ac_on else "off"
+
+    power_watts = energy_watts if energy_watts_valid else None
+    if (
+        control_action in ("on", "hold")
+        and control_source in ("presence_only", *pending_on_hold_sources)
+        and st.pending_action == "on"
+        and st.pending_on_ir_sent
+        and power_watts is not None
+        and not st.physical_ac_on
+        and power_watts > MIN_SOFT_ON_WATTS
+    ):
+        _clear_pending_command_state(st)
+        st.soft_start_ui = True
+
+    if (
+        control_action in ("on", "hold")
+        and control_source in ("presence_only", *pending_on_hold_sources)
+        and st.pending_action == "on"
+        and st.pending_on_ir_sent
+        and st.pending_on_ir_sent_at is not None
+        and not st.physical_ac_on
+    ):
+        await _clear_timed_out_pending_on(room_id, st, now)
+
+    log_with_room(
+        "info",
+        room_id,
+        "[TICK] room=%s action=%s source=%s control_mode=presence_only occupied=%s power=%sW",
+        room_id,
+        action,
+        source,
+        occupied,
+        f"{energy_watts:.0f}" if energy_watts_valid else "n/a",
+    )
+
+    bypass_actuation_delay = _delay_control_bypass(st, cfg, now, control_source)
+    if control_action == "on":
+        if bypass_actuation_delay:
+            await _turn_ac_on(room_id, cfg, indoor_temp, et_eff, now=now)
+            _clear_pending_command_state(st)
+        elif st.ac_state == "on_failed":
+            log_with_room(
+                "info",
+                room_id,
+                "[DELAY_ON][%s] presence-only ON suppressed — ac_state=on_failed",
+                room_id,
+            )
+        else:
+            await _handle_delayed_on(
+                rid_raw,
+                room_id,
+                cfg,
+                indoor_temp,
+                et_eff,
+                now,
+                st,
+                confirmed_ac_on=confirmed_ac_on,
+            )
+        st.last_command_source = "system"
+    elif control_action == "off":
+        force_off = control_source == "presence_max_runtime"
+        reason_off = "max_runtime" if force_off else "vacant"
+        if bypass_actuation_delay:
+            await _turn_ac_off(room_id, cfg, indoor_temp, reason_off, now=now, force=force_off)
+            _clear_pending_command_state(st)
+        else:
+            await _handle_delayed_off(
+                rid_raw,
+                room_id,
+                cfg,
+                indoor_temp,
+                now,
+                st,
+                reason=reason_off,
+                force=force_off,
+            )
+        st.last_command_source = "system"
+
+    await _maintain_session_lifecycle(
+        room_id,
+        cfg,
+        indoor_temp,
+        et_eff,
+        now,
+        energy_watts_valid=energy_watts_valid,
+        energy_watts=energy_watts,
+        in_cooldown=in_cooldown,
+        confirmed_ac_on=confirmed_ac_on,
+        inferred_only_physical=False,
+    )
+    _sync_ac_display_fields(st)
+
+
 async def _tick_impl(rid_raw: str, room_id: str) -> None:
     """
     Core tick body. Caller must hold ``_room_ops_lock(room_id)`` so this never races ``stop_room``.
@@ -1508,6 +1830,8 @@ async def _tick_impl(rid_raw: str, room_id: str) -> None:
         logger.debug("[HawaAI] tick skipped [%s] — no climate_entity", room_id)
         return
     cfg = room_registry.merge_room_config(base_cfg, room_def)
+    control_mode = normalize_control_mode(cfg)
+    presence_only = control_mode == "presence_only"
 
     sync_effective_mode_transition(st, room_id, cfg)
 
@@ -1519,7 +1843,7 @@ async def _tick_impl(rid_raw: str, room_id: str) -> None:
     presence_entity = cfg.get("presence_entity", "")
     indoor_temp_entity = cfg.get("indoor_temp_entity", "")
 
-    if not presence_entity or not indoor_temp_entity:
+    if not presence_entity or (not presence_only and not indoor_temp_entity):
         logger.warning(
             "[HawaAI][%s] Logic skipped — missing entity config (presence=%s, temp=%s)",
             room_id,
@@ -1529,7 +1853,7 @@ async def _tick_impl(rid_raw: str, room_id: str) -> None:
 
     await _load_startup_state(room_id, cfg)
 
-    indoor_temp_raw = await ha_client.get_state(indoor_temp_entity)
+    indoor_temp_raw = await ha_client.get_state(indoor_temp_entity) if indoor_temp_entity else None
     indoor_temp: Optional[float] = None
 
     if indoor_temp_raw not in (None, "unavailable", "unknown"):
@@ -1560,12 +1884,17 @@ async def _tick_impl(rid_raw: str, room_id: str) -> None:
             except (ValueError, TypeError):
                 pass
 
-    if indoor_temp is None:
+    if indoor_temp is None and not presence_only:
         logger.warning(
             "[HawaAI] tick skipped for room=%s — indoor_temp is None (HA unavailable?)",
             room_id,
         )
         return
+    if indoor_temp is None:
+        try:
+            indoor_temp = float(cfg.get("target_temp", 24))
+        except (TypeError, ValueError):
+            indoor_temp = 24.0
 
     presence_raw = await ha_client.get_state(presence_entity)
     use_presence = cfg.get("use_presence", True)
@@ -1603,6 +1932,19 @@ async def _tick_impl(rid_raw: str, room_id: str) -> None:
         return
 
     now = datetime.now(timezone.utc)
+
+    if presence_only:
+        await _tick_presence_only_mode(
+            rid_raw=rid_raw,
+            room_id=room_id,
+            cfg=cfg,
+            climate_data=climate_data,
+            presence_raw=presence_raw,
+            indoor_temp=float(indoor_temp),
+            now=now,
+            st=st,
+        )
+        return
 
     base_temp, slot_label = resolve_base_target_temp(cfg)
     log_target_resolve(room_id, cfg, base_temp, slot_label)
@@ -1988,17 +2330,23 @@ async def _tick_impl(rid_raw: str, room_id: str) -> None:
 
     pending_on_hold_sources = ("pending_on_lock", "pending_on_protection")
 
-    if control_source not in pending_on_hold_sources:
+    preserve_pending_on_hold = _pending_on_emit_hold_in_progress(st, control_action)
+    if control_source not in pending_on_hold_sources and not preserve_pending_on_hold:
         _sync_pending_for_action(st, control_action)
     bypass_actuation_delay = _delay_control_bypass(st, cfg, now, control_source)
 
-    if control_action != "on" and control_source not in pending_on_hold_sources:
+    if (
+        control_action != "on"
+        and control_source not in pending_on_hold_sources
+        and not preserve_pending_on_hold
+    ):
         st.soft_start_ui = False
 
     if (
         st.ac_state == "on_failed"
         and control_action != "on"
         and control_source not in pending_on_hold_sources
+        and not preserve_pending_on_hold
     ):
         st.ac_state = "on" if st.physical_ac_on else "off"
 
@@ -2995,6 +3343,7 @@ def get_runtime_state(room_id: str) -> dict:
         "power_source":          st.effective_power_source,
         "ac_state_source":       st.ac_state_source,
         "control_source":        st.effective_control_source,
+        "control_mode":          normalize_control_mode(merged),
         "target_temp":           st.effective_target_temp,
         "last_command_source":   st.last_command_source,
         "last_ac_on_at":         st.last_ac_on_at,

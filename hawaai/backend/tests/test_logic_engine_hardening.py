@@ -399,6 +399,132 @@ class TestLogicEngineHardening(unittest.TestCase):
 
         self.assertEqual((action, source), ("off", "thermostat_reached"))
 
+    def test_pending_on_emit_hold_preserves_pending_cycle(self):
+        st = logic_engine.RoomRuntime()
+        st.pending_action = "on"
+        st.pending_since = 123.0
+        st.pending_on_ir_sent = True
+
+        self.assertTrue(logic_engine._pending_on_emit_hold_in_progress(st, "hold"))
+        if not logic_engine._pending_on_emit_hold_in_progress(st, "hold"):
+            logic_engine._sync_pending_for_action(st, "hold")
+        self.assertEqual(st.pending_action, "on")
+        self.assertEqual(st.pending_since, 123.0)
+
+    def test_control_mode_defaults_to_thermostat(self):
+        self.assertEqual(logic_engine.normalize_control_mode({}), "thermostat")
+        self.assertEqual(logic_engine.normalize_control_mode({"control_mode": "bad"}), "thermostat")
+        self.assertEqual(
+            logic_engine.normalize_control_mode({"control_mode": "presence_only"}),
+            "presence_only",
+        )
+
+    def test_presence_only_missing_presence_holds_without_on(self):
+        st = logic_engine.RoomRuntime()
+        now = datetime.now(timezone.utc)
+
+        with mock.patch.object(logic_engine, "log_with_room") as log_with_room:
+            action, source, occupied = logic_engine._resolve_presence_only_decision(
+                "room-x",
+                {"control_mode": "presence_only"},
+                st,
+                "unknown",
+                ac_on=False,
+                now=now,
+            )
+
+        self.assertEqual((action, source, occupied), ("hold", "presence_unavailable", False))
+        self.assertIsNone(st.presence_only_present_since)
+        self.assertTrue(log_with_room.called)
+
+    def test_presence_only_on_requires_confirmed_dwell_without_temp_sensor(self):
+        st = logic_engine.RoomRuntime()
+        now = datetime.now(timezone.utc)
+        cfg = {
+            "control_mode": "presence_only",
+            "presence_only_on_dwell_seconds": 20,
+        }
+
+        action, source, occupied = logic_engine._resolve_presence_only_decision(
+            "room-x",
+            cfg,
+            st,
+            "on",
+            ac_on=False,
+            now=now,
+        )
+        self.assertEqual((action, source, occupied), ("hold", "presence_dwell", True))
+
+        action, source, occupied = logic_engine._resolve_presence_only_decision(
+            "room-x",
+            cfg,
+            st,
+            "on",
+            ac_on=False,
+            now=now + timedelta(seconds=21),
+        )
+        self.assertEqual((action, source, occupied), ("on", "presence_only", True))
+
+    def test_presence_only_off_uses_vacancy_grace(self):
+        st = logic_engine.RoomRuntime()
+        now = datetime.now(timezone.utc)
+        cfg = {"control_mode": "presence_only", "vacancy_timeout_minutes": 1}
+
+        action, source, occupied = logic_engine._resolve_presence_only_decision(
+            "room-x",
+            cfg,
+            st,
+            "off",
+            ac_on=True,
+            now=now,
+        )
+        self.assertEqual((action, source, occupied), ("hold", "presence_vacancy_grace", False))
+
+        action, source, occupied = logic_engine._resolve_presence_only_decision(
+            "room-x",
+            cfg,
+            st,
+            "off",
+            ac_on=True,
+            now=now + timedelta(seconds=61),
+        )
+        self.assertEqual((action, source, occupied), ("off", "presence_vacant", False))
+
+    def test_presence_only_max_runtime_failsafe_forces_off(self):
+        st = logic_engine.RoomRuntime()
+        now = datetime.now(timezone.utc)
+        st.effective_on_since_ts = (now - timedelta(minutes=31)).timestamp()
+
+        with mock.patch.object(logic_engine, "log_with_room") as log_with_room:
+            action, source, occupied = logic_engine._resolve_presence_only_decision(
+                "room-x",
+                {
+                    "control_mode": "presence_only",
+                    "presence_only_max_runtime_minutes": 30,
+                },
+                st,
+                "on",
+                ac_on=True,
+                now=now,
+            )
+
+        self.assertEqual((action, source, occupied), ("off", "presence_max_runtime", True))
+        self.assertTrue(log_with_room.called)
+
+    def test_thermostat_decision_unchanged_by_control_mode_default(self):
+        logic_engine._runtime_by_room.clear()
+        now = datetime.now(timezone.utc)
+        action, source, target = logic_engine._resolve_control_decision(
+            "room-x",
+            {},
+            indoor_temp=26.0,
+            effective_target=24.0,
+            is_occupied=True,
+            ac_on=False,
+            now=now,
+        )
+        self.assertEqual((action, source, target), ("on", "thermostat", 24.0))
+
     def test_fp2_zone_gate_metrics_allow_fallback_and_block(self):
         logic_engine._runtime_by_room.clear()
         rid = "z-metrics"

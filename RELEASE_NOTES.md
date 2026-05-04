@@ -1,5 +1,11 @@
 # HawaAI add-on — release notes
 
+## 1.4.32
+
+- **Control:** Added `presence_only` room mode for rooms without indoor temperature sensors. In this mode HawaAI uses occupancy only, with confirmed-presence dwell before ON, vacancy grace before OFF, max runtime failsafe, and safe hold on unavailable presence.
+- **UI:** Added a room control-mode selector, hides thermostat/AI/weather temperature fields in presence-only mode, and shows a mode helper note.
+- **Tests:** Added regression coverage for no-temp presence-only decisions, dwell, vacancy OFF, unavailable presence safety, max runtime failsafe, and thermostat default behavior.
+
 ## 1.4.31
 
 - **UI:** Fixed room logs panel height at 300px with internal scrolling and bottom-aware auto-scroll. Sessions now show full datetimes, date grouping, Stored/Invalid badges, null-safe cost display, and clearer empty states.
