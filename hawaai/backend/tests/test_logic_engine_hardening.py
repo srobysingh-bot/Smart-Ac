@@ -33,6 +33,53 @@ class TestLogicEngineHardening(unittest.TestCase):
         self.assertIsNotNone(r)
         self.assertEqual(r["id"], "aBc123XYZ789")
 
+    def test_tick_impl_initializes_now_before_presence_stabilization(self):
+        logic_engine._runtime_by_room.clear()
+        rid = "tick-now"
+        cfg = {
+            "rooms": [
+                {
+                    "id": rid,
+                    "climate_entity": "climate.test",
+                    "presence_entity": "binary_sensor.presence",
+                    "indoor_temp_entity": "sensor.temp",
+                    "control_mode": "presence_only",
+                    "manual_override": True,
+                    "use_presence": True,
+                },
+            ],
+        }
+
+        async def run_case():
+            async def fake_get_state(entity_id):
+                if entity_id == "sensor.temp":
+                    return "25"
+                return "off"
+
+            with (
+                mock.patch.object(logic_engine.config_manager, "load_config", return_value=cfg),
+                mock.patch.object(logic_engine, "_load_startup_state", new=mock.AsyncMock()),
+                mock.patch.object(
+                    logic_engine.ha_client,
+                    "get_climate_state",
+                    new=mock.AsyncMock(return_value={"state": "off"}),
+                ),
+                mock.patch.object(
+                    logic_engine.ha_client,
+                    "get_state",
+                    side_effect=fake_get_state,
+                ),
+                mock.patch.object(
+                    logic_engine,
+                    "_stabilize_presence",
+                    return_value=True,
+                ) as stabilize_presence,
+            ):
+                await logic_engine._tick_impl(rid, rid)
+            stabilize_presence.assert_called_once()
+
+        asyncio.run(run_case())
+
     def test_get_runtime_state_matches_canonical_room(self):
         """API may pass mixed-case URL id — merge config from resolve_room_definition."""
         rid = "cafef00dbabe"

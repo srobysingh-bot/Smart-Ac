@@ -1963,6 +1963,8 @@ async def _tick_impl(rid_raw: str, room_id: str) -> None:
     """
     Core tick body. Caller must hold ``_room_ops_lock(room_id)`` so this never races ``stop_room``.
     """
+    now = datetime.now(timezone.utc)
+
     base_cfg = config_manager.load_config()
     room_def = resolve_room_definition(base_cfg, rid_raw)
     if not room_def:
@@ -2077,8 +2079,6 @@ async def _tick_impl(rid_raw: str, room_id: str) -> None:
     if cfg.get("manual_override", False):
         logger.info("[HawaAI] Manual override active — skipping logic")
         return
-
-    now = datetime.now(timezone.utc)
 
     if presence_only:
         await _tick_presence_only_mode(

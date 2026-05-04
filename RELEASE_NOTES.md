@@ -1,5 +1,10 @@
 # HawaAI add-on — release notes
 
+## 1.4.39
+
+- **Runtime:** Fixed `_tick_impl` crash by initializing timezone-aware `now` before presence stabilization.
+- **Tests:** Added regression coverage for tick-time initialization before stabilized presence is evaluated.
+
 ## 1.4.38
 
 - **Presence:** Added a 60s stabilization layer so false vacancy spikes are held as occupied before control decisions see them.
