@@ -3210,7 +3210,44 @@ async def _turn_ac_on_tuya(
     state = await ha_client.get_climate_state(climate_entity)
     supported_fan = _resolve_supported_fan_mode(fan_mode, state.get("fan_modes"))
     current_fan = str(state.get("fan_mode") or "").strip().lower()
+    current_hvac = str(state.get("state") or "").strip().lower()
 
+    # ── Step 1: set_hvac_mode — REQUIRED for Tuya IR power-on ──────────────
+    # climate.set_temperature alone does NOT fire a power-on IR blast on Tuya.
+    # Only set_hvac_mode transitioning from off → cool fires the power-on IR code.
+    # This is the reason the AC never beeps/starts even though HA returns 200 OK.
+    if current_hvac != hvac_mode.lower():
+        log_with_room(
+            "info",
+            room_id,
+            "[IR][tuya] step=set_hvac_mode entity=%s hvac=%s (was=%s)",
+            climate_entity,
+            hvac_mode,
+            current_hvac,
+        )
+        ok_mode = await ha_client.call_service("climate", "set_hvac_mode", {
+            "entity_id": climate_entity,
+            "hvac_mode": hvac_mode,
+        })
+        if not ok_mode:
+            log_with_room(
+                "warning",
+                room_id,
+                "[IR][tuya] step=set_hvac_mode FAILED — aborting ON (entity=%s)",
+                climate_entity,
+            )
+            return False
+        # Give Tuya IR blaster time to transmit and AC time to power up before next command.
+        await asyncio.sleep(2.0)
+    else:
+        log_with_room(
+            "info",
+            room_id,
+            "[IR][tuya] step=set_hvac_mode skipped_already=%s",
+            hvac_mode,
+        )
+
+    # ── Step 2: set_temperature with hvac_mode bundled ──────────────────────
     payload_temp = {
         "entity_id": climate_entity,
         "temperature": float(temperature),
@@ -3235,6 +3272,7 @@ async def _turn_ac_on_tuya(
         )
         return False
 
+    # ── Step 3: set_fan_mode if needed ──────────────────────────────────────
     if supported_fan:
         if current_fan == supported_fan.lower():
             log_with_room("info", room_id, "[IR][tuya] step=set_fan_mode skipped_already=%s", supported_fan)

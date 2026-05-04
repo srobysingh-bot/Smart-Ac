@@ -1,5 +1,9 @@
 # HawaAI add-on — release notes
 
+## 1.4.43
+
+- **IR:** Fixed Tuya AC power-on by sending `climate.set_hvac_mode` before temperature and fan commands.
+
 ## 1.4.42
 
 - **Control:** Prevent overlapping event-triggered ticks, extend the decision lock past the scheduler interval, and fix presence-only session lifecycle argument order.
