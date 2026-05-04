@@ -906,6 +906,31 @@ def _apply_pending_on_decision_lock(
     return action, source
 
 
+def _apply_pending_on_off_block(
+    room_id: str,
+    st: RoomRuntime,
+    action: str,
+    source: str,
+    now: datetime,
+) -> Tuple[str, str]:
+    if (
+        action == "off"
+        and st.pending_action == "on"
+        and st.pending_on_ir_sent
+        and st.pending_on_ir_sent_at is not None
+    ):
+        elapsed = (now - st.pending_on_ir_sent_at).total_seconds()
+        if elapsed < float(PENDING_ON_CONFIRM_TIMEOUT_SECS):
+            log_with_room(
+                "info",
+                room_id,
+                "[CONTROL] Block OFF — pending ON not yet confirmed (%.1fs)",
+                elapsed,
+            )
+            return "hold", "pending_on_protection"
+    return action, source
+
+
 async def _clear_timed_out_pending_on(
     room_id: str,
     st: RoomRuntime,
@@ -1916,6 +1941,7 @@ async def _tick_impl(rid_raw: str, room_id: str) -> None:
     )
     action, source, zone_gate_blocked = _fp2_zone_apply_on_gate(room_id, cfg, action, source)
     action, source = _apply_pending_on_decision_lock(room_id, st, action, source)
+    action, source = _apply_pending_on_off_block(room_id, st, action, source, now)
     control_action, control_source = action, source
 
     zone_e_log = (str(cfg.get("zone_entity_id") or "")).strip()
@@ -1960,17 +1986,19 @@ async def _tick_impl(rid_raw: str, room_id: str) -> None:
                 action, source = "hold", "decision_lock"
     st.effective_control_source = source
 
-    if control_source != "pending_on_lock":
+    pending_on_hold_sources = ("pending_on_lock", "pending_on_protection")
+
+    if control_source not in pending_on_hold_sources:
         _sync_pending_for_action(st, control_action)
     bypass_actuation_delay = _delay_control_bypass(st, cfg, now, control_source)
 
-    if control_action != "on" and control_source != "pending_on_lock":
+    if control_action != "on" and control_source not in pending_on_hold_sources:
         st.soft_start_ui = False
 
     if (
         st.ac_state == "on_failed"
         and control_action != "on"
-        and control_source != "pending_on_lock"
+        and control_source not in pending_on_hold_sources
     ):
         st.ac_state = "on" if st.physical_ac_on else "off"
 
@@ -1982,7 +2010,7 @@ async def _tick_impl(rid_raw: str, room_id: str) -> None:
     )
     if (
         control_action in ("on", "hold")
-        and control_source in ("thermostat", "pending_on_lock")
+        and control_source in ("thermostat", *pending_on_hold_sources)
         and st.pending_action == "on"
         and st.pending_on_ir_sent
         and soft_on_detected
@@ -1999,7 +2027,7 @@ async def _tick_impl(rid_raw: str, room_id: str) -> None:
 
     if (
         control_action in ("on", "hold")
-        and control_source in ("thermostat", "pending_on_lock")
+        and control_source in ("thermostat", *pending_on_hold_sources)
         and st.pending_action == "on"
         and st.pending_on_ir_sent
         and st.pending_on_ir_sent_at is not None

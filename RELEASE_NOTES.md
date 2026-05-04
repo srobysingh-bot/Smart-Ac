@@ -1,5 +1,10 @@
 # HawaAI add-on — release notes
 
+## 1.4.30
+
+- **Control:** Protect the pending ON transition from premature OFF decisions. After the single ON emit, OFF is blocked until confirmation or the pending ON timeout, preventing `ON → OFF → ON` command thrashing while the compressor ramps up.
+- **Tests:** Added regression coverage for OFF blocking during pending ON and release after timeout.
+
 ## 1.4.29
 
 - **Control:** Prevent duplicate delayed ON commands while a pending ON is awaiting confirmation. The engine now locks repeated thermostat ON decisions after the single IR emit, preserves the pending cycle until power/HA confirmation or timeout, and clears the pending lock on confirmation, manual override, or `on_failed` timeout.

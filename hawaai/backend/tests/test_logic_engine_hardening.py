@@ -361,6 +361,44 @@ class TestLogicEngineHardening(unittest.TestCase):
             any("Skip ON" in str(call.args) for call in log_with_room.call_args_list)
         )
 
+    def test_pending_on_off_block_protects_until_timeout(self):
+        st = logic_engine.RoomRuntime()
+        now = datetime.now(timezone.utc)
+        st.pending_action = "on"
+        st.pending_on_ir_sent = True
+        st.pending_on_ir_sent_at = now - timedelta(seconds=5)
+
+        with mock.patch.object(logic_engine, "log_with_room") as log_with_room:
+            action, source = logic_engine._apply_pending_on_off_block(
+                "room-x", st, "off", "thermostat_reached", now,
+            )
+
+        self.assertEqual((action, source), ("hold", "pending_on_protection"))
+        self.assertEqual(st.pending_action, "on")
+        self.assertTrue(
+            any("Block OFF" in str(call.args) for call in log_with_room.call_args_list)
+        )
+
+        st.pending_on_ir_sent_at = now - timedelta(
+            seconds=logic_engine.PENDING_ON_CONFIRM_TIMEOUT_SECS + 1
+        )
+        action, source = logic_engine._apply_pending_on_off_block(
+            "room-x", st, "off", "thermostat_reached", now,
+        )
+        self.assertEqual((action, source), ("off", "thermostat_reached"))
+
+    def test_pending_on_off_block_requires_ir_timestamp(self):
+        st = logic_engine.RoomRuntime()
+        st.pending_action = "on"
+        st.pending_on_ir_sent = True
+        st.pending_on_ir_sent_at = None
+
+        action, source = logic_engine._apply_pending_on_off_block(
+            "room-x", st, "off", "thermostat_reached", datetime.now(timezone.utc),
+        )
+
+        self.assertEqual((action, source), ("off", "thermostat_reached"))
+
     def test_fp2_zone_gate_metrics_allow_fallback_and_block(self):
         logic_engine._runtime_by_room.clear()
         rid = "z-metrics"
