@@ -17,14 +17,14 @@ async def start() -> None:
     logger.info("[HawaAI] Scheduler started")
     weather_accumulator = 0
 
-    # Startup configuration — climate-only control path (Aerostate / ac_adapter)
+    # Startup configuration - climate-only control path (AeroState / Tuya adapters)
     try:
         cfg = config_manager.load_config()
         ac_ent = (cfg.get("ac_entity") or cfg.get("climate_entity") or "").strip() or "(not set)"
         smart_on = logic_engine.smart_temp_adjustment_enabled(cfg)
         logger.info("[HawaAI] --- Startup configuration ---")
         logger.info("[HawaAI]   AC entity         : %s", ac_ent)
-        logger.info("[HawaAI]   Control mode      : climate_adapter (Aerostate)")
+        logger.info("[HawaAI]   Control mode      : climate_adapter")
         logger.info("[HawaAI]   presence_entity   : %s", cfg.get("presence_entity") or "(not set)")
         logger.info("[HawaAI]   indoor_temp_entity: %s", cfg.get("indoor_temp_entity") or "(not set)")
         logger.info("[HawaAI]   energy_power      : %s", cfg.get("energy_power_entity") or "(not set)")

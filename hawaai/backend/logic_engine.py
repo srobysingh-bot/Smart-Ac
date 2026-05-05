@@ -3,10 +3,10 @@ HawaAI core decision engine — THE BRAIN.
 
 Called every `logic_interval_seconds` by the scheduler.
 
-AC control architecture (v1.2.0):
+AC control architecture:
   ┌───────────────────────────────────────────────────────────────────────┐
-  │  CONTROL  →  Aerostate (climate entity) via ac_adapter               │
-  │               ac_adapter → HA climate services → Broadlink → AC      │
+  │  CONTROL  →  AeroState adapter or Tuya adapter by ir_backend         │
+  │               AeroState → HA climate entity → Broadlink → AC         │
   │  STATE    →  Power sensor (watts) — primary ground truth              │
   │               Internal _ac_is_on flag — used during 60 s cooldown     │
   │  DISPLAY  →  Climate entity read-only (temp, mode, fan, swing)        │
@@ -28,8 +28,8 @@ Cooldown (60 s after any climate command):
   to avoid false "OFF" detection and a premature re-send of the ON command.
   After 60 s the power sensor takes over as the authoritative source.
 
-Hardware ON/OFF: only ``tick()`` → ``_turn_ac_on`` / ``_turn_ac_off`` → ``ac_adapter``.
-AI adjusts targets only (`_get_ai_target_adjustment`); it never invokes ``ac_adapter`` or turn helpers.
+Hardware ON/OFF: only ``tick()`` → ``_turn_ac_on`` / ``_turn_ac_off`` → backend adapter.
+AI adjusts targets only (`_get_ai_target_adjustment`); it never invokes backend adapters or turn helpers.
 
 Runtime isolation: ``_runtime_by_room`` maps one ``RoomRuntime`` per trimmed ``room_id`` (via ``_rt()``).
 """
@@ -41,7 +41,17 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional, Tuple
 
-from . import ac_adapter, config_manager, database, ha_client, live_broadcast, session_logger, smart_cooling, weather_api
+from . import (
+    ac_aerostate_adapter,
+    ac_tuya_adapter,
+    config_manager,
+    database,
+    ha_client,
+    live_broadcast,
+    session_logger,
+    smart_cooling,
+    weather_api,
+)
 from . import room_registry
 from .room_log_store import room_log_store
 from .ai import (
@@ -552,43 +562,14 @@ def normalize_control_mode(cfg: dict) -> str:
 
 
 def normalize_ir_backend(cfg: dict) -> str:
-    backend = str(cfg.get("ir_backend") or "broadlink").strip().lower()
-    return backend if backend in ("broadlink", "tuya") else "broadlink"
-
-
-async def _auto_detect_ir_backend(climate_entity: str) -> Optional[str]:
-    if not climate_entity:
-        return None
-    try:
-        full = await ha_client.get_entity_state_full(climate_entity)
-    except Exception:
-        return None
-    attrs = (full or {}).get("attributes") or {}
-    candidates = (
-        attrs.get("integration"),
-        attrs.get("platform"),
-        attrs.get("device_class"),
-    )
-    for candidate in candidates:
-        text = str(candidate or "").strip().lower()
-        if text in ("tuya", "broadlink"):
-            return text
-    return None
+    backend = str(cfg.get("ir_backend") or "aerostate").strip().lower()
+    return backend if backend in ("aerostate", "tuya") else "aerostate"
 
 
 async def resolve_ir_backend(room_id: str, cfg: dict, climate_entity: str) -> str:
-    raw = str(cfg.get("ir_backend") or "").strip().lower()
-    if raw in ("broadlink", "tuya"):
-        log_with_room("info", room_id, "[IR] backend=%s (manual)", raw)
-        return raw
-
-    detected = await _auto_detect_ir_backend(climate_entity)
-    if detected:
-        log_with_room("info", room_id, "[IR] backend=%s (auto-detected)", detected)
-        return detected
-
-    log_with_room("info", room_id, "[IR] backend=broadlink (fallback)")
-    return "broadlink"
+    backend = normalize_ir_backend(cfg)
+    log_with_room("info", room_id, "[IR] backend=%s", backend)
+    return backend
 
 
 def _presence_only_on_dwell_seconds(cfg: dict) -> float:
@@ -3238,121 +3219,6 @@ async def _handle_delayed_off(
 
 # ── Turn AC ON ────────────────────────────────────────────────────────────────
 
-def _resolve_supported_fan_mode(requested: str, supported: object) -> Optional[str]:
-    modes = [str(x).strip() for x in (supported or []) if str(x).strip()]
-    if not modes:
-        return None
-    req = str(requested or "").strip()
-    if not req:
-        return None
-    exact = next((m for m in modes if m == req), None)
-    if exact:
-        return exact
-    low_map = {m.lower(): m for m in modes}
-    return low_map.get(req.lower())
-
-
-async def _turn_ac_on_tuya(
-    room_id: str,
-    climate_entity: str,
-    temperature: float,
-    *,
-    fan_mode: str = "auto",
-    hvac_mode: str = "cool",
-) -> bool:
-    if not climate_entity:
-        log_with_room("error", room_id, "[IR][tuya] AC ON FAILED — no climate entity configured")
-        return False
-
-    state = await ha_client.get_climate_state(climate_entity)
-    supported_fan = _resolve_supported_fan_mode(fan_mode, state.get("fan_modes"))
-    current_fan = str(state.get("fan_mode") or "").strip().lower()
-    current_hvac = str(state.get("state") or "").strip().lower()
-
-    # ── Step 1: set_hvac_mode — REQUIRED for Tuya IR power-on ──────────────
-    # climate.set_temperature alone does NOT fire a power-on IR blast on Tuya.
-    # Only set_hvac_mode transitioning from off → cool fires the power-on IR code.
-    # This is the reason the AC never beeps/starts even though HA returns 200 OK.
-    if current_hvac != hvac_mode.lower():
-        log_with_room(
-            "info",
-            room_id,
-            "[IR][tuya] step=set_hvac_mode entity=%s hvac=%s (was=%s)",
-            climate_entity,
-            hvac_mode,
-            current_hvac,
-        )
-        ok_mode = await ha_client.call_service("climate", "set_hvac_mode", {
-            "entity_id": climate_entity,
-            "hvac_mode": hvac_mode,
-        })
-        if not ok_mode:
-            log_with_room(
-                "warning",
-                room_id,
-                "[IR][tuya] step=set_hvac_mode FAILED — aborting ON (entity=%s)",
-                climate_entity,
-            )
-            return False
-        # Give Tuya IR blaster time to transmit and AC time to power up before next command.
-        await asyncio.sleep(2.0)
-    else:
-        log_with_room(
-            "info",
-            room_id,
-            "[IR][tuya] step=set_hvac_mode skipped_already=%s",
-            hvac_mode,
-        )
-
-    # ── Step 2: set_temperature with hvac_mode bundled ──────────────────────
-    payload_temp = {
-        "entity_id": climate_entity,
-        "temperature": float(temperature),
-        "hvac_mode": hvac_mode,
-    }
-
-    log_with_room(
-        "info",
-        room_id,
-        "[IR][tuya] step=set_temperature entity=%s temp=%.1f hvac=%s",
-        climate_entity,
-        float(temperature),
-        hvac_mode,
-    )
-    ok_temp = await ha_client.call_service("climate", "set_temperature", payload_temp)
-
-    if not ok_temp:
-        log_with_room(
-            "warning",
-            room_id,
-            "[IR][tuya] set_temperature full payload failed before fan step",
-        )
-        return False
-
-    # ── Step 3: set_fan_mode if needed ──────────────────────────────────────
-    if supported_fan:
-        if current_fan == supported_fan.lower():
-            log_with_room("info", room_id, "[IR][tuya] step=set_fan_mode skipped_already=%s", supported_fan)
-        else:
-            log_with_room("info", room_id, "[IR][tuya] step=set_fan_mode entity=%s fan=%s", climate_entity, supported_fan)
-            ok_fan = await ha_client.call_service("climate", "set_fan_mode", {
-                "entity_id": climate_entity,
-                "fan_mode": supported_fan,
-            })
-            if not ok_fan:
-                log_with_room("warning", room_id, "[IR][tuya] step=set_fan_mode failed fan=%s", supported_fan)
-    else:
-        log_with_room(
-            "info",
-            room_id,
-            "[IR][tuya] step=skip_fan_mode_unsupported requested=%s supported=%s",
-            fan_mode,
-            state.get("fan_modes") or [],
-        )
-
-    return True
-
-
 async def _turn_ac_on(
     room_id: str,
     cfg: dict,
@@ -3418,30 +3284,26 @@ async def _turn_ac_on(
 
     ir_backend = await resolve_ir_backend(room_id, cfg, climate_entity)
     if ir_backend == "tuya":
-        success = await _turn_ac_on_tuya(
-            room_id,
+        success = await ac_tuya_adapter.turn_on(
             climate_entity,
             target,
             fan_mode="auto",
             hvac_mode="cool",
         )
+    elif ir_backend == "aerostate":
+        success = await ac_aerostate_adapter.turn_on(
+            climate_entity,
+            target,
+        )
     else:
-        log_with_room(
-            "info", room_id,
-            "[IR][broadlink] dispatch=staged_on entity=%s temp=%.1f hvac=cool",
-            climate_entity, target,
-        )
-        success = await ac_adapter.turn_on(
-            entity_id   = climate_entity,
-            temperature = target,
-            fan_mode    = "auto",
-            hvac_mode   = "cool",
-        )
+        logger.error("[HawaAI][%s] AC ON FAILED: unsupported ir_backend=%s", room_id, ir_backend)
+        return False
     if not success:
         logger.error(
-            "[HawaAI][%s] AC ON via Aerostate FAILED — not marking as ON; "
+            "[HawaAI][%s] AC ON via %s FAILED — not marking as ON; "
             "await physical confirmation or tick timeout (no automatic IR retry)",
             room_id,
+            ir_backend,
         )
         return False
 
@@ -3691,8 +3553,16 @@ async def _turn_ac_off(
         # Hard policy: vacancy must not be skipped for duplicate/cooldown — still log once.
         log_with_room("info", room_id, "[VACANCY] AC OFF forced")
 
+    ir_backend = await resolve_ir_backend(room_id, cfg, climate_entity)
+    if ir_backend == "tuya":
+        await ac_tuya_adapter.turn_off(climate_entity)
+    elif ir_backend == "aerostate":
+        await ac_aerostate_adapter.turn_off(climate_entity)
+    else:
+        logger.error("[HawaAI][%s] AC OFF FAILED: unsupported ir_backend=%s", room_id, ir_backend)
+        return
+
     st.ir_last_sent_ts = tnow
-    await ac_adapter.turn_off(climate_entity)
 
     clear_setpoint_command_tracking(room_id)
 

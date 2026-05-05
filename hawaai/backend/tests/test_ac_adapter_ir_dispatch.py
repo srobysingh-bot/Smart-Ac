@@ -1,4 +1,4 @@
-"""AC adapter IR dispatch behavior."""
+"""AC adapter dispatch behavior."""
 
 import asyncio
 import os
@@ -10,11 +10,45 @@ _HAWAAI = os.path.normpath(os.path.join(os.path.dirname(__file__), ".."))
 if _HAWAAI not in sys.path:
     sys.path.insert(0, _HAWAAI)
 
-from backend import ac_adapter  # noqa: E402
+from backend import ac_aerostate_adapter, ac_tuya_adapter  # noqa: E402
 
 
 class TestAcAdapterIrDispatch(unittest.TestCase):
-    def test_turn_on_sends_staged_mode_then_temperature_payload(self):
+    def test_aerostate_turn_on_sends_single_temperature_payload(self):
+        calls = []
+
+        async def fake_call_service(domain, service, payload, **kwargs):
+            calls.append((domain, service, dict(payload), dict(kwargs)))
+            return True
+
+        async def run_case():
+            with mock.patch.object(
+                ac_aerostate_adapter.ha_client,
+                "call_service",
+                side_effect=fake_call_service,
+            ):
+                ok = await ac_aerostate_adapter.turn_on("climate.aerostate", 24.0)
+            self.assertTrue(ok)
+
+        asyncio.run(run_case())
+
+        self.assertEqual(
+            calls,
+            [
+                (
+                    "climate",
+                    "set_temperature",
+                    {
+                        "entity_id": "climate.aerostate",
+                        "hvac_mode": "cool",
+                        "temperature": 24.0,
+                    },
+                    {"blocking": True},
+                ),
+            ],
+        )
+
+    def test_tuya_turn_on_keeps_staged_mode_then_temperature_payload(self):
         calls = []
 
         async def fake_call_service(domain, service, payload, **kwargs):
@@ -24,7 +58,7 @@ class TestAcAdapterIrDispatch(unittest.TestCase):
         async def run_case():
             with (
                 mock.patch.object(
-                    ac_adapter.ha_client,
+                    ac_tuya_adapter.ha_client,
                     "get_climate_state",
                     return_value={
                         "state": "off",
@@ -34,13 +68,13 @@ class TestAcAdapterIrDispatch(unittest.TestCase):
                     },
                 ),
                 mock.patch.object(
-                    ac_adapter.ha_client,
+                    ac_tuya_adapter.ha_client,
                     "call_service",
                     side_effect=fake_call_service,
                 ),
-                mock.patch.object(ac_adapter.asyncio, "sleep", new=mock.AsyncMock()) as sleep,
+                mock.patch.object(ac_tuya_adapter.asyncio, "sleep", new=mock.AsyncMock()) as sleep,
             ):
-                ok = await ac_adapter.turn_on("climate.broadlink", 24.0)
+                ok = await ac_tuya_adapter.turn_on("climate.tuya", 24.0)
             self.assertTrue(ok)
             sleep.assert_awaited_once_with(2.0)
 
@@ -53,44 +87,32 @@ class TestAcAdapterIrDispatch(unittest.TestCase):
                     "climate",
                     "set_hvac_mode",
                     {
-                        "entity_id": "climate.broadlink",
+                        "entity_id": "climate.tuya",
                         "hvac_mode": "cool",
                     },
-                    {"blocking": True},
+                    {},
                 ),
                 (
                     "climate",
                     "set_temperature",
                     {
-                        "entity_id": "climate.broadlink",
+                        "entity_id": "climate.tuya",
                         "temperature": 24.0,
+                        "hvac_mode": "cool",
+                    },
+                    {},
+                ),
+                (
+                    "climate",
+                    "set_fan_mode",
+                    {
+                        "entity_id": "climate.tuya",
                         "fan_mode": "auto",
                     },
-                    {"blocking": True},
+                    {},
                 ),
             ],
         )
-
-    def test_turn_on_skips_temperature_when_on_and_temp_unchanged(self):
-        async def run_case():
-            with (
-                mock.patch.object(
-                    ac_adapter.ha_client,
-                    "get_climate_state",
-                    return_value={
-                        "state": "cool",
-                        "target_temp": 24.1,
-                        "fan_mode": "auto",
-                        "fan_modes": ["auto"],
-                    },
-                ),
-                mock.patch.object(ac_adapter.ha_client, "call_service") as call_service,
-            ):
-                ok = await ac_adapter.turn_on("climate.broadlink", 24.0)
-            self.assertTrue(ok)
-            call_service.assert_not_called()
-
-        asyncio.run(run_case())
 
 
 if __name__ == "__main__":

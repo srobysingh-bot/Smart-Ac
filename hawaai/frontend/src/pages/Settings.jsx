@@ -779,14 +779,14 @@ export default function Settings() {
             <Label>IR backend profile</Label>
             <select
               className="w-full bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm text-gray-100 focus:outline-none focus:border-blue-500"
-              value={cfg.ir_backend || 'broadlink'}
+              value={cfg.ir_backend || 'aerostate'}
               onChange={e => patch('ir_backend', e.target.value)}
             >
-              <option value="broadlink">Broadlink</option>
+              <option value="aerostate">AeroState</option>
               <option value="tuya">Tuya</option>
             </select>
             <p className="text-xs text-gray-500 mt-1">
-              Broadlink uses the existing single adapter path. Tuya uses staged mode, temperature, and supported fan commands.
+              AeroState sends one climate command for Broadlink-backed rooms. Tuya uses staged mode, temperature, and supported fan commands.
             </p>
           </div>
 

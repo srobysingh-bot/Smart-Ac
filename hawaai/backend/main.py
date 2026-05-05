@@ -779,9 +779,9 @@ def _sanitize_control_mode_room_settings(incoming_settings: Dict[str, Any]) -> N
             mode if mode in ("thermostat", "presence_only") else "thermostat"
         )
     if "ir_backend" in incoming_settings:
-        backend = str(incoming_settings.get("ir_backend") or "broadlink").strip().lower()
+        backend = str(incoming_settings.get("ir_backend") or "aerostate").strip().lower()
         incoming_settings["ir_backend"] = (
-            backend if backend in ("broadlink", "tuya") else "broadlink"
+            backend if backend in ("aerostate", "tuya") else "aerostate"
         )
     for key, default, lo, hi in (
         ("presence_only_on_dwell_seconds", 20.0, 0.0, 3600.0),

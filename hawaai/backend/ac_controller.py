@@ -1,8 +1,8 @@
 """
 AC brand/model library + legacy ACController stub.
 
-HawaAI control is climate-only (ac_adapter → Aerostate). IR/Broadlink is no
-longer used from this add-on. The library remains for reference / future use.
+HawaAI control is climate-only (backend adapter -> AeroState/Tuya). Raw IR is
+no longer used from this add-on. The library remains for reference / future use.
 """
 
 import json
