@@ -168,6 +168,7 @@ class RoomRuntime:
     pending_on_ir_sent_at: Optional[datetime] = None
     # Pending ON cleared early on soft power (below compressor threshold) — UI only, not sessions.
     soft_start_ui: bool = False
+    on_failed_retry_used: bool = False
     # FP2 zone (optional): dwell + confirmation for ON-only gating; never used for OFF.
     zone_present: bool = False
     zone_entered_at: Optional[datetime] = None
@@ -540,7 +541,11 @@ def _resolve_control_decision(
         return ("hold", "manual", effective_target)
 
     # ── PRIORITY 3: Global IR cooldown — block thermostat commands only ─────────
-    if _is_in_cooldown(st, now):
+    if (
+        _is_in_cooldown(st, now)
+        and st.pending_action != "on"
+        and st.ac_state != "on_failed"
+    ):
         return ("hold_cooldown", "cooldown", effective_target)
 
     # ── PRIORITY 4: Thermostat hysteresis ─────────────────────────────────────────
@@ -842,6 +847,9 @@ def _fp2_zone_apply_on_gate(
     required = bool(cfg.get("zone_required_for_on", False))
     if not required or not zone_e:
         return action, source, False
+    if not (st.ac_is_on or st.physical_ac_on):
+        st.zone_allow_count += 1
+        return action, source, False
     if not st.zone_sensor_usable:
         st.zone_allow_count += 1
         return action, source, False
@@ -849,6 +857,7 @@ def _fp2_zone_apply_on_gate(
         st.zone_allow_count += 1
         return action, source, False
     st.zone_block_count += 1
+    log_with_room("info", room_id, "[CONTROL] zone_gate_blocked")
     return "hold", "zone_gate", True
 
 
@@ -1268,11 +1277,25 @@ async def _clear_timed_out_pending_on(
     )
     st.ac_state = "on_failed"
     st.last_command = "on_failed"
+    st.on_failed_retry_used = False
     try:
         await live_broadcast.broadcast_room_update(room_id)
     except Exception:
         pass
     _clear_pending_command_state(st)
+    return True
+
+
+def _on_failed_retry_allowed(room_id: str, st: RoomRuntime, now: datetime) -> bool:
+    if st.ac_state != "on_failed" or st.on_failed_retry_used:
+        return False
+    if st.last_command_time is None:
+        return False
+    elapsed = (now - st.last_command_time).total_seconds()
+    if elapsed < 30.0:
+        return False
+    st.on_failed_retry_used = True
+    log_with_room("info", room_id, "[CONTROL] on_retry_allowed")
     return True
 
 
@@ -1578,7 +1601,11 @@ def _gate_turn_ac_on(
         return False
 
     # IR cooldown: bypass when resending same ON while still physically OFF (missed IR / HA drop).
-    if _is_in_cooldown(st, now) and not _is_user_authority_active(st, cfg, now):
+    if (
+        _is_in_cooldown(st, now)
+        and st.pending_action != "on"
+        and not _is_user_authority_active(st, cfg, now)
+    ):
         if not resend_after_missed_ack:
             secs = _seconds_since_last_command(st, now)
             logger.info(
@@ -2005,7 +2032,7 @@ async def _tick_presence_only_mode(
         if bypass_actuation_delay:
             await _turn_ac_on(room_id, cfg, indoor_temp, et_eff, now=now)
             _clear_pending_command_state(st)
-        elif st.ac_state == "on_failed":
+        elif st.ac_state == "on_failed" and not _on_failed_retry_allowed(room_id, st, now):
             log_with_room(
                 "info",
                 room_id,
@@ -2679,7 +2706,11 @@ async def _tick_impl(rid_raw: str, room_id: str) -> None:
             await _turn_ac_on(room_id, cfg, indoor_temp, et_eff, now=now)
             _clear_pending_command_state(st)
             st.last_command_source = "system"
-        elif st.ac_state == "on_failed" and not str(control_source).startswith("safety"):
+        elif (
+            st.ac_state == "on_failed"
+            and not str(control_source).startswith("safety")
+            and not _on_failed_retry_allowed(room_id, st, now)
+        ):
             log_with_room(
                 "info",
                 room_id,
@@ -3316,6 +3347,7 @@ async def _turn_ac_on(
     _bump_last_command_ir_cooldown(st, cmd_ts)
     st.last_command = "on"
     st.last_sent_command_key = _fingerprint_turn_on(target)
+    st.on_failed_retry_used = False
     st.compressor_on_since = None
     st.compressor_off_since = None
     record_setpoint_command(room_id, target, cmd_ts)

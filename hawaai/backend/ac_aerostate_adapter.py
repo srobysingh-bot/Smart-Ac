@@ -17,7 +17,10 @@ async def turn_on(entity_id: str, temperature: float) -> bool:
         logger.error("[HawaAI] AeroState ON failed: no climate entity configured")
         return False
 
-    ok = await ha_client.call_service(
+    state = await ha_client.get_climate_state(entity_id)
+    current_hvac = state.get("state") if state else None
+
+    ok_primary = await ha_client.call_service(
         "climate",
         "set_temperature",
         {
@@ -27,11 +30,32 @@ async def turn_on(entity_id: str, temperature: float) -> bool:
         },
         blocking=True,
     )
-    if ok:
-        logger.info("[IR][aerostate] ON entity=%s temp=%.1f", entity_id, float(temperature))
+    if ok_primary:
+        logger.info(
+            "[IR][aerostate] primary_on_sent entity=%s temp=%.1f",
+            entity_id,
+            float(temperature),
+        )
     else:
-        logger.error("[IR][aerostate] ON failed entity=%s", entity_id)
-    return ok
+        logger.error("[IR][aerostate] primary_on_failed entity=%s", entity_id)
+
+    if current_hvac in (None, "off"):
+        ok_fallback = await ha_client.call_service(
+            "climate",
+            "set_hvac_mode",
+            {
+                "entity_id": entity_id,
+                "hvac_mode": "cool",
+            },
+            blocking=True,
+        )
+        if ok_fallback:
+            logger.info("[IR][aerostate] fallback_hvac_mode_sent entity=%s", entity_id)
+        else:
+            logger.error("[IR][aerostate] fallback_hvac_mode_failed entity=%s", entity_id)
+        return bool(ok_primary or ok_fallback)
+
+    return bool(ok_primary)
 
 
 async def turn_off(entity_id: str) -> bool:

@@ -206,6 +206,22 @@ class TestLogicEngineHardening(unittest.TestCase):
         self.assertFalse(st.pending_on_ir_sent)
         self.assertIsNone(st.pending_on_ir_sent_at)
         self.assertFalse(st.soft_start_ui)
+        self.assertFalse(st.on_failed_retry_used)
+
+    def test_on_failed_retry_allowed_once_after_30s(self):
+        st = logic_engine.RoomRuntime()
+        now = datetime.now(timezone.utc)
+        st.ac_state = "on_failed"
+        st.last_command_time = now - timedelta(seconds=31)
+
+        with mock.patch.object(logic_engine, "log_with_room") as log_with_room:
+            self.assertTrue(logic_engine._on_failed_retry_allowed("room-x", st, now))
+            self.assertFalse(logic_engine._on_failed_retry_allowed("room-x", st, now))
+
+        self.assertTrue(st.on_failed_retry_used)
+        self.assertTrue(
+            any("[CONTROL] on_retry_allowed" in str(call.args) for call in log_with_room.call_args_list)
+        )
 
     def test_clear_pending_off_when_already_off(self):
         st = logic_engine.RoomRuntime()
@@ -759,6 +775,25 @@ class TestLogicEngineHardening(unittest.TestCase):
         )
         self.assertEqual((action, source, target), ("on", "thermostat", 24.0))
 
+    def test_cooldown_does_not_block_pending_initial_on(self):
+        logic_engine._runtime_by_room.clear()
+        now = datetime.now(timezone.utc)
+        st = logic_engine._rt("room-x")
+        st.pending_action = "on"
+        st.last_command_time = now - timedelta(seconds=10)
+
+        action, source, target = logic_engine._resolve_control_decision(
+            "room-x",
+            {},
+            indoor_temp=26.0,
+            effective_target=24.0,
+            is_occupied=True,
+            ac_on=False,
+            now=now,
+        )
+
+        self.assertEqual((action, source, target), ("on", "thermostat", 24.0))
+
     def test_vacancy_off_uses_running_protection_from_on_command(self):
         logic_engine._runtime_by_room.clear()
         now = datetime.now(timezone.utc)
@@ -1069,6 +1104,7 @@ class TestLogicEngineHardening(unittest.TestCase):
         cfg = {"zone_entity_id": "binary_sensor.z", "zone_required_for_on": True}
 
         st.zone_sensor_usable = False
+        st.ac_is_on = True
         allow0 = st.zone_allow_count
         logic_engine._fp2_zone_apply_on_gate(rid, cfg, "on", "thermostat")
         self.assertGreater(st.zone_allow_count, allow0)
@@ -1111,6 +1147,7 @@ class TestLogicEngineHardening(unittest.TestCase):
         logic_engine._runtime_by_room.clear()
         rid = "z-g3"
         st = logic_engine._rt(rid)
+        st.ac_is_on = True
         st.zone_sensor_usable = True
         st.zone_confirmed = False
         cfg = {
@@ -1122,6 +1159,21 @@ class TestLogicEngineHardening(unittest.TestCase):
         st.zone_confirmed = True
         a2, s2, b2 = logic_engine._fp2_zone_apply_on_gate(rid, cfg, "on", "thermostat")
         self.assertEqual((a2, s2, b2), ("on", "thermostat", False))
+
+    def test_fp2_zone_gate_does_not_block_initial_on(self):
+        logic_engine._runtime_by_room.clear()
+        rid = "z-initial"
+        st = logic_engine._rt(rid)
+        st.ac_is_on = False
+        st.physical_ac_on = False
+        st.zone_sensor_usable = True
+        st.zone_confirmed = False
+        cfg = {
+            "zone_entity_id": "binary_sensor.z",
+            "zone_required_for_on": True,
+        }
+        a, s, blocked = logic_engine._fp2_zone_apply_on_gate(rid, cfg, "on", "thermostat")
+        self.assertEqual((a, s, blocked), ("on", "thermostat", False))
 
     def test_fp2_zone_gate_never_changes_off(self):
         logic_engine._runtime_by_room.clear()

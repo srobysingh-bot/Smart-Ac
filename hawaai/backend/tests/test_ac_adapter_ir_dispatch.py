@@ -14,7 +14,7 @@ from backend import ac_aerostate_adapter, ac_tuya_adapter  # noqa: E402
 
 
 class TestAcAdapterIrDispatch(unittest.TestCase):
-    def test_aerostate_turn_on_sends_single_temperature_payload(self):
+    def test_aerostate_turn_on_sends_single_temperature_payload_when_already_cool(self):
         calls = []
 
         async def fake_call_service(domain, service, payload, **kwargs):
@@ -22,10 +22,17 @@ class TestAcAdapterIrDispatch(unittest.TestCase):
             return True
 
         async def run_case():
-            with mock.patch.object(
-                ac_aerostate_adapter.ha_client,
-                "call_service",
-                side_effect=fake_call_service,
+            with (
+                mock.patch.object(
+                    ac_aerostate_adapter.ha_client,
+                    "get_climate_state",
+                    return_value={"state": "cool"},
+                ),
+                mock.patch.object(
+                    ac_aerostate_adapter.ha_client,
+                    "call_service",
+                    side_effect=fake_call_service,
+                ),
             ):
                 ok = await ac_aerostate_adapter.turn_on("climate.aerostate", 24.0)
             self.assertTrue(ok)
@@ -42,6 +49,56 @@ class TestAcAdapterIrDispatch(unittest.TestCase):
                         "entity_id": "climate.aerostate",
                         "hvac_mode": "cool",
                         "temperature": 24.0,
+                    },
+                    {"blocking": True},
+                ),
+            ],
+        )
+
+    def test_aerostate_turn_on_adds_fallback_hvac_mode_only_when_off(self):
+        calls = []
+
+        async def fake_call_service(domain, service, payload, **kwargs):
+            calls.append((domain, service, dict(payload), dict(kwargs)))
+            return True
+
+        async def run_case():
+            with (
+                mock.patch.object(
+                    ac_aerostate_adapter.ha_client,
+                    "get_climate_state",
+                    return_value={"state": "off"},
+                ),
+                mock.patch.object(
+                    ac_aerostate_adapter.ha_client,
+                    "call_service",
+                    side_effect=fake_call_service,
+                ),
+            ):
+                ok = await ac_aerostate_adapter.turn_on("climate.aerostate", 24.0)
+            self.assertTrue(ok)
+
+        asyncio.run(run_case())
+
+        self.assertEqual(
+            calls,
+            [
+                (
+                    "climate",
+                    "set_temperature",
+                    {
+                        "entity_id": "climate.aerostate",
+                        "hvac_mode": "cool",
+                        "temperature": 24.0,
+                    },
+                    {"blocking": True},
+                ),
+                (
+                    "climate",
+                    "set_hvac_mode",
+                    {
+                        "entity_id": "climate.aerostate",
+                        "hvac_mode": "cool",
                     },
                     {"blocking": True},
                 ),
