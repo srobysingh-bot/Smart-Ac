@@ -3417,7 +3417,6 @@ async def _turn_ac_on(
             return True
 
     ir_backend = await resolve_ir_backend(room_id, cfg, climate_entity)
-    st.ir_last_sent_ts = tnow
     if ir_backend == "tuya":
         success = await _turn_ac_on_tuya(
             room_id,
@@ -3429,7 +3428,7 @@ async def _turn_ac_on(
     else:
         log_with_room(
             "info", room_id,
-            "[IR][broadlink] dispatch=single set_temperature entity=%s temp=%.1f hvac=cool",
+            "[IR][broadlink] dispatch=staged_on entity=%s temp=%.1f hvac=cool",
             climate_entity, target,
         )
         success = await ac_adapter.turn_on(
@@ -3448,6 +3447,7 @@ async def _turn_ac_on(
 
     st.ac_is_on = True
     cmd_ts = datetime.now(timezone.utc)
+    st.ir_last_sent_ts = cmd_ts
     st.last_ac_on_at = cmd_ts.timestamp()
     st.last_confirmed_on_at = cmd_ts
     st.just_turned_on_until = cmd_ts + timedelta(seconds=float(POST_ON_STABILIZATION_SECONDS))

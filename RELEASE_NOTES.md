@@ -1,5 +1,10 @@
 # HawaAI add-on — release notes
 
+## 1.4.46
+
+- **IR:** Broadlink ON now follows AeroState staging: `set_hvac_mode(cool)`, wait 2s, then `set_temperature(target)` without bundling `hvac_mode` into the temperature call.
+- **Control:** IR send lock now records after the full ON sequence completes successfully.
+
 ## 1.4.45
 
 - **IR:** Broadlink ON now dispatches one combined `climate.set_temperature` payload with `hvac_mode` and target temperature, avoiding split IR packets that can cause ON/OFF/ON toggles.

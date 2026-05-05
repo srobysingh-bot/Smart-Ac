@@ -14,6 +14,7 @@ Rules:
   - Always logs at INFO level so every command is traceable.
 """
 
+import asyncio
 import logging
 from typing import Optional
 
@@ -35,12 +36,13 @@ async def turn_on(
     """
     Turn AC ON via the Aerostate climate entity.
 
-    Broadlink IR is stateless: separate hvac_mode and temperature calls can
-    emit two full IR packets and cause ON/OFF/ON toggles. Send hvac_mode and
-    temperature together so HA emits one command packet.
+    Broadlink/AeroState ON requires staged commands:
+      1) set_hvac_mode("cool")
+      2) wait 2s so the AC accepts the ON packet
+      3) set_temperature(target)
 
     Returns True if a service call succeeded (or if it was a no-op due to current state).
-    Returns False if the combined call failed.
+    Returns False if either staged call failed.
     """
     if not entity_id:
         logger.error(
@@ -105,20 +107,41 @@ async def turn_on(
     except Exception:
         use_fan = None
 
-    payload_temp = {
+    payload_mode = {
         "entity_id": entity_id,
         "hvac_mode": hvac_mode,
+    }
+    payload_temp = {
+        "entity_id": entity_id,
         "temperature": float(temperature),
     }
     if use_fan:
         payload_temp["fan_mode"] = use_fan
 
-    ok = await ha_client.call_service(
-        "climate",
-        "set_temperature",
-        payload_temp,
-        blocking=True,
-    )
+    if already_on:
+        ok = await ha_client.call_service(
+            "climate",
+            "set_temperature",
+            payload_temp,
+            blocking=True,
+        )
+    else:
+        ok_mode = await ha_client.call_service(
+            "climate",
+            "set_hvac_mode",
+            payload_mode,
+            blocking=True,
+        )
+        if not ok_mode:
+            ok = False
+        else:
+            await asyncio.sleep(2.0)
+            ok = await ha_client.call_service(
+                "climate",
+                "set_temperature",
+                payload_temp,
+                blocking=True,
+            )
     if ok:
         logger.info(
             "[HawaAI] Aerostate ON ✓ | mode=%s | temp=%.1f°C | fan=%s",

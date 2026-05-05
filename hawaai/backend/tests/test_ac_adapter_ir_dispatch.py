@@ -14,7 +14,7 @@ from backend import ac_adapter  # noqa: E402
 
 
 class TestAcAdapterIrDispatch(unittest.TestCase):
-    def test_turn_on_sends_single_combined_temperature_payload(self):
+    def test_turn_on_sends_staged_mode_then_temperature_payload(self):
         calls = []
 
         async def fake_call_service(domain, service, payload, **kwargs):
@@ -38,9 +38,11 @@ class TestAcAdapterIrDispatch(unittest.TestCase):
                     "call_service",
                     side_effect=fake_call_service,
                 ),
+                mock.patch.object(ac_adapter.asyncio, "sleep", new=mock.AsyncMock()) as sleep,
             ):
                 ok = await ac_adapter.turn_on("climate.broadlink", 24.0)
             self.assertTrue(ok)
+            sleep.assert_awaited_once_with(2.0)
 
         asyncio.run(run_case())
 
@@ -49,10 +51,18 @@ class TestAcAdapterIrDispatch(unittest.TestCase):
             [
                 (
                     "climate",
-                    "set_temperature",
+                    "set_hvac_mode",
                     {
                         "entity_id": "climate.broadlink",
                         "hvac_mode": "cool",
+                    },
+                    {"blocking": True},
+                ),
+                (
+                    "climate",
+                    "set_temperature",
+                    {
+                        "entity_id": "climate.broadlink",
                         "temperature": 24.0,
                         "fan_mode": "auto",
                     },
@@ -60,6 +70,27 @@ class TestAcAdapterIrDispatch(unittest.TestCase):
                 ),
             ],
         )
+
+    def test_turn_on_skips_temperature_when_on_and_temp_unchanged(self):
+        async def run_case():
+            with (
+                mock.patch.object(
+                    ac_adapter.ha_client,
+                    "get_climate_state",
+                    return_value={
+                        "state": "cool",
+                        "target_temp": 24.1,
+                        "fan_mode": "auto",
+                        "fan_modes": ["auto"],
+                    },
+                ),
+                mock.patch.object(ac_adapter.ha_client, "call_service") as call_service,
+            ):
+                ok = await ac_adapter.turn_on("climate.broadlink", 24.0)
+            self.assertTrue(ok)
+            call_service.assert_not_called()
+
+        asyncio.run(run_case())
 
 
 if __name__ == "__main__":
