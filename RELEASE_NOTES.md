@@ -1,5 +1,10 @@
 # HawaAI add-on — release notes
 
+## 1.4.44
+
+- **IR:** Broadlink ON now sends `climate.set_hvac_mode` before the temperature command when the climate entity is off, preventing rapid double-IR power cycling.
+- **Sessions:** Provisional session timeout no longer clears setpoint tracking while the AC may still be running, avoiding a redundant follow-up temperature command.
+
 ## 1.4.43
 
 - **IR:** Fixed Tuya AC power-on by sending `climate.set_hvac_mode` before temperature and fan commands.

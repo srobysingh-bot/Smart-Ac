@@ -912,9 +912,59 @@ class TestLogicEngineHardening(unittest.TestCase):
 
         asyncio.run(run_case())
 
-    def test_turn_ac_on_broadlink_uses_existing_adapter_path(self):
+    def test_turn_ac_on_broadlink_powers_on_before_temperature_when_off(self):
         logic_engine._runtime_by_room.clear()
         rid = "ir-broadlink"
+        cfg = {
+            "climate_entity": "climate.broadlink",
+            "ir_backend": "broadlink",
+            "min_command_interval_seconds": 0,
+            "compressor_min_off_seconds": 0,
+        }
+        calls = []
+
+        async def fake_call_service(domain, service, payload):
+            calls.append((domain, service, dict(payload)))
+            return True
+
+        async def run_case():
+            with (
+                mock.patch.object(
+                    logic_engine.ha_client,
+                    "get_climate_state",
+                    return_value={"state": "off"},
+                ),
+                mock.patch.object(logic_engine.ha_client, "call_service", side_effect=fake_call_service),
+                mock.patch.object(logic_engine.ac_adapter, "turn_on", return_value=True) as turn_on,
+                mock.patch.object(logic_engine, "_turn_ac_on_tuya") as turn_on_tuya,
+                mock.patch.object(logic_engine.asyncio, "sleep", new=mock.AsyncMock()) as sleep,
+                mock.patch.object(logic_engine, "log_with_room"),
+            ):
+                ok = await logic_engine._turn_ac_on(rid, cfg, 27.0, 24.0)
+            self.assertTrue(ok)
+            self.assertEqual(
+                calls,
+                [
+                    ("climate", "set_hvac_mode", {
+                        "entity_id": "climate.broadlink",
+                        "hvac_mode": "cool",
+                    }),
+                ],
+            )
+            sleep.assert_awaited_once_with(1.0)
+            turn_on.assert_awaited_once_with(
+                entity_id="climate.broadlink",
+                temperature=24.0,
+                fan_mode="auto",
+                hvac_mode="cool",
+            )
+            turn_on_tuya.assert_not_called()
+
+        asyncio.run(run_case())
+
+    def test_turn_ac_on_broadlink_skips_power_step_when_already_cool(self):
+        logic_engine._runtime_by_room.clear()
+        rid = "ir-broadlink-cool"
         cfg = {
             "climate_entity": "climate.broadlink",
             "ir_backend": "broadlink",
@@ -924,19 +974,26 @@ class TestLogicEngineHardening(unittest.TestCase):
 
         async def run_case():
             with (
+                mock.patch.object(
+                    logic_engine.ha_client,
+                    "get_climate_state",
+                    return_value={"state": "cool"},
+                ),
+                mock.patch.object(logic_engine.ha_client, "call_service") as call_service,
                 mock.patch.object(logic_engine.ac_adapter, "turn_on", return_value=True) as turn_on,
-                mock.patch.object(logic_engine, "_turn_ac_on_tuya") as turn_on_tuya,
+                mock.patch.object(logic_engine.asyncio, "sleep", new=mock.AsyncMock()) as sleep,
                 mock.patch.object(logic_engine, "log_with_room"),
             ):
                 ok = await logic_engine._turn_ac_on(rid, cfg, 27.0, 24.0)
             self.assertTrue(ok)
+            call_service.assert_not_called()
+            sleep.assert_not_called()
             turn_on.assert_awaited_once_with(
                 entity_id="climate.broadlink",
                 temperature=24.0,
                 fan_mode="auto",
                 hvac_mode="cool",
             )
-            turn_on_tuya.assert_not_called()
 
         asyncio.run(run_case())
 
@@ -976,6 +1033,10 @@ class TestLogicEngineHardening(unittest.TestCase):
         self.assertEqual(
             calls,
             [
+                ("climate", "set_hvac_mode", {
+                    "entity_id": "climate.tuya",
+                    "hvac_mode": "cool",
+                }),
                 ("climate", "set_temperature", {
                     "entity_id": "climate.tuya",
                     "temperature": 24.0,
@@ -1115,6 +1176,26 @@ class TestLogicEngineHardening(unittest.TestCase):
                     force=True,
                 )
             turn_off.assert_not_called()
+
+        asyncio.run(run_case())
+
+    def test_close_session_preserves_setpoint_tracking_on_provisional_timeout(self):
+        logic_engine._runtime_by_room.clear()
+        rid = "session-provisional"
+        st = logic_engine._rt(rid)
+        st.session_start_time = datetime.now(timezone.utc) - timedelta(minutes=5)
+        st.last_applied_setpoint = 24.0
+
+        async def run_case():
+            with (
+                mock.patch.object(logic_engine.session_logger, "current_session_id", return_value=42),
+                mock.patch.object(logic_engine.session_logger, "session_start_time", return_value=st.session_start_time),
+                mock.patch.object(logic_engine.session_logger, "end_session", new=mock.AsyncMock()),
+                mock.patch.object(logic_engine, "clear_setpoint_command_tracking") as clear_tracking,
+                mock.patch.object(logic_engine.smart_cooling, "reset"),
+            ):
+                await logic_engine._close_session(rid, {}, 24.0, "provisional_timeout")
+            clear_tracking.assert_not_called()
 
         asyncio.run(run_case())
 

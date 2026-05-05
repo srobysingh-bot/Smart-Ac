@@ -3369,13 +3369,64 @@ async def _turn_ac_on(
             hvac_mode="cool",
         )
     else:
-        log_with_room("info", room_id, "[IR][broadlink] dispatch=ac_adapter.turn_on entity=%s", climate_entity)
-        success = await ac_adapter.turn_on(
-            entity_id   = climate_entity,
-            temperature = target,
-            fan_mode    = "auto",
-            hvac_mode   = "cool",
-        )
+        # FIX: triple-trigger / ON→OFF→ON hardware cycle.
+        #
+        # Previously: ac_adapter.turn_on() sent a single climate.set_temperature call.
+        # When ha_mode was "off", the Broadlink HA integration sent TWO IR blasts:
+        #   1. power-on IR code
+        #   2. set-temperature IR code
+        # The AC received two rapid IR commands and physically cycled ON→OFF→ON.
+        #
+        # Fix: mirror the Tuya two-step approach — if the AC is currently off,
+        # send set_hvac_mode first (one clean power-on IR blast), then set_temperature.
+        # If the AC is already in cool mode, skip set_hvac_mode entirely (no power cycle).
+        current_state = await ha_client.get_climate_state(climate_entity)
+        current_hvac = str((current_state or {}).get("state") or "").strip().lower()
+
+        if current_hvac != "cool":
+            log_with_room(
+                "info", room_id,
+                "[IR][broadlink] step=set_hvac_mode entity=%s hvac=cool (was=%s)",
+                climate_entity, current_hvac,
+            )
+            ok_mode = await ha_client.call_service("climate", "set_hvac_mode", {
+                "entity_id": climate_entity,
+                "hvac_mode": "cool",
+            })
+            if not ok_mode:
+                log_with_room(
+                    "warning", room_id,
+                    "[IR][broadlink] set_hvac_mode FAILED — aborting ON",
+                )
+                success = False
+            else:
+                # Brief pause so the AC has time to process the power-on IR code
+                # before receiving the temperature command.
+                await asyncio.sleep(1.0)
+                log_with_room(
+                    "info", room_id,
+                    "[IR][broadlink] step=set_temperature entity=%s temp=%.1f",
+                    climate_entity, target,
+                )
+                success = await ac_adapter.turn_on(
+                    entity_id   = climate_entity,
+                    temperature = target,
+                    fan_mode    = "auto",
+                    hvac_mode   = "cool",
+                )
+        else:
+            # AC already in cool mode — safe to set temperature directly, no power cycle risk.
+            log_with_room(
+                "info", room_id,
+                "[IR][broadlink] dispatch=ac_adapter.turn_on entity=%s (already cool)",
+                climate_entity,
+            )
+            success = await ac_adapter.turn_on(
+                entity_id   = climate_entity,
+                temperature = target,
+                fan_mode    = "auto",
+                hvac_mode   = "cool",
+            )
     if not success:
         logger.error(
             "[HawaAI][%s] AC ON via Aerostate FAILED — not marking as ON; "
@@ -3579,7 +3630,11 @@ async def _close_session(room_id: str, cfg: dict, indoor_temp: float, reason: st
     st.session_start_kwh = None
     st.watts_samples = []
     st.session_state = "idle"
-    clear_setpoint_command_tracking(room_id)
+    # Don't clear setpoint tracking on provisional_timeout — the AC is still physically
+    # running, so clearing last_applied_setpoint would cause a redundant IR command on
+    # the next tick (should_send_setpoint_command returns "initial_setpoint").
+    if reason != "provisional_timeout":
+        clear_setpoint_command_tracking(room_id)
     smart_cooling.reset(room_id)
 
 
