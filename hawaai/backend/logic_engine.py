@@ -144,6 +144,9 @@ class RoomRuntime:
     effective_on_since_ts: Optional[float] = None
     # Last IR / control ON or OFF command applied (wall time, UTC)
     last_decision_at: Optional[datetime] = None
+    # Last physical IR dispatch and short post-ON lock for stateless IR stability.
+    ir_last_sent_ts: Optional[datetime] = None
+    just_turned_on_until: Optional[datetime] = None
 
     # Delayed actuation (thermostat intent → pending → _turn_ac_*)
     pending_action: Optional[str] = None  # "on" | "off"
@@ -354,6 +357,8 @@ _COOLDOWN_SECS: int = 60
 # After first delayed-path ON IR in a pending cycle, wait this long for physical confirmation
 # (compressor watts / HA command) before surfacing on_failed and clearing pending.
 PENDING_ON_CONFIRM_TIMEOUT_SECS: float = 20.0
+IR_SEND_LOCK_SECONDS: float = 10.0
+POST_ON_STABILIZATION_SECONDS: float = 20.0
 
 # Power-based state thresholds
 _WATTS_COMPRESSOR: float = 500.0   # watts above this → compressor running (AC ON)
@@ -380,6 +385,20 @@ def _seconds_since_last_command(st: RoomRuntime, now: datetime) -> float:
     if st.last_command_time is None:
         return float("inf")
     return (now - st.last_command_time).total_seconds()
+
+
+def _seconds_since_last_ir(st: RoomRuntime, now: datetime) -> float:
+    if st.ir_last_sent_ts is None:
+        return float("inf")
+    return (now - st.ir_last_sent_ts).total_seconds()
+
+
+def _ir_send_lock_active(st: RoomRuntime, now: datetime) -> bool:
+    return _seconds_since_last_ir(st, now) < float(IR_SEND_LOCK_SECONDS)
+
+
+def _post_on_stabilization_active(st: RoomRuntime, now: datetime) -> bool:
+    return st.just_turned_on_until is not None and now < st.just_turned_on_until
 
 
 def _power_band_indicates_on(
@@ -1549,6 +1568,25 @@ def _gate_turn_ac_on(
     duplicate_intent = st.last_sent_command_key == fp
     resend_after_missed_ack = duplicate_intent and not st.physical_ac_on
 
+    if _ir_send_lock_active(st, now):
+        secs = _seconds_since_last_ir(st, now)
+        logger.info(
+            "[HawaAI][%s] Skip ON: IR send lock active (elapsed=%.1fs < %.0fs)",
+            room_id,
+            secs,
+            IR_SEND_LOCK_SECONDS,
+        )
+        return False
+
+    if _post_on_stabilization_active(st, now):
+        until = st.just_turned_on_until.isoformat() if st.just_turned_on_until else None
+        logger.info(
+            "[HawaAI][%s] Skip ON: post-ON stabilization active until %s",
+            room_id,
+            until,
+        )
+        return False
+
     # Dedup only when compressor is observed ON; same fingerprint + OFF → allow resend path.
     if duplicate_intent and st.physical_ac_on:
         logger.info(
@@ -1621,6 +1659,25 @@ def _gate_turn_ac_off(room_id: str, cfg: dict, now: datetime, *, force: bool = F
     Vacancy/security path uses ``force=True`` to bypass throttle + compressor protections.
     """
     st = _rt(room_id)
+
+    if _ir_send_lock_active(st, now):
+        secs = _seconds_since_last_ir(st, now)
+        logger.info(
+            "[HawaAI][%s] Skip OFF: IR send lock active (elapsed=%.1fs < %.0fs)",
+            room_id,
+            secs,
+            IR_SEND_LOCK_SECONDS,
+        )
+        return False
+
+    if _post_on_stabilization_active(st, now):
+        until = st.just_turned_on_until.isoformat() if st.just_turned_on_until else None
+        logger.info(
+            "[HawaAI][%s] Skip OFF: post-ON stabilization active until %s",
+            room_id,
+            until,
+        )
+        return False
 
     if force:
         logger.info("[HawaAI][%s] Enforcing OFF (force=safety/thermostat bypass)", room_id)
@@ -3360,6 +3417,7 @@ async def _turn_ac_on(
             return True
 
     ir_backend = await resolve_ir_backend(room_id, cfg, climate_entity)
+    st.ir_last_sent_ts = tnow
     if ir_backend == "tuya":
         success = await _turn_ac_on_tuya(
             room_id,
@@ -3369,64 +3427,17 @@ async def _turn_ac_on(
             hvac_mode="cool",
         )
     else:
-        # FIX: triple-trigger / ON→OFF→ON hardware cycle.
-        #
-        # Previously: ac_adapter.turn_on() sent a single climate.set_temperature call.
-        # When ha_mode was "off", the Broadlink HA integration sent TWO IR blasts:
-        #   1. power-on IR code
-        #   2. set-temperature IR code
-        # The AC received two rapid IR commands and physically cycled ON→OFF→ON.
-        #
-        # Fix: mirror the Tuya two-step approach — if the AC is currently off,
-        # send set_hvac_mode first (one clean power-on IR blast), then set_temperature.
-        # If the AC is already in cool mode, skip set_hvac_mode entirely (no power cycle).
-        current_state = await ha_client.get_climate_state(climate_entity)
-        current_hvac = str((current_state or {}).get("state") or "").strip().lower()
-
-        if current_hvac != "cool":
-            log_with_room(
-                "info", room_id,
-                "[IR][broadlink] step=set_hvac_mode entity=%s hvac=cool (was=%s)",
-                climate_entity, current_hvac,
-            )
-            ok_mode = await ha_client.call_service("climate", "set_hvac_mode", {
-                "entity_id": climate_entity,
-                "hvac_mode": "cool",
-            })
-            if not ok_mode:
-                log_with_room(
-                    "warning", room_id,
-                    "[IR][broadlink] set_hvac_mode FAILED — aborting ON",
-                )
-                success = False
-            else:
-                # Brief pause so the AC has time to process the power-on IR code
-                # before receiving the temperature command.
-                await asyncio.sleep(1.0)
-                log_with_room(
-                    "info", room_id,
-                    "[IR][broadlink] step=set_temperature entity=%s temp=%.1f",
-                    climate_entity, target,
-                )
-                success = await ac_adapter.turn_on(
-                    entity_id   = climate_entity,
-                    temperature = target,
-                    fan_mode    = "auto",
-                    hvac_mode   = "cool",
-                )
-        else:
-            # AC already in cool mode — safe to set temperature directly, no power cycle risk.
-            log_with_room(
-                "info", room_id,
-                "[IR][broadlink] dispatch=ac_adapter.turn_on entity=%s (already cool)",
-                climate_entity,
-            )
-            success = await ac_adapter.turn_on(
-                entity_id   = climate_entity,
-                temperature = target,
-                fan_mode    = "auto",
-                hvac_mode   = "cool",
-            )
+        log_with_room(
+            "info", room_id,
+            "[IR][broadlink] dispatch=single set_temperature entity=%s temp=%.1f hvac=cool",
+            climate_entity, target,
+        )
+        success = await ac_adapter.turn_on(
+            entity_id   = climate_entity,
+            temperature = target,
+            fan_mode    = "auto",
+            hvac_mode   = "cool",
+        )
     if not success:
         logger.error(
             "[HawaAI][%s] AC ON via Aerostate FAILED — not marking as ON; "
@@ -3439,6 +3450,7 @@ async def _turn_ac_on(
     cmd_ts = datetime.now(timezone.utc)
     st.last_ac_on_at = cmd_ts.timestamp()
     st.last_confirmed_on_at = cmd_ts
+    st.just_turned_on_until = cmd_ts + timedelta(seconds=float(POST_ON_STABILIZATION_SECONDS))
     _bump_last_command_ir_cooldown(st, cmd_ts)
     st.last_command = "on"
     st.last_sent_command_key = _fingerprint_turn_on(target)
@@ -3673,10 +3685,13 @@ async def _turn_ac_off(
             return
         if not _gate_turn_ac_off(room_id, cfg, tnow, force=False):
             return
+    elif not _gate_turn_ac_off(room_id, cfg, tnow, force=True):
+        return
     elif reason == "vacant":
         # Hard policy: vacancy must not be skipped for duplicate/cooldown — still log once.
         log_with_room("info", room_id, "[VACANCY] AC OFF forced")
 
+    st.ir_last_sent_ts = tnow
     await ac_adapter.turn_off(climate_entity)
 
     clear_setpoint_command_tracking(room_id)
@@ -3694,6 +3709,7 @@ async def _turn_ac_off(
     st.last_sent_command_key = _fingerprint_turn_off()
     st.compressor_off_since = cmd_ts
     st.compressor_on_since = None
+    st.just_turned_on_until = None
     st.last_decision_at = cmd_ts
 
     await _close_session(room_id, cfg, indoor_temp, reason)
@@ -3790,6 +3806,11 @@ def get_runtime_state(room_id: str) -> dict:
         "last_command_source":   st.last_command_source,
         "last_ac_on_at":         st.last_ac_on_at,
         "last_ac_off_at":        st.last_ac_off_at,
+        "ir_last_sent_at":       st.ir_last_sent_ts.isoformat() if st.ir_last_sent_ts else None,
+        "ir_send_lock_seconds":  float(IR_SEND_LOCK_SECONDS),
+        "just_turned_on_until":  (
+            st.just_turned_on_until.isoformat() if st.just_turned_on_until else None
+        ),
         "last_power_confirmed_on":  st.last_power_confirmed_on,
         "last_power_confirmed_off": st.last_power_confirmed_off,
         "ai_enabled":            bool(merged.get("ai_enabled", False)),

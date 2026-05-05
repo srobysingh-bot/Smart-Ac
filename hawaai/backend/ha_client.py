@@ -158,9 +158,17 @@ async def get_all_entities() -> List[Dict[str, Any]]:
         return []
 
 
-async def call_service(domain: str, service: str, data: Dict[str, Any]) -> bool:
+async def call_service(
+    domain: str,
+    service: str,
+    data: Dict[str, Any],
+    *,
+    blocking: bool = False,
+) -> bool:
     """Call a HA service (e.g. switch.turn_on, remote.send_command)."""
     url = f"{HA_BASE_URL}/api/services/{domain}/{service}"
+    if blocking:
+        logger.debug("[HawaAI] call_service %s.%s requested blocking dispatch", domain, service)
     try:
         async with aiohttp.ClientSession() as session:
             async with session.post(

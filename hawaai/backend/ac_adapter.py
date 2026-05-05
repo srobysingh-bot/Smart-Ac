@@ -14,7 +14,6 @@ Rules:
   - Always logs at INFO level so every command is traceable.
 """
 
-import asyncio
 import logging
 from typing import Optional
 
@@ -36,23 +35,12 @@ async def turn_on(
     """
     Turn AC ON via the Aerostate climate entity.
 
-    Tuya IR requires an explicit power-on (hvac_mode) call; do not rely on
-    ``set_temperature`` to turn the unit on.
-
-    Primary sequence:
-      1) climate.set_hvac_mode hvac_mode ("cool")
-      2) sleep 0.5s
-      3) climate.set_temperature (temperature + fan_mode)
-
-    Fallback sequence (when primary fails):
-      1) climate.set_hvac_mode off
-      2) sleep 1s
-      3) climate.set_hvac_mode hvac_mode ("cool")
-      4) sleep 0.5s
-      5) climate.set_temperature (temperature + fan_mode)
+    Broadlink IR is stateless: separate hvac_mode and temperature calls can
+    emit two full IR packets and cause ON/OFF/ON toggles. Send hvac_mode and
+    temperature together so HA emits one command packet.
 
     Returns True if a service call succeeded (or if it was a no-op due to current state).
-    Returns False if both primary and fallback calls failed.
+    Returns False if the combined call failed.
     """
     if not entity_id:
         logger.error(
@@ -117,64 +105,20 @@ async def turn_on(
     except Exception:
         use_fan = None
 
-    payload_mode = {
-        "entity_id": entity_id,
-        "hvac_mode": hvac_mode,
-    }
     payload_temp = {
         "entity_id": entity_id,
+        "hvac_mode": hvac_mode,
         "temperature": float(temperature),
     }
     if use_fan:
         payload_temp["fan_mode"] = use_fan
 
-    ok_mode = await ha_client.call_service("climate", "set_hvac_mode", payload_mode)
-    # Tuya IR can be slow; allow the state machine time to accept mode change.
-    await asyncio.sleep(1.0)
-    ok_temp = await ha_client.call_service("climate", "set_temperature", payload_temp)
-    ok = bool(ok_mode and ok_temp)
-    if not ok:
-        logger.warning(
-            "[AC_ADAPTER] Primary ON call failed — trying Tuya fallback OFF→ON (entity=%s)",
-            entity_id,
-        )
-        off_ok = await ha_client.call_service("climate", "set_hvac_mode", {
-            "entity_id": entity_id,
-            "hvac_mode": "off",
-        })
-        if not off_ok:
-            logger.warning("[AC_ADAPTER] Fallback step OFF failed (entity=%s)", entity_id)
-        await asyncio.sleep(1)
-        cool_ok = await ha_client.call_service("climate", "set_hvac_mode", payload_mode)
-        if not cool_ok:
-            logger.warning("[AC_ADAPTER] Fallback step hvac_mode=%s failed (entity=%s)", hvac_mode, entity_id)
-        await asyncio.sleep(1.0)
-        ok_temp2 = await ha_client.call_service("climate", "set_temperature", payload_temp)
-        ok = bool(cool_ok and ok_temp2)
-
-    # Post-send verification (best effort): HA may be optimistic for Tuya IR, but this can still
-    # catch cases where the mode didn't take at all. Returning False keeps logic_engine pending retries alive.
-    await asyncio.sleep(2.0)
-    full_after = await ha_client.get_entity_state_full(entity_id)
-    if full_after:
-        st_after = full_after.get("state")
-        attrs = full_after.get("attributes", {}) or {}
-        logger.info(
-            "[AC_ADAPTER] Post-call state → entity=%s hvac=%s temp=%s fan=%s",
-            entity_id,
-            st_after,
-            attrs.get("temperature"),
-            attrs.get("fan_mode"),
-        )
-        if str(st_after or "").strip().lower() != str(hvac_mode or "cool").strip().lower():
-            logger.warning(
-                "[AC_ADAPTER] ON verification mismatch — expected hvac=%s got=%s (entity=%s)",
-                hvac_mode,
-                st_after,
-                entity_id,
-            )
-            return False
-
+    ok = await ha_client.call_service(
+        "climate",
+        "set_temperature",
+        payload_temp,
+        blocking=True,
+    )
     if ok:
         logger.info(
             "[HawaAI] Aerostate ON ✓ | mode=%s | temp=%.1f°C | fan=%s",

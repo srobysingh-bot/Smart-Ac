@@ -1,5 +1,10 @@
 # HawaAI add-on — release notes
 
+## 1.4.45
+
+- **IR:** Broadlink ON now dispatches one combined `climate.set_temperature` payload with `hvac_mode` and target temperature, avoiding split IR packets that can cause ON/OFF/ON toggles.
+- **Control:** Added a 10s IR send lock and 20s post-ON stabilization window to suppress immediate OFF/ON retriggers while HA climate state settles.
+
 ## 1.4.44
 
 - **IR:** Broadlink ON now sends `climate.set_hvac_mode` before the temperature command when the climate entity is off, preventing rapid double-IR power cycling.
