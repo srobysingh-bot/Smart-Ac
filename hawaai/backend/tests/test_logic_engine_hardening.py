@@ -887,6 +887,156 @@ class TestLogicEngineHardening(unittest.TestCase):
         )
         self.assertEqual((action, source, occupied), ("hold", "vacancy_debounce", False))
 
+    def test_presence_only_vacant_already_off_enters_idle_once(self):
+        st = logic_engine.RoomRuntime()
+        now = datetime.now(timezone.utc)
+        st.pending_action = "on"
+        st.pending_since = now.timestamp()
+        st.pending_on_ir_sent = True
+        st.pending_on_ir_sent_at = now
+        st.last_command_time = now
+        st.last_command = "on"
+        st.last_sent_command_key = "stale-on"
+        st.last_decision_at = now
+        st.ir_last_sent_ts = now
+        st.session_start_time = now - timedelta(minutes=1)
+        st.session_state = "provisional"
+        st.watts_samples = [0.0]
+        cfg = {
+            "control_mode": "presence_only",
+            "energy_power_entity": "sensor.power",
+            "target_temp": 24,
+        }
+
+        async def run_once(log_with_room):
+            with (
+                mock.patch.object(
+                    logic_engine.ha_client,
+                    "get_state",
+                    new=mock.AsyncMock(return_value="0"),
+                ),
+                mock.patch.object(
+                    logic_engine.session_logger,
+                    "current_session_id",
+                    return_value=None,
+                ),
+                mock.patch.object(
+                    logic_engine,
+                    "_maintain_session_lifecycle",
+                    new=mock.AsyncMock(),
+                ),
+                mock.patch.object(logic_engine, "log_with_room", log_with_room),
+            ):
+                await logic_engine._tick_presence_only_mode(
+                    rid_raw="room-x",
+                    room_id="room-x",
+                    cfg=cfg,
+                    climate_data={"target_temp": 24},
+                    presence_raw="off",
+                    resolved_occupied=False,
+                    indoor_temp=24.0,
+                    now=now,
+                    st=st,
+                )
+
+        first_logs = mock.Mock()
+        asyncio.run(run_once(first_logs))
+
+        self.assertTrue(st.presence_only_idle)
+        self.assertFalse(st.ac_is_on)
+        self.assertFalse(st.physical_ac_on)
+        self.assertFalse(st.effective_ac_on)
+        self.assertEqual(st.ac_state, "off")
+        self.assertEqual(st.effective_control_source, "presence_idle")
+        self.assertIsNone(st.pending_action)
+        self.assertIsNone(st.pending_since)
+        self.assertFalse(st.pending_on_ir_sent)
+        self.assertIsNone(st.session_start_time)
+        self.assertEqual(st.session_state, "idle")
+        self.assertIsNone(st.last_command_time)
+        self.assertEqual(st.last_command, "")
+        self.assertIsNone(st.last_sent_command_key)
+        self.assertIsNone(st.last_decision_at)
+        self.assertIsNone(st.ir_last_sent_ts)
+        self.assertTrue(
+            any("[PRESENCE_ONLY] off_finalize" in str(call.args) for call in first_logs.call_args_list)
+        )
+        self.assertTrue(
+            any("[PRESENCE_ONLY] runtime_reset" in str(call.args) for call in first_logs.call_args_list)
+        )
+        self.assertTrue(
+            any("[PRESENCE_ONLY] idle_entered" in str(call.args) for call in first_logs.call_args_list)
+        )
+        self.assertTrue(
+            any(
+                "[PRESENCE_ONLY] duplicate_off_block_detected" in str(call.args)
+                for call in first_logs.call_args_list
+            )
+        )
+        self.assertTrue(
+            any("action=%s source=%s" in str(call.args) and "idle" in str(call.args) for call in first_logs.call_args_list)
+        )
+
+        second_logs = mock.Mock()
+        asyncio.run(run_once(second_logs))
+        self.assertFalse(
+            any("[PRESENCE_ONLY] off_finalize" in str(call.args) for call in second_logs.call_args_list)
+        )
+        self.assertFalse(
+            any("action=hold source=presence_only" in str(call.args) for call in second_logs.call_args_list)
+        )
+
+    def test_presence_only_tick_uses_single_vacancy_stabilization(self):
+        logic_engine._runtime_by_room.clear()
+        rid = "presence-dup"
+        cfg = {
+            "rooms": [
+                {
+                    "id": rid,
+                    "climate_entity": "climate.test",
+                    "presence_entity": "binary_sensor.presence",
+                    "indoor_temp_entity": "sensor.temp",
+                    "energy_power_entity": "sensor.power",
+                    "control_mode": "presence_only",
+                    "use_presence": True,
+                },
+            ],
+        }
+
+        async def fake_get_state(entity_id):
+            if entity_id == "sensor.temp":
+                return "24"
+            if entity_id == "sensor.power":
+                return "0"
+            return "off"
+
+        async def run_case():
+            with (
+                mock.patch.object(logic_engine.config_manager, "load_config", return_value=cfg),
+                mock.patch.object(logic_engine, "_load_startup_state", new=mock.AsyncMock()),
+                mock.patch.object(
+                    logic_engine.ha_client,
+                    "get_climate_state",
+                    new=mock.AsyncMock(return_value={"state": "off", "target_temp": 24}),
+                ),
+                mock.patch.object(logic_engine.ha_client, "get_state", side_effect=fake_get_state),
+                mock.patch.object(
+                    logic_engine,
+                    "_maintain_session_lifecycle",
+                    new=mock.AsyncMock(),
+                ),
+                mock.patch.object(logic_engine, "log_with_room") as log_with_room,
+            ):
+                await logic_engine._tick_impl(rid, rid)
+            return log_with_room
+
+        log_with_room = asyncio.run(run_case())
+        block_count = sum(
+            "Block OFF" in str(call.args) and "vacancy not stable" in str(call.args)
+            for call in log_with_room.call_args_list
+        )
+        self.assertEqual(block_count, 1)
+
     def test_presence_only_max_runtime_failsafe_forces_off(self):
         st = logic_engine.RoomRuntime()
         now = datetime.now(timezone.utc)

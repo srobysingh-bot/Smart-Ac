@@ -1,5 +1,11 @@
 # HawaAI add-on — release notes
 
+## 1.4.50
+
+- **Presence-only:** Vacant rooms that are already physically OFF now finalize once, clear stale pending/session/runtime state, and enter `presence_idle` instead of looping forever as `hold/presence_only`.
+- **Presence-only:** Reuses the main tick's stabilized occupancy decision so vacancy debounce is not evaluated twice in the same cycle.
+- **Diagnostics:** Added `[PRESENCE_ONLY]` target logs for OFF finalization, runtime reset, idle entry, vacancy timestamp, and duplicate OFF-block detection.
+
 ## 1.4.49
 
 - **Control:** Fixed thermostat target synchronization so schedule/AI/manual effective targets are the single runtime source for TICK decisions.

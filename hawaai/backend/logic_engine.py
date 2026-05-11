@@ -145,6 +145,7 @@ class RoomRuntime:
     last_confirmed_on_at: Optional[datetime] = None
     presence_only_present_since: Optional[datetime] = None
     presence_only_last_invalid_log_at: Optional[datetime] = None
+    presence_only_idle: bool = False
 
     # ── Startup recovery flag ──
     startup_state_loaded: bool = False
@@ -722,6 +723,7 @@ def _resolve_presence_only_decision(
     presence_raw: object,
     ac_on: bool,
     now: datetime,
+    resolved_occupied: Optional[bool] = None,
 ) -> Tuple[str, str, bool]:
     """
     Presence-only control: occupancy drives ON/OFF; temperature and AI are ignored.
@@ -743,7 +745,11 @@ def _resolve_presence_only_decision(
             st.presence_only_last_invalid_log_at = now
         return "hold", "presence_unavailable", False
 
-    occupied = _stabilize_presence(st, presence_raw, now, room_id)
+    occupied = (
+        bool(resolved_occupied)
+        if resolved_occupied is not None
+        else _stabilize_presence(st, presence_raw, now, room_id)
+    )
     st.presence_only_last_invalid_log_at = None
 
     runtime = _presence_only_runtime_seconds(st, now)
@@ -760,6 +766,7 @@ def _resolve_presence_only_decision(
         return "off", "presence_max_runtime", occupied
 
     if occupied:
+        st.presence_only_idle = False
         st.vacant_since = None
         if ac_on:
             st.presence_only_present_since = now
@@ -777,6 +784,12 @@ def _resolve_presence_only_decision(
     if ac_on:
         if st.vacant_since is None:
             st.vacant_since = now
+        log_with_room(
+            "info",
+            room_id,
+            "[PRESENCE_ONLY] vacancy_ts=%s",
+            st.vacant_since.isoformat(),
+        )
         elapsed_vacant = (now - st.vacant_since).total_seconds()
         if elapsed_vacant < float(VACANCY_CONFIRM_SECS):
             return "hold", "vacancy_debounce", occupied
@@ -788,8 +801,137 @@ def _resolve_presence_only_decision(
             return "hold", "presence_vacancy_grace", occupied
         return "off", "presence_vacant", occupied
 
+    if st.presence_only_idle:
+        return "idle", "presence_idle", occupied
+
+    if st.vacant_since is None:
+        st.vacant_since = now
+    log_with_room(
+        "info",
+        room_id,
+        "[PRESENCE_ONLY] vacancy_ts=%s",
+        st.vacant_since.isoformat(),
+    )
+    return "idle", "presence_idle", occupied
+
+
+async def _finalize_presence_only_idle(
+    room_id: str,
+    cfg: dict,
+    indoor_temp: float,
+    now: datetime,
+    st: RoomRuntime,
+    *,
+    reason: str,
+    duplicate_off_block_detected: bool = False,
+) -> None:
+    """Collapse vacant + already-off presence-only runtime into an idempotent idle state."""
+    open_session = session_logger.current_session_id(room_id)
+    had_runtime_state = any(
+        (
+            st.pending_action is not None,
+            st.pending_on_ir_sent,
+            st.ac_is_on,
+            st.physical_ac_on,
+            st.effective_ac_on,
+            st.effective_ac_idle,
+            st.effective_on_since_ts is not None,
+            st.possible_on_since is not None,
+            st.soft_start_ui,
+            st.session_start_time is not None,
+            st.session_state != "idle",
+            bool(st.watts_samples),
+            st.last_command_time is not None,
+            st.last_command != "",
+            st.last_sent_command_key is not None,
+            st.last_decision_at is not None,
+            st.ir_last_sent_ts is not None,
+            open_session is not None,
+        )
+    )
+    entering_idle = not st.presence_only_idle or had_runtime_state
+    vacancy_ts = st.vacant_since.isoformat() if st.vacant_since else "none"
+
+    if duplicate_off_block_detected:
+        log_with_room(
+            "warning",
+            room_id,
+            "[PRESENCE_ONLY] duplicate_off_block_detected pending_action=%s pending_on_ir_sent=%s",
+            st.pending_action,
+            st.pending_on_ir_sent,
+        )
+
+    if open_session is not None:
+        await _close_session(room_id, cfg, indoor_temp, reason=reason)
+
+    if not entering_idle and not duplicate_off_block_detected:
+        return
+
+    if entering_idle:
+        log_with_room(
+            "info",
+            room_id,
+            "[PRESENCE_ONLY] off_finalize reason=%s",
+            reason,
+        )
+        log_with_room(
+            "info",
+            room_id,
+            "[PRESENCE_ONLY] vacancy_ts=%s",
+            vacancy_ts,
+        )
+
+    _clear_pending_command_state(st)
+    clear_setpoint_command_tracking(room_id)
+    smart_cooling.reset(room_id)
+
+    st.ac_is_on = False
+    st.physical_ac_on = False
+    st.effective_ac_on = False
+    st.effective_ac_idle = False
+    st.ac_state = "off"
+    if st.ac_state_source == "power":
+        st.effective_power_source = "watts"
+    elif st.ac_state_source == "cooldown":
+        st.effective_power_source = "cooldown"
+    else:
+        st.effective_power_source = "internal"
+    st.effective_control_source = "presence_idle"
+    st.effective_on_since_ts = None
+    st.possible_on_since = None
+    st.presence_only_present_since = None
     st.vacant_since = None
-    return "hold", "presence_only", occupied
+    st.soft_start_ui = False
+    st.on_failed_retry_used = False
+    st.session_start_time = None
+    st.session_start_temp = None
+    st.session_start_kwh = None
+    st.watts_samples = []
+    st.session_state = "idle"
+    st.compressor_on_since = None
+    st.compressor_watts_high_since = None
+    st.compressor_off_since = now
+    st.last_command_time = None
+    st.last_command = ""
+    st.last_sent_command_key = None
+    st.last_decision_at = None
+    st.ir_last_sent_ts = None
+    st.just_turned_on_until = None
+    st.last_user_command_time = None
+    st.last_command_source = "system"
+    st.presence_only_idle = True
+
+    if entering_idle:
+        log_with_room(
+            "info",
+            room_id,
+            "[PRESENCE_ONLY] runtime_reset",
+        )
+        log_with_room(
+            "info",
+            room_id,
+            "[PRESENCE_ONLY] idle_entered",
+        )
 
 
 async def _fp2_zone_sensor_tick(room_id: str, cfg: dict, now: datetime) -> None:
@@ -2035,6 +2177,7 @@ async def _tick_presence_only_mode(
     cfg: dict,
     climate_data: dict,
     presence_raw: object,
+    resolved_occupied: bool,
     indoor_temp: float,
     now: datetime,
     st: RoomRuntime,
@@ -2062,6 +2205,7 @@ async def _tick_presence_only_mode(
     if energy_watts_valid and not in_cooldown:
         if energy_watts > _WATTS_COMPRESSOR:
             ac_on = True
+            st.presence_only_idle = False
             st.last_power_confirmed_on = now.timestamp()
             if not st.ac_is_on:
                 st.ac_is_on = True
@@ -2079,6 +2223,7 @@ async def _tick_presence_only_mode(
             st.ac_state_source = "power"
         else:
             ac_on = True
+            st.presence_only_idle = False
             if not st.ac_is_on:
                 st.ac_is_on = True
                 st.last_ac_on_at = now.timestamp()
@@ -2110,6 +2255,7 @@ async def _tick_presence_only_mode(
         presence_raw,
         st.physical_ac_on,
         now,
+        resolved_occupied=resolved_occupied,
     )
     action, source = _apply_pending_on_decision_lock(room_id, st, action, source)
     action, source = _apply_pending_on_off_block(room_id, st, action, source, now)
@@ -2138,7 +2284,25 @@ async def _tick_presence_only_mode(
                 action, source = "hold", "decision_lock"
                 control_action, control_source = action, source
 
+    duplicate_idle_off_block = (
+        control_action == "idle"
+        and (st.pending_action is not None or st.pending_on_ir_sent or st.ac_state == "pending_off")
+    )
     st.effective_control_source = source
+    if control_action == "idle":
+        await _finalize_presence_only_idle(
+            room_id,
+            cfg,
+            indoor_temp,
+            now,
+            st,
+            reason="presence_idle",
+            duplicate_off_block_detected=duplicate_idle_off_block,
+        )
+        action = control_action = "idle"
+        source = control_source = "presence_idle"
+        st.effective_control_source = source
+
     pending_on_hold_sources = ("pending_on_lock", "pending_on_protection")
     preserve_pending_on_hold = _pending_on_emit_hold_in_progress(st, control_action)
     if control_source not in pending_on_hold_sources and not preserve_pending_on_hold:
@@ -2377,6 +2541,7 @@ async def _tick_impl(rid_raw: str, room_id: str) -> None:
             cfg=cfg,
             climate_data=climate_data,
             presence_raw=presence_raw,
+            resolved_occupied=bool(is_occupied_bool),
             indoor_temp=float(indoor_temp),
             now=now,
             st=st,
