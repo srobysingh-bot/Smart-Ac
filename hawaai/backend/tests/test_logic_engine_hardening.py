@@ -325,6 +325,25 @@ class TestLogicEngineHardening(unittest.TestCase):
     def test_effective_max_delta_deg_bounded_1_to_5(self):
         self.assertAlmostEqual(logic_engine.effective_max_delta_deg({"effective_max_delta_deg": 99}), 5.0)
         self.assertAlmostEqual(logic_engine.effective_max_delta_deg({"effective_max_delta_deg": 0.25}), 1.0)
+        self.assertAlmostEqual(logic_engine.effective_max_delta_deg({"effective_max_delta_deg": "bad"}), 3.0)
+
+    def test_control_decision_uses_defaults_for_invalid_numeric_config(self):
+        logic_engine._runtime_by_room.clear()
+        action, source, target = logic_engine._resolve_control_decision(
+            room_id="invalid-numeric",
+            cfg={
+                "thermostat_on_delta_deg": "bad",
+                "thermostat_off_delta_deg": None,
+                "vacancy_timeout_minutes": "bad",
+                "user_authority_lock_secs": "bad",
+            },
+            indoor_temp=25.0,
+            effective_target=24.0,
+            is_occupied=True,
+            ac_on=False,
+            now=datetime.now(timezone.utc),
+        )
+        self.assertEqual((action, source, target), ("on", "thermostat", 24.0))
 
     def test_sync_effective_mode_transition_clears_pending(self):
         st = logic_engine.RoomRuntime()
@@ -335,6 +354,134 @@ class TestLogicEngineHardening(unittest.TestCase):
         self.assertIsNone(st.pending_action)
         self.assertIsNone(st.pending_since)
         self.assertEqual(st.last_effective_mode, "manual")
+
+    def test_schedule_target_sync_ignores_stale_manual_setpoint(self):
+        logic_engine._runtime_by_room.clear()
+        rid = "targetsync"
+        st = logic_engine._rt(rid)
+        st.prev_ha_setpoint_seen = 27.0
+        st.manual_override_temp = 27.0
+        st.manual_override_until = datetime.now(timezone.utc) + timedelta(minutes=5)
+        st.effective_target_temp = 27.0
+
+        cfg = {
+            "rooms": [
+                {
+                    "id": rid,
+                    "name": "Target Sync",
+                    "climate_entity": "climate.targetsync",
+                    "presence_entity": "binary_sensor.targetsync_presence",
+                    "indoor_temp_entity": "sensor.targetsync_temp",
+                    "energy_power_entity": "sensor.targetsync_power",
+                    "settings": {
+                        "target_temp": 20,
+                        "temperature_mode": "schedule",
+                        "schedule": {
+                            "morning_temp": 20,
+                            "afternoon_temp": 20,
+                            "evening_temp": 20,
+                            "night_temp": 20,
+                        },
+                        "smart_temp_adjustment": True,
+                        "use_outdoor_temp": True,
+                        "effective_mode": "auto",
+                        "effective_max_delta_deg": 3.0,
+                        "manual_override": False,
+                        "use_presence": True,
+                        "thermostat_on_delta_deg": 0.7,
+                        "thermostat_off_delta_deg": 0.3,
+                    },
+                }
+            ]
+        }
+
+        async def fake_get_state(entity_id):
+            vals = {
+                "sensor.targetsync_temp": "25.4",
+                "binary_sensor.targetsync_presence": "on",
+                "sensor.targetsync_power": "700",
+            }
+            return vals.get(entity_id)
+
+        async def run_case():
+            with (
+                mock.patch.object(logic_engine.config_manager, "load_config", return_value=cfg),
+                mock.patch.object(
+                    logic_engine.ha_client,
+                    "get_climate_state",
+                    new=mock.AsyncMock(
+                        return_value={
+                            "state": "cool",
+                            "mode": "cool",
+                            "current_temp": 25.4,
+                            "target_temp": 27.0,
+                            "is_on": True,
+                        }
+                    ),
+                ),
+                mock.patch.object(logic_engine.ha_client, "get_state", side_effect=fake_get_state),
+                mock.patch.object(logic_engine, "resolve_base_target_temp", return_value=(20.0, "night")),
+                mock.patch.object(logic_engine, "log_target_resolve"),
+                mock.patch.object(
+                    logic_engine.weather_api,
+                    "get_cached",
+                    new=mock.AsyncMock(return_value={"temp": 28.0, "humidity": 50}),
+                ),
+                mock.patch.object(logic_engine, "_stabilize_presence", return_value=True),
+                mock.patch.object(logic_engine, "_maintain_session_lifecycle", new=mock.AsyncMock()),
+                mock.patch.object(logic_engine.smart_cooling, "apply_effective_target", new=mock.AsyncMock()),
+                mock.patch.object(logic_engine.session_logger, "current_session_id", return_value=None),
+            ):
+                await logic_engine._tick_impl(rid, rid)
+
+        asyncio.run(run_case())
+
+        self.assertAlmostEqual(st.effective_target_temp, 21.0)
+        self.assertEqual(st.effective_target_source, "control_effective")
+        self.assertEqual(st.effective_control_source, "thermostat")
+        self.assertIsNone(st.manual_override_temp)
+        self.assertIsNone(st.manual_override_until)
+
+    def test_manual_mode_can_still_use_fresh_manual_setpoint_lock(self):
+        logic_engine._runtime_by_room.clear()
+        rid = "manual-sync"
+        st = logic_engine._rt(rid)
+        st.prev_ha_setpoint_seen = 24.0
+        now = datetime.now(timezone.utc)
+
+        active, target = logic_engine._manual_override_resolve(
+            rid,
+            {"temperature_mode": "manual", "manual_override_duration_minutes": 10},
+            {"target_temp": 23.0},
+            indoor_temp=26.0,
+            now=now,
+            engine_planned_target=21.0,
+        )
+
+        self.assertTrue(active)
+        self.assertAlmostEqual(target, 23.0)
+        self.assertAlmostEqual(st.manual_override_temp, 23.0)
+
+    def test_target_context_change_clears_stale_target_state(self):
+        st = logic_engine.RoomRuntime()
+        st.last_target_context_key = ("manual", "manual", 27.0, False, "auto", None, 3.0)
+        st.manual_override_temp = 27.0
+        st.manual_override_until = datetime.now(timezone.utc) + timedelta(minutes=5)
+        st.prev_ha_setpoint_seen = 27.0
+        st.effective_target_temp = 27.0
+
+        cfg = {
+            "temperature_mode": "schedule",
+            "effective_mode": "auto",
+            "ai_enabled": False,
+            "effective_max_delta_deg": 3.0,
+        }
+        logic_engine.sync_target_context_transition(st, "target-context", cfg, "night", 20.0)
+
+        self.assertIsNone(st.manual_override_temp)
+        self.assertIsNone(st.manual_override_until)
+        self.assertIsNone(st.prev_ha_setpoint_seen)
+        self.assertAlmostEqual(st.effective_target_temp, 20.0)
 
     def test_gate_turn_ac_on_duplicate_physical_on_skips(self):
         """Same fingerprint allowed only when compressor not observed ON — duplicate + ON skips."""

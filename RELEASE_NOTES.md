@@ -1,5 +1,11 @@
 # HawaAI add-on — release notes
 
+## 1.4.49
+
+- **Control:** Fixed thermostat target synchronization so schedule/AI/manual effective targets are the single runtime source for TICK decisions.
+- **Runtime:** Clears stale manual target/session references when the configured temperature plan changes, preventing old climate setpoints from causing false `thermostat_reached` shutdowns.
+- **Hardening:** Added safe numeric config fallbacks and regression coverage for malformed config values.
+
 ## 1.4.46
 
 - **IR:** Broadlink ON now follows AeroState staging: `set_hvac_mode(cool)`, wait 2s, then `set_temperature(target)` without bundling `hvac_mode` into the temperature call.

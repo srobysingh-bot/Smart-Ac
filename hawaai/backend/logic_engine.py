@@ -36,6 +36,7 @@ Runtime isolation: ``_runtime_by_room`` maps one ``RoomRuntime`` per trimmed ``r
 
 import asyncio
 import logging
+import math
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
@@ -187,6 +188,11 @@ class RoomRuntime:
     last_event_probe_indoor_temp: Optional[float] = None
     # Last applied comfort-mode (effective_mode) — detects config changes to clear stale delays.
     last_effective_mode: Optional[str] = None
+    # Last temperature-plan context used for thermostat target sync.
+    last_target_context_key: Optional[tuple] = None
+    last_temperature_mode: Optional[str] = None
+    last_control_effective_target_temp: Optional[float] = None
+    effective_target_source: str = "init"
 
 
 _runtime_by_room: Dict[str, RoomRuntime] = {}
@@ -392,6 +398,50 @@ MAX_PROVISIONAL_SECONDS: float = 180.0
 _POST_ON_SESSION_INTENT_SECONDS: float = float(_COOLDOWN_SECS) + 120.0
 
 
+def _cfg_float(
+    cfg: dict,
+    key: str,
+    default: float,
+    *,
+    lo: Optional[float] = None,
+    hi: Optional[float] = None,
+) -> float:
+    try:
+        val = float(cfg.get(key, default))
+        if not math.isfinite(val):
+            raise ValueError("non-finite")
+    except (TypeError, ValueError):
+        val = float(default)
+    if lo is not None:
+        val = max(float(lo), val)
+    if hi is not None:
+        val = min(float(hi), val)
+    return val
+
+
+def _cfg_int(
+    cfg: dict,
+    key: str,
+    default: int,
+    *,
+    lo: Optional[int] = None,
+    hi: Optional[int] = None,
+) -> int:
+    try:
+        raw = cfg.get(key, default)
+        val = int(raw)
+    except (TypeError, ValueError):
+        try:
+            val = int(float(cfg.get(key, default)))
+        except (TypeError, ValueError):
+            val = int(default)
+    if lo is not None:
+        val = max(int(lo), val)
+    if hi is not None:
+        val = min(int(hi), val)
+    return val
+
+
 def _seconds_since_last_command(st: RoomRuntime, now: datetime) -> float:
     if st.last_command_time is None:
         return float("inf")
@@ -456,7 +506,7 @@ def _is_user_authority_active(st: RoomRuntime, cfg: dict, now: datetime) -> bool
     """
     if st.last_user_command_time is None:
         return False
-    lock_secs = int(cfg.get("user_authority_lock_secs", 120))
+    lock_secs = _cfg_int(cfg, "user_authority_lock_secs", 120, lo=0)
     elapsed = (now - st.last_user_command_time).total_seconds()
     return elapsed < lock_secs
 
@@ -484,10 +534,10 @@ def _resolve_control_decision(
     AI only adjusts effective_target BEFORE this function is called.
     """
     st = _rt(room_id)
-    on_delta = float(cfg.get("thermostat_on_delta_deg", 0.7))
-    off_delta = float(cfg.get("thermostat_off_delta_deg", 0.3))
+    on_delta = _cfg_float(cfg, "thermostat_on_delta_deg", 0.7, lo=0.0)
+    off_delta = _cfg_float(cfg, "thermostat_off_delta_deg", 0.3, lo=0.0)
     vacancy_timeout = max(
-        int(cfg.get("vacancy_timeout_minutes", 5)) * 60,
+        _cfg_int(cfg, "vacancy_timeout_minutes", 5, lo=0) * 60,
         float(VACANCY_CONFIRM_SECS),
     )
     use_presence = cfg.get("use_presence", True)
@@ -731,7 +781,7 @@ def _resolve_presence_only_decision(
         if elapsed_vacant < float(VACANCY_CONFIRM_SECS):
             return "hold", "vacancy_debounce", occupied
         vacancy_timeout = max(
-            int(cfg.get("vacancy_timeout_minutes", 5)) * 60,
+            _cfg_int(cfg, "vacancy_timeout_minutes", 5, lo=0) * 60,
             float(VACANCY_CONFIRM_SECS),
         )
         if elapsed_vacant < vacancy_timeout:
@@ -1031,10 +1081,13 @@ _EFF_DELTA_MAX = 5.0
 
 def effective_max_delta_deg(cfg: dict) -> float:
     """Max °C above schedule base for auto combined adjustment and manual ceiling (default 3, clamp 1–5)."""
-    try:
-        return max(_EFF_DELTA_MIN, min(float(cfg.get("effective_max_delta_deg", 3.0)), _EFF_DELTA_MAX))
-    except (TypeError, ValueError):
-        return 3.0
+    return _cfg_float(
+        cfg,
+        "effective_max_delta_deg",
+        3.0,
+        lo=_EFF_DELTA_MIN,
+        hi=_EFF_DELTA_MAX,
+    )
 
 
 def apply_effective_mode_engine_target(
@@ -1128,6 +1181,101 @@ def sync_effective_mode_transition(st: RoomRuntime, room_id: str, cfg: dict) -> 
         )
         _clear_pending_command_state(st)
     st.last_effective_mode = cur
+
+
+def _target_context_key(cfg: dict, slot_label: str, base_temp: float) -> tuple:
+    mode = str(cfg.get("temperature_mode") or "manual").strip().lower()
+    if mode not in ("manual", "schedule", "schedule_ai"):
+        mode = "manual"
+    eff_mode = str(cfg.get("effective_mode") or "auto").strip().lower()
+    if eff_mode not in ("auto", "manual"):
+        eff_mode = "auto"
+    raw_manual_eff = cfg.get("manual_effective_temp")
+    try:
+        manual_eff = (
+            round(float(raw_manual_eff), 1)
+            if raw_manual_eff is not None and str(raw_manual_eff).strip() != ""
+            else None
+        )
+    except (TypeError, ValueError):
+        manual_eff = None
+    return (
+        mode,
+        slot_label if mode != "manual" else "manual",
+        round(float(base_temp), 1),
+        bool(cfg.get("ai_enabled", False)),
+        eff_mode,
+        manual_eff,
+        round(effective_max_delta_deg(cfg), 1),
+    )
+
+
+def _clear_stale_target_runtime_state(
+    st: RoomRuntime,
+    room_id: str,
+    *,
+    reason: str,
+    reset_target: Optional[float] = None,
+) -> None:
+    _clear_pending_command_state(st)
+    st.manual_override_until = None
+    st.manual_override_temp = None
+    st.prev_ha_setpoint_seen = None
+    if reset_target is not None:
+        try:
+            st.effective_target_temp = float(reset_target)
+        except (TypeError, ValueError):
+            pass
+    log_with_room(
+        "info",
+        room_id,
+        "[TARGET_SYNC] cleared stale runtime target state reason=%s",
+        reason,
+    )
+
+
+def sync_target_context_transition(
+    st: RoomRuntime,
+    room_id: str,
+    cfg: dict,
+    slot_label: str,
+    base_temp: float,
+) -> None:
+    """
+    Schedule/manual/AI target-plan changes invalidate HA setpoint-derived state.
+
+    This prevents an old manual/climate target from replacing the freshly
+    computed control effective target during thermostat evaluation.
+    """
+    cur = _target_context_key(cfg, slot_label, base_temp)
+    prev = st.last_target_context_key
+    if prev is not None and prev != cur:
+        log_with_room(
+            "info",
+            room_id,
+            "[TARGET_SYNC] target context changed %s -> %s",
+            prev,
+            cur,
+        )
+        _clear_stale_target_runtime_state(
+            st,
+            room_id,
+            reason="target_context_changed",
+            reset_target=base_temp,
+        )
+    elif (
+        prev is None
+        and cur[0] != "manual"
+        and (st.manual_override_until is not None or st.manual_override_temp is not None)
+    ):
+        _clear_stale_target_runtime_state(
+            st,
+            room_id,
+            reason="non_manual_initial_context",
+            reset_target=base_temp,
+        )
+    st.last_target_context_key = cur
+    st.last_temperature_mode = cur[0]
 
 
 def _nonnegative_delay_seconds(cfg: dict, key: str) -> float:
@@ -1426,8 +1574,8 @@ def should_send_setpoint_command(
     Avoid repeated IR / climate service spam: require both a meaningful delta from the
     last applied setpoint and a minimum interval since last setpoint command.
     """
-    dmin = float(cfg.get("setpoint_min_delta_deg", 0.7))
-    tmin = float(cfg.get("setpoint_command_min_interval_seconds", 180))
+    dmin = _cfg_float(cfg, "setpoint_min_delta_deg", 0.7, lo=0.0)
+    tmin = _cfg_float(cfg, "setpoint_command_min_interval_seconds", 180.0, lo=0.0)
     try:
         nt = round(float(new_temp), 1)
     except (TypeError, ValueError):
@@ -1484,9 +1632,9 @@ def _manual_override_resolve(
     spurious locks and expiry → immediate re-lock while HA still stale).
     """
     st = _rt(room_id)
-    dur_min = float(cfg.get("manual_override_duration_minutes", 30))
-    detect = float(cfg.get("manual_override_detect_delta_deg", 0.5))
-    exit_near = float(cfg.get("manual_override_exit_within_deg", 0.5))
+    dur_min = _cfg_float(cfg, "manual_override_duration_minutes", 30.0, lo=0.0)
+    detect = _cfg_float(cfg, "manual_override_detect_delta_deg", 0.5, lo=0.0)
+    exit_near = _cfg_float(cfg, "manual_override_exit_within_deg", 0.5, lo=0.0)
 
     raw_ct = climate_data.get("target_temp") if climate_data else None
     ct: Optional[float] = None
@@ -1495,6 +1643,22 @@ def _manual_override_resolve(
             ct = float(raw_ct)
         except (TypeError, ValueError):
             ct = None
+
+    temperature_mode = str(cfg.get("temperature_mode") or "manual").strip().lower()
+    if temperature_mode not in ("manual", "schedule", "schedule_ai"):
+        temperature_mode = "manual"
+    if temperature_mode != "manual":
+        if st.manual_override_until is not None or st.manual_override_temp is not None:
+            logger.info(
+                "[HawaAI][%s] Clearing manual setpoint lock because temperature_mode=%s",
+                room_id,
+                temperature_mode,
+            )
+        st.manual_override_until = None
+        st.manual_override_temp = None
+        if ct is not None:
+            st.prev_ha_setpoint_seen = ct
+        return False, engine_planned_target
 
     if st.manual_override_until is not None and now >= st.manual_override_until:
         logger.info(
@@ -1621,7 +1785,7 @@ def _gate_turn_ac_on(
             fp,
         )
 
-    min_iv = float(cfg.get("min_command_interval_seconds", 150))
+    min_iv = _cfg_float(cfg, "min_command_interval_seconds", 150.0, lo=0.0)
 
     secs = _seconds_since_last_command(st, now)
     if secs < min_iv and not resend_after_missed_ack:
@@ -1642,7 +1806,7 @@ def _gate_turn_ac_on(
             min_iv,
         )
 
-    min_off = float(cfg.get("compressor_min_off_seconds", 180))
+    min_off = _cfg_float(cfg, "compressor_min_off_seconds", 180.0, lo=0.0)
     if st.compressor_off_since is not None:
         off_elapsed = (now - st.compressor_off_since).total_seconds()
         if off_elapsed < min_off:
@@ -1701,7 +1865,7 @@ def _gate_turn_ac_off(room_id: str, cfg: dict, now: datetime, *, force: bool = F
         )
         return False
 
-    min_iv = float(cfg.get("min_command_interval_seconds", 150))
+    min_iv = _cfg_float(cfg, "min_command_interval_seconds", 150.0, lo=0.0)
 
     secs = _seconds_since_last_command(st, now)
     if secs < min_iv:
@@ -1711,7 +1875,7 @@ def _gate_turn_ac_off(room_id: str, cfg: dict, now: datetime, *, force: bool = F
         )
         return False
 
-    min_on = float(cfg.get("compressor_min_on_seconds", 300))
+    min_on = _cfg_float(cfg, "compressor_min_on_seconds", 300.0, lo=0.0)
     if st.compressor_on_since is not None:
         on_elapsed = (now - st.compressor_on_since).total_seconds()
         if on_elapsed < min_on:
@@ -1763,7 +1927,7 @@ async def _maybe_record_ai_user_adjustment(
     if abs(ct - ai_target) <= 0.55:
         ai_cache.clear_pending_ml_label(room_id)
         return
-    base_t = float(cfg.get("target_temp", 24))
+    base_t = _cfg_float(cfg, "target_temp", 24.0)
     if abs(ct - ai_target) > 0.55 and abs(ct - base_t) > 0.12:
         await database.update_ai_decision_ml_labels(
             decision_id,
@@ -2168,7 +2332,7 @@ async def _tick_impl(rid_raw: str, room_id: str) -> None:
         return
     if indoor_temp is None:
         try:
-            indoor_temp = float(cfg.get("target_temp", 24))
+            indoor_temp = _cfg_float(cfg, "target_temp", 24.0)
         except (TypeError, ValueError):
             indoor_temp = 24.0
 
@@ -2222,9 +2386,10 @@ async def _tick_impl(rid_raw: str, room_id: str) -> None:
     base_temp, slot_label = resolve_base_target_temp(cfg)
     log_target_resolve(room_id, cfg, base_temp, slot_label)
     temperature_mode_str = (cfg.get("temperature_mode") or "manual")
+    sync_target_context_transition(st, room_id, cfg, slot_label, base_temp)
 
     vacancy_timeout = max(
-        int(cfg.get("vacancy_timeout_minutes", 5)) * 60,
+        _cfg_int(cfg, "vacancy_timeout_minutes", 5, lo=0) * 60,
         float(VACANCY_CONFIRM_SECS),
     )
     smart_curve = smart_temp_adjustment_enabled(cfg) and bool(cfg.get("use_outdoor_temp", True))
@@ -2424,23 +2589,50 @@ async def _tick_impl(rid_raw: str, room_id: str) -> None:
         control_log=True,
     )
 
-    manual_override_active, effective_target = _manual_override_resolve(
+    manual_override_active, manual_target = _manual_override_resolve(
         room_id, cfg, climate_data or {}, indoor_temp, now, engine_target,
     )
     if manual_override_active:
         try:
-            et_u = float(effective_target)
+            et_u = float(manual_target)
             logger.info(
-                "[HawaAI][%s] User override window — HA setpoint %.1f°C drives control; "
-                "smart outdoor adjustment and AI clamp bypassed",
+                "[HawaAI][%s] User setpoint lock candidate %.1f°C "
+                "(control_effective=%.1f°C)",
                 room_id,
                 et_u,
+                float(engine_target),
             )
         except (TypeError, ValueError):
             pass
 
-    et_eff = float(effective_target)
+    manual_mode_active = str(temperature_mode_str or "manual").strip().lower() == "manual"
+    if manual_override_active and manual_mode_active:
+        et_eff = float(manual_target)
+        target_source = "manual_setpoint"
+    else:
+        et_eff = float(engine_target)
+        target_source = "control_effective"
+    st.last_control_effective_target_temp = float(engine_target)
     st.effective_target_temp = et_eff
+    st.effective_target_source = target_source
+    log_with_room(
+        "info",
+        room_id,
+        "[TARGET_SYNC] control_effective=%.2f",
+        float(engine_target),
+    )
+    log_with_room(
+        "info",
+        room_id,
+        "[TARGET_SYNC] runtime_target=%.2f",
+        et_eff,
+    )
+    log_with_room(
+        "info",
+        room_id,
+        "[TARGET_SYNC] source=%s",
+        st.effective_target_source,
+    )
 
     now_ts = now.timestamp()
     power_high = energy_watts_valid and not in_cooldown and energy_watts > _WATTS_COMPRESSOR
@@ -2785,8 +2977,8 @@ async def _tick_impl(rid_raw: str, room_id: str) -> None:
             )
 
     if smart_curve and climate_entity and ac_on and occ_res and not in_cooldown:
-        interval = int(cfg.get("setpoint_command_min_interval_seconds", 180))
-        meaningful = float(cfg.get("setpoint_min_delta_deg", 0.7))
+        interval = _cfg_int(cfg, "setpoint_command_min_interval_seconds", 180, lo=0)
+        meaningful = _cfg_float(cfg, "setpoint_min_delta_deg", 0.7, lo=0.0)
         await smart_cooling.apply_effective_target(
             room_id,
             climate_entity=climate_entity,
@@ -2828,9 +3020,10 @@ async def _tick_impl(rid_raw: str, room_id: str) -> None:
 
     if manual_override_active:
         logger.info(
-            "[HawaAI][%s] Skip: manual override active — control at %.1f°C (schedule/AI bypassed)",
+            "[HawaAI][%s] Manual setpoint lock active; runtime target source=%s target=%.1f°C",
             room_id,
-            effective_target,
+            st.effective_target_source,
+            et_eff,
         )
 
     session_active = bool(st.physical_ac_on or st.ac_is_on)
@@ -3286,7 +3479,7 @@ async def _turn_ac_on(
         )
         return False
 
-    target = effective_target if effective_target is not None else float(cfg.get("target_temp", 24))
+    target = effective_target if effective_target is not None else _cfg_float(cfg, "target_temp", 24.0)
 
     # Avoid redundant IR when compressor is already observed ON from power or HA/command —
     # never skip based on inferred-only transient ON.
@@ -3382,7 +3575,7 @@ async def _indoor_temp_for_shutdown(cfg: dict) -> float:
     if indoor_temp is not None:
         return indoor_temp
     try:
-        return float(cfg.get("target_temp", 24))
+        return _cfg_float(cfg, "target_temp", 24.0)
     except (TypeError, ValueError):
         return 24.0
 
@@ -3503,7 +3696,7 @@ async def _close_session(room_id: str, cfg: dict, indoor_temp: float, reason: st
             kwh_consumed = max(0.0, (avg_watts * duration_secs) / 3_600_000.0)
             kwh_consumed = round(kwh_consumed, 4)
 
-    tariff = float(cfg.get("energy_tariff_per_kwh", 8.0))
+    tariff = _cfg_float(cfg, "energy_tariff_per_kwh", 8.0, lo=0.0)
     cost: Optional[float] = (
         round(kwh_consumed * tariff, 2) if kwh_consumed is not None else None
     )
@@ -3630,7 +3823,7 @@ def get_runtime_state(room_id: str) -> dict:
     base_cfg = config_manager.load_config()
     room_def = resolve_room_definition(base_cfg, room_id)
     merged = room_registry.merge_room_config(base_cfg, room_def) if room_def else base_cfg
-    min_iv = float(merged.get("min_command_interval_seconds", 150))
+    min_iv = _cfg_float(merged, "min_command_interval_seconds", 150.0, lo=0.0)
 
     mo_until = st.manual_override_until.isoformat() if st.manual_override_until else None
     mo_active = bool(
@@ -3705,6 +3898,8 @@ def get_runtime_state(room_id: str) -> dict:
         "control_source":        st.effective_control_source,
         "control_mode":          normalize_control_mode(merged),
         "target_temp":           st.effective_target_temp,
+        "target_source":         st.effective_target_source,
+        "control_effective_target": st.last_control_effective_target_temp,
         "last_command_source":   st.last_command_source,
         "last_ac_on_at":         st.last_ac_on_at,
         "last_ac_off_at":        st.last_ac_off_at,
