@@ -1000,6 +1000,16 @@ export default function Dashboard() {
             smartMode={displayStatus?.smart_mode}
             smartFanMode={displayStatus?.smart_fan_mode}
             smartDelta={displayStatus?.smart_delta}
+            sleepOptimizationActive={displayStatus?.sleep_optimization_active}
+            sleepPhase={displayStatus?.sleep_phase}
+            sleepOffset={displayStatus?.sleep_offset}
+            humidityPercent={displayStatus?.humidity_percent}
+            feelsLikeTemp={displayStatus?.feels_like_temp}
+            dewPoint={displayStatus?.dew_point}
+            humidityOffset={displayStatus?.humidity_offset}
+            comfortLevel={displayStatus?.comfort_level}
+            humidityBand={displayStatus?.humidity_band}
+            dryModeRecommended={displayStatus?.dry_mode_recommended}
           />
           <SmartAdjustmentCard
             smartAdjustment={displayStatus?.smart_adjustment ?? displayStatus?.smart_temp_adjustment}

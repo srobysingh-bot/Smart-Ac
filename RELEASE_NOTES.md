@@ -1,5 +1,10 @@
 # HawaAI add-on — release notes
 
+## 1.4.53
+
+- **Dashboard:** Added a read-only comfort intelligence panel showing sleep optimization, humidity, feels-like temperature, dew point, comfort band, humidity adjustment, and dry-mode recommendation from live status data.
+- **Versioning:** Aligned add-on metadata, frontend package metadata, and the FastAPI advertised version.
+
 ## 1.4.52
 
 - **Comfort:** Added passive sleep optimization and humidity-aware comfort layers that adjust effective targets without changing ON/OFF, cooldown, delay, adapter, presence, or session logic.

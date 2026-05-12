@@ -11,7 +11,18 @@
  * Climate entity is used ONLY for display (temp, mode, fan, swing).
  */
 import { useEffect, useState } from 'react'
-import { Wind, Timer, Zap, Thermometer, Gauge, Brain, SlidersHorizontal } from 'lucide-react'
+import {
+  Wind,
+  Timer,
+  Zap,
+  Thermometer,
+  Gauge,
+  Brain,
+  SlidersHorizontal,
+  Moon,
+  Droplets,
+  Flame,
+} from 'lucide-react'
 
 function elapsed(startIso) {
   if (!startIso) return null
@@ -67,6 +78,23 @@ function formatDelayCountdown(totalSec) {
   return `${m}:${String(r).padStart(2, '0')}`
 }
 
+function fmtTemp(v, digits = 1) {
+  const n = Number(v)
+  return Number.isFinite(n) ? `${n.toFixed(digits)}°C` : '—'
+}
+
+function fmtOffset(v) {
+  const n = Number(v)
+  if (!Number.isFinite(n)) return null
+  if (Math.abs(n) < 0.05) return null
+  return `${n > 0 ? '+' : ''}${n.toFixed(1)}°C`
+}
+
+function fmtHumidity(v) {
+  const n = Number(v)
+  return Number.isFinite(n) ? `${n.toFixed(0)}%` : '—'
+}
+
 function StateSourceHint({ source, show }) {
   if (!show || !source) return null
   const cfg = {
@@ -96,6 +124,133 @@ function StateSourceHint({ source, show }) {
       <Icon size={11} aria-hidden />
       {label}
     </span>
+  )
+}
+
+const COMFORT_LEVEL_STYLE = {
+  comfortable: 'text-emerald-300 bg-emerald-950/35 border-emerald-800/55',
+  humid: 'text-sky-200 bg-sky-950/35 border-sky-800/50',
+  sticky: 'text-amber-200 bg-amber-950/35 border-amber-800/55',
+  dry: 'text-orange-200 bg-orange-950/35 border-orange-800/55',
+  disabled: 'text-gray-400 bg-gray-900/45 border-gray-800',
+  unknown: 'text-gray-400 bg-gray-900/45 border-gray-800',
+}
+
+function labelize(raw) {
+  const s = String(raw || '').replace(/_/g, ' ').trim()
+  return s ? s.charAt(0).toUpperCase() + s.slice(1) : 'Unknown'
+}
+
+function ComfortRuntimePanel({
+  sleepActive,
+  sleepPhase,
+  sleepOffset,
+  humidityPercent,
+  feelsLikeTemp,
+  dewPoint,
+  comfortLevel,
+  humidityBand,
+  humidityOffset,
+  dryModeRecommended,
+}) {
+  const hasSleep = sleepPhase || Math.abs(Number(sleepOffset) || 0) >= 0.05
+  const hasHumidity =
+    humidityPercent != null ||
+    feelsLikeTemp != null ||
+    dewPoint != null ||
+    comfortLevel ||
+    humidityBand ||
+    dryModeRecommended
+
+  const sleepOffsetLabel = fmtOffset(sleepOffset)
+  const humidityOffsetLabel = fmtOffset(humidityOffset)
+  const explanations = []
+  if (sleepOffsetLabel) explanations.push(`${sleepOffsetLabel} sleep optimization`)
+  if (humidityOffsetLabel) explanations.push(`${humidityOffsetLabel} humidity adjustment`)
+
+  if (!hasSleep && !hasHumidity && explanations.length === 0) return null
+
+  const comfortKey = String(comfortLevel || 'unknown').toLowerCase()
+  const comfortCls = COMFORT_LEVEL_STYLE[comfortKey] || COMFORT_LEVEL_STYLE.unknown
+
+  return (
+    <div className="rounded-lg border border-gray-800/80 bg-gray-950/35 px-2.5 py-2 space-y-2">
+      <div className="flex items-center justify-between gap-2">
+        <p className="text-[10px] uppercase tracking-wide text-gray-500">Comfort intelligence</p>
+        {explanations.length > 0 && (
+          <span className="text-[10px] text-violet-300 bg-violet-950/35 border border-violet-800/45 rounded px-1.5 py-0.5">
+            AI explanation
+          </span>
+        )}
+      </div>
+
+      <div className="grid grid-cols-1 sm:grid-cols-2 gap-2 text-xs">
+        {hasSleep && (
+          <div className="rounded-md border border-indigo-900/45 bg-indigo-950/20 px-2 py-1.5 min-w-0">
+            <div className="flex items-center justify-between gap-2">
+              <span className="inline-flex items-center gap-1 text-indigo-200">
+                <Moon size={12} aria-hidden />
+                Sleep
+              </span>
+              <span className={sleepActive ? 'text-emerald-300' : 'text-gray-500'}>
+                {sleepActive ? 'Active' : 'Idle'}
+              </span>
+            </div>
+            <div className="mt-1 flex items-center justify-between gap-2 text-[11px]">
+              <span className="text-gray-500 truncate">{labelize(sleepPhase || 'inactive')}</span>
+              <span className="font-mono text-gray-100">{sleepOffsetLabel || '+0.0°C'}</span>
+            </div>
+          </div>
+        )}
+
+        {hasHumidity && (
+          <div className="rounded-md border border-cyan-900/45 bg-cyan-950/15 px-2 py-1.5 min-w-0">
+            <div className="flex items-center justify-between gap-2">
+              <span className="inline-flex items-center gap-1 text-cyan-200">
+                <Droplets size={12} aria-hidden />
+                Humidity
+              </span>
+              <span className="font-mono text-gray-100">{fmtHumidity(humidityPercent)}</span>
+            </div>
+            <div className="mt-1 grid grid-cols-2 gap-x-2 gap-y-0.5 text-[11px]">
+              <span className="text-gray-500">Feels</span>
+              <span className="font-mono text-gray-100 text-right">{fmtTemp(feelsLikeTemp)}</span>
+              <span className="text-gray-500">Dew point</span>
+              <span className="font-mono text-gray-100 text-right">{fmtTemp(dewPoint)}</span>
+            </div>
+            <div className="mt-1.5 flex flex-wrap gap-1">
+              <span className={`rounded border px-1.5 py-0.5 text-[10px] ${comfortCls}`}>
+                {labelize(comfortLevel)}
+              </span>
+              {humidityBand && (
+                <span className="rounded border border-gray-800 bg-gray-900/60 px-1.5 py-0.5 text-[10px] text-gray-400">
+                  {labelize(humidityBand)}
+                </span>
+              )}
+              {dryModeRecommended && (
+                <span className="inline-flex items-center gap-1 rounded border border-amber-700/55 bg-amber-950/35 px-1.5 py-0.5 text-[10px] text-amber-200">
+                  <Flame size={10} aria-hidden />
+                  Dry mode
+                </span>
+              )}
+            </div>
+          </div>
+        )}
+      </div>
+
+      {explanations.length > 0 && (
+        <div className="flex flex-wrap gap-1.5">
+          {explanations.map((line) => (
+            <span
+              key={line}
+              className="rounded border border-violet-800/45 bg-violet-950/25 px-2 py-0.5 text-[11px] text-violet-100"
+            >
+              {line}
+            </span>
+          ))}
+        </div>
+      )}
+    </div>
   )
 }
 
@@ -166,6 +321,17 @@ export default function ACStatusCard({
   smartMode,
   smartFanMode,
   smartDelta,
+  // Passive comfort intelligence (read-only display)
+  sleepOptimizationActive,
+  sleepPhase,
+  sleepOffset,
+  humidityPercent,
+  feelsLikeTemp,
+  dewPoint,
+  humidityOffset,
+  comfortLevel,
+  humidityBand,
+  dryModeRecommended,
   // Climate entity display data (read-only, never used for state)
   acCurrentTemp,
   acTargetTemp,
@@ -252,6 +418,19 @@ export default function ACStatusCard({
           delta={smartDelta}
         />
       )}
+
+      <ComfortRuntimePanel
+        sleepActive={sleepOptimizationActive}
+        sleepPhase={sleepPhase}
+        sleepOffset={sleepOffset}
+        humidityPercent={humidityPercent}
+        feelsLikeTemp={feelsLikeTemp}
+        dewPoint={dewPoint}
+        humidityOffset={humidityOffset}
+        comfortLevel={comfortLevel}
+        humidityBand={humidityBand}
+        dryModeRecommended={dryModeRecommended}
+      />
 
       {(acOnLine || acOffLine) && (
         <div className="rounded-lg border border-gray-800/80 bg-gray-900/40 px-2.5 py-2 space-y-1">
