@@ -50,6 +50,7 @@ from . import (
     ha_client,
     humidity_comfort,
     live_broadcast,
+    runtime_self_heal,
     session_logger,
     sleep_optimizer,
     smart_cooling,
@@ -2270,6 +2271,113 @@ async def _read_indoor_humidity(cfg: dict) -> Optional[float]:
     return humidity_comfort.valid_humidity_percent(raw)
 
 
+async def _apply_runtime_self_heal(
+    room_id: str,
+    cfg: dict,
+    st: RoomRuntime,
+    *,
+    now: datetime,
+    indoor_temp: Optional[float],
+    indoor_temp_raw: object,
+    indoor_humidity: Optional[float],
+    climate_data: dict,
+    energy_watts_valid: bool,
+    energy_watts: float,
+    in_cooldown: bool,
+) -> runtime_self_heal.HealthReport:
+    """
+    Passive runtime resilience hook.
+
+    The self-heal engine only emits recommendations. This adapter applies the
+    safe, idempotent ones by reusing existing runtime/session helpers. It never
+    sends IR and never changes thermostat decisions.
+    """
+    climate_entity = (cfg.get("climate_entity") or cfg.get("ac_entity") or "").strip()
+    power_entity = str(cfg.get("energy_power_entity") or "").strip()
+    humidity_entity = _humidity_sensor_entity(cfg)
+    session_id = session_logger.current_session_id(room_id)
+    report = runtime_self_heal.evaluate(
+        runtime_self_heal.runtime_snapshot_from_object(
+            room_id,
+            st,
+            session_id=session_id,
+        ),
+        runtime_self_heal.ObservationSnapshot(
+            climate_entity=climate_entity,
+            climate_state=(climate_data or {}).get("mode") or (climate_data or {}).get("state"),
+            climate_available=bool(climate_data),
+            climate_last_updated=(climate_data or {}).get("last_updated"),
+            power_entity=power_entity,
+            power_watts=energy_watts if energy_watts_valid else None,
+            power_available=bool(energy_watts_valid) or not power_entity,
+            sensors=(
+                runtime_self_heal.SensorSnapshot(
+                    str(cfg.get("indoor_temp_entity") or "").strip(),
+                    indoor_temp_raw if indoor_temp_raw is not None else indoor_temp,
+                    available=indoor_temp is not None,
+                    kind="temperature",
+                ),
+                runtime_self_heal.SensorSnapshot(
+                    humidity_entity,
+                    indoor_humidity,
+                    available=indoor_humidity is not None,
+                    kind="humidity",
+                ),
+                runtime_self_heal.SensorSnapshot(
+                    power_entity,
+                    energy_watts if energy_watts_valid else None,
+                    available=energy_watts_valid or not power_entity,
+                    kind="power",
+                ),
+            ),
+        ),
+        now=now,
+    )
+    runtime_self_heal.log_report_changes(report)
+
+    for rec in report.recommendations:
+        action = rec.action
+        if (
+            action == runtime_self_heal.RecoveryAction.CLEAR_STALE_PENDING_ON
+            and st.pending_action == "on"
+        ):
+            _clear_pending_command_state(st)
+            if st.ac_state == "pending_on":
+                st.ac_state = "on" if st.physical_ac_on else "off"
+        elif (
+            action == runtime_self_heal.RecoveryAction.CLEAR_STALE_PENDING_OFF
+            and st.pending_action == "off"
+        ):
+            _clear_pending_command_state(st)
+            if st.ac_state == "pending_off":
+                st.ac_state = "on" if st.physical_ac_on else "off"
+        elif action == runtime_self_heal.RecoveryAction.RELEASE_FAILED_ON_RETRY:
+            if st.ac_state == "on_failed":
+                st.on_failed_retry_used = False
+        elif action == runtime_self_heal.RecoveryAction.REBUILD_RUNTIME:
+            if in_cooldown:
+                continue
+            observed_on = bool(rec.metadata.get("observed_on"))
+            if observed_on != bool(st.ac_is_on or st.physical_ac_on):
+                st.ac_is_on = observed_on
+                st.physical_ac_on = observed_on
+                st.effective_ac_on = observed_on
+                st.ac_state = "on" if observed_on else "off"
+                if observed_on:
+                    st.last_ac_on_at = now.timestamp()
+                    st.last_confirmed_on_at = now
+                    st.effective_on_since_ts = st.effective_on_since_ts or now.timestamp()
+                else:
+                    st.last_ac_off_at = now.timestamp()
+                    st.effective_on_since_ts = None
+                    st.possible_on_since = None
+        elif action == runtime_self_heal.RecoveryAction.CLOSE_ORPHAN_SESSION:
+            if session_logger.current_session_id(room_id) is not None and indoor_temp is not None:
+                await _close_session(room_id, cfg, float(indoor_temp), "self_heal_orphan_session")
+
+    return report
+
+
 def _clear_humidity_runtime(st: RoomRuntime) -> None:
     st.humidity_percent = None
     st.feels_like_temp = None
@@ -2452,6 +2560,19 @@ async def _tick_presence_only_mode(
         manual_override_active=False,
         confirmed_ac_on=confirmed_ac_on,
         physical_ac_on=st.physical_ac_on,
+    )
+    await _apply_runtime_self_heal(
+        room_id,
+        cfg,
+        st,
+        now=now,
+        indoor_temp=indoor_temp,
+        indoor_temp_raw=indoor_temp,
+        indoor_humidity=None,
+        climate_data=climate_data or {},
+        energy_watts_valid=energy_watts_valid,
+        energy_watts=energy_watts,
+        in_cooldown=in_cooldown,
     )
     presence_off_confirmed = awaiting_presence_off_confirmation and not st.physical_ac_on
 
@@ -3106,6 +3227,19 @@ async def _tick_impl(rid_raw: str, room_id: str) -> None:
         manual_override_active=manual_override_active,
         confirmed_ac_on=confirmed_ac_on,
         physical_ac_on=st.physical_ac_on,
+    )
+    await _apply_runtime_self_heal(
+        room_id,
+        cfg,
+        st,
+        now=now,
+        indoor_temp=indoor_temp,
+        indoor_temp_raw=indoor_temp_raw,
+        indoor_humidity=indoor_humidity,
+        climate_data=climate_data or {},
+        energy_watts_valid=energy_watts_valid,
+        energy_watts=energy_watts,
+        in_cooldown=in_cooldown,
     )
 
     schedule_slot_snap: Optional[str] = (
@@ -4396,4 +4530,7 @@ def get_runtime_state(room_id: str) -> dict:
         "effective_mode":             str(merged.get("effective_mode") or "auto"),
         "manual_effective_temp":      merged.get("manual_effective_temp"),
         "effective_max_delta_deg":    effective_max_delta_deg(merged),
+        "self_heal": runtime_self_heal.report_to_dict(
+            runtime_self_heal.global_state().latest_report(canonical)
+        ),
     }

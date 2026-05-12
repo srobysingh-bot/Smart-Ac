@@ -1,5 +1,11 @@
 # HawaAI add-on — release notes
 
+## 1.4.54
+
+- **Runtime resilience:** Added a passive Self-Healing Runtime Engine that validates runtime, HA climate, power, sensor, pending, and session consistency without sending IR or changing thermostat decisions.
+- **Recovery:** Safely clears stale pending flags, rebuilds runtime truth from settled HA/power observations, closes orphan sessions, releases aged failed-ON retry locks, and uses short-lived cached HA values during instability.
+- **Diagnostics:** Added confidence scores, structured `[SELF_HEAL]` change-based logs, runtime `self_heal` status, and regression coverage for stale/desynced runtime states.
+
 ## 1.4.53
 
 - **Dashboard:** Added a read-only comfort intelligence panel showing sleep optimization, humidity, feels-like temperature, dew point, comfort band, humidity adjustment, and dry-mode recommendation from live status data.
