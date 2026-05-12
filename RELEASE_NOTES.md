@@ -1,5 +1,9 @@
 # HawaAI add-on — release notes
 
+## 1.4.51
+
+- **Presence-only:** Vacant rooms that are still physically running now send OFF immediately, wait for power-confirmed OFF, then finalize runtime/session cleanup and enter `presence_idle`.
+
 ## 1.4.50
 
 - **Presence-only:** Vacant rooms that are already physically OFF now finalize once, clear stale pending/session/runtime state, and enter `presence_idle` instead of looping forever as `hold/presence_only`.

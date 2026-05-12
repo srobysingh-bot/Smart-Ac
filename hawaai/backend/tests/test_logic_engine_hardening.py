@@ -986,6 +986,119 @@ class TestLogicEngineHardening(unittest.TestCase):
             any("action=hold source=presence_only" in str(call.args) for call in second_logs.call_args_list)
         )
 
+    def test_presence_only_vacant_running_sends_off_then_waits_for_power_confirmation(self):
+        logic_engine._runtime_by_room.clear()
+        rid = "presence-active-off"
+        st = logic_engine._rt(rid)
+        base = datetime.now(timezone.utc)
+        st.ac_is_on = True
+        st.physical_ac_on = True
+        st.effective_ac_on = True
+        st.vacant_since = base - timedelta(minutes=6)
+        st.effective_on_since_ts = (base - timedelta(minutes=10)).timestamp()
+        st.last_ac_on_at = st.effective_on_since_ts
+        st.last_confirmed_on_at = base - timedelta(minutes=10)
+        st.session_start_time = base - timedelta(minutes=10)
+        st.session_state = "confirmed"
+        cfg = {
+            "control_mode": "presence_only",
+            "climate_entity": "climate.test",
+            "ir_backend": "aerostate",
+            "energy_power_entity": "sensor.power",
+            "target_temp": 24,
+            "vacancy_timeout_minutes": 5,
+            "off_delay_seconds": 3600,
+        }
+
+        async def close_session(*_args, **_kwargs):
+            st.session_start_time = None
+            st.session_state = "idle"
+
+        async def run_once(power, now, log_with_room):
+            with (
+                mock.patch.object(
+                    logic_engine.ha_client,
+                    "get_state",
+                    new=mock.AsyncMock(return_value=str(power)),
+                ),
+                mock.patch.object(
+                    logic_engine.ac_aerostate_adapter,
+                    "turn_off",
+                    new=mock.AsyncMock(return_value=True),
+                ) as turn_off,
+                mock.patch.object(
+                    logic_engine,
+                    "_maintain_session_lifecycle",
+                    new=mock.AsyncMock(),
+                ),
+                mock.patch.object(
+                    logic_engine,
+                    "_close_session",
+                    new=mock.AsyncMock(side_effect=close_session),
+                ) as close_session_mock,
+                mock.patch.object(
+                    logic_engine.session_logger,
+                    "current_session_id",
+                    return_value=None,
+                ),
+                mock.patch.object(logic_engine, "log_with_room", log_with_room),
+            ):
+                await logic_engine._tick_presence_only_mode(
+                    rid_raw=rid,
+                    room_id=rid,
+                    cfg=cfg,
+                    climate_data={"target_temp": 24, "mode": "off"},
+                    presence_raw="off",
+                    resolved_occupied=False,
+                    indoor_temp=24.0,
+                    now=now,
+                    st=st,
+                )
+            return turn_off, close_session_mock
+
+        first_logs = mock.Mock()
+        turn_off, close_session_mock = asyncio.run(run_once(800, base, first_logs))
+        turn_off.assert_awaited_once_with("climate.test")
+        close_session_mock.assert_not_called()
+        self.assertEqual(st.pending_action, "off")
+        self.assertFalse(st.presence_only_idle)
+        self.assertEqual(st.ac_state, "pending_off")
+        self.assertFalse(
+            any("[PRESENCE_ONLY] off_finalize" in str(call.args) for call in first_logs.call_args_list)
+        )
+
+        second_logs = mock.Mock()
+        turn_off, close_session_mock = asyncio.run(
+            run_once(800, datetime.now(timezone.utc) + timedelta(seconds=1), second_logs)
+        )
+        turn_off.assert_not_awaited()
+        close_session_mock.assert_not_called()
+        self.assertEqual(st.pending_action, "off")
+        self.assertFalse(st.presence_only_idle)
+        self.assertFalse(
+            any("[PRESENCE_ONLY] off_finalize" in str(call.args) for call in second_logs.call_args_list)
+        )
+
+        third_logs = mock.Mock()
+        turn_off, close_session_mock = asyncio.run(
+            run_once(0, datetime.now(timezone.utc) + timedelta(seconds=2), third_logs)
+        )
+        turn_off.assert_not_awaited()
+        close_session_mock.assert_awaited_once()
+        self.assertTrue(st.presence_only_idle)
+        self.assertFalse(st.physical_ac_on)
+        self.assertIsNone(st.pending_action)
+        self.assertEqual(st.ac_state, "off")
+        self.assertTrue(
+            any("[PRESENCE_ONLY] off_finalize" in str(call.args) for call in third_logs.call_args_list)
+        )
+        self.assertTrue(
+            any("[PRESENCE_ONLY] runtime_reset" in str(call.args) for call in third_logs.call_args_list)
+        )
+        self.assertTrue(
+            any("[PRESENCE_ONLY] idle_entered" in str(call.args) for call in third_logs.call_args_list)
+        )
+
     def test_presence_only_tick_uses_single_vacancy_stabilization(self):
         logic_engine._runtime_by_room.clear()
         rid = "presence-dup"

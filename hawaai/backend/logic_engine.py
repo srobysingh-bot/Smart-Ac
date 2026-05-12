@@ -1540,6 +1540,14 @@ def _pending_on_emit_hold_in_progress(st: RoomRuntime, action: str) -> bool:
     return action == "hold" and st.pending_action == "on" and st.pending_on_ir_sent
 
 
+def _presence_only_awaiting_off_confirmation(st: RoomRuntime) -> bool:
+    return (
+        st.pending_action == "off"
+        and st.last_command == "off"
+        and not st.presence_only_idle
+    )
+
+
 async def _clear_timed_out_pending_on(
     room_id: str,
     st: RoomRuntime,
@@ -2202,7 +2210,11 @@ async def _tick_presence_only_mode(
                 energy_watts = 0.0
 
     in_cooldown = _is_in_cooldown(st, now)
-    if energy_watts_valid and not in_cooldown:
+    awaiting_presence_off_confirmation = _presence_only_awaiting_off_confirmation(st)
+    power_can_confirm_state = energy_watts_valid and (
+        not in_cooldown or awaiting_presence_off_confirmation
+    )
+    if power_can_confirm_state:
         if energy_watts > _WATTS_COMPRESSOR:
             ac_on = True
             st.presence_only_idle = False
@@ -2215,11 +2227,15 @@ async def _tick_presence_only_mode(
         elif energy_watts < _WATTS_FAN_ONLY:
             ac_on = False
             st.last_power_confirmed_off = now.timestamp()
-            if st.ac_is_on:
+            if st.ac_is_on or awaiting_presence_off_confirmation:
                 st.ac_is_on = False
                 st.last_ac_off_at = now.timestamp()
-                if st.session_start_time is not None:
-                    await _close_session(room_id, cfg, indoor_temp, reason="power_off")
+                reason = "vacant" if awaiting_presence_off_confirmation else "power_off"
+                if (
+                    st.session_start_time is not None
+                    or session_logger.current_session_id(room_id) is not None
+                ):
+                    await _close_session(room_id, cfg, indoor_temp, reason=reason)
             st.ac_state_source = "power"
         else:
             ac_on = True
@@ -2247,6 +2263,7 @@ async def _tick_presence_only_mode(
         confirmed_ac_on=confirmed_ac_on,
         physical_ac_on=st.physical_ac_on,
     )
+    presence_off_confirmed = awaiting_presence_off_confirmation and not st.physical_ac_on
 
     action, source, occupied = _resolve_presence_only_decision(
         room_id,
@@ -2296,7 +2313,7 @@ async def _tick_presence_only_mode(
             indoor_temp,
             now,
             st,
-            reason="presence_idle",
+            reason="presence_vacant" if presence_off_confirmed else "presence_idle",
             duplicate_off_block_detected=duplicate_idle_off_block,
         )
         action = control_action = "idle"
@@ -2305,13 +2322,24 @@ async def _tick_presence_only_mode(
 
     pending_on_hold_sources = ("pending_on_lock", "pending_on_protection")
     preserve_pending_on_hold = _pending_on_emit_hold_in_progress(st, control_action)
-    if control_source not in pending_on_hold_sources and not preserve_pending_on_hold:
+    preserve_pending_off_hold = (
+        control_action == "hold"
+        and not occupied
+        and st.physical_ac_on
+        and _presence_only_awaiting_off_confirmation(st)
+    )
+    if (
+        control_source not in pending_on_hold_sources
+        and not preserve_pending_on_hold
+        and not preserve_pending_off_hold
+    ):
         _sync_pending_for_action(st, control_action)
 
     if (
         control_action != "on"
         and control_source not in pending_on_hold_sources
         and not preserve_pending_on_hold
+        and not preserve_pending_off_hold
     ):
         st.soft_start_ui = False
     if (
@@ -2380,9 +2408,22 @@ async def _tick_presence_only_mode(
             )
         st.last_command_source = "system"
     elif control_action == "off":
-        force_off = control_source == "presence_max_runtime"
-        reason_off = "max_runtime" if force_off else "vacant"
-        if bypass_actuation_delay:
+        force_off = control_source in ("presence_vacant", "presence_max_runtime")
+        reason_off = "max_runtime" if control_source == "presence_max_runtime" else "vacant"
+        if control_source == "presence_vacant":
+            if st.pending_action != "off":
+                st.pending_action = "off"
+                st.pending_since = time.time()
+            await _turn_ac_off(
+                room_id,
+                cfg,
+                indoor_temp,
+                reason_off,
+                now=now,
+                force=True,
+                close_session_on_send=False,
+            )
+        elif bypass_actuation_delay:
             await _turn_ac_off(room_id, cfg, indoor_temp, reason_off, now=now, force=force_off)
             _clear_pending_command_state(st)
         else:
@@ -3910,6 +3951,7 @@ async def _turn_ac_off(
     now: Optional[datetime] = None,
     *,
     force: bool = False,
+    close_session_on_send: bool = True,
 ) -> None:
     st = _rt(room_id)
     climate_entity = (cfg.get("climate_entity") or "").strip()
@@ -3972,7 +4014,8 @@ async def _turn_ac_off(
     st.just_turned_on_until = None
     st.last_decision_at = cmd_ts
 
-    await _close_session(room_id, cfg, indoor_temp, reason)
+    if close_session_on_send:
+        await _close_session(room_id, cfg, indoor_temp, reason)
 
 
 def get_runtime_state(room_id: str) -> dict:
