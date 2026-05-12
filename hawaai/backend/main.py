@@ -546,10 +546,19 @@ async def _dashboard_status_payload(rid: str) -> Dict[str, Any]:
         effective_target = float(runtime.get("target_temp"))
     except (TypeError, ValueError):
         effective_target = effective_after_weather
+    try:
+        sleep_offset = float(runtime.get("sleep_offset") or 0.0)
+    except (TypeError, ValueError):
+        sleep_offset = 0.0
+    try:
+        humidity_offset = float(runtime.get("humidity_offset") or 0.0)
+    except (TypeError, ValueError):
+        humidity_offset = 0.0
+    effective_without_comfort_layers = float(effective_target) - sleep_offset - humidity_offset
     ai_adjust_applied = (
         tm == "schedule_ai"
         and bool(cfg.get("ai_enabled", False))
-        and abs(float(effective_target) - float(effective_after_weather)) >= 0.01
+        and abs(float(effective_without_comfort_layers) - float(effective_after_weather)) >= 0.01
     )
 
     rt = _runtime_block(runtime)
@@ -558,6 +567,10 @@ async def _dashboard_status_payload(rid: str) -> Dict[str, Any]:
     )
 
     ai_snap = get_ai_status(rid)
+    humidity_entity = (
+        str(cfg.get("humidity_entity_id") or "").strip()
+        or str(cfg.get("indoor_humidity_entity") or "").strip()
+    )
     health = {
         "fetched_at": datetime.now(timezone.utc).isoformat(),
         "climate": {
@@ -572,6 +585,9 @@ async def _dashboard_status_payload(rid: str) -> Dict[str, Any]:
             "presence": _sensor_health(cfg.get("presence_entity", ""), presence_raw),
             "energy_power": _sensor_health(cfg.get("energy_power_entity", ""), energy_power_raw),
             "energy_kwh": _sensor_health(cfg.get("energy_kwh_entity", ""), energy_kwh_raw),
+            "humidity": (
+                None if not humidity_entity else runtime.get("humidity_percent") is not None
+            ),
         },
         "ai": {
             "status": ai_snap.get("status"),
@@ -645,6 +661,18 @@ async def _dashboard_status_payload(rid: str) -> Dict[str, Any]:
         "manual_effective_temp": cfg.get("manual_effective_temp"),
         "effective_max_delta_deg": logic_engine.effective_max_delta_deg(cfg),
         "effective_after_weather": effective_after_weather,
+        "sleep_offset": runtime.get("sleep_offset", 0.0),
+        "sleep_phase": runtime.get("sleep_phase", "inactive"),
+        "sleep_optimization_active": runtime.get("sleep_optimization_active", False),
+        "sleep_suspended_reason": runtime.get("sleep_suspended_reason"),
+        "humidity_percent": runtime.get("humidity_percent"),
+        "feels_like_temp": runtime.get("feels_like_temp"),
+        "dew_point": runtime.get("dew_point"),
+        "humidity_offset": runtime.get("humidity_offset", 0.0),
+        "comfort_score": runtime.get("comfort_score", 0.0),
+        "comfort_level": runtime.get("comfort_level", "unknown"),
+        "humidity_band": runtime.get("humidity_band", "unavailable"),
+        "dry_mode_recommended": runtime.get("dry_mode_recommended", False),
         "temperature_mode": tm,
         "schedule_slot": schedule_slot,
         "ai_adjust_applied": ai_adjust_applied,
@@ -739,6 +767,7 @@ async def api_create_room(body: Dict[str, Any] = Body(...)):
         "presence_entity",
         "indoor_temp_entity",
         "indoor_humidity_entity",
+        "humidity_entity_id",
         "energy_power_entity",
         "energy_kwh_entity",
     ):
@@ -872,6 +901,7 @@ async def api_update_room(room_id: str, body: Dict[str, Any] = Body(...)):
         "presence_entity",
         "indoor_temp_entity",
         "indoor_humidity_entity",
+        "humidity_entity_id",
         "energy_power_entity",
         "energy_kwh_entity",
     ):

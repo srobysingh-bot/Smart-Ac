@@ -1,5 +1,11 @@
 # HawaAI add-on — release notes
 
+## 1.4.52
+
+- **Comfort:** Added passive sleep optimization and humidity-aware comfort layers that adjust effective targets without changing ON/OFF, cooldown, delay, adapter, presence, or session logic.
+- **Analytics:** Exposes sleep phase/offset plus humidity, feels-like temperature, dew point, comfort score, comfort band, and dry-mode recommendation.
+- **Tests:** Added regression coverage for sleep progression, high-heat suspension, humidity offsets, dew point, dry-mode recommendation, and sleep/humidity target stacking.
+
 ## 1.4.51
 
 - **Presence-only:** Vacant rooms that are still physically running now send OFF immediately, wait for power-confirmed OFF, then finalize runtime/session cleanup and enter `presence_idle`.

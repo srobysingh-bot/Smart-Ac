@@ -1,5 +1,5 @@
 name: HawaAI AC Optimizer
-version: 1.4.51
+version: 1.4.52
 slug: hawaai
 description: AI-powered AC optimization using presence, temperature, and energy data
 url: https://github.com/srobysingh-bot/Smart-Ac
@@ -41,6 +41,19 @@ options:
   use_outdoor_temp: true
   smart_temp_adjustment: true
   smart_cooling_enabled: false
+  sleep_optimization_enabled: true
+  sleep_start_hour: 22
+  sleep_end_hour: 6
+  sleep_max_offset: 1.5
+  sleep_curve_mode: "gradual"
+  humidity_entity_id: ""
+  humidity_comfort_enabled: true
+  humidity_ideal_min: 40
+  humidity_ideal_max: 60
+  humidity_warning_threshold: 65
+  humidity_critical_threshold: 75
+  humidity_min_offset: -1.0
+  humidity_max_offset: 0.5
   manual_override: false
   ai_enabled: false
   ai_provider: "ollama"
@@ -76,6 +89,19 @@ schema:
   use_outdoor_temp: bool
   smart_temp_adjustment: bool
   smart_cooling_enabled: bool?
+  sleep_optimization_enabled: bool?
+  sleep_start_hour: int?
+  sleep_end_hour: int?
+  sleep_max_offset: float?
+  sleep_curve_mode: str?
+  humidity_entity_id: str?
+  humidity_comfort_enabled: bool?
+  humidity_ideal_min: float?
+  humidity_ideal_max: float?
+  humidity_warning_threshold: float?
+  humidity_critical_threshold: float?
+  humidity_min_offset: float?
+  humidity_max_offset: float?
   manual_override: bool
   ai_enabled: bool?
   ai_provider: str?

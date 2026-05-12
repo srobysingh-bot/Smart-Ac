@@ -21,6 +21,7 @@ _ROOM_ENTITY_KEYS = (
     "presence_entity",
     "indoor_temp_entity",
     "indoor_humidity_entity",
+    "humidity_entity_id",
     "energy_power_entity",
     "energy_kwh_entity",
 )

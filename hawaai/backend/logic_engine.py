@@ -48,8 +48,10 @@ from . import (
     config_manager,
     database,
     ha_client,
+    humidity_comfort,
     live_broadcast,
     session_logger,
+    sleep_optimizer,
     smart_cooling,
     weather_api,
 )
@@ -194,6 +196,20 @@ class RoomRuntime:
     last_temperature_mode: Optional[str] = None
     last_control_effective_target_temp: Optional[float] = None
     effective_target_source: str = "init"
+    sleep_offset: float = 0.0
+    sleep_phase: str = "inactive"
+    sleep_optimization_active: bool = False
+    sleep_suspended_reason: Optional[str] = None
+    last_sleep_log_sig: Optional[tuple] = None
+    humidity_percent: Optional[float] = None
+    feels_like_temp: Optional[float] = None
+    dew_point: Optional[float] = None
+    humidity_offset: float = 0.0
+    comfort_score: float = 0.0
+    comfort_level: str = "unknown"
+    humidity_band: str = "unavailable"
+    dry_mode_recommended: bool = False
+    last_humidity_log_sig: Optional[tuple] = None
 
 
 _runtime_by_room: Dict[str, RoomRuntime] = {}
@@ -1208,13 +1224,32 @@ async def effective_target_for_temp_cross(
     eff_aw = compute_effective_target(base_temp, outdoor_temp, smart_curve)
     ai_delta = await _get_ai_target_adjustment(room_canon, indoor_temp, eff_aw, merged_cfg)
     planned_raw = float(eff_aw + ai_delta)
-    return apply_effective_mode_engine_target(
+    target_before_sleep = apply_effective_mode_engine_target(
         room_id=room_canon,
         base_temp=float(base_temp),
         planned_with_ai=planned_raw,
         cfg=merged_cfg,
         control_log=False,
     )
+    sleep_result = _apply_sleep_optimizer_layer(
+        room_canon,
+        merged_cfg,
+        now=datetime.now(timezone.utc),
+        indoor_temp=indoor_temp,
+        target_before_sleep=target_before_sleep,
+        log_change=False,
+    )
+    humidity_percent = await _read_indoor_humidity(merged_cfg)
+    humidity_result = _apply_humidity_comfort_layer(
+        room_canon,
+        merged_cfg,
+        indoor_temp=indoor_temp,
+        humidity_percent=humidity_percent,
+        target_before_humidity=sleep_result.adjusted_target,
+        ac_on=False,
+        log_change=False,
+    )
+    return humidity_result.adjusted_target
 
 
 _EFF_DELTA_MIN = 1.0
@@ -2162,6 +2197,156 @@ def bounded_effective_from_ai_cache(
     return bounded, changed
 
 
+def _sleep_manual_target_cap(cfg: dict) -> Optional[float]:
+    """User-facing manual target is a cap on additional sleep relaxation only."""
+    try:
+        return float(cfg.get("target_temp"))
+    except (TypeError, ValueError):
+        return None
+
+
+def _apply_sleep_optimizer_layer(
+    room_id: str,
+    cfg: dict,
+    *,
+    now: datetime,
+    indoor_temp: Optional[float],
+    target_before_sleep: float,
+    log_change: bool,
+) -> sleep_optimizer.SleepAdjustment:
+    """
+    Passive target modifier: schedule/weather/AI/effective-mode target in, adjusted target out.
+    No AC control, sessions, occupancy, cooldown, or command state is touched here.
+    """
+    result = sleep_optimizer.calculate_sleep_adjustment(
+        cfg,
+        current_time=now,
+        target_temp=float(target_before_sleep),
+        indoor_temp=indoor_temp,
+        user_manual_target=_sleep_manual_target_cap(cfg),
+    )
+
+    st = _rt(room_id)
+    st.sleep_offset = float(result.offset)
+    st.sleep_phase = result.phase
+    st.sleep_optimization_active = bool(result.active)
+    st.sleep_suspended_reason = result.suspended
+
+    if log_change:
+        sig = (
+            bool(result.active),
+            round(float(result.offset), 2),
+            result.phase,
+            result.suspended or "none",
+        )
+        if sig != st.last_sleep_log_sig:
+            log_with_room(
+                "info",
+                room_id,
+                "[SLEEP] active=%s offset=%+.1f phase=%s suspended=%s",
+                bool(result.active),
+                float(result.offset),
+                result.phase,
+                result.suspended or "none",
+            )
+            st.last_sleep_log_sig = sig
+
+    return result
+
+
+def _humidity_sensor_entity(cfg: dict) -> str:
+    """Preferred new key with legacy indoor_humidity_entity fallback."""
+    return (
+        str(cfg.get("humidity_entity_id") or "").strip()
+        or str(cfg.get("indoor_humidity_entity") or "").strip()
+    )
+
+
+async def _read_indoor_humidity(cfg: dict) -> Optional[float]:
+    entity_id = _humidity_sensor_entity(cfg)
+    if not entity_id:
+        return None
+    raw = await ha_client.get_state(entity_id)
+    return humidity_comfort.valid_humidity_percent(raw)
+
+
+def _clear_humidity_runtime(st: RoomRuntime) -> None:
+    st.humidity_percent = None
+    st.feels_like_temp = None
+    st.dew_point = None
+    st.humidity_offset = 0.0
+    st.comfort_score = 0.0
+    st.comfort_level = "unknown"
+    st.humidity_band = "unavailable"
+    st.dry_mode_recommended = False
+
+
+def _apply_humidity_comfort_layer(
+    room_id: str,
+    cfg: dict,
+    *,
+    indoor_temp: float,
+    humidity_percent: Optional[float],
+    target_before_humidity: float,
+    ac_on: bool,
+    log_change: bool,
+) -> humidity_comfort.HumidityComfort:
+    """
+    Passive humidity modifier: target in, adjusted target out.
+    The calculation is pure; this wrapper only copies diagnostics into runtime state.
+    """
+    result = humidity_comfort.calculate_humidity_comfort(
+        cfg,
+        indoor_temp=float(indoor_temp),
+        target_temp=float(target_before_humidity),
+        humidity_percent=humidity_percent,
+        ac_on=bool(ac_on),
+    )
+
+    st = _rt(room_id)
+    st.humidity_percent = result.humidity_percent
+    st.feels_like_temp = result.feels_like_temp
+    st.dew_point = result.dew_point
+    st.humidity_offset = float(result.humidity_offset)
+    st.comfort_score = float(result.comfort_score)
+    st.comfort_level = result.comfort_level
+    st.humidity_band = result.humidity_band
+    st.dry_mode_recommended = bool(result.dry_mode_recommended)
+
+    if log_change:
+        sig = (
+            result.humidity_percent,
+            result.feels_like_temp,
+            round(float(result.humidity_offset), 2),
+            result.comfort_level,
+            bool(result.dry_mode_recommended),
+            result.reason,
+        )
+        if sig != st.last_humidity_log_sig:
+            humidity_label = (
+                f"{result.humidity_percent:.0f}%"
+                if result.humidity_percent is not None else "n/a"
+            )
+            feels_label = (
+                f"{result.feels_like_temp:.1f}"
+                if result.feels_like_temp is not None else "n/a"
+            )
+            log_with_room(
+                "info",
+                room_id,
+                "[HUMIDITY] humidity=%s feels_like=%s offset=%+.1f comfort=%s "
+                "dry_mode_recommended=%s",
+                humidity_label,
+                feels_label,
+                float(result.humidity_offset),
+                result.comfort_level,
+                bool(result.dry_mode_recommended),
+            )
+            st.last_humidity_log_sig = sig
+
+    return result
+
+
 async def tick(room_id: str) -> None:
     """
     Single decision-loop iteration for one room.
@@ -2196,6 +2381,11 @@ async def _tick_presence_only_mode(
     except (TypeError, ValueError):
         et_eff = 24.0
     st.effective_target_temp = et_eff
+    st.sleep_offset = 0.0
+    st.sleep_phase = "inactive"
+    st.sleep_optimization_active = False
+    st.sleep_suspended_reason = None
+    _clear_humidity_runtime(st)
 
     energy_power_entity = cfg.get("energy_power_entity", "")
     energy_watts: float = 0.0
@@ -2623,15 +2813,7 @@ async def _tick_impl(rid_raw: str, room_id: str) -> None:
                 outdoor_temp, effective_after_weather,
             )
 
-    indoor_humidity: Optional[float] = None
-    ih_entity = (cfg.get("indoor_humidity_entity") or "").strip()
-    if ih_entity:
-        raw_ih = await ha_client.get_state(ih_entity)
-        if raw_ih not in (None, "unavailable", "unknown", ""):
-            try:
-                indoor_humidity = float(raw_ih)
-            except (ValueError, TypeError):
-                pass
+    indoor_humidity = await _read_indoor_humidity(cfg)
 
     energy_power_entity = cfg.get("energy_power_entity", "")
     energy_watts: float = 0.0
@@ -2787,13 +2969,31 @@ async def _tick_impl(rid_raw: str, room_id: str) -> None:
 
     ai_delta = await _get_ai_target_adjustment(room_id, indoor_temp, eff_aw, cfg)
     planned_with_ai = eff_aw + ai_delta
-    engine_target = apply_effective_mode_engine_target(
+    target_before_sleep = apply_effective_mode_engine_target(
         room_id=room_id,
         base_temp=float(base_temp),
         planned_with_ai=float(planned_with_ai),
         cfg=cfg,
         control_log=True,
     )
+    sleep_result = _apply_sleep_optimizer_layer(
+        room_id,
+        cfg,
+        now=now,
+        indoor_temp=indoor_temp,
+        target_before_sleep=target_before_sleep,
+        log_change=True,
+    )
+    humidity_result = _apply_humidity_comfort_layer(
+        room_id,
+        cfg,
+        indoor_temp=indoor_temp,
+        humidity_percent=indoor_humidity,
+        target_before_humidity=float(sleep_result.adjusted_target),
+        ac_on=bool(ac_on),
+        log_change=True,
+    )
+    engine_target = float(humidity_result.adjusted_target)
 
     manual_override_active, manual_target = _manual_override_resolve(
         room_id, cfg, climate_data or {}, indoor_temp, now, engine_target,
@@ -3182,7 +3382,12 @@ async def _tick_impl(rid_raw: str, room_id: str) -> None:
                 enabled=True,
             )
 
-    if smart_curve and climate_entity and ac_on and occ_res and not in_cooldown:
+    sleep_target_changed = abs(float(getattr(sleep_result, "offset", 0.0))) >= 0.01
+    humidity_target_changed = abs(float(getattr(humidity_result, "humidity_offset", 0.0))) >= 0.01
+    if (
+        (smart_curve or sleep_target_changed or humidity_target_changed)
+        and climate_entity and ac_on and occ_res and not in_cooldown
+    ):
         interval = _cfg_int(cfg, "setpoint_command_min_interval_seconds", 180, lo=0)
         meaningful = _cfg_float(cfg, "setpoint_min_delta_deg", 0.7, lo=0.0)
         await smart_cooling.apply_effective_target(
@@ -3264,6 +3469,14 @@ async def _tick_impl(rid_raw: str, room_id: str) -> None:
             "schedule_base_temp": base_temp,
             "effective_after_weather": eff_aw,
             "effective_final_temp": et_eff,
+            "sleep_offset": st.sleep_offset,
+            "sleep_phase": st.sleep_phase,
+            "sleep_optimization_active": st.sleep_optimization_active,
+            "humidity_offset": st.humidity_offset,
+            "comfort_score": st.comfort_score,
+            "comfort_level": st.comfort_level,
+            "humidity_band": st.humidity_band,
+            "dry_mode_recommended": st.dry_mode_recommended,
             "ai_adjust_applied": 1 if ai_adj_snap else 0,
             "target_temp": base_temp,
             "control_source": st.effective_control_source,
@@ -4108,6 +4321,18 @@ def get_runtime_state(room_id: str) -> dict:
         "target_temp":           st.effective_target_temp,
         "target_source":         st.effective_target_source,
         "control_effective_target": st.last_control_effective_target_temp,
+        "sleep_offset":          st.sleep_offset,
+        "sleep_phase":           st.sleep_phase,
+        "sleep_optimization_active": st.sleep_optimization_active,
+        "sleep_suspended_reason": st.sleep_suspended_reason,
+        "humidity_percent":      st.humidity_percent,
+        "feels_like_temp":       st.feels_like_temp,
+        "dew_point":             st.dew_point,
+        "humidity_offset":       st.humidity_offset,
+        "comfort_score":         st.comfort_score,
+        "comfort_level":         st.comfort_level,
+        "humidity_band":         st.humidity_band,
+        "dry_mode_recommended":  st.dry_mode_recommended,
         "last_command_source":   st.last_command_source,
         "last_ac_on_at":         st.last_ac_on_at,
         "last_ac_off_at":        st.last_ac_off_at,
