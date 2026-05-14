@@ -1507,6 +1507,225 @@ class TestLogicEngineHardening(unittest.TestCase):
 
         asyncio.run(run_case())
 
+    def test_long_confirmed_cooling_session_stores_valid(self):
+        logic_engine._runtime_by_room.clear()
+        rid = "session-long-valid"
+        st = logic_engine._rt(rid)
+        st.session_start_time = datetime.now(timezone.utc) - timedelta(minutes=45)
+        st.session_start_temp = 28.0
+        st.session_state = "confirmed"
+        st.session_runtime_confirmed = True
+        st.watts_samples = [720.0, 760.0, 740.0]
+
+        async def run_case():
+            end_session = mock.AsyncMock()
+            with (
+                mock.patch.object(logic_engine.session_logger, "current_session_id", return_value="sid"),
+                mock.patch.object(logic_engine.session_logger, "session_start_time", return_value=st.session_start_time),
+                mock.patch.object(logic_engine.session_logger, "end_session", new=end_session),
+                mock.patch.object(logic_engine, "clear_setpoint_command_tracking"),
+                mock.patch.object(logic_engine.smart_cooling, "reset"),
+            ):
+                await logic_engine._close_session(rid, {}, 24.5, "thermostat_reached")
+            payload = end_session.await_args.args[1]
+            self.assertEqual(payload["is_record_valid"], 1)
+            self.assertGreater(payload["energy_kwh"], 0)
+            self.assertGreater(payload["time_to_cool_minutes"], 40)
+
+        asyncio.run(run_case())
+
+    def test_delayed_power_confirmation_promotes_provisional(self):
+        logic_engine._runtime_by_room.clear()
+        rid = "session-delayed-power"
+        st = logic_engine._rt(rid)
+        now = datetime.now(timezone.utc)
+        st.session_start_time = now - timedelta(seconds=logic_engine.MAX_PROVISIONAL_SECONDS + 30)
+        st.ac_is_on = True
+        st.last_ac_on_at = st.session_start_time.timestamp()
+
+        async def run_case():
+            with (
+                mock.patch.object(logic_engine.session_logger, "current_session_id", return_value="sid"),
+                mock.patch.object(logic_engine.session_logger, "current_session_is_provisional", return_value=True),
+                mock.patch.object(logic_engine.session_logger, "session_start_time", return_value=st.session_start_time),
+                mock.patch.object(logic_engine.session_logger, "upgrade_current_session_to_confirmed", new=mock.AsyncMock()) as upgrade,
+                mock.patch.object(logic_engine, "_close_session", new=mock.AsyncMock()) as close_session,
+            ):
+                await logic_engine._maintain_session_lifecycle(
+                    rid,
+                    {},
+                    25.0,
+                    now,
+                    24.0,
+                    energy_watts_valid=False,
+                    energy_watts=0.0,
+                    in_cooldown=False,
+                    confirmed_ac_on=True,
+                    inferred_only_physical=False,
+                )
+            upgrade.assert_awaited()
+            close_session.assert_not_awaited()
+
+        asyncio.run(run_case())
+
+    def test_presence_only_vacancy_shutdown_preserves_valid_session(self):
+        logic_engine._runtime_by_room.clear()
+        rid = "session-presence-valid"
+        st = logic_engine._rt(rid)
+        st.session_start_time = datetime.now(timezone.utc) - timedelta(minutes=12)
+        st.session_start_temp = 27.0
+        st.session_state = "confirmed"
+        st.session_runtime_confirmed = True
+        st.watts_samples = [650.0, 670.0]
+
+        async def run_case():
+            end_session = mock.AsyncMock()
+            with (
+                mock.patch.object(logic_engine.session_logger, "current_session_id", return_value="sid"),
+                mock.patch.object(logic_engine.session_logger, "session_start_time", return_value=st.session_start_time),
+                mock.patch.object(logic_engine.session_logger, "end_session", new=end_session),
+                mock.patch.object(logic_engine, "clear_setpoint_command_tracking"),
+                mock.patch.object(logic_engine.smart_cooling, "reset"),
+            ):
+                await logic_engine._close_session(rid, {}, 25.0, "vacant")
+            payload = end_session.await_args.args[1]
+            self.assertEqual(payload["is_record_valid"], 1)
+            self.assertEqual(payload["reason_stopped"], "vacant")
+
+        asyncio.run(run_case())
+
+    def test_aerostate_confirmed_runtime_valid_without_power_samples(self):
+        logic_engine._runtime_by_room.clear()
+        rid = "session-aerostate-valid"
+        st = logic_engine._rt(rid)
+        st.session_start_time = datetime.now(timezone.utc) - timedelta(minutes=20)
+        st.session_start_temp = 28.0
+        st.session_state = "confirmed"
+        st.session_runtime_confirmed = True
+
+        async def run_case():
+            end_session = mock.AsyncMock()
+            with (
+                mock.patch.object(logic_engine.session_logger, "current_session_id", return_value="sid"),
+                mock.patch.object(logic_engine.session_logger, "session_start_time", return_value=st.session_start_time),
+                mock.patch.object(logic_engine.session_logger, "end_session", new=end_session),
+                mock.patch.object(logic_engine, "clear_setpoint_command_tracking"),
+                mock.patch.object(logic_engine.smart_cooling, "reset"),
+            ):
+                await logic_engine._close_session(rid, {}, 26.0, "manual_off")
+            self.assertEqual(end_session.await_args.args[1]["is_record_valid"], 1)
+
+        asyncio.run(run_case())
+
+    def test_tuya_delayed_power_update_does_not_timeout_confirmed_runtime(self):
+        logic_engine._runtime_by_room.clear()
+        rid = "session-tuya-lag"
+        st = logic_engine._rt(rid)
+        now = datetime.now(timezone.utc)
+        st.session_start_time = now - timedelta(minutes=4)
+        st.ac_is_on = True
+        st.physical_ac_on = True
+
+        async def run_case():
+            with (
+                mock.patch.object(logic_engine.session_logger, "current_session_id", return_value="sid"),
+                mock.patch.object(logic_engine.session_logger, "current_session_is_provisional", return_value=True),
+                mock.patch.object(logic_engine.session_logger, "session_start_time", return_value=st.session_start_time),
+                mock.patch.object(logic_engine.session_logger, "upgrade_current_session_to_confirmed", new=mock.AsyncMock()) as upgrade,
+                mock.patch.object(logic_engine, "_close_session", new=mock.AsyncMock()) as close_session,
+            ):
+                await logic_engine._maintain_session_lifecycle(
+                    rid,
+                    {},
+                    26.0,
+                    now,
+                    24.0,
+                    energy_watts_valid=True,
+                    energy_watts=120.0,
+                    in_cooldown=False,
+                    confirmed_ac_on=True,
+                    inferred_only_physical=False,
+                )
+            upgrade.assert_awaited()
+            close_session.assert_not_awaited()
+
+        asyncio.run(run_case())
+
+    def test_short_accidental_on_remains_invalid(self):
+        logic_engine._runtime_by_room.clear()
+        rid = "session-short-invalid"
+        st = logic_engine._rt(rid)
+        st.session_start_time = datetime.now(timezone.utc) - timedelta(seconds=12)
+
+        async def run_case():
+            end_session = mock.AsyncMock()
+            with (
+                mock.patch.object(logic_engine.session_logger, "current_session_id", return_value="sid"),
+                mock.patch.object(logic_engine.session_logger, "session_start_time", return_value=st.session_start_time),
+                mock.patch.object(logic_engine.session_logger, "end_session", new=end_session),
+                mock.patch.object(logic_engine, "clear_setpoint_command_tracking"),
+                mock.patch.object(logic_engine.smart_cooling, "reset"),
+            ):
+                await logic_engine._close_session(rid, {}, 26.0, "power_off")
+            self.assertEqual(end_session.await_args.args[1]["is_record_valid"], 0)
+
+        asyncio.run(run_case())
+
+    def test_runtime_reconciliation_after_off_uses_logger_start_and_preserves_metrics(self):
+        logic_engine._runtime_by_room.clear()
+        rid = "session-reset-reconcile"
+        st = logic_engine._rt(rid)
+        logger_start = datetime.now(timezone.utc) - timedelta(minutes=30)
+        st.session_start_time = None
+        st.session_start_temp = 28.0
+        st.session_state = "confirmed"
+        st.session_runtime_confirmed = True
+        st.watts_samples = [600.0, 640.0, 620.0]
+
+        async def run_case():
+            end_session = mock.AsyncMock()
+            with (
+                mock.patch.object(logic_engine.session_logger, "current_session_id", return_value="sid"),
+                mock.patch.object(logic_engine.session_logger, "session_start_time", return_value=logger_start),
+                mock.patch.object(logic_engine.session_logger, "end_session", new=end_session),
+                mock.patch.object(logic_engine, "clear_setpoint_command_tracking"),
+                mock.patch.object(logic_engine.smart_cooling, "reset"),
+            ):
+                await logic_engine._close_session(rid, {}, 25.0, "power_off")
+            payload = end_session.await_args.args[1]
+            self.assertEqual(payload["is_record_valid"], 1)
+            self.assertGreater(payload["energy_kwh"], 0)
+            self.assertGreater(payload["time_to_cool_minutes"], 25)
+
+        asyncio.run(run_case())
+
+    def test_session_persistence_survives_runtime_reset_after_close(self):
+        logic_engine._runtime_by_room.clear()
+        rid = "session-reset-after-close"
+        st = logic_engine._rt(rid)
+        st.session_start_time = datetime.now(timezone.utc) - timedelta(minutes=10)
+        st.session_start_temp = 27.0
+        st.session_state = "confirmed"
+        st.session_runtime_confirmed = True
+        st.watts_samples = [700.0]
+
+        async def run_case():
+            end_session = mock.AsyncMock()
+            with (
+                mock.patch.object(logic_engine.session_logger, "current_session_id", return_value="sid"),
+                mock.patch.object(logic_engine.session_logger, "session_start_time", return_value=st.session_start_time),
+                mock.patch.object(logic_engine.session_logger, "end_session", new=end_session),
+                mock.patch.object(logic_engine, "clear_setpoint_command_tracking"),
+                mock.patch.object(logic_engine.smart_cooling, "reset"),
+            ):
+                await logic_engine._close_session(rid, {}, 25.0, "presence_idle")
+            payload = end_session.await_args.args[1]
+            self.assertEqual(payload["is_record_valid"], 1)
+            self.assertIsNone(st.session_start_time)
+            self.assertEqual(st.session_state, "idle")
+
+        asyncio.run(run_case())
+
     def test_fp2_zone_gate_metrics_allow_fallback_and_block(self):
         logic_engine._runtime_by_room.clear()
         rid = "z-metrics"

@@ -155,6 +155,9 @@ class RoomRuntime:
 
     # Session lifecycle — idle | provisional | confirmed (ended → idle after DB close)
     session_state: str = "idle"
+    session_runtime_confirmed: bool = False
+    session_power_confirmed: bool = False
+    session_power_confirmed_at: Optional[datetime] = None
     # First tick we believe the room is actively being cooled (effective ON); used for vacancy grace
     effective_on_since_ts: Optional[float] = None
     # Last IR / control ON or OFF command applied (wall time, UTC)
@@ -408,6 +411,9 @@ COMPRESSOR_STABLE_SECONDS: float = 10.0
 VACANCY_SESSION_GRACE_SECONDS: float = 120.0
 MIN_ON_TIME_SECONDS: float = 90.0
 RUNNING_OFF_BLOCK_SECS: float = 180.0
+SESSION_FINALIZATION_GRACE_SECONDS: float = 20.0
+MEANINGFUL_SESSION_SECONDS: float = 180.0
+MIN_SESSION_ENERGY_KWH: float = 0.001
 VACANCY_CONFIRM_SECS: float = 60.0
 PRESENCE_STABILIZATION_SECS: float = 60.0
 DECISION_LOCK_SECONDS: float = 65.0
@@ -1731,6 +1737,94 @@ def _session_creation_eligible(st: RoomRuntime, now: datetime) -> bool:
     return False
 
 
+def _epoch_after_start(epoch_ts: Optional[float], start_ref: Optional[datetime]) -> bool:
+    if epoch_ts is None or start_ref is None:
+        return False
+    try:
+        return datetime.fromtimestamp(float(epoch_ts), timezone.utc) >= start_ref
+    except (TypeError, ValueError, OSError):
+        return False
+
+
+def _mark_session_runtime_confirmed(
+    room_id: str,
+    st: RoomRuntime,
+    now: datetime,
+    *,
+    source: str,
+    watts: Optional[float] = None,
+) -> None:
+    first_runtime = not st.session_runtime_confirmed
+    st.session_runtime_confirmed = True
+    st.session_state = "confirmed"
+    if first_runtime:
+        log_with_room("info", room_id, "[SESSION] runtime_confirmed source=%s", source)
+    if source == "power":
+        first_power = not st.session_power_confirmed
+        st.session_power_confirmed = True
+        st.session_power_confirmed_at = now
+        if first_power:
+            log_with_room(
+                "info",
+                room_id,
+                "[SESSION] power_confirmed watts=%s",
+                f"{watts:.0f}" if watts is not None else "n/a",
+            )
+
+
+def _session_has_confirmation_evidence(
+    st: RoomRuntime,
+    start_ref: Optional[datetime],
+    duration_secs: float,
+    *,
+    energy_watts_valid: bool = False,
+    energy_watts: float = 0.0,
+    avg_watts: Optional[float] = None,
+    peak_watts: Optional[float] = None,
+    kwh_consumed: Optional[float] = None,
+) -> bool:
+    if st.session_runtime_confirmed or st.session_power_confirmed:
+        return True
+    if st.session_state == "confirmed":
+        return True
+    if _epoch_after_start(st.last_power_confirmed_on, start_ref):
+        return True
+    if energy_watts_valid and energy_watts > _WATTS_COMPRESSOR:
+        return True
+    if peak_watts is not None and peak_watts > _WATTS_COMPRESSOR:
+        return True
+    if avg_watts is not None and avg_watts >= 100.0 and duration_secs >= MIN_SESSION_SECONDS:
+        return True
+    if kwh_consumed is not None and kwh_consumed >= MIN_SESSION_ENERGY_KWH:
+        return True
+    if duration_secs >= MEANINGFUL_SESSION_SECONDS and (
+        st.ac_is_on
+        or st.physical_ac_on
+        or _epoch_after_start(
+            st.last_confirmed_on_at.timestamp() if st.last_confirmed_on_at else None,
+            start_ref,
+        )
+    ):
+        return True
+    return False
+
+
+def _session_finalization_grace_seconds(cfg: dict, reason: str) -> float:
+    if reason in ("room_disabled", "room_deleted", "self_heal_orphan_session"):
+        return 0.0
+    has_power_or_meter = bool(
+        str(cfg.get("energy_power_entity") or "").strip()
+        or str(cfg.get("energy_kwh_entity") or "").strip()
+    )
+    if not has_power_or_meter:
+        return 0.0
+    try:
+        raw = cfg.get("session_finalization_grace_seconds", SESSION_FINALIZATION_GRACE_SECONDS)
+        return max(0.0, min(float(raw), 30.0))
+    except (TypeError, ValueError):
+        return SESSION_FINALIZATION_GRACE_SECONDS
+
+
 def _vacancy_signals_ac_should_stop(
     st: RoomRuntime,
     *,
@@ -2517,6 +2611,20 @@ async def _tick_presence_only_mode(
             ac_on = True
             st.presence_only_idle = False
             st.last_power_confirmed_on = now.timestamp()
+            if st.compressor_watts_high_since is None:
+                st.compressor_watts_high_since = now
+            if (
+                session_logger.current_session_id(room_id) is not None
+                and (now - st.compressor_watts_high_since).total_seconds()
+                >= float(COMPRESSOR_STABLE_SECONDS)
+            ):
+                _mark_session_runtime_confirmed(
+                    room_id,
+                    st,
+                    now,
+                    source="power",
+                    watts=energy_watts,
+                )
             if not st.ac_is_on:
                 st.ac_is_on = True
                 st.last_ac_on_at = now.timestamp()
@@ -2524,6 +2632,7 @@ async def _tick_presence_only_mode(
             st.ac_state_source = "power"
         elif energy_watts < _WATTS_FAN_ONLY:
             ac_on = False
+            st.compressor_watts_high_since = None
             st.last_power_confirmed_off = now.timestamp()
             if st.ac_is_on or awaiting_presence_off_confirmation:
                 st.ac_is_on = False
@@ -2538,6 +2647,7 @@ async def _tick_presence_only_mode(
         else:
             ac_on = True
             st.presence_only_idle = False
+            st.compressor_watts_high_since = None
             if not st.ac_is_on:
                 st.ac_is_on = True
                 st.last_ac_on_at = now.timestamp()
@@ -2763,6 +2873,8 @@ async def _tick_presence_only_mode(
         inferred_only_physical=False,
     )
     _sync_ac_display_fields(st)
+    if session_logger.current_session_id(room_id) and energy_watts_valid:
+        st.watts_samples.append(energy_watts)
 
 
 async def _tick_impl(rid_raw: str, room_id: str) -> None:
@@ -2970,6 +3082,18 @@ async def _tick_impl(rid_raw: str, room_id: str) -> None:
             st.last_power_confirmed_on = now.timestamp()
             if st.compressor_watts_high_since is None:
                 st.compressor_watts_high_since = now
+            elif (
+                session_logger.current_session_id(room_id) is not None
+                and (now - st.compressor_watts_high_since).total_seconds()
+                >= float(COMPRESSOR_STABLE_SECONDS)
+            ):
+                _mark_session_runtime_confirmed(
+                    room_id,
+                    st,
+                    now,
+                    source="power",
+                    watts=energy_watts,
+                )
             if not st.ac_is_on:
                 logger.info(
                     "[HawaAI][%s] AC confirmed ON by power sensor (%.0f W > %.0f W threshold) "
@@ -3651,22 +3775,6 @@ async def _maintain_session_lifecycle(
     """
     st = _rt(room_id)
     sid_open = session_logger.current_session_id(room_id)
-    if sid_open and session_logger.current_session_is_provisional(room_id):
-        start_ref = st.session_start_time or session_logger.session_start_time(room_id)
-        if start_ref is not None:
-            prov_age = (now - start_ref).total_seconds()
-            if prov_age > float(MAX_PROVISIONAL_SECONDS):
-                log_with_room(
-                    "info",
-                    room_id,
-                    "[SESSION_PROVISIONAL_TIMEOUT] room=%s session=%s age=%.0fs (max %.0fs) — closing",
-                    room_id,
-                    sid_open,
-                    prov_age,
-                    MAX_PROVISIONAL_SECONDS,
-                )
-                await _close_session(room_id, cfg, indoor_temp, reason="provisional_timeout")
-                return
 
     eligibility = _session_creation_eligible(st, now)
     eligible_confirmed_session = eligibility and confirmed_ac_on and not inferred_only_physical
@@ -3685,6 +3793,51 @@ async def _maintain_session_lifecycle(
             if since_ir >= float(COMPRESSOR_STABLE_SECONDS):
                 no_meter_confirm = True
 
+    if sid_open and stable_power:
+        _mark_session_runtime_confirmed(
+            room_id,
+            st,
+            now,
+            source="power",
+            watts=energy_watts,
+        )
+    elif sid_open and no_meter_confirm:
+        _mark_session_runtime_confirmed(room_id, st, now, source="runtime")
+
+    if sid_open and session_logger.current_session_is_provisional(room_id):
+        start_ref = st.session_start_time or session_logger.session_start_time(room_id)
+        if start_ref is not None:
+            prov_age = (now - start_ref).total_seconds()
+            if prov_age > float(MAX_PROVISIONAL_SECONDS):
+                can_promote = _session_has_confirmation_evidence(
+                    st,
+                    start_ref,
+                    prov_age,
+                    energy_watts_valid=energy_watts_valid,
+                    energy_watts=energy_watts,
+                )
+                if can_promote:
+                    log_with_room(
+                        "info",
+                        room_id,
+                        "[SESSION] provisional_promoted reason=timeout_reconciled age=%.0fs",
+                        prov_age,
+                    )
+                    await session_logger.upgrade_current_session_to_confirmed(room_id)
+                    st.session_state = "confirmed"
+                else:
+                    log_with_room(
+                        "info",
+                        room_id,
+                        "[SESSION_PROVISIONAL_TIMEOUT] room=%s session=%s age=%.0fs (max %.0fs) - closing",
+                        room_id,
+                        sid_open,
+                        prov_age,
+                        MAX_PROVISIONAL_SECONDS,
+                    )
+                    await _close_session(room_id, cfg, indoor_temp, reason="provisional_timeout")
+                    return
+
     if eligible_confirmed_session and session_logger.current_session_id(room_id) is None:
         await _start_provisional_session(room_id, cfg, indoor_temp, now, et_eff)
 
@@ -3694,6 +3847,7 @@ async def _maintain_session_lifecycle(
         and (stable_power or no_meter_confirm)
     ):
         await session_logger.upgrade_current_session_to_confirmed(room_id)
+        log_with_room("info", room_id, "[SESSION] provisional_promoted")
         st.session_state = "confirmed"
 
 
@@ -3733,6 +3887,9 @@ async def _start_provisional_session(
     st.compressor_off_since = None
     st.watts_samples = []
     st.session_state = "provisional"
+    st.session_runtime_confirmed = False
+    st.session_power_confirmed = False
+    st.session_power_confirmed_at = None
     weather = await weather_api.get_cached()
 
     sid = await session_logger.start_session(
@@ -4195,6 +4352,18 @@ async def _close_session(room_id: str, cfg: dict, indoor_temp: float, reason: st
         )
         start_ref = now
 
+    grace_secs = _session_finalization_grace_seconds(cfg, reason)
+    if grace_secs > 0:
+        log_with_room(
+            "info",
+            room_id,
+            "[SESSION] reconciliation_window_started reason=%s grace=%.0fs",
+            reason,
+            grace_secs,
+        )
+        await asyncio.sleep(grace_secs)
+        now = datetime.now(timezone.utc)
+
     duration_secs = max(0.0, (now - start_ref).total_seconds())
     short_invalid = duration_secs < float(MIN_SESSION_SECONDS)
     if short_invalid:
@@ -4249,6 +4418,56 @@ async def _close_session(room_id: str, cfg: dict, indoor_temp: float, reason: st
             kwh_consumed = max(0.0, (avg_watts * duration_secs) / 3_600_000.0)
             kwh_consumed = round(kwh_consumed, 4)
 
+    try:
+        temp_drop = (
+            float(st.session_start_temp) - float(indoor_temp)
+            if st.session_start_temp is not None and indoor_temp is not None
+            else None
+        )
+    except (TypeError, ValueError):
+        temp_drop = None
+    confirmed_evidence = _session_has_confirmation_evidence(
+        st,
+        start_ref,
+        duration_secs,
+        avg_watts=avg_watts,
+        peak_watts=peak_watts,
+        kwh_consumed=kwh_consumed,
+    )
+    energy_evidence = bool(kwh_consumed is not None and kwh_consumed >= MIN_SESSION_ENERGY_KWH)
+    cooling_evidence = bool(temp_drop is not None and temp_drop >= 0.2)
+    meaningful_duration = duration_secs >= MEANINGFUL_SESSION_SECONDS
+    short_invalid = not (
+        duration_secs >= float(MIN_SESSION_SECONDS)
+        and (
+            confirmed_evidence
+            or energy_evidence
+            or cooling_evidence
+            or meaningful_duration
+        )
+    )
+    if short_invalid:
+        log_with_room(
+            "info",
+            room_id,
+            "[SESSION] finalized_invalid reason=insufficient_evidence duration=%.2fs energy=%s",
+            duration_secs,
+            f"{kwh_consumed:.4f}" if kwh_consumed is not None else "none",
+        )
+    else:
+        if session_logger.current_session_is_provisional(room_id):
+            await session_logger.upgrade_current_session_to_confirmed(room_id)
+            log_with_room("info", room_id, "[SESSION] provisional_promoted reason=final_validation")
+        log_with_room(
+            "info",
+            room_id,
+            "[SESSION] validation_passed runtime=%s power=%s energy=%s duration=%.0fs",
+            confirmed_evidence,
+            st.session_power_confirmed or (peak_watts is not None and peak_watts > _WATTS_COMPRESSOR),
+            energy_evidence,
+            duration_secs,
+        )
+
     tariff = _cfg_float(cfg, "energy_tariff_per_kwh", 8.0, lo=0.0)
     cost: Optional[float] = (
         round(kwh_consumed * tariff, 2) if kwh_consumed is not None else None
@@ -4276,12 +4495,24 @@ async def _close_session(room_id: str, cfg: dict, indoor_temp: float, reason: st
         "user_override":         1 if reason in ("power_off", "manual", "manual_off") else 0,
         "is_record_valid":       0 if short_invalid else 1,
     })
+    log_with_room(
+        "info",
+        room_id,
+        "[SESSION] finalized_%s reason=%s duration=%.0fs kwh=%s",
+        "invalid" if short_invalid else "valid",
+        reason,
+        duration_secs,
+        f"{kwh_consumed:.4f}" if kwh_consumed is not None else "none",
+    )
 
     st.session_start_time = None
     st.session_start_temp = None
     st.session_start_kwh = None
     st.watts_samples = []
     st.session_state = "idle"
+    st.session_runtime_confirmed = False
+    st.session_power_confirmed = False
+    st.session_power_confirmed_at = None
     # Don't clear setpoint tracking on provisional_timeout — the AC is still physically
     # running, so clearing last_applied_setpoint would cause a redundant IR command on
     # the next tick (should_send_setpoint_command returns "initial_setpoint").

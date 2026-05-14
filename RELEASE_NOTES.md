@@ -1,5 +1,11 @@
 # HawaAI add-on — release notes
 
+## 1.4.55
+
+- **Sessions:** Hardened Session History persistence so confirmed cooling sessions promote from provisional, wait briefly for delayed power/meter updates, and persist stable duration/energy/validity metrics.
+- **Validation:** Relaxed read-side quality checks to accept real runtime evidence such as confirmed runtime, power samples, energy delta, cooling duration, or temperature drop.
+- **Tests:** Added regressions for delayed power confirmation, presence-only shutdown, AeroState runtime, Tuya power lag, runtime reset, and short accidental ON handling.
+
 ## 1.4.54
 
 - **Runtime resilience:** Added a passive Self-Healing Runtime Engine that validates runtime, HA climate, power, sensor, pending, and session consistency without sending IR or changing thermostat decisions.

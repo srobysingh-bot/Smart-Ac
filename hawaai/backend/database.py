@@ -279,13 +279,41 @@ def _enrich_session(row: Dict[str, Any]) -> Dict[str, Any]:
 
     # ── Validity flag ─────────────────────────────────────────────────────────
     energy_ok = s["energy_consumed_kwh"] is None or s["energy_consumed_kwh"] >= 0
+    try:
+        stored_valid = int(s.get("is_record_valid", 1) or 0) != 0
+    except (TypeError, ValueError):
+        stored_valid = True
+    try:
+        provisional = int(s.get("provisional", 0) or 0) == 1
+    except (TypeError, ValueError):
+        provisional = False
+    try:
+        cooling_time = float(s.get("cooling_time")) if s.get("cooling_time") is not None else None
+    except (TypeError, ValueError):
+        cooling_time = None
+    try:
+        peak_watts = float(s.get("peak_watt_draw") or 0)
+        avg_watts = float(s.get("avg_watt_draw") or 0)
+    except (TypeError, ValueError):
+        peak_watts = avg_watts = 0.0
+    energy_positive = bool(
+        s["energy_consumed_kwh"] is not None
+        and s["energy_consumed_kwh"] >= 0.001
+    )
+    power_seen = bool(peak_watts > 0 or avg_watts > 0)
+    evidence_ok = bool(
+        (duration_min is not None and duration_min >= 3.0)
+        or (s["delta_temp"] is not None and s["delta_temp"] >= 0.3)
+        or energy_positive
+        or power_seen
+        or (cooling_time is not None and cooling_time >= 3.0)
+    )
     s["valid"] = bool(
-        s.get("end_time") is not None          # session completed
-        and duration_min is not None
-        and duration_min >= 3.0                # at least 3 minutes
-        and s["delta_temp"] is not None
-        and s["delta_temp"] >= 0.3             # room cooled by at least 0.3 °C
-        and energy_ok                          # no negative energy
+        s.get("end_time") is not None
+        and stored_valid
+        and not provisional
+        and energy_ok
+        and evidence_ok
     )
 
     return s
