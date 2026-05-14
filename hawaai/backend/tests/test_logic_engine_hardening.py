@@ -1507,6 +1507,247 @@ class TestLogicEngineHardening(unittest.TestCase):
 
         asyncio.run(run_case())
 
+    def test_vacancy_off_terminal_reconciliation_clears_idle(self):
+        logic_engine._runtime_by_room.clear()
+        rid = "runtime-vacant-off"
+        st = logic_engine._rt(rid)
+        now = datetime.now(timezone.utc)
+        st.ac_state = "on"
+        st.ac_state_source = "power"
+        st.physical_ac_on = True
+        st.effective_ac_on = True
+        st.effective_ac_idle = True
+        st.last_command = "off"
+        st.last_command_time = now - timedelta(seconds=90)
+        st.last_confirmed_on_at = now - timedelta(minutes=8)
+
+        with (
+            mock.patch.object(logic_engine.session_logger, "current_session_id", return_value=None),
+            mock.patch.object(logic_engine, "log_with_room") as log_with_room,
+        ):
+            cleared = logic_engine._maybe_finalize_terminal_off(
+                rid,
+                st,
+                now,
+                climate_data={"mode": "off"},
+                energy_watts_valid=True,
+                energy_watts=120.0,
+                in_cooldown=False,
+            )
+
+        self.assertTrue(cleared)
+        self.assertEqual(st.ac_state, "off")
+        self.assertFalse(st.physical_ac_on)
+        self.assertFalse(st.effective_ac_idle)
+        self.assertIsNone(st.last_confirmed_on_at)
+        self.assertTrue(any("[RUNTIME] finalized_off" in str(c.args) for c in log_with_room.call_args_list))
+
+    def test_aerostate_off_reconciliation_has_no_stuck_idle(self):
+        logic_engine._runtime_by_room.clear()
+        rid = "runtime-aero-off"
+        st = logic_engine._rt(rid)
+        now = datetime.now(timezone.utc)
+        st.ac_state = "on"
+        st.ac_state_source = "power"
+        st.effective_power_source = "watts"
+        st.physical_ac_on = True
+        st.effective_ac_idle = True
+        st.last_command = "off"
+        st.last_command_time = now - timedelta(seconds=120)
+        st.session_state = "idle"
+
+        with mock.patch.object(logic_engine.session_logger, "current_session_id", return_value=None):
+            logic_engine._maybe_finalize_terminal_off(
+                rid,
+                st,
+                now,
+                climate_data={"state": "off"},
+                energy_watts_valid=True,
+                energy_watts=75.0,
+                in_cooldown=False,
+            )
+
+        self.assertEqual(st.ac_state, "off")
+        self.assertFalse(st.physical_ac_on)
+        self.assertFalse(st.effective_ac_idle)
+        self.assertEqual(st.effective_power_source, "watts")
+
+    def test_tuya_delayed_power_drop_keeps_idle_until_reconciled(self):
+        logic_engine._runtime_by_room.clear()
+        rid = "runtime-tuya-lag"
+        st = logic_engine._rt(rid)
+        now = datetime.now(timezone.utc)
+        st.ac_state = "on"
+        st.physical_ac_on = True
+        st.effective_ac_idle = True
+        st.last_command = "off"
+        st.last_command_time = now - timedelta(seconds=15)
+
+        with mock.patch.object(logic_engine.session_logger, "current_session_id", return_value=None):
+            early = logic_engine._maybe_finalize_terminal_off(
+                rid,
+                st,
+                now,
+                climate_data={"mode": "off"},
+                energy_watts_valid=True,
+                energy_watts=130.0,
+                in_cooldown=True,
+            )
+            late = logic_engine._maybe_finalize_terminal_off(
+                rid,
+                st,
+                now + timedelta(seconds=90),
+                climate_data={"mode": "off"},
+                energy_watts_valid=True,
+                energy_watts=80.0,
+                in_cooldown=False,
+            )
+
+        self.assertFalse(early)
+        self.assertTrue(late)
+        self.assertEqual(st.ac_state, "off")
+        self.assertFalse(st.effective_ac_idle)
+
+    def test_cooldown_expiration_transitions_idle_to_off(self):
+        logic_engine._runtime_by_room.clear()
+        rid = "runtime-cooldown-expired"
+        st = logic_engine._rt(rid)
+        now = datetime.now(timezone.utc)
+        st.ac_state = "on"
+        st.physical_ac_on = True
+        st.effective_ac_idle = True
+        st.last_command = "off"
+        st.last_command_time = now
+
+        with mock.patch.object(logic_engine.session_logger, "current_session_id", return_value=None):
+            self.assertFalse(
+                logic_engine._maybe_finalize_terminal_off(
+                    rid,
+                    st,
+                    now + timedelta(seconds=20),
+                    climate_data={"mode": "off"},
+                    energy_watts_valid=True,
+                    energy_watts=100.0,
+                    in_cooldown=True,
+                )
+            )
+            self.assertTrue(
+                logic_engine._maybe_finalize_terminal_off(
+                    rid,
+                    st,
+                    now + timedelta(seconds=70),
+                    climate_data={"mode": "off"},
+                    energy_watts_valid=True,
+                    energy_watts=100.0,
+                    in_cooldown=False,
+                )
+            )
+
+        self.assertEqual(st.ac_state, "off")
+        self.assertFalse(st.physical_ac_on)
+
+    def test_session_finalized_no_lingering_confirmed_state(self):
+        logic_engine._runtime_by_room.clear()
+        rid = "runtime-no-session"
+        st = logic_engine._rt(rid)
+        now = datetime.now(timezone.utc)
+        st.ac_state = "on"
+        st.ac_state_source = "power"
+        st.physical_ac_on = True
+        st.effective_ac_on = True
+        st.effective_ac_idle = True
+        st.session_state = "idle"
+        st.session_runtime_confirmed = True
+        st.session_power_confirmed = True
+        st.last_confirmed_on_at = now - timedelta(minutes=15)
+        st.last_command = "off"
+        st.last_command_time = now - timedelta(seconds=90)
+
+        with mock.patch.object(logic_engine.session_logger, "current_session_id", return_value=None):
+            logic_engine._maybe_finalize_terminal_off(
+                rid,
+                st,
+                now,
+                climate_data={"mode": "off"},
+                energy_watts_valid=True,
+                energy_watts=90.0,
+                in_cooldown=False,
+            )
+
+        self.assertFalse(st.session_runtime_confirmed)
+        self.assertFalse(st.session_power_confirmed)
+        self.assertIsNone(st.last_confirmed_on_at)
+        self.assertFalse(st.physical_ac_on)
+
+    def test_manual_off_terminal_reconciliation_clears_stale_idle(self):
+        logic_engine._runtime_by_room.clear()
+        rid = "runtime-manual-off"
+        st = logic_engine._rt(rid)
+        now = datetime.now(timezone.utc)
+        st.ac_state = "on"
+        st.physical_ac_on = True
+        st.effective_ac_idle = True
+        st.last_command = "off"
+        st.last_command_time = now - timedelta(seconds=80)
+        st.last_command_source = "user"
+
+        with mock.patch.object(logic_engine.session_logger, "current_session_id", return_value=None):
+            cleared = logic_engine._maybe_finalize_terminal_off(
+                rid,
+                st,
+                now,
+                climate_data={"mode": "off"},
+                energy_watts_valid=False,
+                energy_watts=0.0,
+                in_cooldown=False,
+            )
+
+        self.assertTrue(cleared)
+        self.assertEqual(st.ac_state, "off")
+        self.assertFalse(st.effective_ac_idle)
+
+    def test_off_while_vacant_runtime_reset_is_deterministic(self):
+        logic_engine._runtime_by_room.clear()
+        rid = "runtime-vacant-reset"
+        st = logic_engine._rt(rid)
+        now = datetime.now(timezone.utc)
+        st.ac_state = "pending_off"
+        st.ac_state_source = "power"
+        st.ac_is_on = True
+        st.physical_ac_on = True
+        st.effective_ac_on = True
+        st.effective_ac_idle = True
+        st.effective_on_since_ts = (now - timedelta(minutes=20)).timestamp()
+        st.possible_on_since = (now - timedelta(minutes=10)).timestamp()
+        st.soft_start_ui = True
+        st.compressor_on_since = now - timedelta(minutes=20)
+        st.compressor_watts_high_since = now - timedelta(minutes=20)
+        st.last_confirmed_on_at = now - timedelta(minutes=20)
+        st.last_command = "off"
+        st.last_command_time = now - timedelta(seconds=100)
+
+        with mock.patch.object(logic_engine.session_logger, "current_session_id", return_value=None):
+            logic_engine._maybe_finalize_terminal_off(
+                rid,
+                st,
+                now,
+                climate_data={"mode": "off"},
+                energy_watts_valid=True,
+                energy_watts=30.0,
+                in_cooldown=False,
+            )
+
+        self.assertEqual(st.ac_state, "off")
+        self.assertFalse(st.ac_is_on)
+        self.assertFalse(st.physical_ac_on)
+        self.assertFalse(st.effective_ac_on)
+        self.assertFalse(st.effective_ac_idle)
+        self.assertIsNone(st.effective_on_since_ts)
+        self.assertIsNone(st.possible_on_since)
+        self.assertFalse(st.soft_start_ui)
+        self.assertIsNone(st.compressor_on_since)
+        self.assertIsNone(st.compressor_watts_high_since)
+
     def test_long_confirmed_cooling_session_stores_valid(self):
         logic_engine._runtime_by_room.clear()
         rid = "session-long-valid"

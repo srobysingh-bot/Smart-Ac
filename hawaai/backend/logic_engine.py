@@ -414,6 +414,7 @@ RUNNING_OFF_BLOCK_SECS: float = 180.0
 SESSION_FINALIZATION_GRACE_SECONDS: float = 20.0
 MEANINGFUL_SESSION_SECONDS: float = 180.0
 MIN_SESSION_ENERGY_KWH: float = 0.001
+OFF_TERMINAL_RECONCILE_SECONDS: float = 60.0
 VACANCY_CONFIRM_SECS: float = 60.0
 PRESENCE_STABILIZATION_SECS: float = 60.0
 DECISION_LOCK_SECONDS: float = 65.0
@@ -1690,6 +1691,111 @@ def _sync_ac_display_fields(st: RoomRuntime) -> None:
         st.ac_state = "off"
 
 
+def _climate_reports_off(climate_data: dict) -> bool:
+    mode = str(
+        (climate_data or {}).get("mode")
+        or (climate_data or {}).get("state")
+        or ""
+    ).strip().lower()
+    return mode in ("off", "idle")
+
+
+def _runtime_has_open_session(room_id: str, st: RoomRuntime) -> bool:
+    return bool(
+        session_logger.current_session_id(room_id)
+        or st.session_start_time is not None
+        or st.session_state != "idle"
+    )
+
+
+def _terminal_off_elapsed(st: RoomRuntime, now: datetime) -> bool:
+    if st.last_command_time is None:
+        return True
+    return (now - st.last_command_time).total_seconds() >= float(OFF_TERMINAL_RECONCILE_SECONDS)
+
+
+def _finalize_runtime_off_state(
+    room_id: str,
+    st: RoomRuntime,
+    now: datetime,
+    *,
+    reason: str,
+    power_source: str,
+) -> None:
+    had_stale_idle = bool(
+        st.ac_is_on
+        or st.physical_ac_on
+        or st.effective_ac_on
+        or st.effective_ac_idle
+        or st.ac_state != "off"
+        or st.effective_on_since_ts is not None
+        or st.possible_on_since is not None
+        or st.soft_start_ui
+        or st.compressor_on_since is not None
+        or st.compressor_watts_high_since is not None
+        or st.last_confirmed_on_at is not None
+    )
+
+    st.ac_is_on = False
+    st.physical_ac_on = False
+    st.effective_ac_on = False
+    st.effective_ac_idle = False
+    st.ac_state = "off"
+    st.effective_power_source = power_source
+    st.ac_state_source = "power" if power_source == "watts" else "system"
+    st.effective_on_since_ts = None
+    st.possible_on_since = None
+    st.soft_start_ui = False
+    st.compressor_on_since = None
+    st.compressor_watts_high_since = None
+    st.compressor_off_since = st.compressor_off_since or now
+    st.last_confirmed_on_at = None
+    st.session_runtime_confirmed = False
+    st.session_power_confirmed = False
+    st.session_power_confirmed_at = None
+
+    if had_stale_idle:
+        log_with_room("info", room_id, "[RUNTIME] reconciliation_complete reason=%s", reason)
+        log_with_room("info", room_id, "[RUNTIME] stale_idle_cleared")
+        log_with_room("info", room_id, "[RUNTIME] finalized_off")
+
+
+def _maybe_finalize_terminal_off(
+    room_id: str,
+    st: RoomRuntime,
+    now: datetime,
+    *,
+    climate_data: dict,
+    energy_watts_valid: bool,
+    energy_watts: float,
+    in_cooldown: bool,
+) -> bool:
+    if in_cooldown:
+        return False
+    if st.pending_action is not None or st.pending_on_ir_sent:
+        return False
+    if _runtime_has_open_session(room_id, st):
+        return False
+    if st.last_command not in ("off", "manual_off"):
+        return False
+    if not _terminal_off_elapsed(st, now):
+        return False
+    if not _climate_reports_off(climate_data):
+        return False
+    if energy_watts_valid and energy_watts > _WATTS_COMPRESSOR:
+        return False
+
+    power_source = "watts" if energy_watts_valid else "internal"
+    _finalize_runtime_off_state(
+        room_id,
+        st,
+        now,
+        reason="terminal_off",
+        power_source=power_source,
+    )
+    return True
+
+
 def _decision_lock_blocks_delayed_emit(st: RoomRuntime, now: datetime) -> bool:
     """True if a real ON/OFF command was issued recently — delayed path must not bypass this."""
     lda = st.last_decision_at
@@ -2873,6 +2979,15 @@ async def _tick_presence_only_mode(
         inferred_only_physical=False,
     )
     _sync_ac_display_fields(st)
+    _maybe_finalize_terminal_off(
+        room_id,
+        st,
+        now,
+        climate_data=climate_data or {},
+        energy_watts_valid=energy_watts_valid,
+        energy_watts=energy_watts,
+        in_cooldown=_is_in_cooldown(st, now),
+    )
     if session_logger.current_session_id(room_id) and energy_watts_valid:
         st.watts_samples.append(energy_watts)
 
@@ -3683,6 +3798,15 @@ async def _tick_impl(rid_raw: str, room_id: str) -> None:
     )
 
     _sync_ac_display_fields(st)
+    _maybe_finalize_terminal_off(
+        room_id,
+        st,
+        now,
+        climate_data=climate_data or {},
+        energy_watts_valid=energy_watts_valid,
+        energy_watts=energy_watts,
+        in_cooldown=_is_in_cooldown(st, now),
+    )
 
     if session_logger.current_session_id(room_id) and energy_watts_valid:
         st.watts_samples.append(energy_watts)
@@ -4591,6 +4715,7 @@ async def _turn_ac_off(
     st.compressor_on_since = None
     st.just_turned_on_until = None
     st.last_decision_at = cmd_ts
+    log_with_room("info", room_id, "[RUNTIME] entering_idle reason=%s", reason)
 
     if close_session_on_send:
         await _close_session(room_id, cfg, indoor_temp, reason)

@@ -1,5 +1,11 @@
 # HawaAI add-on — release notes
 
+## 1.4.56
+
+- **Runtime:** Added terminal OFF reconciliation so transitional IDLE state clears after OFF cooldown, session finalization, HA OFF, and below-compressor power settle.
+- **Diagnostics:** Added `[RUNTIME]` lifecycle logs for idle entry, reconciliation completion, stale idle cleanup, and finalized OFF.
+- **Tests:** Added regressions for vacancy OFF, AeroState OFF, Tuya delayed power drop, cooldown expiry, manual OFF, and finalized-session runtime cleanup.
+
 ## 1.4.55
 
 - **Sessions:** Hardened Session History persistence so confirmed cooling sessions promote from provisional, wait briefly for delayed power/meter updates, and persist stable duration/energy/validity metrics.
