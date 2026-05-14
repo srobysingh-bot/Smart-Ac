@@ -1748,6 +1748,186 @@ class TestLogicEngineHardening(unittest.TestCase):
         self.assertIsNone(st.compressor_on_since)
         self.assertIsNone(st.compressor_watts_high_since)
 
+    def test_vacancy_off_sends_off_only_once_during_reconciliation(self):
+        logic_engine._runtime_by_room.clear()
+        rid = "presence-off-once"
+        st = logic_engine._rt(rid)
+        base = datetime.now(timezone.utc)
+        st.ac_is_on = True
+        st.physical_ac_on = True
+        st.effective_ac_on = True
+        st.vacant_since = base - timedelta(minutes=6)
+        st.effective_on_since_ts = (base - timedelta(minutes=10)).timestamp()
+        st.last_ac_on_at = st.effective_on_since_ts
+        cfg = {
+            "control_mode": "presence_only",
+            "climate_entity": "climate.test",
+            "ir_backend": "aerostate",
+            "energy_power_entity": "sensor.power",
+            "target_temp": 24,
+            "vacancy_timeout_minutes": 5,
+        }
+
+        async def run_once(power, now):
+            with (
+                mock.patch.object(logic_engine.ha_client, "get_state", new=mock.AsyncMock(return_value=str(power))),
+                mock.patch.object(logic_engine.ac_aerostate_adapter, "turn_off", new=mock.AsyncMock(return_value=True)) as turn_off,
+                mock.patch.object(logic_engine, "_maintain_session_lifecycle", new=mock.AsyncMock()),
+                mock.patch.object(logic_engine.session_logger, "current_session_id", return_value=None),
+            ):
+                await logic_engine._tick_presence_only_mode(
+                    rid_raw=rid,
+                    room_id=rid,
+                    cfg=cfg,
+                    climate_data={"target_temp": 24, "mode": "off"},
+                    presence_raw="off",
+                    resolved_occupied=False,
+                    indoor_temp=24.0,
+                    now=now,
+                    st=st,
+                )
+            return turn_off
+
+        first = asyncio.run(run_once(800, base))
+        second = asyncio.run(run_once(120, base + timedelta(seconds=20)))
+
+        first.assert_awaited_once()
+        second.assert_not_awaited()
+        self.assertTrue(st.off_dispatch_pending)
+        self.assertEqual(st.last_command, "off")
+
+    def test_aerostate_duplicate_off_does_not_repeat(self):
+        logic_engine._runtime_by_room.clear()
+        rid = "aero-no-repeat"
+        st = logic_engine._rt(rid)
+        now = datetime.now(timezone.utc)
+        st.last_command = "off"
+        st.off_dispatch_pending = True
+        st.off_dispatched_at = now - timedelta(seconds=10)
+        st.physical_ac_on = True
+
+        async def run_case():
+            with mock.patch.object(logic_engine.ac_aerostate_adapter, "turn_off", new=mock.AsyncMock(return_value=True)) as turn_off:
+                await logic_engine._turn_ac_off(
+                    rid,
+                    {"climate_entity": "climate.test", "ir_backend": "aerostate"},
+                    24.0,
+                    "vacant",
+                    now=now,
+                    force=True,
+                )
+            turn_off.assert_not_awaited()
+
+        asyncio.run(run_case())
+
+    def test_tuya_duplicate_off_does_not_repeat(self):
+        logic_engine._runtime_by_room.clear()
+        rid = "tuya-no-repeat"
+        st = logic_engine._rt(rid)
+        now = datetime.now(timezone.utc)
+        st.last_command = "off"
+        st.off_dispatch_pending = True
+        st.off_dispatched_at = now - timedelta(seconds=10)
+        st.physical_ac_on = True
+
+        async def run_case():
+            with mock.patch.object(logic_engine.ac_tuya_adapter, "turn_off", new=mock.AsyncMock(return_value=True)) as turn_off:
+                await logic_engine._turn_ac_off(
+                    rid,
+                    {"climate_entity": "climate.test", "ir_backend": "tuya"},
+                    24.0,
+                    "vacant",
+                    now=now,
+                    force=True,
+                )
+            turn_off.assert_not_awaited()
+
+        asyncio.run(run_case())
+
+    def test_finalized_off_suppresses_duplicate_off_dispatch(self):
+        logic_engine._runtime_by_room.clear()
+        rid = "finalized-no-repeat"
+        st = logic_engine._rt(rid)
+        now = datetime.now(timezone.utc)
+        st.last_command = "off"
+        st.off_finalized = True
+        st.off_settled_at = now - timedelta(seconds=30)
+        st.physical_ac_on = False
+
+        async def run_case():
+            with mock.patch.object(logic_engine.ac_aerostate_adapter, "turn_off", new=mock.AsyncMock(return_value=True)) as turn_off:
+                await logic_engine._turn_ac_off(
+                    rid,
+                    {"climate_entity": "climate.test", "ir_backend": "aerostate"},
+                    24.0,
+                    "vacant",
+                    now=now,
+                    force=True,
+                )
+            turn_off.assert_not_awaited()
+
+        asyncio.run(run_case())
+
+    def test_ui_runtime_state_becomes_off_after_reconciliation(self):
+        logic_engine._runtime_by_room.clear()
+        rid = "ui-off-runtime"
+        now = datetime.now(timezone.utc)
+        st = logic_engine._rt(rid)
+        st.ac_state = "on"
+        st.ac_state_source = "power"
+        st.ac_is_on = True
+        st.physical_ac_on = True
+        st.effective_ac_on = True
+        st.effective_ac_idle = True
+        st.last_command = "off"
+        st.last_command_time = now - timedelta(seconds=90)
+
+        with mock.patch.object(logic_engine.session_logger, "current_session_id", return_value=None):
+            logic_engine._maybe_finalize_terminal_off(
+                rid,
+                st,
+                now,
+                climate_data={"mode": "off"},
+                energy_watts_valid=True,
+                energy_watts=20.0,
+                in_cooldown=False,
+            )
+        with (
+            mock.patch.object(logic_engine.config_manager, "load_config", return_value={"rooms": [{"id": rid}]}),
+            mock.patch.object(logic_engine.room_registry, "merge_room_config", return_value={}),
+            mock.patch.object(logic_engine.session_logger, "current_session_id", return_value=None),
+        ):
+            runtime = logic_engine.get_runtime_state(rid)
+
+        self.assertEqual(runtime["ac_state"], "off")
+        self.assertFalse(runtime["ac_idle"])
+        self.assertFalse(runtime["physical_ac_on"])
+        self.assertFalse(runtime["effective_ac_on"])
+
+    def test_cooldown_expiration_does_not_redispatch_off(self):
+        logic_engine._runtime_by_room.clear()
+        rid = "cooldown-no-repeat"
+        st = logic_engine._rt(rid)
+        now = datetime.now(timezone.utc)
+        st.last_command = "off"
+        st.last_command_time = now - timedelta(seconds=70)
+        st.off_finalized = True
+        st.physical_ac_on = False
+
+        async def run_case():
+            with mock.patch.object(logic_engine.ac_aerostate_adapter, "turn_off", new=mock.AsyncMock(return_value=True)) as turn_off:
+                await logic_engine._turn_ac_off(
+                    rid,
+                    {"climate_entity": "climate.test", "ir_backend": "aerostate"},
+                    24.0,
+                    "vacant",
+                    now=now,
+                    force=True,
+                )
+            turn_off.assert_not_awaited()
+
+        asyncio.run(run_case())
+
     def test_long_confirmed_cooling_session_stores_valid(self):
         logic_engine._runtime_by_room.clear()
         rid = "session-long-valid"

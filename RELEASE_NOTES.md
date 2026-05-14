@@ -1,5 +1,11 @@
 # HawaAI add-on — release notes
 
+## 1.4.57
+
+- **Runtime:** Added an OFF dispatch settlement latch so vacancy/manual OFF commands are idempotent after a successful OFF.
+- **Control:** Suppresses duplicate OFF IR sends during reconciliation or after terminal OFF settlement, preventing cooldown refresh loops and stuck IDLE UI state.
+- **Tests:** Added regressions proving AeroState/Tuya OFF dispatches do not repeat, cooldown expiry does not redispatch OFF, and UI-facing runtime settles to OFF.
+
 ## 1.4.56
 
 - **Runtime:** Added terminal OFF reconciliation so transitional IDLE state clears after OFF cooldown, session finalization, HA OFF, and below-compressor power settle.

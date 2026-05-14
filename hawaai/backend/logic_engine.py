@@ -158,6 +158,10 @@ class RoomRuntime:
     session_runtime_confirmed: bool = False
     session_power_confirmed: bool = False
     session_power_confirmed_at: Optional[datetime] = None
+    off_dispatch_pending: bool = False
+    off_dispatched_at: Optional[datetime] = None
+    off_finalized: bool = False
+    off_settled_at: Optional[datetime] = None
     # First tick we believe the room is actively being cooled (effective ON); used for vacancy grace
     effective_on_since_ts: Optional[float] = None
     # Last IR / control ON or OFF command applied (wall time, UTC)
@@ -943,6 +947,10 @@ async def _finalize_presence_only_idle(
     st.just_turned_on_until = None
     st.last_user_command_time = None
     st.last_command_source = "system"
+    st.off_dispatch_pending = False
+    st.off_dispatched_at = None
+    st.off_finalized = True
+    st.off_settled_at = now
     st.presence_only_idle = True
 
     if entering_idle:
@@ -1722,6 +1730,7 @@ def _finalize_runtime_off_state(
     reason: str,
     power_source: str,
 ) -> None:
+    first_finalized = not st.off_finalized
     had_stale_idle = bool(
         st.ac_is_on
         or st.physical_ac_on
@@ -1753,11 +1762,18 @@ def _finalize_runtime_off_state(
     st.session_runtime_confirmed = False
     st.session_power_confirmed = False
     st.session_power_confirmed_at = None
+    st.off_dispatch_pending = False
+    st.off_dispatched_at = None
+    st.off_finalized = True
+    st.off_settled_at = now
 
-    if had_stale_idle:
+    if had_stale_idle or first_finalized:
         log_with_room("info", room_id, "[RUNTIME] reconciliation_complete reason=%s", reason)
-        log_with_room("info", room_id, "[RUNTIME] stale_idle_cleared")
+        if had_stale_idle:
+            log_with_room("info", room_id, "[RUNTIME] idle_expired")
+            log_with_room("info", room_id, "[RUNTIME] stale_idle_cleared")
         log_with_room("info", room_id, "[RUNTIME] finalized_off")
+        log_with_room("info", room_id, "[RUNTIME] off_settled")
 
 
 def _maybe_finalize_terminal_off(
@@ -1772,7 +1788,7 @@ def _maybe_finalize_terminal_off(
 ) -> bool:
     if in_cooldown:
         return False
-    if st.pending_action is not None or st.pending_on_ir_sent:
+    if st.pending_action == "on" or st.pending_on_ir_sent:
         return False
     if _runtime_has_open_session(room_id, st):
         return False
@@ -1786,6 +1802,8 @@ def _maybe_finalize_terminal_off(
         return False
 
     power_source = "watts" if energy_watts_valid else "internal"
+    if st.pending_action == "off":
+        _clear_pending_command_state(st)
     _finalize_runtime_off_state(
         room_id,
         st,
@@ -1793,6 +1811,46 @@ def _maybe_finalize_terminal_off(
         reason="terminal_off",
         power_source=power_source,
     )
+    return True
+
+
+def _off_dispatch_elapsed(st: RoomRuntime, now: datetime) -> float:
+    if st.off_dispatched_at is None:
+        return float("inf")
+    return max(0.0, (now - st.off_dispatched_at).total_seconds())
+
+
+def _should_suppress_duplicate_off(
+    room_id: str,
+    st: RoomRuntime,
+    now: datetime,
+    *,
+    climate_data: dict,
+    energy_watts_valid: bool,
+    energy_watts: float,
+) -> bool:
+    if st.last_command != "off":
+        return False
+
+    power_running = bool(energy_watts_valid and energy_watts > _WATTS_COMPRESSOR)
+    ha_off = _climate_reports_off(climate_data)
+
+    suppress = False
+    reason = ""
+    if st.off_finalized and ha_off and not power_running:
+        suppress = True
+        reason = "settled_off"
+    elif st.off_dispatch_pending and _off_dispatch_elapsed(st, now) < float(OFF_TERMINAL_RECONCILE_SECONDS):
+        suppress = True
+        reason = "reconciliation_active"
+    elif _is_in_cooldown(st, now) and ha_off and not power_running:
+        suppress = True
+        reason = "cooldown_off"
+
+    if not suppress:
+        return False
+
+    log_with_room("info", room_id, "[RUNTIME] duplicate_off_suppressed reason=%s", reason)
     return True
 
 
@@ -2937,7 +2995,17 @@ async def _tick_presence_only_mode(
     elif control_action == "off":
         force_off = control_source in ("presence_vacant", "presence_max_runtime")
         reason_off = "max_runtime" if control_source == "presence_max_runtime" else "vacant"
-        if control_source == "presence_vacant":
+        if _should_suppress_duplicate_off(
+            room_id,
+            st,
+            now,
+            climate_data=climate_data or {},
+            energy_watts_valid=energy_watts_valid,
+            energy_watts=energy_watts,
+        ):
+            if st.off_finalized:
+                _clear_pending_command_state(st)
+        elif control_source == "presence_vacant":
             if st.pending_action != "off":
                 st.pending_action = "off"
                 st.pending_since = time.time()
@@ -3702,7 +3770,17 @@ async def _tick_impl(rid_raw: str, room_id: str) -> None:
 
         reason_off = "vacant" if "vacant" in control_source else "target_reached"
         force_off = control_source.startswith("safety") or control_source == "thermostat_reached"
-        if bypass_actuation_delay:
+        if _should_suppress_duplicate_off(
+            room_id,
+            st,
+            now,
+            climate_data=climate_data or {},
+            energy_watts_valid=energy_watts_valid,
+            energy_watts=energy_watts,
+        ):
+            if st.off_finalized:
+                _clear_pending_command_state(st)
+        elif bypass_actuation_delay:
             if control_source == "thermostat_reached":
                 session_logger.mark_cooled(room_id)
             await _turn_ac_off(
@@ -4379,6 +4457,10 @@ async def _turn_ac_on(
     st.compressor_off_since = None
     record_setpoint_command(room_id, target, cmd_ts)
     st.last_decision_at = cmd_ts
+    st.off_dispatch_pending = False
+    st.off_dispatched_at = None
+    st.off_finalized = False
+    st.off_settled_at = None
     logger.info(
         "[HawaAI][%s] AC ON accepted; provisional session opens on next lifecycle sync",
         room_id,
@@ -4660,6 +4742,17 @@ async def _turn_ac_off(
 
     tnow = now if now is not None else datetime.now(timezone.utc)
 
+    if st.last_command == "off":
+        if st.off_finalized and not st.physical_ac_on:
+            log_with_room("info", room_id, "[RUNTIME] duplicate_off_suppressed reason=settled_off")
+            return
+        if (
+            st.off_dispatch_pending
+            and _off_dispatch_elapsed(st, tnow) < float(OFF_TERMINAL_RECONCILE_SECONDS)
+        ):
+            log_with_room("info", room_id, "[RUNTIME] duplicate_off_suppressed reason=reconciliation_active")
+            return
+
     if reason not in (
         "manual",
         "manual_off",
@@ -4715,6 +4808,10 @@ async def _turn_ac_off(
     st.compressor_on_since = None
     st.just_turned_on_until = None
     st.last_decision_at = cmd_ts
+    st.off_dispatch_pending = True
+    st.off_dispatched_at = cmd_ts
+    st.off_finalized = False
+    st.off_settled_at = None
     log_with_room("info", room_id, "[RUNTIME] entering_idle reason=%s", reason)
 
     if close_session_on_send:
