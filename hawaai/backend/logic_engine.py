@@ -141,6 +141,15 @@ class RoomRuntime:
 
     # Last trusted occupancy reading when presence sensor is flaky (None/unavailable).
     last_known_presence: Optional[bool] = None
+    # Canonical runtime occupancy after all authoritative inputs are reconciled.
+    occupied: bool = True
+    vacancy_active: bool = False
+    vacancy_hold: bool = False
+    safety_vacant: bool = False
+    pending_vacancy: bool = False
+    thermostat_blocked: bool = False
+    off_reason: Optional[str] = None
+    stale_idle: bool = False
     presence_last_true_at: Optional[datetime] = None
     presence_last_false_at: Optional[datetime] = None
     stable_occupied: bool = True
@@ -540,6 +549,100 @@ def _is_user_authority_active(st: RoomRuntime, cfg: dict, now: datetime) -> bool
     return elapsed < lock_secs
 
 
+def _has_vacancy_runtime_state(st: RoomRuntime) -> bool:
+    return bool(
+        not st.occupied
+        or st.vacancy_active
+        or st.vacancy_hold
+        or st.safety_vacant
+        or st.pending_vacancy
+        or st.thermostat_blocked
+        or st.vacant_since is not None
+        or st.vacancy_confirmed_at is not None
+        or st.stable_occupied is False
+        or st.last_known_presence is False
+        or st.presence_only_idle
+        or st.effective_control_source in (
+            "safety_vacant",
+            "vacancy_debounce",
+            "presence_vacant",
+            "presence_vacancy_grace",
+            "presence_idle",
+        )
+    )
+
+
+def _clear_vacancy_state(
+    room_id: str,
+    st: RoomRuntime,
+    now: datetime,
+    *,
+    reason: str,
+) -> bool:
+    """
+    Make confirmed occupancy canonical and release stale vacancy/off latches.
+
+    Returns True when a recovery transition was actually performed. Repeated
+    occupied ticks remain quiet so the recovery log is a transition signal.
+    """
+    had_vacancy_state = _has_vacancy_runtime_state(st)
+    previous_occupied = bool(st.occupied)
+    previous_vacancy_active = bool(st.vacancy_active)
+
+    st.occupied = True
+    st.stable_occupied = True
+    st.last_known_presence = True
+    st.presence_last_true_at = now
+    st.presence_last_false_at = None
+    st.vacant_since = None
+    st.vacancy_confirmed_at = None
+    st.vacancy_active = False
+    st.vacancy_hold = False
+    st.safety_vacant = False
+    st.pending_vacancy = False
+    st.thermostat_blocked = False
+    st.stale_idle = False
+    st.presence_only_idle = False
+
+    if st.pending_action == "off" and st.off_reason == "vacant":
+        _clear_pending_command_state(st)
+
+    if st.last_command == "off" and st.off_reason == "vacant":
+        st.last_command_time = None
+        st.last_command = ""
+        st.last_sent_command_key = None
+        st.off_dispatch_pending = False
+        st.off_dispatched_at = None
+        st.off_finalized = False
+        st.off_settled_at = None
+        st.off_reason = None
+
+    if st.effective_control_source in (
+        "safety_vacant",
+        "vacancy_debounce",
+        "presence_vacant",
+        "presence_vacancy_grace",
+        "presence_idle",
+    ):
+        st.effective_control_source = "none"
+
+    if had_vacancy_state:
+        log_with_room(
+            "info",
+            room_id,
+            "[OCCUPANCY] zone_present=%s zone_confirmed=%s runtime_occupied=%s "
+            "vacancy_active=%s recovery_triggered=%s",
+            st.zone_present,
+            st.zone_confirmed,
+            previous_occupied,
+            previous_vacancy_active,
+            True,
+        )
+        log_with_room("info", room_id, "[RUNTIME] vacancy_cleared reason=%s", reason)
+        return True
+    return False
+
+
 def _resolve_control_decision(
     room_id: str,
     cfg: dict,
@@ -571,12 +674,26 @@ def _resolve_control_decision(
     )
     use_presence = cfg.get("use_presence", True)
 
+    if use_presence and st.zone_present and st.zone_confirmed and not is_occupied:
+        _clear_vacancy_state(room_id, st, now, reason="zone_reentry")
+        is_occupied = True
+    elif use_presence and is_occupied:
+        _clear_vacancy_state(room_id, st, now, reason="presence_reentry")
+    else:
+        st.occupied = bool(is_occupied)
+
     # ── PRIORITY 1: Safety — vacancy (may issue OFF even during global cooldown) ─
     if use_presence and not is_occupied:
+        st.occupied = False
+        st.vacancy_active = True
+        st.thermostat_blocked = True
         if st.vacant_since is None:
             st.vacant_since = now
         elapsed = (now - st.vacant_since).total_seconds()
         if elapsed < float(VACANCY_CONFIRM_SECS):
+            st.pending_vacancy = True
+            st.vacancy_hold = False
+            st.safety_vacant = False
             log_with_room(
                 "info",
                 room_id,
@@ -585,8 +702,11 @@ def _resolve_control_decision(
                 VACANCY_CONFIRM_SECS,
             )
             return ("hold", "vacancy_debounce", effective_target)
+        st.pending_vacancy = False
         if st.vacant_since is not None:
             if elapsed >= vacancy_timeout and (ac_on or st.ac_is_on):
+                st.vacancy_hold = True
+                st.safety_vacant = True
                 on_age = _seconds_since_effective_on_or_command(st, now)
                 if on_age < float(RUNNING_OFF_BLOCK_SECS):
                     log_with_room(
@@ -610,7 +730,10 @@ def _resolve_control_decision(
                             VACANCY_SESSION_GRACE_SECONDS,
                         )
                         return ("hold_vacant", "safety_vacant", effective_target)
+                st.vacancy_hold = False
                 return ("off", "safety_vacant", effective_target)
+        st.vacancy_hold = True
+        st.safety_vacant = True
         return ("hold_vacant", "safety_vacant", effective_target)
     if use_presence:
         st.vacant_since = None
@@ -1762,6 +1885,7 @@ def _finalize_runtime_off_state(
     st.session_runtime_confirmed = False
     st.session_power_confirmed = False
     st.session_power_confirmed_at = None
+    st.stale_idle = bool(had_stale_idle)
     st.off_dispatch_pending = False
     st.off_dispatched_at = None
     st.off_finalized = True
@@ -1794,7 +1918,7 @@ def _maybe_finalize_terminal_off(
         return False
     if st.last_command not in ("off", "manual_off"):
         return False
-    if not _terminal_off_elapsed(st, now):
+    if not st.off_finalized and not _terminal_off_elapsed(st, now):
         return False
     if not _climate_reports_off(climate_data):
         return False
@@ -1838,6 +1962,21 @@ def _should_suppress_duplicate_off(
     suppress = False
     reason = ""
     if st.off_finalized and ha_off and not power_running:
+        suppress = True
+        reason = "settled_off"
+    elif (
+        st.off_dispatch_pending
+        and ha_off
+        and not power_running
+        and _off_dispatch_elapsed(st, now) >= float(OFF_TERMINAL_RECONCILE_SECONDS)
+    ):
+        _finalize_runtime_off_state(
+            room_id,
+            st,
+            now,
+            reason="duplicate_off_reconciled",
+            power_source="watts" if energy_watts_valid else "internal",
+        )
         suppress = True
         reason = "settled_off"
     elif st.off_dispatch_pending and _off_dispatch_elapsed(st, now) < float(OFF_TERMINAL_RECONCILE_SECONDS):
@@ -2775,6 +2914,10 @@ async def _tick_presence_only_mode(
             ac_on = True
             st.presence_only_idle = False
             st.last_power_confirmed_on = now.timestamp()
+            st.off_dispatch_pending = False
+            st.off_dispatched_at = None
+            st.off_finalized = False
+            st.off_settled_at = None
             if st.compressor_watts_high_since is None:
                 st.compressor_watts_high_since = now
             if (
@@ -2823,6 +2966,17 @@ async def _tick_presence_only_mode(
 
     st.physical_ac_on = bool(ac_on)
     confirmed_ac_on = bool(ac_on)
+    if _maybe_finalize_terminal_off(
+        room_id,
+        st,
+        now,
+        climate_data=climate_data or {},
+        energy_watts_valid=energy_watts_valid,
+        energy_watts=energy_watts,
+        in_cooldown=_is_in_cooldown(st, now),
+    ):
+        ac_on = False
+        confirmed_ac_on = False
     if st.physical_ac_on:
         if st.effective_on_since_ts is None:
             st.effective_on_since_ts = now.timestamp()
@@ -3005,6 +3159,8 @@ async def _tick_presence_only_mode(
         ):
             if st.off_finalized:
                 _clear_pending_command_state(st)
+            action = control_action = "hold"
+            source = control_source = "off_settled"
         elif control_source == "presence_vacant":
             if st.pending_action != "off":
                 st.pending_action = "off"
@@ -3263,6 +3419,10 @@ async def _tick_impl(rid_raw: str, room_id: str) -> None:
             ac_on = True
             ac_idle = False
             st.last_power_confirmed_on = now.timestamp()
+            st.off_dispatch_pending = False
+            st.off_dispatched_at = None
+            st.off_finalized = False
+            st.off_settled_at = None
             if st.compressor_watts_high_since is None:
                 st.compressor_watts_high_since = now
             elif (
@@ -3327,6 +3487,19 @@ async def _tick_impl(rid_raw: str, room_id: str) -> None:
 
     st.effective_ac_idle = ac_idle
     st.effective_power_source = power_source
+    if _maybe_finalize_terminal_off(
+        room_id,
+        st,
+        now,
+        climate_data=climate_data or {},
+        energy_watts_valid=energy_watts_valid,
+        energy_watts=energy_watts,
+        in_cooldown=_is_in_cooldown(st, now),
+    ):
+        ac_on = False
+        ac_idle = False
+        power_source = st.effective_power_source
+        st.effective_ac_idle = False
 
     secs_since_cmd = (
         (now - st.last_command_time).total_seconds()
@@ -3597,13 +3770,19 @@ async def _tick_impl(rid_raw: str, room_id: str) -> None:
     else:
         st.vacant_since = None
 
-    occ_res = True if not use_presence else bool(is_occupied_bool)
-
     # Drop stale API "user" marker so thermostat lock still works after authority expires.
     if st.last_command_source == "user" and not _is_user_authority_active(st, cfg, now):
         st.last_command_source = "system"
 
     await _fp2_zone_sensor_tick(room_id, cfg, now)
+    occ_res = True if not use_presence else bool(is_occupied_bool)
+    if use_presence and st.zone_present and st.zone_confirmed:
+        recovered = _clear_vacancy_state(room_id, st, now, reason="zone_reentry")
+        if recovered or not occ_res:
+            is_occupied_bool = True
+            occ_res = True
+    else:
+        st.occupied = bool(occ_res)
 
     action, source, tgt = _resolve_control_decision(
         room_id, cfg, indoor_temp, et_eff,
@@ -3780,6 +3959,8 @@ async def _tick_impl(rid_raw: str, room_id: str) -> None:
         ):
             if st.off_finalized:
                 _clear_pending_command_state(st)
+            action = control_action = "hold"
+            source = control_source = "off_settled"
         elif bypass_actuation_delay:
             if control_source == "thermostat_reached":
                 session_logger.mark_cooled(room_id)
@@ -4301,6 +4482,7 @@ async def _handle_delayed_off(
     if st.pending_action != "off":
         st.pending_action = "off"
         st.pending_since = ts
+        st.off_reason = reason
         logger.info(
             "[DELAY_OFF][%s] ARM pending_off pending_since=%.3f delay_s=%.0f (reason=%s force=%s)",
             room_canon,
@@ -4451,6 +4633,7 @@ async def _turn_ac_on(
     st.just_turned_on_until = cmd_ts + timedelta(seconds=float(POST_ON_STABILIZATION_SECONDS))
     _bump_last_command_ir_cooldown(st, cmd_ts)
     st.last_command = "on"
+    st.off_reason = None
     st.last_sent_command_key = _fingerprint_turn_on(target)
     st.on_failed_retry_used = False
     st.compressor_on_since = None
@@ -4743,7 +4926,7 @@ async def _turn_ac_off(
     tnow = now if now is not None else datetime.now(timezone.utc)
 
     if st.last_command == "off":
-        if st.off_finalized and not st.physical_ac_on:
+        if st.off_finalized:
             log_with_room("info", room_id, "[RUNTIME] duplicate_off_suppressed reason=settled_off")
             return
         if (
@@ -4803,6 +4986,7 @@ async def _turn_ac_off(
     else:
         _bump_last_command_ir_cooldown(st, cmd_ts)
     st.last_command = "off"
+    st.off_reason = reason
     st.last_sent_command_key = _fingerprint_turn_off()
     st.compressor_off_since = cmd_ts
     st.compressor_on_since = None
@@ -4905,6 +5089,17 @@ def get_runtime_state(room_id: str) -> dict:
         "ac_state_source":       st.ac_state_source,
         "control_source":        st.effective_control_source,
         "control_mode":          normalize_control_mode(merged),
+        "occupied":              st.occupied,
+        "vacancy_active":        st.vacancy_active,
+        "vacancy_hold":          st.vacancy_hold,
+        "safety_vacant":         st.safety_vacant,
+        "pending_vacancy":       st.pending_vacancy,
+        "thermostat_blocked":    st.thermostat_blocked,
+        "vacant_since":          st.vacant_since.isoformat() if st.vacant_since else None,
+        "off_reason":            st.off_reason,
+        "stale_idle":            st.stale_idle,
+        "stable_occupied":       st.stable_occupied,
+        "occupancy_cache":       st.last_known_presence,
         "target_temp":           st.effective_target_temp,
         "target_source":         st.effective_target_source,
         "control_effective_target": st.last_control_effective_target_temp,
@@ -4977,6 +5172,12 @@ def get_runtime_state(room_id: str) -> dict:
         "zone_sensor_usable": st.zone_sensor_usable,
         "zone_block_count": int(st.zone_block_count),
         "zone_allow_count": int(st.zone_allow_count),
+        "zone_cache": {
+            "present": st.zone_present,
+            "confirmed": st.zone_confirmed,
+            "confidence": st.zone_confidence,
+            "sensor_usable": st.zone_sensor_usable,
+        },
         "zone_ui_phase": zone_ui_phase,
         "zone_dwell_elapsed_seconds": zone_dwell_elapsed_seconds,
         "zone_dwell_remaining_seconds": zone_dwell_remaining_seconds,

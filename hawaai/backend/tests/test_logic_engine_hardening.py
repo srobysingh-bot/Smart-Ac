@@ -1311,6 +1311,112 @@ class TestLogicEngineHardening(unittest.TestCase):
 
         self.assertEqual((action, source, target), ("off", "safety_vacant", 24.0))
 
+    def test_confirmed_zone_presence_clears_stale_vacancy_runtime(self):
+        logic_engine._runtime_by_room.clear()
+        now = datetime.now(timezone.utc)
+        rid = "zone-reentry"
+        st = logic_engine._rt(rid)
+        st.zone_present = True
+        st.zone_confirmed = True
+        st.zone_sensor_usable = True
+        st.zone_confidence = "high"
+        st.occupied = False
+        st.stable_occupied = False
+        st.last_known_presence = False
+        st.vacant_since = now - timedelta(minutes=6)
+        st.vacancy_confirmed_at = now - timedelta(minutes=5)
+        st.vacancy_active = True
+        st.vacancy_hold = True
+        st.safety_vacant = True
+        st.pending_vacancy = False
+        st.thermostat_blocked = True
+        st.effective_control_source = "safety_vacant"
+        st.last_command = "off"
+        st.last_command_time = now - timedelta(seconds=5)
+        st.off_reason = "vacant"
+        st.off_dispatch_pending = True
+        st.off_dispatched_at = now - timedelta(seconds=5)
+
+        with mock.patch.object(logic_engine, "log_with_room") as log_with_room:
+            action, source, target = logic_engine._resolve_control_decision(
+                rid,
+                {"vacancy_timeout_minutes": 0},
+                indoor_temp=24.0,
+                effective_target=24.0,
+                is_occupied=False,
+                ac_on=False,
+                now=now,
+            )
+
+        self.assertEqual((action, source, target), ("hold", "thermostat", 24.0))
+        self.assertTrue(st.occupied)
+        self.assertTrue(st.stable_occupied)
+        self.assertTrue(st.last_known_presence)
+        self.assertIsNone(st.vacant_since)
+        self.assertIsNone(st.vacancy_confirmed_at)
+        self.assertFalse(st.vacancy_active)
+        self.assertFalse(st.vacancy_hold)
+        self.assertFalse(st.safety_vacant)
+        self.assertFalse(st.pending_vacancy)
+        self.assertFalse(st.thermostat_blocked)
+        self.assertIsNone(st.last_command_time)
+        self.assertEqual(st.last_command, "")
+        self.assertIsNone(st.off_reason)
+        self.assertFalse(st.off_dispatch_pending)
+        self.assertTrue(
+            any("[OCCUPANCY]" in str(call.args) and "recovery_triggered" in str(call.args) for call in log_with_room.call_args_list)
+        )
+        self.assertTrue(
+            any("[RUNTIME] vacancy_cleared" in str(call.args) and "zone_reentry" in str(call.args) for call in log_with_room.call_args_list)
+        )
+
+    def test_confirmed_zone_presence_overrides_vacancy_and_resumes_thermostat(self):
+        logic_engine._runtime_by_room.clear()
+        now = datetime.now(timezone.utc)
+        rid = "zone-thermostat-reentry"
+        st = logic_engine._rt(rid)
+        st.zone_present = True
+        st.zone_confirmed = True
+        st.zone_sensor_usable = True
+        st.occupied = False
+        st.vacant_since = now - timedelta(minutes=10)
+        st.vacancy_active = True
+        st.safety_vacant = True
+        st.thermostat_blocked = True
+
+        action, source, target = logic_engine._resolve_control_decision(
+            rid,
+            {"vacancy_timeout_minutes": 0},
+            indoor_temp=27.0,
+            effective_target=24.0,
+            is_occupied=False,
+            ac_on=False,
+            now=now,
+        )
+
+        self.assertEqual((action, source, target), ("on", "thermostat", 24.0))
+        self.assertTrue(st.occupied)
+        self.assertFalse(st.safety_vacant)
+        self.assertFalse(st.thermostat_blocked)
+
+    def test_recovery_does_not_clear_recent_decision_lock(self):
+        logic_engine._runtime_by_room.clear()
+        now = datetime.now(timezone.utc)
+        rid = "zone-reentry-no-spam"
+        st = logic_engine._rt(rid)
+        st.zone_present = True
+        st.zone_confirmed = True
+        st.occupied = False
+        st.vacant_since = now - timedelta(minutes=5)
+        st.vacancy_active = True
+        st.last_decision_at = now - timedelta(seconds=2)
+
+        logic_engine._clear_vacancy_state(rid, st, now, reason="zone_reentry")
+
+        self.assertEqual(st.last_decision_at, now - timedelta(seconds=2))
+        self.assertTrue(st.occupied)
+        self.assertFalse(st.vacancy_active)
+
     def test_ir_backend_default_and_invalid_are_aerostate(self):
         self.assertEqual(logic_engine.normalize_ir_backend({}), "aerostate")
         self.assertEqual(logic_engine.normalize_ir_backend({"ir_backend": "bad"}), "aerostate")
@@ -1852,7 +1958,7 @@ class TestLogicEngineHardening(unittest.TestCase):
         st.last_command = "off"
         st.off_finalized = True
         st.off_settled_at = now - timedelta(seconds=30)
-        st.physical_ac_on = False
+        st.physical_ac_on = True
 
         async def run_case():
             with mock.patch.object(logic_engine.ac_aerostate_adapter, "turn_off", new=mock.AsyncMock(return_value=True)) as turn_off:
@@ -1865,6 +1971,78 @@ class TestLogicEngineHardening(unittest.TestCase):
                     force=True,
                 )
             turn_off.assert_not_awaited()
+
+        asyncio.run(run_case())
+
+    def test_elapsed_safety_vacant_duplicate_finalizes_without_dispatch(self):
+        logic_engine._runtime_by_room.clear()
+        rid = "safety-vacant-finalize"
+        st = logic_engine._rt(rid)
+        now = datetime.now(timezone.utc)
+        st.last_command = "off"
+        st.last_command_time = now - timedelta(seconds=90)
+        st.off_dispatch_pending = True
+        st.off_dispatched_at = now - timedelta(seconds=90)
+        st.ac_state = "on"
+        st.ac_state_source = "power"
+        st.physical_ac_on = True
+        st.effective_ac_idle = True
+
+        with (
+            mock.patch.object(logic_engine.session_logger, "current_session_id", return_value=None),
+            mock.patch.object(logic_engine, "log_with_room") as log_with_room,
+        ):
+            suppressed = logic_engine._should_suppress_duplicate_off(
+                rid,
+                st,
+                now,
+                climate_data={"mode": "off"},
+                energy_watts_valid=True,
+                energy_watts=101.0,
+            )
+
+        self.assertTrue(suppressed)
+        self.assertTrue(st.off_finalized)
+        self.assertFalse(st.off_dispatch_pending)
+        self.assertEqual(st.ac_state, "off")
+        self.assertFalse(st.effective_ac_idle)
+        self.assertTrue(any("[RUNTIME] finalized_off" in str(c.args) for c in log_with_room.call_args_list))
+
+    def test_entering_idle_logged_once_when_off_is_repeated(self):
+        logic_engine._runtime_by_room.clear()
+        rid = "idle-once"
+        st = logic_engine._rt(rid)
+        now = datetime.now(timezone.utc)
+        st.ac_is_on = True
+        st.physical_ac_on = True
+
+        async def run_case():
+            with (
+                mock.patch.object(logic_engine.ac_aerostate_adapter, "turn_off", new=mock.AsyncMock(return_value=True)) as turn_off,
+                mock.patch.object(logic_engine, "log_with_room") as log_with_room,
+            ):
+                await logic_engine._turn_ac_off(
+                    rid,
+                    {"climate_entity": "climate.test", "ir_backend": "aerostate"},
+                    24.0,
+                    "vacant",
+                    now=now,
+                    force=True,
+                )
+                await logic_engine._turn_ac_off(
+                    rid,
+                    {"climate_entity": "climate.test", "ir_backend": "aerostate"},
+                    24.0,
+                    "vacant",
+                    now=now + timedelta(seconds=20),
+                    force=True,
+                )
+            turn_off.assert_awaited_once()
+            entering = [
+                c for c in log_with_room.call_args_list
+                if "[RUNTIME] entering_idle" in str(c.args)
+            ]
+            self.assertEqual(len(entering), 1)
 
         asyncio.run(run_case())
 

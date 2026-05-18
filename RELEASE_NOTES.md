@@ -1,5 +1,11 @@
 # HawaAI add-on — release notes
 
+## 1.4.58
+
+- **Occupancy recovery:** Confirmed FP2 zone re-entry now immediately clears stale vacancy runtime state, safety-vacant holds, pending vacant OFF state, and thermostat suppression.
+- **Diagnostics:** Added structured `[OCCUPANCY] recovery_triggered` and `[RUNTIME] vacancy_cleared reason=zone_reentry` logs plus runtime vacancy audit fields.
+- **Tests:** Added regressions proving zone-confirmed occupancy overrides stale vacancy and resumes thermostat control without repeated IR spam.
+
 ## 1.4.57
 
 - **Runtime:** Added an OFF dispatch settlement latch so vacancy/manual OFF commands are idempotent after a successful OFF.
