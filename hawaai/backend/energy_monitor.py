@@ -66,7 +66,7 @@ class EnergyMonitor:
     async def refresh(self) -> float:
         """Poll the energy sensor entity. Returns current watt draw."""
         from . import ha_client
-        entity = config_manager.get("energy_sensor_entity")
+        entity = config_manager.get("energy_power_entity")
         if not entity:
             return self._watt_draw
 

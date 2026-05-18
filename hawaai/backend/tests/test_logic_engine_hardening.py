@@ -111,6 +111,15 @@ class TestLogicEngineHardening(unittest.TestCase):
         self.assertEqual(out["ac_state"], "on")
         self.assertIn(out["ac_state_source"], ("power", "inferred", "system"))
 
+    def test_energy_runtime_parser_distinguishes_invalid_from_zero(self):
+        self.assertEqual(logic_engine._parse_energy_sensor_value("0"), 0.0)
+        self.assertEqual(logic_engine._parse_energy_sensor_value(0), 0.0)
+        self.assertEqual(logic_engine._parse_energy_sensor_value("611.5"), 611.5)
+        self.assertIsNone(logic_engine._parse_energy_sensor_value("unknown"))
+        self.assertIsNone(logic_engine._parse_energy_sensor_value("unavailable"))
+        self.assertIsNone(logic_engine._parse_energy_sensor_value(None))
+        self.assertIsNone(logic_engine._parse_energy_sensor_value("not-a-number"))
+
     def test_sync_pending_clears_when_decision_not_on_off(self):
         st = logic_engine.RoomRuntime()
         st.pending_action = "on"

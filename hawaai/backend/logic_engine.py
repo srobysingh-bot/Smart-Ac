@@ -86,6 +86,117 @@ def log_with_room(level: str, room_id: str, msg: str, *args) -> None:
     except Exception:
         pass
 
+
+def _parse_energy_sensor_value(value: object) -> Optional[float]:
+    if value is None:
+        return None
+    if isinstance(value, str):
+        text = value.strip()
+        if not text or text.lower() in ("unavailable", "unknown", "none", "nan"):
+            return None
+        value = text
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return None
+    return parsed if math.isfinite(parsed) else None
+
+
+def _energy_runtime_status(
+    entity_id: str,
+    raw_state: object,
+    parsed_value: Optional[float],
+) -> str:
+    if not entity_id:
+        return "missing"
+    if parsed_value is not None:
+        return "ok"
+    if raw_state is None:
+        return "unavailable"
+    return "invalid"
+
+
+def _log_energy_runtime_diagnostic(
+    room_id: str,
+    st: "RoomRuntime",
+    *,
+    power_entity: str,
+    kwh_entity: str,
+    raw_power_state: object,
+    raw_kwh_state: object,
+    parsed_power: Optional[float],
+    parsed_kwh: Optional[float],
+) -> None:
+    power_status = _energy_runtime_status(power_entity, raw_power_state, parsed_power)
+    kwh_status = _energy_runtime_status(kwh_entity, raw_kwh_state, parsed_kwh)
+    sig = (
+        power_entity,
+        power_status,
+        str(raw_power_state) if power_status in ("invalid", "unavailable") else "",
+        kwh_entity,
+        kwh_status,
+        str(raw_kwh_state) if kwh_status in ("invalid", "unavailable") else "",
+    )
+    if sig == st.energy_runtime_log_sig:
+        return
+    st.energy_runtime_log_sig = sig
+
+    if power_status == "missing":
+        log_with_room("info", room_id, "[ENERGY_RUNTIME] room=%s entity_missing kind=power", room_id)
+    elif power_status != "ok":
+        log_with_room(
+            "warning",
+            room_id,
+            "[ENERGY_RUNTIME] room=%s invalid_power_state entity=%s state=%r",
+            room_id,
+            power_entity,
+            raw_power_state,
+        )
+
+    if kwh_status == "missing":
+        log_with_room("info", room_id, "[ENERGY_RUNTIME] room=%s entity_missing kind=kwh", room_id)
+    elif kwh_status != "ok":
+        log_with_room(
+            "warning",
+            room_id,
+            "[ENERGY_RUNTIME] room=%s invalid_kwh_state entity=%s state=%r",
+            room_id,
+            kwh_entity,
+            raw_kwh_state,
+        )
+
+
+async def _read_runtime_energy(
+    room_id: str,
+    cfg: dict,
+    st: "RoomRuntime",
+) -> Tuple[Optional[float], Optional[float]]:
+    power_entity = str(cfg.get("energy_power_entity") or "").strip()
+    kwh_entity = str(cfg.get("energy_kwh_entity") or "").strip()
+
+    raw_power_state = await ha_client.get_state(power_entity) if power_entity else None
+    raw_kwh_state = await ha_client.get_state(kwh_entity) if kwh_entity else None
+
+    parsed_power = _parse_energy_sensor_value(raw_power_state)
+    parsed_kwh = _parse_energy_sensor_value(raw_kwh_state)
+
+    if parsed_power is not None:
+        st.last_valid_power_watts = parsed_power
+    if parsed_kwh is not None:
+        st.last_valid_energy_kwh = parsed_kwh
+
+    _log_energy_runtime_diagnostic(
+        room_id,
+        st,
+        power_entity=power_entity,
+        kwh_entity=kwh_entity,
+        raw_power_state=raw_power_state,
+        raw_kwh_state=raw_kwh_state,
+        parsed_power=parsed_power,
+        parsed_kwh=parsed_kwh,
+    )
+    return parsed_power, parsed_kwh
+
 @dataclass
 class RoomRuntime:
     """Isolated logic-engine state per room."""
@@ -203,6 +314,9 @@ class RoomRuntime:
     zone_block_count: int = 0
     zone_allow_count: int = 0
     zone_log_sig: Optional[tuple] = None
+    energy_runtime_log_sig: Optional[tuple] = None
+    last_valid_power_watts: Optional[float] = None
+    last_valid_energy_kwh: Optional[float] = None
     # Hybrid event triggers — last sampled values from HA WS (not authoritative for control)
     last_event_presence_bool: Optional[bool] = None
     last_event_probe_indoor_temp: Optional[float] = None
@@ -2892,17 +3006,9 @@ async def _tick_presence_only_mode(
     st.sleep_suspended_reason = None
     _clear_humidity_runtime(st)
 
-    energy_power_entity = cfg.get("energy_power_entity", "")
-    energy_watts: float = 0.0
-    energy_watts_valid = False
-    if energy_power_entity:
-        energy_raw = await ha_client.get_state(energy_power_entity)
-        if energy_raw not in (None, "unavailable", "unknown", ""):
-            try:
-                energy_watts = float(energy_raw)
-                energy_watts_valid = True
-            except (ValueError, TypeError):
-                energy_watts = 0.0
+    parsed_power, _parsed_kwh = await _read_runtime_energy(room_id, cfg, st)
+    energy_watts_valid = parsed_power is not None
+    energy_watts: float = float(parsed_power) if parsed_power is not None else 0.0
 
     in_cooldown = _is_in_cooldown(st, now)
     awaiting_presence_off_confirmation = _presence_only_awaiting_off_confirmation(st)
@@ -3387,28 +3493,9 @@ async def _tick_impl(rid_raw: str, room_id: str) -> None:
 
     indoor_humidity = await _read_indoor_humidity(cfg)
 
-    energy_power_entity = cfg.get("energy_power_entity", "")
-    energy_watts: float = 0.0
-    energy_watts_valid: bool = False
-
-    if energy_power_entity:
-        energy_raw = await ha_client.get_state(energy_power_entity)
-        if energy_raw not in (None, "unavailable", "unknown", ""):
-            try:
-                energy_watts = float(energy_raw)
-                energy_watts_valid = True
-            except (ValueError, TypeError):
-                energy_watts = 0.0
-
-    energy_kwh_reading: Optional[float] = None
-    kwh_entity_snap = (cfg.get("energy_kwh_entity") or "").strip()
-    if kwh_entity_snap:
-        raw_ke = await ha_client.get_state(kwh_entity_snap)
-        if raw_ke not in (None, "unavailable", "unknown", ""):
-            try:
-                energy_kwh_reading = float(raw_ke)
-            except (ValueError, TypeError):
-                energy_kwh_reading = None
+    parsed_power, energy_kwh_reading = await _read_runtime_energy(room_id, cfg, st)
+    energy_watts_valid: bool = parsed_power is not None
+    energy_watts: float = float(parsed_power) if parsed_power is not None else 0.0
 
     in_cooldown = _is_in_cooldown(st, now)
 
@@ -5125,6 +5212,8 @@ def get_runtime_state(room_id: str) -> dict:
         ),
         "last_power_confirmed_on":  st.last_power_confirmed_on,
         "last_power_confirmed_off": st.last_power_confirmed_off,
+        "last_valid_power_watts": st.last_valid_power_watts,
+        "last_valid_energy_kwh": st.last_valid_energy_kwh,
         "ai_enabled":            bool(merged.get("ai_enabled", False)),
         "ai_cached":             _ce is not None,
         "session_id":            session_logger.current_session_id(canonical),

@@ -83,7 +83,10 @@ class TestConfigLoad(unittest.TestCase):
                 json.dump(initial, f)
 
             cm._last_known_good_config = None
-            with mock.patch.object(cm, "CONFIG_PATH", primary):
+            with (
+                mock.patch.object(cm, "CONFIG_PATH", primary),
+                mock.patch.object(main.logic_engine, "trigger_tick") as trigger_tick,
+            ):
                 asyncio.run(
                     main.api_update_room(
                         "roomabc12345",
@@ -97,6 +100,11 @@ class TestConfigLoad(unittest.TestCase):
                     )
                 )
                 reloaded = cm.load_config()
+                trigger_tick.assert_called_once_with(
+                    "roomabc12345",
+                    reason="config_updated",
+                    skip_debounce=True,
+                )
 
             room = reloaded["rooms"][0]
             self.assertEqual(room["energy_device_id"], "dev-breaker-1")
@@ -130,7 +138,10 @@ class TestConfigLoad(unittest.TestCase):
                 json.dump(initial, f)
 
             cm._last_known_good_config = None
-            with mock.patch.object(cm, "CONFIG_PATH", primary):
+            with (
+                mock.patch.object(cm, "CONFIG_PATH", primary),
+                mock.patch.object(main.logic_engine, "trigger_tick") as trigger_tick,
+            ):
                 asyncio.run(
                     main.api_update_room(
                         "roomdef12345",
@@ -144,6 +155,11 @@ class TestConfigLoad(unittest.TestCase):
                     )
                 )
                 reloaded = cm.load_config()
+                trigger_tick.assert_called_once_with(
+                    "roomdef12345",
+                    reason="config_updated",
+                    skip_debounce=True,
+                )
 
         room = reloaded["rooms"][0]
         self.assertEqual(room["energy_device_id"], "dev-legacy")

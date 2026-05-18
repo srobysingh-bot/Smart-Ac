@@ -271,7 +271,7 @@ async def lifespan(app: FastAPI):
     logger.info("[HawaAI] Add-on stopped")
 
 
-app = FastAPI(title="HawaAI API", version="1.4.59", lifespan=lifespan)
+app = FastAPI(title="HawaAI API", version="1.4.60", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -897,6 +897,7 @@ async def api_create_room(body: Dict[str, Any] = Body(...)):
     if not config_manager.save_config({"rooms": rooms}):
         raise HTTPException(status_code=500, detail="failed to save rooms")
     logger.info("[ENERGY_CONFIG] persisted=%s", _energy_config_snapshot(row))
+    logic_engine.trigger_tick(rid, reason="config_updated", skip_debounce=True)
     out = room_registry.public_room_view(row)
     if warnings:
         out["config_warnings"] = warnings
@@ -1073,6 +1074,7 @@ async def api_update_room(room_id: str, body: Dict[str, Any] = Body(...)):
     if not config_manager.save_config({"rooms": rooms}):
         raise HTTPException(status_code=500, detail="failed to save rooms")
     logger.info("[ENERGY_CONFIG] persisted=%s", _energy_config_snapshot(r))
+    logic_engine.trigger_tick(rid, reason="config_updated", skip_debounce=True)
     out = room_registry.public_room_view(r)
     if warnings:
         out["config_warnings"] = warnings

@@ -1,5 +1,12 @@
 # HawaAI add-on — release notes
 
+## 1.4.60
+
+- **Energy runtime:** Hardened room-scoped runtime power resolution so ticks use canonical `energy_power_entity` / `energy_kwh_entity` from the merged effective room config only.
+- **Runtime safety:** Added safe numeric parsing that keeps invalid/unavailable sensor states distinct from real `0 W`, tracks last valid readings separately, and avoids poisoning AC/session state.
+- **Dynamic updates:** Room saves now trigger an immediate non-blocking runtime tick so energy config changes apply without an add-on restart.
+- **Compatibility:** Removed legacy energy field reads from runtime paths; aliases remain only at ingestion/migration boundaries.
+
 ## 1.4.59
 
 - **Energy config:** Fixed room-scoped Energy Monitoring persistence so breaker device, live power sensor, and kWh sensor survive save, reload, restart, and room edits.
