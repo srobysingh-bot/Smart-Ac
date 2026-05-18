@@ -271,7 +271,7 @@ async def lifespan(app: FastAPI):
     logger.info("[HawaAI] Add-on stopped")
 
 
-app = FastAPI(title="HawaAI API", version="1.4.58", lifespan=lifespan)
+app = FastAPI(title="HawaAI API", version="1.4.59", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -734,6 +734,111 @@ def _mask_effective_room_settings(eff: Dict[str, Any]) -> Dict[str, Any]:
     return masked
 
 
+_ENERGY_ROOM_FIELDS = (
+    "energy_device_id",
+    "energy_device_name",
+    "energy_power_entity",
+    "energy_kwh_entity",
+)
+
+_ENERGY_REQUEST_ALIASES = {
+    "energy_power_entity": (
+        "energy_sensor_entity",
+        "power_sensor",
+        "live_power_sensor",
+        "live_power_entity",
+        "power_sensor_entity",
+    ),
+    "energy_kwh_entity": (
+        "energy_usage_sensor",
+        "energy_meter_entity",
+        "energy_usage_entity",
+        "kwh_sensor",
+        "kwh_sensor_entity",
+        "energy_kwh_sensor",
+    ),
+    "energy_device_id": (
+        "breaker_device_id",
+        "circuit_breaker_device_id",
+        "power_device_id",
+        "energy_monitor_device_id",
+    ),
+    "energy_device_name": (
+        "breaker_device_name",
+        "circuit_breaker_name",
+        "power_device_name",
+        "energy_monitor_device_name",
+    ),
+}
+
+
+def _energy_config_snapshot(cfg: Dict[str, Any]) -> Dict[str, Any]:
+    return {k: cfg.get(k) or "" for k in _ENERGY_ROOM_FIELDS}
+
+
+def _normalize_energy_request(body: Dict[str, Any]) -> Dict[str, Any]:
+    normalized = dict(body)
+    settings = normalized.get("settings")
+    for canonical, aliases in _ENERGY_REQUEST_ALIASES.items():
+        if canonical not in normalized or normalized.get(canonical) in (None, ""):
+            for alias in aliases:
+                raw = normalized.get(alias)
+                if raw is not None and str(raw).strip():
+                    normalized[canonical] = str(raw).strip()
+                    break
+        for alias in aliases:
+            normalized.pop(alias, None)
+
+        if isinstance(settings, dict):
+            if canonical not in normalized or normalized.get(canonical) in (None, ""):
+                raw = settings.get(canonical)
+                if raw is not None and str(raw).strip():
+                    normalized[canonical] = str(raw).strip()
+                else:
+                    for alias in aliases:
+                        raw = settings.get(alias)
+                        if raw is not None and str(raw).strip():
+                            normalized[canonical] = str(raw).strip()
+                            break
+            for alias in aliases:
+                settings.pop(alias, None)
+            settings.pop(canonical, None)
+
+    for key in _ENERGY_ROOM_FIELDS:
+        if key in normalized and normalized[key] is not None:
+            normalized[key] = str(normalized[key]).strip()
+    return normalized
+
+
+def _energy_config_warnings(body: Dict[str, Any]) -> list:
+    warnings = []
+    for key, label in (
+        ("energy_power_entity", "live power sensor"),
+        ("energy_kwh_entity", "energy usage sensor"),
+    ):
+        eid = str(body.get(key) or "").strip()
+        if not eid:
+            continue
+        if "." not in eid:
+            warnings.append(f"{label} '{eid}' is not a valid Home Assistant entity id")
+            continue
+        domain = eid.split(".", 1)[0]
+        if domain != "sensor":
+            warnings.append(f"{label} '{eid}' should be a sensor entity")
+    return warnings
+
+
+def _apply_energy_room_fields(row: Dict[str, Any], body: Dict[str, Any]) -> None:
+    for key in _ENERGY_ROOM_FIELDS:
+        if key not in body:
+            continue
+        value = body.get(key)
+        if value is None or str(value).strip() == "":
+            row.pop(key, None)
+        else:
+            row[key] = str(value).strip()
+
+
 @app.get("/api/rooms/{room_id}")
 async def api_get_room(room_id: str):
     """Room row + merged effective config (same shape as legacy global /config for the form)."""
@@ -751,6 +856,10 @@ async def api_get_room(room_id: str):
 
 @app.post("/api/rooms")
 async def api_create_room(body: Dict[str, Any] = Body(...)):
+    logger.info("[ENERGY_CONFIG] received_payload=%s", _energy_config_snapshot(body))
+    body = _normalize_energy_request(body)
+    warnings = _energy_config_warnings(body)
+    logger.info("[ENERGY_CONFIG] normalized=%s", _energy_config_snapshot(body))
     base = config_manager.load_config()
     rooms = [dict(r) for r in room_registry.list_room_dicts(base)]
     rid = (str(body.get("id") or "")).strip() or room_registry._new_room_id()
@@ -768,18 +877,30 @@ async def api_create_room(body: Dict[str, Any] = Body(...)):
         "indoor_temp_entity",
         "indoor_humidity_entity",
         "humidity_entity_id",
-        "energy_power_entity",
-        "energy_kwh_entity",
     ):
         v = body.get(k)
         if v and str(v).strip():
             row[k] = str(v).strip()
+    _apply_energy_room_fields(row, body)
+    if isinstance(body.get("settings"), dict):
+        inc = dict(body["settings"])
+        _sanitize_zone_room_settings(inc)
+        _sanitize_control_mode_room_settings(inc)
+        _sanitize_effective_target_room_settings(base, row, inc)
+        row["settings"] = {
+            k: v for k, v in inc.items()
+            if v is not None and not (k in ("weather_api_key", "ai_api_key") and v in ("", "***"))
+        }
     if isinstance(body.get("ai_config"), dict):
         row["ai_config"] = body["ai_config"]
     rooms.append(row)
     if not config_manager.save_config({"rooms": rooms}):
         raise HTTPException(status_code=500, detail="failed to save rooms")
-    return room_registry.public_room_view(row)
+    logger.info("[ENERGY_CONFIG] persisted=%s", _energy_config_snapshot(row))
+    out = room_registry.public_room_view(row)
+    if warnings:
+        out["config_warnings"] = warnings
+    return out
 
 
 def _sanitize_zone_room_settings(incoming_settings: Dict[str, Any]) -> None:
@@ -885,6 +1006,10 @@ def _sanitize_effective_target_room_settings(
 @app.put("/api/rooms/{room_id}")
 async def api_update_room(room_id: str, body: Dict[str, Any] = Body(...)):
     rid = _require_room_query(room_id)
+    logger.info("[ENERGY_CONFIG] received_payload=%s", _energy_config_snapshot(body))
+    body = _normalize_energy_request(body)
+    warnings = _energy_config_warnings(body)
+    logger.info("[ENERGY_CONFIG] normalized=%s", _energy_config_snapshot(body))
     base = config_manager.load_config()
     rooms = [dict(r) for r in room_registry.list_room_dicts(base)]
     idx = next((i for i, re in enumerate(rooms) if re.get("id") == rid), None)
@@ -902,8 +1027,6 @@ async def api_update_room(room_id: str, body: Dict[str, Any] = Body(...)):
         "indoor_temp_entity",
         "indoor_humidity_entity",
         "humidity_entity_id",
-        "energy_power_entity",
-        "energy_kwh_entity",
     ):
         if k in body:
             v = body[k]
@@ -911,6 +1034,7 @@ async def api_update_room(room_id: str, body: Dict[str, Any] = Body(...)):
                 r.pop(k, None)
             else:
                 r[k] = str(v).strip()
+    _apply_energy_room_fields(r, body)
     if "settings" in body:
         inc = body["settings"]
         if isinstance(inc, dict):
@@ -948,7 +1072,11 @@ async def api_update_room(room_id: str, body: Dict[str, Any] = Body(...)):
     rooms[idx] = r
     if not config_manager.save_config({"rooms": rooms}):
         raise HTTPException(status_code=500, detail="failed to save rooms")
-    return room_registry.public_room_view(r)
+    logger.info("[ENERGY_CONFIG] persisted=%s", _energy_config_snapshot(r))
+    out = room_registry.public_room_view(r)
+    if warnings:
+        out["config_warnings"] = warnings
+    return out
 
 
 @app.post("/api/rooms/{room_id}/disable")

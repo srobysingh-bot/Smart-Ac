@@ -24,6 +24,8 @@ _ROOM_ENTITY_KEYS = (
     "humidity_entity_id",
     "energy_power_entity",
     "energy_kwh_entity",
+    "energy_device_id",
+    "energy_device_name",
 )
 
 # Minimum length for persisted room ids (collision resistance + readability).

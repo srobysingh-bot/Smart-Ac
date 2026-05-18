@@ -32,6 +32,8 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "climate_entity": "",
     "energy_power_entity": "",
     "energy_kwh_entity": "",
+    "energy_device_id": "",
+    "energy_device_name": "",
     "ac_brand": "",
     "ac_model": "",
     "room_name": "Living Room",
@@ -95,6 +97,78 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "timezone": "",
     "rooms": [],
 }
+
+_ENERGY_FIELD_ALIASES = {
+    "energy_power_entity": (
+        "energy_sensor_entity",
+        "power_sensor",
+        "live_power_sensor",
+        "live_power_entity",
+        "power_sensor_entity",
+    ),
+    "energy_kwh_entity": (
+        "energy_usage_sensor",
+        "energy_meter_entity",
+        "energy_usage_entity",
+        "kwh_sensor",
+        "kwh_sensor_entity",
+        "energy_kwh_sensor",
+    ),
+    "energy_device_id": (
+        "breaker_device_id",
+        "circuit_breaker_device_id",
+        "power_device_id",
+        "energy_monitor_device_id",
+    ),
+    "energy_device_name": (
+        "breaker_device_name",
+        "circuit_breaker_name",
+        "power_device_name",
+        "energy_monitor_device_name",
+    ),
+}
+
+
+def _energy_config_snapshot(cfg: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "energy_device_id": cfg.get("energy_device_id") or "",
+        "energy_device_name": cfg.get("energy_device_name") or "",
+        "energy_power_entity": cfg.get("energy_power_entity") or "",
+        "energy_kwh_entity": cfg.get("energy_kwh_entity") or "",
+    }
+
+
+def _normalize_energy_fields_in_place(cfg: Dict[str, Any]) -> None:
+    if not isinstance(cfg, dict):
+        return
+    for canonical, aliases in _ENERGY_FIELD_ALIASES.items():
+        if not str(cfg.get(canonical) or "").strip():
+            for alias in aliases:
+                raw = cfg.get(alias)
+                if raw is not None and str(raw).strip():
+                    cfg[canonical] = str(raw).strip()
+                    break
+        for alias in aliases:
+            cfg.pop(alias, None)
+
+    for key in _ENERGY_FIELD_ALIASES:
+        if key in cfg and cfg[key] is not None:
+            cfg[key] = str(cfg[key]).strip()
+
+
+def _normalize_room_energy_fields(rooms: Any) -> None:
+    if not isinstance(rooms, list):
+        return
+    for room in rooms:
+        if not isinstance(room, dict):
+            continue
+        _normalize_energy_fields_in_place(room)
+        settings = room.get("settings")
+        if isinstance(settings, dict):
+            _normalize_energy_fields_in_place(settings)
+            for key in _ENERGY_FIELD_ALIASES:
+                if key in settings and not str(room.get(key) or "").strip():
+                    room[key] = settings.pop(key)
 
 
 def _read_json_dict(path: str) -> Dict[str, Any]:
@@ -171,6 +245,9 @@ def _assemble_merged_config(saved: Dict[str, Any], options: Dict[str, Any]) -> D
     for _k in _LEGACY_IR_KEYS:
         merged.pop(_k, None)
 
+    _normalize_energy_fields_in_place(merged)
+    _normalize_room_energy_fields(merged.get("rooms"))
+
     if merged.get("ai_enabled") is None:
         merged["ai_enabled"] = False
 
@@ -201,12 +278,6 @@ def _assemble_merged_config(saved: Dict[str, Any], options: Dict[str, Any]) -> D
     merged["ac_entity"] = _ace
     merged["climate_entity"] = _ace
 
-    if "energy_sensor_entity" in merged and "energy_power_entity" not in merged:
-        merged["energy_power_entity"] = merged.pop("energy_sensor_entity")
-        merged.setdefault("energy_kwh_entity", "")
-    elif "energy_sensor_entity" in merged:
-        merged.pop("energy_sensor_entity", None)
-
     room_registry.ensure_migrated(merged)
     return merged
 
@@ -227,6 +298,19 @@ def load_config() -> Dict[str, Any]:
         saved = _read_json_dict(CONFIG_PATH)
         opts = _read_json_dict("/data/options.json")
         merged = _assemble_merged_config(saved, opts)
+        logger.info(
+            "[ENERGY_CONFIG] loaded_from_disk=%s",
+            {
+                "global": _energy_config_snapshot(merged),
+                "rooms": [
+                    {
+                        "id": r.get("id"),
+                        **_energy_config_snapshot(r),
+                    }
+                    for r in room_registry.list_room_dicts(merged)
+                ],
+            },
+        )
         return _remember(merged)
 
     except Exception:
@@ -269,8 +353,40 @@ def save_config(data: Dict[str, Any]) -> bool:
     """Write config to /data/ which persists across HA addon restarts."""
     try:
         data = {k: v for k, v in data.items() if k not in _LEGACY_IR_KEYS}
+        logger.info(
+            "[ENERGY_CONFIG] received_payload=%s",
+            {
+                "global": _energy_config_snapshot(data),
+                "rooms": [
+                    {
+                        "id": r.get("id"),
+                        **_energy_config_snapshot(r),
+                    }
+                    for r in data.get("rooms", [])
+                    if isinstance(r, dict)
+                ],
+            },
+        )
+        _normalize_energy_fields_in_place(data)
+        _normalize_room_energy_fields(data.get("rooms"))
+        logger.info(
+            "[ENERGY_CONFIG] normalized=%s",
+            {
+                "global": _energy_config_snapshot(data),
+                "rooms": [
+                    {
+                        "id": r.get("id"),
+                        **_energy_config_snapshot(r),
+                    }
+                    for r in data.get("rooms", [])
+                    if isinstance(r, dict)
+                ],
+            },
+        )
         current = load_config()
         current.update(data)
+        _normalize_energy_fields_in_place(current)
+        _normalize_room_energy_fields(current.get("rooms"))
         current["timezone"] = validate_timezone_optional(current.get("timezone"))
         _ace = (current.get("ac_entity") or current.get("climate_entity") or "").strip()
         current["ac_entity"] = _ace
@@ -278,6 +394,19 @@ def save_config(data: Dict[str, Any]) -> bool:
         os.makedirs(os.path.dirname(CONFIG_PATH), exist_ok=True)
         with open(CONFIG_PATH, "w", encoding="utf-8") as f:
             json.dump(current, f, indent=2, ensure_ascii=False)
+        logger.info(
+            "[ENERGY_CONFIG] persisted=%s",
+            {
+                "global": _energy_config_snapshot(current),
+                "rooms": [
+                    {
+                        "id": r.get("id"),
+                        **_energy_config_snapshot(r),
+                    }
+                    for r in room_registry.list_room_dicts(current)
+                ],
+            },
+        )
         logger.info("[HawaAI] Config saved to %s", CONFIG_PATH)
         return True
     except Exception as e:

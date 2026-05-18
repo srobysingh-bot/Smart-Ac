@@ -371,6 +371,9 @@ export default function Settings() {
         setRoomDisabled(Boolean(detail.room?.disabled))
         setEntities(e)
         setAllDevices(devs)
+        setSelectedDevice(
+          devs.find(d => d.device_id === String(c.energy_device_id || '').trim()) || null,
+        )
       })
       .catch(err => {
         console.error(err)
@@ -428,19 +431,25 @@ export default function Settings() {
       }
       if (!ai_config.ai_api_key) delete ai_config.ai_api_key
 
-      await updateRoom(roomId, {
+      const saved = await updateRoom(roomId, {
         name: (cfg.room_name || roomTitle || 'Room').trim(),
         climate_entity: (cfg.ac_entity || cfg.climate_entity || '').trim(),
         presence_entity: cfg.presence_entity?.trim() || null,
         indoor_temp_entity: cfg.indoor_temp_entity?.trim() || null,
         indoor_humidity_entity: cfg.indoor_humidity_entity?.trim() || null,
+        energy_device_id: (cfg.energy_device_id || selectedDevice?.device_id || '').trim() || null,
+        energy_device_name: (cfg.energy_device_name || selectedDevice?.name || '').trim() || null,
         energy_power_entity: cfg.energy_power_entity?.trim() || null,
         energy_kwh_entity: cfg.energy_kwh_entity?.trim() || null,
         settings,
         ai_config,
       })
       setSaveStatus('ok')
-      setSaveMsg('Room settings saved — logic engine updated')
+      setSaveMsg(
+        saved?.config_warnings?.length
+          ? `Room settings saved with warning: ${saved.config_warnings.join('; ')}`
+          : 'Room settings saved - logic engine updated',
+      )
       const detail = await getRoom(roomId)
       const c = { ...detail.effective }
       if (c.weather_api_key === '***') c.weather_api_key = ''
@@ -448,6 +457,9 @@ export default function Settings() {
       setCfg(c)
       setRoomTitle(detail.room?.name || roomId)
       setRoomDisabled(Boolean(detail.room?.disabled))
+      setSelectedDevice(
+        allDevices.find(d => d.device_id === String(c.energy_device_id || '').trim()) || selectedDevice,
+      )
       refreshRooms().catch(() => {})
     } catch (err) {
       console.error('Save failed:', err)
@@ -549,6 +561,8 @@ export default function Settings() {
     setSelectedDevice(device)
     setDeviceEntities([])
     setEntitiesError(null)
+    patch('energy_device_id', device?.device_id || '')
+    patch('energy_device_name', device?.name || '')
     if (!device) return
 
     setLoadingEntities(true)

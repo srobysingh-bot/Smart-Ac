@@ -1,5 +1,12 @@
 # HawaAI add-on — release notes
 
+## 1.4.59
+
+- **Energy config:** Fixed room-scoped Energy Monitoring persistence so breaker device, live power sensor, and kWh sensor survive save, reload, restart, and room edits.
+- **Compatibility:** Migrates legacy/alternate energy field names into canonical room fields without silently dropping values.
+- **Diagnostics:** Added `[ENERGY_CONFIG]` received, normalized, persisted, and loaded logs plus validation warnings for invalid energy entity ids.
+- **Tests:** Added regressions for energy config save, reload, room merge, and alias migration.
+
 ## 1.4.58
 
 - **Occupancy recovery:** Confirmed FP2 zone re-entry now immediately clears stale vacancy runtime state, safety-vacant holds, pending vacant OFF state, and thermostat suppression.
