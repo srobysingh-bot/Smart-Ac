@@ -1,5 +1,11 @@
 # HawaAI add-on — release notes
 
+## 1.4.61
+
+- **Energy runtime:** Removed the remaining duplicate dashboard/status energy read path so runtime energy has one canonical source: `_read_runtime_energy()`.
+- **UI consistency:** `/api/status` now reports current parsed runtime energy values instead of fetching and parsing energy sensors independently.
+- **Tests:** Added coverage proving current invalid readings stay distinct from last-valid diagnostics.
+
 ## 1.4.60
 
 - **Energy runtime:** Hardened room-scoped runtime power resolution so ticks use canonical `energy_power_entity` / `energy_kwh_entity` from the merged effective room config only.

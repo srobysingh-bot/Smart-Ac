@@ -271,7 +271,7 @@ async def lifespan(app: FastAPI):
     logger.info("[HawaAI] Add-on stopped")
 
 
-app = FastAPI(title="HawaAI API", version="1.4.60", lifespan=lifespan)
+app = FastAPI(title="HawaAI API", version="1.4.61", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -499,9 +499,6 @@ async def _dashboard_status_payload(rid: str) -> Dict[str, Any]:
 
     indoor_temp_raw  = await ha_client.get_state(cfg.get("indoor_temp_entity", ""))
     presence_raw     = await ha_client.get_state(cfg.get("presence_entity", ""))
-    energy_power_raw = await ha_client.get_state(cfg.get("energy_power_entity", ""))
-    energy_kwh_raw   = await ha_client.get_state(cfg.get("energy_kwh_entity", ""))
-
     is_occupied = parse_presence(presence_raw)
     weather     = await weather_api.get_cached()
 
@@ -511,10 +508,11 @@ async def _dashboard_status_payload(rid: str) -> Dict[str, Any]:
         except (ValueError, TypeError):
             return None
 
-    energy_watts = safe_float(energy_power_raw)
-    energy_kwh   = safe_float(energy_kwh_raw)
-
     runtime = logic_engine.get_runtime_state(rid)
+    energy_watts = runtime.get("energy_watts")
+    energy_kwh = runtime.get("energy_kwh_total")
+    energy_power_raw = runtime.get("energy_power_raw_state")
+    energy_kwh_raw = runtime.get("energy_kwh_raw_state")
     ac_state = str(runtime.get("ac_state") or "off")
     physical_ac_on = bool(runtime.get("physical_ac_on", runtime.get("ac_is_on", False)))
     effective_ac_on = bool(runtime.get("effective_ac_on", False))
@@ -583,8 +581,16 @@ async def _dashboard_status_payload(rid: str) -> Dict[str, Any]:
         "sensors": {
             "indoor_temp": _sensor_health(cfg.get("indoor_temp_entity", ""), indoor_temp_raw),
             "presence": _sensor_health(cfg.get("presence_entity", ""), presence_raw),
-            "energy_power": _sensor_health(cfg.get("energy_power_entity", ""), energy_power_raw),
-            "energy_kwh": _sensor_health(cfg.get("energy_kwh_entity", ""), energy_kwh_raw),
+            "energy_power": (
+                None
+                if not (cfg.get("energy_power_entity") or "").strip()
+                else energy_watts is not None
+            ),
+            "energy_kwh": (
+                None
+                if not (cfg.get("energy_kwh_entity") or "").strip()
+                else energy_kwh is not None
+            ),
             "humidity": (
                 None if not humidity_entity else runtime.get("humidity_percent") is not None
             ),

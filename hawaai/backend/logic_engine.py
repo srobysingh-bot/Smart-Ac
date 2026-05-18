@@ -180,6 +180,13 @@ async def _read_runtime_energy(
     parsed_power = _parse_energy_sensor_value(raw_power_state)
     parsed_kwh = _parse_energy_sensor_value(raw_kwh_state)
 
+    st.energy_power_entity = power_entity
+    st.energy_kwh_entity = kwh_entity
+    st.energy_power_raw_state = raw_power_state
+    st.energy_kwh_raw_state = raw_kwh_state
+    st.energy_watts = parsed_power
+    st.energy_kwh = parsed_kwh
+
     if parsed_power is not None:
         st.last_valid_power_watts = parsed_power
     if parsed_kwh is not None:
@@ -314,6 +321,12 @@ class RoomRuntime:
     zone_block_count: int = 0
     zone_allow_count: int = 0
     zone_log_sig: Optional[tuple] = None
+    energy_power_entity: str = ""
+    energy_kwh_entity: str = ""
+    energy_power_raw_state: Optional[object] = None
+    energy_kwh_raw_state: Optional[object] = None
+    energy_watts: Optional[float] = None
+    energy_kwh: Optional[float] = None
     energy_runtime_log_sig: Optional[tuple] = None
     last_valid_power_watts: Optional[float] = None
     last_valid_energy_kwh: Optional[float] = None
@@ -5212,6 +5225,12 @@ def get_runtime_state(room_id: str) -> dict:
         ),
         "last_power_confirmed_on":  st.last_power_confirmed_on,
         "last_power_confirmed_off": st.last_power_confirmed_off,
+        "energy_power_entity": st.energy_power_entity,
+        "energy_kwh_entity": st.energy_kwh_entity,
+        "energy_power_raw_state": st.energy_power_raw_state,
+        "energy_kwh_raw_state": st.energy_kwh_raw_state,
+        "energy_watts": st.energy_watts,
+        "energy_kwh_total": st.energy_kwh,
         "last_valid_power_watts": st.last_valid_power_watts,
         "last_valid_energy_kwh": st.last_valid_energy_kwh,
         "ai_enabled":            bool(merged.get("ai_enabled", False)),

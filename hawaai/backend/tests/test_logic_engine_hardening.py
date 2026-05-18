@@ -120,6 +120,52 @@ class TestLogicEngineHardening(unittest.TestCase):
         self.assertIsNone(logic_engine._parse_energy_sensor_value(None))
         self.assertIsNone(logic_engine._parse_energy_sensor_value("not-a-number"))
 
+    def test_read_runtime_energy_tracks_current_separately_from_last_valid(self):
+        st = logic_engine.RoomRuntime()
+
+        async def run_case():
+            with mock.patch.object(
+                logic_engine.ha_client,
+                "get_state",
+                new=mock.AsyncMock(side_effect=["611.5", "42.25"]),
+            ):
+                watts, kwh = await logic_engine._read_runtime_energy(
+                    "room-x",
+                    {
+                        "energy_power_entity": "sensor.room_power",
+                        "energy_kwh_entity": "sensor.room_kwh",
+                    },
+                    st,
+                )
+            self.assertEqual(watts, 611.5)
+            self.assertEqual(kwh, 42.25)
+            self.assertEqual(st.energy_watts, 611.5)
+            self.assertEqual(st.energy_kwh, 42.25)
+            self.assertEqual(st.last_valid_power_watts, 611.5)
+            self.assertEqual(st.last_valid_energy_kwh, 42.25)
+
+            with mock.patch.object(
+                logic_engine.ha_client,
+                "get_state",
+                new=mock.AsyncMock(side_effect=["unknown", "bad-kwh"]),
+            ):
+                watts2, kwh2 = await logic_engine._read_runtime_energy(
+                    "room-x",
+                    {
+                        "energy_power_entity": "sensor.room_power",
+                        "energy_kwh_entity": "sensor.room_kwh",
+                    },
+                    st,
+                )
+            self.assertIsNone(watts2)
+            self.assertIsNone(kwh2)
+            self.assertIsNone(st.energy_watts)
+            self.assertIsNone(st.energy_kwh)
+            self.assertEqual(st.last_valid_power_watts, 611.5)
+            self.assertEqual(st.last_valid_energy_kwh, 42.25)
+
+        asyncio.run(run_case())
+
     def test_sync_pending_clears_when_decision_not_on_off(self):
         st = logic_engine.RoomRuntime()
         st.pending_action = "on"
