@@ -85,6 +85,7 @@ class EnergyConfigResolverTests(unittest.TestCase):
                         return_value=[
                             {
                                 "entity_id": "sensor.ac_power",
+                                "state": "611",
                                 "attributes": {
                                     "device_class": "power",
                                     "state_class": "measurement",
@@ -93,6 +94,7 @@ class EnergyConfigResolverTests(unittest.TestCase):
                             },
                             {
                                 "entity_id": "sensor.ac_energy",
+                                "state": "42.5",
                                 "attributes": {
                                     "device_class": "energy",
                                     "state_class": "total_increasing",
@@ -112,6 +114,90 @@ class EnergyConfigResolverTests(unittest.TestCase):
         self.assertEqual(resolved.power_entity, "sensor.ac_power")
         self.assertEqual(resolved.kwh_entity, "sensor.ac_energy")
         self.assertFalse(resolved.device_lookup_skipped)
+
+    def test_auto_discovery_rejects_select_power_behaviour(self):
+        async def run_case():
+            with (
+                mock.patch.object(
+                    energy_config.ha_client,
+                    "get_entity_registry",
+                    new=mock.AsyncMock(
+                        return_value=[
+                            {
+                                "entity_id": "select.breaker_power_on_behaviour",
+                                "device_id": "abc123",
+                            },
+                            {"entity_id": "sensor.breaker_power", "device_id": "abc123"},
+                        ]
+                    ),
+                ),
+                mock.patch.object(
+                    energy_config.ha_client,
+                    "get_all_entities",
+                    new=mock.AsyncMock(
+                        return_value=[
+                            {
+                                "entity_id": "select.breaker_power_on_behaviour",
+                                "state": "previous",
+                                "attributes": {},
+                            },
+                            {
+                                "entity_id": "sensor.breaker_power",
+                                "state": "611",
+                                "attributes": {
+                                    "device_class": "power",
+                                    "state_class": "measurement",
+                                    "unit_of_measurement": "W",
+                                },
+                            },
+                        ]
+                    ),
+                ),
+            ):
+                return await energy_config.resolve_runtime_energy_config(
+                    {"energy_device_id": "abc123"},
+                    room_id="study",
+                )
+
+        resolved = asyncio.run(run_case())
+        self.assertEqual(resolved.power_entity, "sensor.breaker_power")
+
+    def test_auto_discovery_does_not_assign_invalid_power_entity(self):
+        async def run_case():
+            with (
+                mock.patch.object(
+                    energy_config.ha_client,
+                    "get_entity_registry",
+                    new=mock.AsyncMock(
+                        return_value=[
+                            {
+                                "entity_id": "select.breaker_power_on_behaviour",
+                                "device_id": "abc123",
+                            },
+                        ]
+                    ),
+                ),
+                mock.patch.object(
+                    energy_config.ha_client,
+                    "get_all_entities",
+                    new=mock.AsyncMock(
+                        return_value=[
+                            {
+                                "entity_id": "select.breaker_power_on_behaviour",
+                                "state": "previous",
+                                "attributes": {},
+                            },
+                        ]
+                    ),
+                ),
+            ):
+                return await energy_config.resolve_runtime_energy_config(
+                    {"energy_device_id": "abc123"},
+                    room_id="study",
+                )
+
+        resolved = asyncio.run(run_case())
+        self.assertEqual(resolved.power_entity, "")
 
     def test_dashboard_status_hydrates_live_energy_from_latest_room_config(self):
         from backend import logic_engine, main
@@ -135,15 +221,39 @@ class EnergyConfigResolverTests(unittest.TestCase):
             return {
                 "sensor.energy_temp": "24.5",
                 "binary_sensor.energy_presence": "on",
-                "sensor.energy_power": "611",
-                "sensor.energy_total": "42.75",
             }.get(entity_id)
+
+        async def fake_get_entity_state_full(entity_id):
+            state = {
+                "sensor.energy_power": {
+                    "state": "611",
+                    "attributes": {
+                        "device_class": "power",
+                        "state_class": "measurement",
+                        "unit_of_measurement": "W",
+                    },
+                },
+                "sensor.energy_total": {
+                    "state": "42.75",
+                    "attributes": {
+                        "device_class": "energy",
+                        "state_class": "total_increasing",
+                        "unit_of_measurement": "kWh",
+                    },
+                },
+            }
+            return state.get(entity_id)
 
         async def run_case():
             logic_engine._runtime_by_room.clear()
             with (
                 mock.patch.object(main.config_manager, "load_config", return_value=cfg),
                 mock.patch.object(main.ha_client, "get_state", side_effect=fake_get_state),
+                mock.patch.object(
+                    main.ha_client,
+                    "get_entity_state_full",
+                    side_effect=fake_get_entity_state_full,
+                ),
                 mock.patch.object(
                     main.ha_client,
                     "get_climate_state",
@@ -166,6 +276,89 @@ class EnergyConfigResolverTests(unittest.TestCase):
         self.assertEqual(payload["energy_kwh_entity"], "sensor.energy_total")
         self.assertEqual(payload["energy_watts"], 611.0)
         self.assertEqual(payload["energy_kwh_total"], 42.75)
+
+    def test_invalid_room_energy_does_not_clear_another_room_runtime(self):
+        from backend import logic_engine, main
+
+        cfg = {
+            "rooms": [
+                {
+                    "id": "diningroom01",
+                    "name": "Dining",
+                    "presence_entity": "binary_sensor.dining_presence",
+                    "indoor_temp_entity": "sensor.dining_temp",
+                    "climate_entity": "climate.dining",
+                    "energy_power_entity": "sensor.dining_power",
+                },
+                {
+                    "id": "studyroom001",
+                    "name": "Study",
+                    "presence_entity": "binary_sensor.study_presence",
+                    "indoor_temp_entity": "sensor.study_temp",
+                    "climate_entity": "climate.study",
+                    "energy_power_entity": "select.study_power_on_behaviour",
+                },
+            ]
+        }
+
+        async def fake_get_state(entity_id):
+            return {
+                "sensor.dining_temp": "24",
+                "binary_sensor.dining_presence": "on",
+                "sensor.study_temp": "24",
+                "binary_sensor.study_presence": "on",
+            }.get(entity_id)
+
+        async def fake_get_entity_state_full(entity_id):
+            state = {
+                "sensor.dining_power": {
+                    "state": "611",
+                    "attributes": {
+                        "device_class": "power",
+                        "state_class": "measurement",
+                        "unit_of_measurement": "W",
+                    },
+                },
+                "select.study_power_on_behaviour": {
+                    "state": "previous",
+                    "attributes": {},
+                },
+            }
+            return state.get(entity_id)
+
+        async def run_case():
+            logic_engine._runtime_by_room.clear()
+            with (
+                mock.patch.object(main.config_manager, "load_config", return_value=cfg),
+                mock.patch.object(main.ha_client, "get_state", side_effect=fake_get_state),
+                mock.patch.object(
+                    main.ha_client,
+                    "get_entity_state_full",
+                    side_effect=fake_get_entity_state_full,
+                ),
+                mock.patch.object(
+                    main.ha_client,
+                    "get_climate_state",
+                    new=mock.AsyncMock(return_value={}),
+                ),
+                mock.patch.object(
+                    main.weather_api,
+                    "get_cached",
+                    new=mock.AsyncMock(return_value={"temp": 34, "humidity": 55}),
+                ),
+                mock.patch.object(main, "get_ai_status", return_value={}),
+            ):
+                dining_before = await main._dashboard_status_payload("diningroom01")
+                study = await main._dashboard_status_payload("studyroom001")
+                dining_after = await main._dashboard_status_payload("diningroom01")
+            return dining_before, study, dining_after
+
+        dining_before, study, dining_after = asyncio.run(run_case())
+        self.assertEqual(dining_before["energy_watts"], 611.0)
+        self.assertEqual(dining_after["energy_watts"], 611.0)
+        self.assertEqual(dining_after["energy_power_entity"], "sensor.dining_power")
+        self.assertFalse(study["energy_live_available"])
+        self.assertEqual(study["energy_status"], "unavailable")
 
 
 if __name__ == "__main__":

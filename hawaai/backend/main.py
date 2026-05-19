@@ -28,6 +28,7 @@ Routes:
 """
 
 import asyncio
+import copy
 import json
 import logging
 import time
@@ -273,7 +274,7 @@ async def lifespan(app: FastAPI):
     logger.info("[HawaAI] Add-on stopped")
 
 
-app = FastAPI(title="HawaAI API", version="1.4.63", lifespan=lifespan)
+app = FastAPI(title="HawaAI API", version="1.4.64", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -947,7 +948,7 @@ async def api_create_room(body: Dict[str, Any] = Body(...)):
     warnings = _energy_config_warnings(body)
     logger.info("[ENERGY_CONFIG] normalized=%s", _energy_config_snapshot(body))
     base = config_manager.load_config()
-    rooms = [dict(r) for r in room_registry.list_room_dicts(base)]
+    rooms = [copy.deepcopy(r) for r in room_registry.list_room_dicts(base)]
     rid = (str(body.get("id") or "")).strip() or room_registry._new_room_id()
     if rid.lower() == "default":
         raise HTTPException(status_code=400, detail="room id 'default' is reserved — choose another id")
@@ -1098,7 +1099,7 @@ async def api_update_room(room_id: str, body: Dict[str, Any] = Body(...)):
     warnings = _energy_config_warnings(body)
     logger.info("[ENERGY_CONFIG] normalized=%s", _energy_config_snapshot(body))
     base = config_manager.load_config()
-    rooms = [dict(r) for r in room_registry.list_room_dicts(base)]
+    rooms = [copy.deepcopy(r) for r in room_registry.list_room_dicts(base)]
     idx = next((i for i, re in enumerate(rooms) if re.get("id") == rid), None)
     if idx is None:
         raise HTTPException(status_code=404, detail="room not found")
@@ -1175,7 +1176,7 @@ async def api_disable_room(room_id: str):
     stored = _resolve_stored_room_id(base, rq)
     if not stored:
         raise HTTPException(status_code=404, detail="room not found")
-    rooms = [dict(r) for r in room_registry.list_room_dicts(base)]
+    rooms = [copy.deepcopy(r) for r in room_registry.list_room_dicts(base)]
     idx = next((i for i, re in enumerate(rooms) if re.get("id") == stored), None)
     if idx is None:
         raise HTTPException(status_code=404, detail="room not found")
@@ -1202,7 +1203,7 @@ async def api_enable_room(room_id: str):
     stored = _resolve_stored_room_id(base, rq)
     if not stored:
         raise HTTPException(status_code=404, detail="room not found")
-    rooms = [dict(r) for r in room_registry.list_room_dicts(base)]
+    rooms = [copy.deepcopy(r) for r in room_registry.list_room_dicts(base)]
     idx = next((i for i, re in enumerate(rooms) if re.get("id") == stored), None)
     if idx is None:
         raise HTTPException(status_code=404, detail="room not found")
@@ -1231,7 +1232,7 @@ async def api_delete_room(room_id: str, purge: bool = Query(False)):
     stored = _resolve_stored_room_id(base, rq)
     if not stored:
         return {"status": "already_deleted", "purged": bool(purge)}
-    rooms = [dict(r) for r in room_registry.list_room_dicts(base)]
+    rooms = [copy.deepcopy(r) for r in room_registry.list_room_dicts(base)]
     idx = next((i for i, re in enumerate(rooms) if re.get("id") == stored), None)
     if idx is None:
         return {"status": "already_deleted", "purged": bool(purge)}
@@ -1497,7 +1498,10 @@ async def list_entities(filter: Optional[str] = None, domain: Optional[str] = No
             "friendly_name": friendly_name,
             "domain": entity_domain,
             "state": e.get("state"),
+            "unit": attrs.get("unit_of_measurement", ""),
             "device_class": dc if dc is None else str(dc),
+            "state_class": attrs.get("state_class"),
+            "entity_category": attrs.get("entity_category"),
         })
     result.sort(key=lambda x: x["entity_id"])
     return result
@@ -1556,6 +1560,9 @@ async def get_device_entities(device_id: str):
             "friendly_name": attrs.get("friendly_name", eid),
             "domain":        eid.split(".")[0] if "." in eid else "",
             "unit":          attrs.get("unit_of_measurement", ""),
+            "device_class":  attrs.get("device_class"),
+            "state_class":   attrs.get("state_class"),
+            "entity_category": attrs.get("entity_category"),
             "state":         state_obj.get("state"),
         })
     return result

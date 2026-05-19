@@ -531,34 +531,54 @@ export default function Settings() {
   const byDomain = domain => entities.filter(e => e.entity_id.startsWith(`${domain}.`))
 
   const allSensors = entities.filter(e => e.entity_id.startsWith('sensor.'))
+  const entityUnit = e => String(e?.unit || e?.unit_of_measurement || '').trim().toLowerCase().replace(/\s+/g, '')
+  const entityClass = (e, key) => String(e?.[key] || '').trim().toLowerCase()
+  const numericState = e => {
+    const raw = e?.state
+    if (raw == null) return false
+    const text = String(raw).trim().toLowerCase()
+    if (!text || ['unknown', 'unavailable', 'none', 'nan'].includes(text)) return false
+    return Number.isFinite(Number(text))
+  }
+  const isRuntimeSensorCandidate = e =>
+    String(e?.domain || e?.entity_id?.split('.')?.[0] || '').toLowerCase() === 'sensor' &&
+    !['config', 'diagnostic'].includes(entityClass(e, 'entity_category')) &&
+    numericState(e)
+  const isPowerSensor = e => {
+    const unit = entityUnit(e)
+    return isRuntimeSensorCandidate(e) &&
+      (entityClass(e, 'device_class') === 'power' || unit === 'w' || unit === 'kw')
+  }
+  const isKwhSensor = e => {
+    const unit = entityUnit(e)
+    return isRuntimeSensorCandidate(e) &&
+      (entityClass(e, 'device_class') === 'energy' || unit === 'kwh' || unit === 'wh')
+  }
+  const energyEntityRank = (e, kind) => {
+    const id = String(e?.entity_id || '').toLowerCase()
+    const unit = entityUnit(e)
+    const dc = entityClass(e, 'device_class')
+    const sc = entityClass(e, 'state_class')
+    let score = 0
+    if (kind === 'power') {
+      if (id.endsWith('_power')) score += 1000
+      if (dc === 'power') score += 500
+      if (unit === 'w' || unit === 'kw') score += 250
+      return score
+    }
+    if (id.endsWith('_total_energy')) score += 1000
+    if (dc === 'energy') score += 500
+    if (unit === 'kwh' || unit === 'wh') score += 250
+    if (sc === 'total_increasing') score += 100
+    else if (sc === 'total') score += 75
+    return score
+  }
 
   // Live power sensors — watts / current / breaker / circuit
-  const powerSensors = allSensors.filter(e => {
-    const id   = e.entity_id.toLowerCase()
-    const name = (e.friendly_name || '').toLowerCase()
-    return (
-      id.includes('power')   || id.includes('watt')    ||
-      id.includes('current') || id.includes('breaker') ||
-      id.includes('circuit') || id.includes('30a')     ||
-      name.includes('power') || name.includes('watt')  ||
-      name.includes('current')|| name.includes('breaker')||
-      name.includes('circuit')|| name.includes('30a')
-    )
-  })
+  const powerSensors = allSensors.filter(isPowerSensor)
 
   // Cumulative kWh sensors — energy / usage / total / consumption
-  const kwhSensors = allSensors.filter(e => {
-    const id   = e.entity_id.toLowerCase()
-    const name = (e.friendly_name || '').toLowerCase()
-    return (
-      id.includes('kwh')         || id.includes('energy')      ||
-      id.includes('usage')       || id.includes('total')       ||
-      id.includes('consumption') ||
-      name.includes('kwh')       || name.includes('energy')    ||
-      name.includes('usage')     || name.includes('total')     ||
-      name.includes('consumption')
-    )
-  })
+  const kwhSensors = allSensors.filter(isKwhSensor)
 
   const onDeviceSelect = async (device) => {
     setSelectedDevice(device)
@@ -573,23 +593,14 @@ export default function Settings() {
       const devEnts = await getDeviceEntities(device.device_id)
       setDeviceEntities(devEnts)
 
-      // Auto-detect power (watts) entity — match by unit first, then by entity_id pattern
-      const powerEnt = devEnts.find(e => {
-        const id   = e.entity_id.toLowerCase()
-        const unit = (e.unit || '').toLowerCase()
-        return unit === 'w' || unit === 'watt' || unit === 'watts' ||
-               (id.includes('power') && !id.includes('usage') &&
-                !id.includes('total') && !id.includes('kwh'))
-      })
-
-      // Auto-detect kWh entity — match by unit first, then by entity_id pattern
-      const kwhEnt = devEnts.find(e => {
-        const id   = e.entity_id.toLowerCase()
-        const unit = (e.unit || '').toLowerCase()
-        return unit === 'kwh' || id.includes('kwh') || id.includes('power_usage') ||
-               id.includes('energy') ||
-               (id.includes('total') && !id.includes('voltage') && !id.includes('current'))
-      })
+      const sortedPower = devEnts
+        .filter(isPowerSensor)
+        .sort((a, b) => energyEntityRank(b, 'power') - energyEntityRank(a, 'power'))
+      const sortedKwh = devEnts
+        .filter(isKwhSensor)
+        .sort((a, b) => energyEntityRank(b, 'energy') - energyEntityRank(a, 'energy'))
+      const powerEnt = sortedPower[0]
+      const kwhEnt = sortedKwh[0]
 
       if (powerEnt) patch('energy_power_entity', powerEnt.entity_id)
       if (kwhEnt)   patch('energy_kwh_entity',   kwhEnt.entity_id)

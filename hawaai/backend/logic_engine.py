@@ -58,6 +58,7 @@ from . import (
 )
 from .energy_config import (
     EnergyConfigMode,
+    read_validated_energy_state,
     resolve_energy_config,
     resolve_runtime_energy_config,
 )
@@ -201,16 +202,21 @@ async def _read_runtime_energy(
     cfg: dict,
     st: "RoomRuntime",
 ) -> Tuple[Optional[float], Optional[float]]:
-    resolved = await resolve_runtime_energy_config(cfg)
+    resolved = await resolve_runtime_energy_config(cfg, room_id=room_id)
     mode = resolved.mode.value
     power_entity = resolved.power_entity
     kwh_entity = resolved.kwh_entity
 
-    raw_power_state = await ha_client.get_state(power_entity) if power_entity else None
-    raw_kwh_state = await ha_client.get_state(kwh_entity) if kwh_entity else None
-
-    parsed_power = _parse_energy_sensor_value(raw_power_state)
-    parsed_kwh = _parse_energy_sensor_value(raw_kwh_state)
+    raw_power_state, parsed_power, _power_validation = await read_validated_energy_state(
+        room_id,
+        power_entity,
+        kind="power",
+    )
+    raw_kwh_state, parsed_kwh, _kwh_validation = await read_validated_energy_state(
+        room_id,
+        kwh_entity,
+        kind="energy",
+    )
 
     st.energy_config_mode = mode
     st.energy_configured = resolved.configured

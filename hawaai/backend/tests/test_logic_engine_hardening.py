@@ -124,10 +124,28 @@ class TestLogicEngineHardening(unittest.TestCase):
         st = logic_engine.RoomRuntime()
 
         async def run_case():
+            first_states = [
+                {
+                    "state": "611.5",
+                    "attributes": {
+                        "device_class": "power",
+                        "state_class": "measurement",
+                        "unit_of_measurement": "W",
+                    },
+                },
+                {
+                    "state": "42.25",
+                    "attributes": {
+                        "device_class": "energy",
+                        "state_class": "total_increasing",
+                        "unit_of_measurement": "kWh",
+                    },
+                },
+            ]
             with mock.patch.object(
                 logic_engine.ha_client,
-                "get_state",
-                new=mock.AsyncMock(side_effect=["611.5", "42.25"]),
+                "get_entity_state_full",
+                new=mock.AsyncMock(side_effect=first_states),
             ):
                 watts, kwh = await logic_engine._read_runtime_energy(
                     "room-x",
@@ -144,10 +162,28 @@ class TestLogicEngineHardening(unittest.TestCase):
             self.assertEqual(st.last_valid_power_watts, 611.5)
             self.assertEqual(st.last_valid_energy_kwh, 42.25)
 
+            second_states = [
+                {
+                    "state": "unknown",
+                    "attributes": {
+                        "device_class": "power",
+                        "state_class": "measurement",
+                        "unit_of_measurement": "W",
+                    },
+                },
+                {
+                    "state": "bad-kwh",
+                    "attributes": {
+                        "device_class": "energy",
+                        "state_class": "total_increasing",
+                        "unit_of_measurement": "kWh",
+                    },
+                },
+            ]
             with mock.patch.object(
                 logic_engine.ha_client,
-                "get_state",
-                new=mock.AsyncMock(side_effect=["unknown", "bad-kwh"]),
+                "get_entity_state_full",
+                new=mock.AsyncMock(side_effect=second_states),
             ):
                 watts2, kwh2 = await logic_engine._read_runtime_energy(
                     "room-x",
@@ -1070,11 +1106,28 @@ class TestLogicEngineHardening(unittest.TestCase):
             st.session_state = "idle"
 
         async def run_once(power, now, log_with_room):
+            async def fake_full(entity_id):
+                if entity_id == "sensor.power":
+                    return {
+                        "state": str(power),
+                        "attributes": {
+                            "device_class": "power",
+                            "state_class": "measurement",
+                            "unit_of_measurement": "W",
+                        },
+                    }
+                return None
+
             with (
                 mock.patch.object(
                     logic_engine.ha_client,
                     "get_state",
                     new=mock.AsyncMock(return_value=str(power)),
+                ),
+                mock.patch.object(
+                    logic_engine.ha_client,
+                    "get_entity_state_full",
+                    side_effect=fake_full,
                 ),
                 mock.patch.object(
                     logic_engine.ac_aerostate_adapter,
@@ -1930,8 +1983,21 @@ class TestLogicEngineHardening(unittest.TestCase):
         }
 
         async def run_once(power, now):
+            async def fake_full(entity_id):
+                if entity_id == "sensor.power":
+                    return {
+                        "state": str(power),
+                        "attributes": {
+                            "device_class": "power",
+                            "state_class": "measurement",
+                            "unit_of_measurement": "W",
+                        },
+                    }
+                return None
+
             with (
                 mock.patch.object(logic_engine.ha_client, "get_state", new=mock.AsyncMock(return_value=str(power))),
+                mock.patch.object(logic_engine.ha_client, "get_entity_state_full", side_effect=fake_full),
                 mock.patch.object(logic_engine.ac_aerostate_adapter, "turn_off", new=mock.AsyncMock(return_value=True)) as turn_off,
                 mock.patch.object(logic_engine, "_maintain_session_lifecycle", new=mock.AsyncMock()),
                 mock.patch.object(logic_engine.session_logger, "current_session_id", return_value=None),

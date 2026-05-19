@@ -352,6 +352,7 @@ def load_config() -> Dict[str, Any]:
 def save_config(data: Dict[str, Any]) -> bool:
     """Write config to /data/ which persists across HA addon restarts."""
     try:
+        data = copy.deepcopy(data)
         data = {k: v for k, v in data.items() if k not in _LEGACY_IR_KEYS}
         logger.info(
             "[ENERGY_CONFIG] received_payload=%s",
