@@ -7,6 +7,7 @@ import logging
 import os
 from typing import Any, Dict, Optional
 
+from .energy_config import static_energy_entity_rejection_reason
 from . import room_registry
 from .temperature_schedule import validate_timezone_optional
 
@@ -16,6 +17,7 @@ CONFIG_PATH = "/data/hawaai_config.json"
 
 # Last successful merged config (survives single bad load so rooms are not silently wiped).
 _last_known_good_config: Optional[Dict[str, Any]] = None
+_last_load_sanitized_energy_entities = False
 
 # Default matches Ollama add-on pull (gemma:2b); override in Settings if needed.
 DEFAULT_OLLAMA_MODEL = "gemma:2b"
@@ -171,6 +173,56 @@ def _normalize_room_energy_fields(rooms: Any) -> None:
                     room[key] = settings.pop(key)
 
 
+def _sanitize_energy_entities_in_place(cfg: Dict[str, Any], *, room_id: str = "global") -> bool:
+    changed = False
+    for key, kind in (
+        ("energy_power_entity", "power"),
+        ("energy_kwh_entity", "energy"),
+    ):
+        entity_id = str(cfg.get(key) or "").strip()
+        if not entity_id:
+            continue
+        reason = static_energy_entity_rejection_reason(entity_id, kind=kind)
+        if not reason:
+            continue
+        logger.warning(
+            "[ENERGY_VALIDATE] room=%s entity=%s reason=%s action=clear_saved_field",
+            room_id,
+            entity_id,
+            reason,
+        )
+        cfg[key] = ""
+        changed = True
+
+    device_id = str(cfg.get("energy_device_id") or "").strip()
+    if cfg.get("energy_device_id") != device_id:
+        cfg["energy_device_id"] = device_id
+        changed = True
+    return changed
+
+
+def sanitize_energy_entities(config: Dict[str, Any]) -> Dict[str, Any]:
+    """Clear statically-invalid saved energy entity ids without touching valid fields."""
+    clean = copy.deepcopy(config) if isinstance(config, dict) else {}
+    _sanitize_energy_entities_in_place(clean)
+    rooms = clean.get("rooms")
+    if isinstance(rooms, list):
+        for room in rooms:
+            if isinstance(room, dict):
+                _sanitize_energy_entities_in_place(
+                    room,
+                    room_id=str(room.get("id") or room.get("name") or "unknown"),
+                )
+    return clean
+
+
+def consume_energy_sanitized_load_flag() -> bool:
+    global _last_load_sanitized_energy_entities
+    value = _last_load_sanitized_energy_entities
+    _last_load_sanitized_energy_entities = False
+    return value
+
+
 def _read_json_dict(path: str) -> Dict[str, Any]:
     """Read JSON object from path; return {} if missing / invalid."""
     if not os.path.isfile(path):
@@ -178,7 +230,13 @@ def _read_json_dict(path: str) -> Dict[str, Any]:
     try:
         with open(path, "r", encoding="utf-8") as f:
             raw = json.load(f)
-        return raw if isinstance(raw, dict) else {}
+        if not isinstance(raw, dict):
+            return {}
+        clean = sanitize_energy_entities(raw)
+        global _last_load_sanitized_energy_entities
+        if clean != raw:
+            _last_load_sanitized_energy_entities = True
+        return clean
     except json.JSONDecodeError as e:
         logger.error("[HawaAI] Invalid JSON at %s: %s", path, e)
         return {}

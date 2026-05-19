@@ -590,7 +590,16 @@ export default function Settings() {
 
     setLoadingEntities(true)
     try {
-      const devEnts = await getDeviceEntities(device.device_id)
+      const [devEntsRaw, refreshedEntities] = await Promise.all([
+        getDeviceEntities(device.device_id),
+        getEntities(),
+      ])
+      setEntities(refreshedEntities)
+      const refreshedById = new Map(refreshedEntities.map(e => [e.entity_id, e]))
+      const devEnts = devEntsRaw.map(e => ({
+        ...e,
+        ...(refreshedById.get(e.entity_id) || {}),
+      }))
       setDeviceEntities(devEnts)
 
       const sortedPower = devEnts

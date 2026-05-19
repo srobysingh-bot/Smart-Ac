@@ -52,7 +52,12 @@ from . import ha_client
 from .ac_controller import get_brands
 from .ai import get_cached
 from .ai.ai_worker import get_ai_status, init_ai_worker
-from .energy_config import EnergyConfigMode, resolve_energy_config
+from .energy_config import (
+    EnergyConfigMode,
+    discover_energy_entities_for_device,
+    resolve_energy_config,
+    validate_energy_entity,
+)
 from .temperature_schedule import resolve_base_target_temp
 from .utils import parse_presence
 
@@ -67,6 +72,84 @@ _climate_command_state: Dict[str, Dict[str, Any]] = {}
 _climate_command_lock = asyncio.Lock()
 _CLIMATE_COMMAND_DEBOUNCE_SECS = 1.2
 _CLIMATE_DUPLICATE_WINDOW_SECS = 2.0
+
+
+async def _repair_persisted_energy_config(cfg: Dict[str, Any]) -> bool:
+    """HA-aware startup repair for poisoned/stale saved energy entities."""
+    rooms = [copy.deepcopy(r) for r in room_registry.list_room_dicts(cfg)]
+    if not rooms:
+        return False
+
+    try:
+        registry_devices = await ha_client.get_device_registry()
+    except Exception:
+        logger.debug("[ENERGY_CONFIG] device registry unavailable during startup repair", exc_info=True)
+        registry_devices = []
+    known_device_ids = {
+        str(d.get("id") or "").strip()
+        for d in registry_devices
+        if str(d.get("id") or "").strip()
+    }
+
+    changed = config_manager.consume_energy_sanitized_load_flag()
+    for room in rooms:
+        room_id = str(room.get("id") or room.get("name") or "unknown").strip()
+        device_id = str(room.get("energy_device_id") or "").strip()
+        if device_id and known_device_ids and device_id not in known_device_ids:
+            logger.warning(
+                "[ENERGY_VALIDATE] room=%s entity=%s reason=invalid_device_id action=clear_saved_field",
+                room_id,
+                device_id,
+            )
+            room["energy_device_id"] = ""
+            room["energy_device_name"] = ""
+            device_id = ""
+            changed = True
+
+        missing_power = not str(room.get("energy_power_entity") or "").strip()
+        missing_kwh = not str(room.get("energy_kwh_entity") or "").strip()
+        for key, kind in (
+            ("energy_power_entity", "power"),
+            ("energy_kwh_entity", "energy"),
+        ):
+            entity_id = str(room.get(key) or "").strip()
+            if not entity_id:
+                continue
+            full = await ha_client.get_entity_state_full(entity_id)
+            validation = validate_energy_entity(entity_id, full, kind=kind)
+            if validation.valid:
+                continue
+            logger.warning(
+                "[ENERGY_VALIDATE] room=%s entity=%s reason=%s action=clear_saved_field",
+                room_id,
+                entity_id,
+                validation.reason,
+            )
+            room[key] = ""
+            changed = True
+            if key == "energy_power_entity":
+                missing_power = True
+            else:
+                missing_kwh = True
+
+        if device_id and (missing_power or missing_kwh):
+            discovered = await discover_energy_entities_for_device(device_id, room_id=room_id)
+            power_entity = str(discovered.get("power_entity") or "").strip()
+            kwh_entity = str(discovered.get("kwh_entity") or "").strip()
+            if missing_power and power_entity:
+                room["energy_power_entity"] = power_entity
+                changed = True
+            if missing_kwh and kwh_entity:
+                room["energy_kwh_entity"] = kwh_entity
+                changed = True
+
+    if not changed:
+        return False
+    if config_manager.save_config({"rooms": rooms}):
+        logger.info("[ENERGY_CONFIG] startup_repair persisted cleaned room energy config")
+        return True
+    logger.error("[ENERGY_CONFIG] startup_repair failed to persist cleaned room energy config")
+    return False
 
 
 async def _enqueue_climate_command(
@@ -245,6 +328,8 @@ async def lifespan(app: FastAPI):
     database.backup_db("startup")
     await database.init_db()
     cfg = config_manager.load_config()
+    await _repair_persisted_energy_config(cfg)
+    cfg = config_manager.load_config()
     room_log_store.set_max_lines_per_room(int(cfg.get("log_buffer_size", 300)))
     ac_ent = (cfg.get("ac_entity") or cfg.get("climate_entity") or "").strip() or "(not set)"
     smart_on = logic_engine.smart_temp_adjustment_enabled(cfg)
@@ -274,7 +359,7 @@ async def lifespan(app: FastAPI):
     logger.info("[HawaAI] Add-on stopped")
 
 
-app = FastAPI(title="HawaAI API", version="1.4.64", lifespan=lifespan)
+app = FastAPI(title="HawaAI API", version="1.4.65", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,

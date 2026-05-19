@@ -92,6 +92,18 @@ def _entity_domain(entity_id: str) -> str:
     return entity_id.split(".", 1)[0].lower() if "." in entity_id else ""
 
 
+def static_energy_entity_rejection_reason(entity_id: object, *, kind: str) -> str:
+    entity_id = _clean(entity_id)
+    if not entity_id:
+        return ""
+    if _entity_domain(entity_id) != "sensor":
+        return "invalid_domain"
+    object_id = entity_id.split(".", 1)[-1].lower()
+    if object_id.endswith(("_behaviour", "_behavior", "_configuration", "_setting")):
+        return "configuration_entity"
+    return ""
+
+
 def parse_numeric_state(value: object) -> Optional[float]:
     if value is None:
         return None
@@ -125,11 +137,9 @@ def validate_energy_entity(
     entity_id = _clean(entity_id)
     if not entity_id:
         return EnergyEntityValidation(False, reason="missing_entity")
-    if _entity_domain(entity_id) != "sensor":
-        return EnergyEntityValidation(False, reason="invalid_domain")
-    object_id = entity_id.split(".", 1)[-1].lower()
-    if object_id.endswith(("_behaviour", "_behavior", "_configuration", "_setting")):
-        return EnergyEntityValidation(False, reason="configuration_entity")
+    static_rejection = static_energy_entity_rejection_reason(entity_id, kind=kind)
+    if static_rejection:
+        return EnergyEntityValidation(False, reason=static_rejection)
     if not state_obj:
         return EnergyEntityValidation(False, reason="state_unavailable")
 

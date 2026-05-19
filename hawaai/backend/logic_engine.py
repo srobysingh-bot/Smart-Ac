@@ -58,6 +58,7 @@ from . import (
 )
 from .energy_config import (
     EnergyConfigMode,
+    discover_energy_entities_for_device,
     read_validated_energy_state,
     resolve_energy_config,
     resolve_runtime_energy_config,
@@ -206,6 +207,7 @@ async def _read_runtime_energy(
     mode = resolved.mode.value
     power_entity = resolved.power_entity
     kwh_entity = resolved.kwh_entity
+    device_lookup_skipped = resolved.device_lookup_skipped
 
     raw_power_state, parsed_power, _power_validation = await read_validated_energy_state(
         room_id,
@@ -218,11 +220,34 @@ async def _read_runtime_energy(
         kind="energy",
     )
 
+    device_id = str(cfg.get("energy_device_id") or "").strip()
+    missing_power = not power_entity or not _power_validation.valid
+    missing_kwh = bool(kwh_entity and not _kwh_validation.valid)
+    if device_id and (missing_power or missing_kwh):
+        device_lookup_skipped = False
+        discovered = await discover_energy_entities_for_device(device_id, room_id=room_id)
+        recovered_power = str(discovered.get("power_entity") or "").strip()
+        recovered_kwh = str(discovered.get("kwh_entity") or "").strip()
+        if missing_power and recovered_power and recovered_power != power_entity:
+            power_entity = recovered_power
+            raw_power_state, parsed_power, _power_validation = await read_validated_energy_state(
+                room_id,
+                power_entity,
+                kind="power",
+            )
+        if (not kwh_entity or missing_kwh) and recovered_kwh and recovered_kwh != kwh_entity:
+            kwh_entity = recovered_kwh
+            raw_kwh_state, parsed_kwh, _kwh_validation = await read_validated_energy_state(
+                room_id,
+                kwh_entity,
+                kind="energy",
+            )
+
     st.energy_config_mode = mode
     st.energy_configured = resolved.configured
-    st.energy_device_id = resolved.device_id
+    st.energy_device_id = resolved.device_id or device_id
     st.energy_device_name = resolved.device_name
-    st.energy_device_lookup_skipped = resolved.device_lookup_skipped
+    st.energy_device_lookup_skipped = device_lookup_skipped
     st.energy_power_entity = power_entity
     st.energy_kwh_entity = kwh_entity
     st.energy_power_raw_state = raw_power_state
@@ -240,7 +265,7 @@ async def _read_runtime_energy(
         st,
         mode=mode,
         configured=resolved.configured,
-        device_lookup_skipped=resolved.device_lookup_skipped,
+        device_lookup_skipped=device_lookup_skipped,
         power_entity=power_entity,
         kwh_entity=kwh_entity,
         raw_power_state=raw_power_state,

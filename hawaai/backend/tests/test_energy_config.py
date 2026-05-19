@@ -162,6 +162,59 @@ class EnergyConfigResolverTests(unittest.TestCase):
         resolved = asyncio.run(run_case())
         self.assertEqual(resolved.power_entity, "sensor.breaker_power")
 
+    def test_tuya_suffix_and_unit_fallback_accepts_missing_device_class(self):
+        async def run_case():
+            with (
+                mock.patch.object(
+                    energy_config.ha_client,
+                    "get_entity_registry",
+                    new=mock.AsyncMock(
+                        return_value=[
+                            {
+                                "entity_id": "sensor.30a_smart_circuit_breaker_energy_meter_8_power",
+                                "device_id": "abc123",
+                            },
+                            {
+                                "entity_id": "sensor.30a_smart_circuit_breaker_energy_meter_8_total_energy",
+                                "device_id": "abc123",
+                            },
+                        ]
+                    ),
+                ),
+                mock.patch.object(
+                    energy_config.ha_client,
+                    "get_all_entities",
+                    new=mock.AsyncMock(
+                        return_value=[
+                            {
+                                "entity_id": "sensor.30a_smart_circuit_breaker_energy_meter_8_power",
+                                "state": "611",
+                                "attributes": {"unit_of_measurement": "W"},
+                            },
+                            {
+                                "entity_id": "sensor.30a_smart_circuit_breaker_energy_meter_8_total_energy",
+                                "state": "42.5",
+                                "attributes": {"unit_of_measurement": "kWh"},
+                            },
+                        ]
+                    ),
+                ),
+            ):
+                return await energy_config.resolve_runtime_energy_config(
+                    {"energy_device_id": "abc123"},
+                    room_id="study",
+                )
+
+        resolved = asyncio.run(run_case())
+        self.assertEqual(
+            resolved.power_entity,
+            "sensor.30a_smart_circuit_breaker_energy_meter_8_power",
+        )
+        self.assertEqual(
+            resolved.kwh_entity,
+            "sensor.30a_smart_circuit_breaker_energy_meter_8_total_energy",
+        )
+
     def test_auto_discovery_does_not_assign_invalid_power_entity(self):
         async def run_case():
             with (
@@ -359,6 +412,36 @@ class EnergyConfigResolverTests(unittest.TestCase):
         self.assertEqual(dining_after["energy_power_entity"], "sensor.dining_power")
         self.assertFalse(study["energy_live_available"])
         self.assertEqual(study["energy_status"], "unavailable")
+
+    def test_load_time_sanitizer_clears_only_poisoned_energy_fields(self):
+        from backend import config_manager
+
+        cfg = {
+            "rooms": [
+                {
+                    "id": "study",
+                    "name": "Study",
+                    "climate_entity": "climate.study",
+                    "energy_power_entity": "select.study_power_on_behaviour",
+                    "energy_kwh_entity": "sensor.study_total_energy",
+                    "settings": {"target_temp": 25},
+                },
+                {
+                    "id": "dining",
+                    "name": "Dining",
+                    "climate_entity": "climate.dining",
+                    "energy_power_entity": "sensor.dining_power",
+                },
+            ]
+        }
+
+        cleaned = config_manager.sanitize_energy_entities(cfg)
+        study = cleaned["rooms"][0]
+        dining = cleaned["rooms"][1]
+        self.assertEqual(study["energy_power_entity"], "")
+        self.assertEqual(study["energy_kwh_entity"], "sensor.study_total_energy")
+        self.assertEqual(study["settings"]["target_temp"], 25)
+        self.assertEqual(dining["energy_power_entity"], "sensor.dining_power")
 
 
 if __name__ == "__main__":
