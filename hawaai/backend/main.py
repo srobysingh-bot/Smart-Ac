@@ -59,6 +59,7 @@ from .utils import parse_presence
 _ws_by_room: Dict[str, List[WebSocket]] = defaultdict(list)
 _ws_lock = asyncio.Lock()
 _ws_log_token_by_room: Dict[str, str] = {}
+_dashboard_energy_trace_sig_by_room: Dict[str, tuple] = {}
 
 _api_last_command: Dict[str, float] = defaultdict(float)
 _climate_command_state: Dict[str, Dict[str, Any]] = {}
@@ -272,7 +273,7 @@ async def lifespan(app: FastAPI):
     logger.info("[HawaAI] Add-on stopped")
 
 
-app = FastAPI(title="HawaAI API", version="1.4.62", lifespan=lifespan)
+app = FastAPI(title="HawaAI API", version="1.4.63", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -476,6 +477,43 @@ def _smart_adjustment_reason(
     return "Effective target matches config (outdoor in 30–40 °C band)."
 
 
+def _log_dashboard_energy_trace(
+    rid: str,
+    *,
+    power_entity: str,
+    kwh_entity: str,
+    raw_power_state: object,
+    raw_kwh_state: object,
+    watts: object,
+    kwh: object,
+    status: str,
+) -> None:
+    sig = (
+        power_entity,
+        kwh_entity,
+        str(raw_power_state),
+        str(raw_kwh_state),
+        str(watts),
+        str(kwh),
+        status,
+    )
+    if _dashboard_energy_trace_sig_by_room.get(rid) == sig:
+        return
+    _dashboard_energy_trace_sig_by_room[rid] = sig
+    logger.info(
+        "[ENERGY_RUNTIME] room=%s power_entity=%s kwh_entity=%s "
+        "resolved_power_state=%r resolved_kwh_state=%r watts=%s kwh=%s status=%s",
+        rid,
+        power_entity or "none",
+        kwh_entity or "none",
+        raw_power_state,
+        raw_kwh_state,
+        watts,
+        kwh,
+        status,
+    )
+
+
 @app.get("/api/status")
 async def get_status(room_id: str = Query(..., min_length=1)):
     """Dashboard status for one room. `room_id` is required — no default room fallback."""
@@ -509,6 +547,7 @@ async def _dashboard_status_payload(rid: str) -> Dict[str, Any]:
         except (ValueError, TypeError):
             return None
 
+    await logic_engine.refresh_runtime_energy(rid, cfg)
     runtime = logic_engine.get_runtime_state(rid)
     energy_watts = runtime.get("energy_watts")
     energy_kwh = runtime.get("energy_kwh_total")
@@ -533,6 +572,22 @@ async def _dashboard_status_payload(rid: str) -> Dict[str, Any]:
     effective_kwh_entity = str(
         runtime.get("energy_kwh_entity") or configured_energy.kwh_entity or ""
     ).strip()
+    energy_live_available = energy_watts is not None
+    energy_status = (
+        "ok"
+        if energy_live_available
+        else ("unconfigured" if not energy_configured else "unavailable")
+    )
+    _log_dashboard_energy_trace(
+        rid,
+        power_entity=effective_power_entity,
+        kwh_entity=effective_kwh_entity,
+        raw_power_state=energy_power_raw,
+        raw_kwh_state=energy_kwh_raw,
+        watts=energy_watts,
+        kwh=energy_kwh,
+        status=energy_status,
+    )
     ac_state = str(runtime.get("ac_state") or "off")
     physical_ac_on = bool(runtime.get("physical_ac_on", runtime.get("ac_is_on", False)))
     effective_ac_on = bool(runtime.get("effective_ac_on", False))
@@ -643,6 +698,8 @@ async def _dashboard_status_payload(rid: str) -> Dict[str, Any]:
         "watt_draw":        energy_watts or 0.0,
         "energy_watts":     energy_watts,
         "energy_kwh_total": energy_kwh,
+        "energy_live_available": energy_live_available,
+        "energy_status": energy_status,
         "energy_config_mode": energy_mode,
         "energy_configured": energy_configured,
         "energy_device_id": runtime.get("energy_device_id") or configured_energy.device_id,

@@ -244,6 +244,16 @@ async def _read_runtime_energy(
     )
     return parsed_power, parsed_kwh
 
+
+async def refresh_runtime_energy(room_id: str, cfg: Optional[dict] = None) -> Tuple[Optional[float], Optional[float]]:
+    """Refresh only room-scoped energy runtime from the latest effective config."""
+    canon = normalize_room_id(room_id)
+    if cfg is None:
+        base_cfg = config_manager.load_config()
+        room_def = resolve_room_definition(base_cfg, room_id)
+        cfg = room_registry.merge_room_config(base_cfg, room_def) if room_def else base_cfg
+    return await _read_runtime_energy(canon, cfg, _rt(canon))
+
 @dataclass
 class RoomRuntime:
     """Isolated logic-engine state per room."""

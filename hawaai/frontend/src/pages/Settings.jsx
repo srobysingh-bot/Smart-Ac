@@ -460,6 +460,9 @@ export default function Settings() {
       setSelectedDevice(
         allDevices.find(d => d.device_id === String(c.energy_device_id || '').trim()) || selectedDevice,
       )
+      window.dispatchEvent(new CustomEvent('hawaai:room-config-saved', {
+        detail: { roomId },
+      }))
       refreshRooms().catch(() => {})
     } catch (err) {
       console.error('Save failed:', err)

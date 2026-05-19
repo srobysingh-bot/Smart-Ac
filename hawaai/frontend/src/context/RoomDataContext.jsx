@@ -122,6 +122,22 @@ export function RoomDataProvider({ children }) {
 
     load()
 
+    const refreshStatus = () => {
+      getStatus(rid)
+        .then((s) => {
+          if (cancelled || gen !== loadGenRef.current) return
+          setRoomData((prev) => ({ ...prev, status: s }))
+        })
+        .catch(() => {})
+    }
+
+    const onRoomConfigSaved = (event) => {
+      const savedRoomId = normalizeRoomKey(event?.detail?.roomId)
+      if (savedRoomId && savedRoomId !== normalizeRoomKey(rid)) return
+      refreshStatus()
+    }
+    window.addEventListener('hawaai:room-config-saved', onRoomConfigSaved)
+
     const { close } = connectLive(rid, (msg) => {
       if (cancelled || gen !== loadGenRef.current) return
       if (!msg || msg.type !== 'tick') return
@@ -155,12 +171,7 @@ export function RoomDataProvider({ children }) {
 
     const pollId = window.setInterval(() => {
       if (wsConnectedRef.current) return
-      getStatus(rid)
-        .then((s) => {
-          if (cancelled || gen !== loadGenRef.current) return
-          setRoomData((prev) => ({ ...prev, status: s }))
-        })
-        .catch(() => {})
+      refreshStatus()
     }, 15000)
 
     const snapId = window.setInterval(() => {
@@ -186,6 +197,7 @@ export function RoomDataProvider({ children }) {
       window.clearInterval(pollId)
       window.clearInterval(snapId)
       window.clearInterval(pollAiId)
+      window.removeEventListener('hawaai:room-config-saved', onRoomConfigSaved)
       close()
     }
   }, [activeRoomId])

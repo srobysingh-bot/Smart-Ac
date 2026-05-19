@@ -113,6 +113,60 @@ class EnergyConfigResolverTests(unittest.TestCase):
         self.assertEqual(resolved.kwh_entity, "sensor.ac_energy")
         self.assertFalse(resolved.device_lookup_skipped)
 
+    def test_dashboard_status_hydrates_live_energy_from_latest_room_config(self):
+        from backend import logic_engine, main
+
+        rid = "roomenergy01"
+        cfg = {
+            "rooms": [
+                {
+                    "id": rid,
+                    "name": "Energy Room",
+                    "presence_entity": "binary_sensor.energy_presence",
+                    "indoor_temp_entity": "sensor.energy_temp",
+                    "climate_entity": "climate.energy_room",
+                    "energy_power_entity": "sensor.energy_power",
+                    "energy_kwh_entity": "sensor.energy_total",
+                }
+            ]
+        }
+
+        async def fake_get_state(entity_id):
+            return {
+                "sensor.energy_temp": "24.5",
+                "binary_sensor.energy_presence": "on",
+                "sensor.energy_power": "611",
+                "sensor.energy_total": "42.75",
+            }.get(entity_id)
+
+        async def run_case():
+            logic_engine._runtime_by_room.clear()
+            with (
+                mock.patch.object(main.config_manager, "load_config", return_value=cfg),
+                mock.patch.object(main.ha_client, "get_state", side_effect=fake_get_state),
+                mock.patch.object(
+                    main.ha_client,
+                    "get_climate_state",
+                    new=mock.AsyncMock(return_value={}),
+                ),
+                mock.patch.object(
+                    main.weather_api,
+                    "get_cached",
+                    new=mock.AsyncMock(return_value={"temp": 34, "humidity": 55}),
+                ),
+                mock.patch.object(main, "get_ai_status", return_value={}),
+            ):
+                return await main._dashboard_status_payload(rid)
+
+        payload = asyncio.run(run_case())
+        self.assertTrue(payload["energy_configured"])
+        self.assertTrue(payload["energy_live_available"])
+        self.assertEqual(payload["energy_status"], "ok")
+        self.assertEqual(payload["energy_power_entity"], "sensor.energy_power")
+        self.assertEqual(payload["energy_kwh_entity"], "sensor.energy_total")
+        self.assertEqual(payload["energy_watts"], 611.0)
+        self.assertEqual(payload["energy_kwh_total"], 42.75)
+
 
 if __name__ == "__main__":
     unittest.main()
