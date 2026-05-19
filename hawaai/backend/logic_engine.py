@@ -56,6 +56,11 @@ from . import (
     smart_cooling,
     weather_api,
 )
+from .energy_config import (
+    EnergyConfigMode,
+    resolve_energy_config,
+    resolve_runtime_energy_config,
+)
 from . import room_registry
 from .room_log_store import room_log_store
 from .ai import (
@@ -120,6 +125,9 @@ def _log_energy_runtime_diagnostic(
     room_id: str,
     st: "RoomRuntime",
     *,
+    mode: str,
+    configured: bool,
+    device_lookup_skipped: bool,
     power_entity: str,
     kwh_entity: str,
     raw_power_state: object,
@@ -130,6 +138,9 @@ def _log_energy_runtime_diagnostic(
     power_status = _energy_runtime_status(power_entity, raw_power_state, parsed_power)
     kwh_status = _energy_runtime_status(kwh_entity, raw_kwh_state, parsed_kwh)
     sig = (
+        mode,
+        configured,
+        device_lookup_skipped,
         power_entity,
         power_status,
         str(raw_power_state) if power_status in ("invalid", "unavailable") else "",
@@ -140,6 +151,20 @@ def _log_energy_runtime_diagnostic(
     if sig == st.energy_runtime_log_sig:
         return
     st.energy_runtime_log_sig = sig
+
+    log_with_room(
+        "info",
+        room_id,
+        "[ENERGY_RUNTIME] room=%s mode=%s power_entity=%s kwh_entity=%s device_lookup_skipped=%s",
+        room_id,
+        mode,
+        power_entity or "none",
+        kwh_entity or "none",
+        device_lookup_skipped,
+    )
+
+    if not configured:
+        return
 
     if power_status == "missing":
         log_with_room("info", room_id, "[ENERGY_RUNTIME] room=%s entity_missing kind=power", room_id)
@@ -154,7 +179,12 @@ def _log_energy_runtime_diagnostic(
         )
 
     if kwh_status == "missing":
-        log_with_room("info", room_id, "[ENERGY_RUNTIME] room=%s entity_missing kind=kwh", room_id)
+        log_with_room(
+            "info",
+            room_id,
+            "[ENERGY_RUNTIME] room=%s entity_missing kind=kwh optional=true",
+            room_id,
+        )
     elif kwh_status != "ok":
         log_with_room(
             "warning",
@@ -171,8 +201,10 @@ async def _read_runtime_energy(
     cfg: dict,
     st: "RoomRuntime",
 ) -> Tuple[Optional[float], Optional[float]]:
-    power_entity = str(cfg.get("energy_power_entity") or "").strip()
-    kwh_entity = str(cfg.get("energy_kwh_entity") or "").strip()
+    resolved = await resolve_runtime_energy_config(cfg)
+    mode = resolved.mode.value
+    power_entity = resolved.power_entity
+    kwh_entity = resolved.kwh_entity
 
     raw_power_state = await ha_client.get_state(power_entity) if power_entity else None
     raw_kwh_state = await ha_client.get_state(kwh_entity) if kwh_entity else None
@@ -180,6 +212,11 @@ async def _read_runtime_energy(
     parsed_power = _parse_energy_sensor_value(raw_power_state)
     parsed_kwh = _parse_energy_sensor_value(raw_kwh_state)
 
+    st.energy_config_mode = mode
+    st.energy_configured = resolved.configured
+    st.energy_device_id = resolved.device_id
+    st.energy_device_name = resolved.device_name
+    st.energy_device_lookup_skipped = resolved.device_lookup_skipped
     st.energy_power_entity = power_entity
     st.energy_kwh_entity = kwh_entity
     st.energy_power_raw_state = raw_power_state
@@ -195,6 +232,9 @@ async def _read_runtime_energy(
     _log_energy_runtime_diagnostic(
         room_id,
         st,
+        mode=mode,
+        configured=resolved.configured,
+        device_lookup_skipped=resolved.device_lookup_skipped,
         power_entity=power_entity,
         kwh_entity=kwh_entity,
         raw_power_state=raw_power_state,
@@ -321,6 +361,11 @@ class RoomRuntime:
     zone_block_count: int = 0
     zone_allow_count: int = 0
     zone_log_sig: Optional[tuple] = None
+    energy_config_mode: str = EnergyConfigMode.UNCONFIGURED.value
+    energy_configured: bool = False
+    energy_device_id: str = ""
+    energy_device_name: str = ""
+    energy_device_lookup_skipped: bool = True
     energy_power_entity: str = ""
     energy_kwh_entity: str = ""
     energy_power_raw_state: Optional[object] = None
@@ -2242,11 +2287,7 @@ def _session_has_confirmation_evidence(
 def _session_finalization_grace_seconds(cfg: dict, reason: str) -> float:
     if reason in ("room_disabled", "room_deleted", "self_heal_orphan_session"):
         return 0.0
-    has_power_or_meter = bool(
-        str(cfg.get("energy_power_entity") or "").strip()
-        or str(cfg.get("energy_kwh_entity") or "").strip()
-    )
-    if not has_power_or_meter:
+    if not resolve_energy_config(cfg).configured:
         return 0.0
     try:
         raw = cfg.get("session_finalization_grace_seconds", SESSION_FINALIZATION_GRACE_SECONDS)
@@ -2817,7 +2858,7 @@ async def _apply_runtime_self_heal(
     sends IR and never changes thermostat decisions.
     """
     climate_entity = (cfg.get("climate_entity") or cfg.get("ac_entity") or "").strip()
-    power_entity = str(cfg.get("energy_power_entity") or "").strip()
+    power_entity = st.energy_power_entity or resolve_energy_config(cfg).power_entity
     humidity_entity = _humidity_sensor_entity(cfg)
     session_id = session_logger.current_session_id(room_id)
     report = runtime_self_heal.evaluate(
@@ -4354,14 +4395,7 @@ async def _start_provisional_session(
         return
 
     target = float(et_eff)
-    kwh_entity = (cfg.get("energy_kwh_entity") or "").strip()
-    start_kwh = None
-    if kwh_entity:
-        raw = await ha_client.get_state(kwh_entity)
-        try:
-            start_kwh = float(raw) if raw else None
-        except (ValueError, TypeError):
-            start_kwh = None
+    start_kwh = st.energy_kwh if st.energy_kwh_entity else None
 
     st.session_start_kwh = start_kwh
     st.session_start_time = now
@@ -4891,16 +4925,13 @@ async def _close_session(room_id: str, cfg: dict, indoor_temp: float, reason: st
 
     kwh_consumed: Optional[float] = None
     energy_from_meter = False
-    kwh_entity = (cfg.get("energy_kwh_entity") or "").strip()
-    if kwh_entity and st.session_start_kwh is not None:
-        raw_end = await ha_client.get_state(kwh_entity)
-        if raw_end not in (None, "unavailable", "unknown", ""):
-            try:
-                end_k = float(raw_end)
-                kwh_consumed = max(0.0, round(end_k - float(st.session_start_kwh), 4))
-                energy_from_meter = True
-            except (ValueError, TypeError):
-                kwh_consumed = None
+    if st.energy_kwh_entity and st.session_start_kwh is not None and st.energy_kwh is not None:
+        try:
+            end_k = float(st.energy_kwh)
+            kwh_consumed = max(0.0, round(end_k - float(st.session_start_kwh), 4))
+            energy_from_meter = True
+        except (ValueError, TypeError):
+            kwh_consumed = None
 
     if kwh_consumed is None:
         if st.watts_samples and avg_watts >= 100.0 and duration_secs > 0:
@@ -5225,6 +5256,11 @@ def get_runtime_state(room_id: str) -> dict:
         ),
         "last_power_confirmed_on":  st.last_power_confirmed_on,
         "last_power_confirmed_off": st.last_power_confirmed_off,
+        "energy_config_mode": st.energy_config_mode,
+        "energy_configured": st.energy_configured,
+        "energy_device_id": st.energy_device_id,
+        "energy_device_name": st.energy_device_name,
+        "energy_device_lookup_skipped": st.energy_device_lookup_skipped,
         "energy_power_entity": st.energy_power_entity,
         "energy_kwh_entity": st.energy_kwh_entity,
         "energy_power_raw_state": st.energy_power_raw_state,

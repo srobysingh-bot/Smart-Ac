@@ -51,6 +51,7 @@ from . import ha_client
 from .ac_controller import get_brands
 from .ai import get_cached
 from .ai.ai_worker import get_ai_status, init_ai_worker
+from .energy_config import EnergyConfigMode, resolve_energy_config
 from .temperature_schedule import resolve_base_target_temp
 from .utils import parse_presence
 
@@ -271,7 +272,7 @@ async def lifespan(app: FastAPI):
     logger.info("[HawaAI] Add-on stopped")
 
 
-app = FastAPI(title="HawaAI API", version="1.4.61", lifespan=lifespan)
+app = FastAPI(title="HawaAI API", version="1.4.62", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -513,6 +514,25 @@ async def _dashboard_status_payload(rid: str) -> Dict[str, Any]:
     energy_kwh = runtime.get("energy_kwh_total")
     energy_power_raw = runtime.get("energy_power_raw_state")
     energy_kwh_raw = runtime.get("energy_kwh_raw_state")
+    configured_energy = resolve_energy_config(cfg)
+    runtime_energy_mode = str(runtime.get("energy_config_mode") or "").strip()
+    energy_mode = (
+        runtime_energy_mode
+        if runtime_energy_mode and runtime_energy_mode != EnergyConfigMode.UNCONFIGURED.value
+        else configured_energy.mode.value
+    )
+    energy_configured = configured_energy.configured or bool(runtime.get("energy_configured"))
+    energy_device_lookup_skipped = (
+        runtime.get("energy_device_lookup_skipped")
+        if runtime_energy_mode and runtime_energy_mode != EnergyConfigMode.UNCONFIGURED.value
+        else configured_energy.mode != EnergyConfigMode.AUTO_DISCOVERY
+    )
+    effective_power_entity = str(
+        runtime.get("energy_power_entity") or configured_energy.power_entity or ""
+    ).strip()
+    effective_kwh_entity = str(
+        runtime.get("energy_kwh_entity") or configured_energy.kwh_entity or ""
+    ).strip()
     ac_state = str(runtime.get("ac_state") or "off")
     physical_ac_on = bool(runtime.get("physical_ac_on", runtime.get("ac_is_on", False)))
     effective_ac_on = bool(runtime.get("effective_ac_on", False))
@@ -583,12 +603,12 @@ async def _dashboard_status_payload(rid: str) -> Dict[str, Any]:
             "presence": _sensor_health(cfg.get("presence_entity", ""), presence_raw),
             "energy_power": (
                 None
-                if not (cfg.get("energy_power_entity") or "").strip()
+                if not energy_configured
                 else energy_watts is not None
             ),
             "energy_kwh": (
                 None
-                if not (cfg.get("energy_kwh_entity") or "").strip()
+                if not effective_kwh_entity
                 else energy_kwh is not None
             ),
             "humidity": (
@@ -623,6 +643,13 @@ async def _dashboard_status_payload(rid: str) -> Dict[str, Any]:
         "watt_draw":        energy_watts or 0.0,
         "energy_watts":     energy_watts,
         "energy_kwh_total": energy_kwh,
+        "energy_config_mode": energy_mode,
+        "energy_configured": energy_configured,
+        "energy_device_id": runtime.get("energy_device_id") or configured_energy.device_id,
+        "energy_device_name": runtime.get("energy_device_name") or configured_energy.device_name,
+        "energy_device_lookup_skipped": energy_device_lookup_skipped,
+        "energy_power_entity": effective_power_entity,
+        "energy_kwh_entity": effective_kwh_entity,
         # ── Session ───────────────────────────────────────────────────────────
         "session_kwh":      runtime.get("session_start_kwh"),
         "session_id":       runtime.get("session_id"),
@@ -827,10 +854,6 @@ def _energy_config_warnings(body: Dict[str, Any]) -> list:
             continue
         if "." not in eid:
             warnings.append(f"{label} '{eid}' is not a valid Home Assistant entity id")
-            continue
-        domain = eid.split(".", 1)[0]
-        if domain != "sensor":
-            warnings.append(f"{label} '{eid}' should be a sensor entity")
     return warnings
 
 

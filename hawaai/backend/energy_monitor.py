@@ -1,9 +1,9 @@
 """Energy monitoring from a HA power/energy sensor entity."""
 
 import logging
-from typing import Optional
 
 from . import config_manager
+from .energy_config import resolve_runtime_energy_config
 
 logger = logging.getLogger(__name__)
 
@@ -66,7 +66,8 @@ class EnergyMonitor:
     async def refresh(self) -> float:
         """Poll the energy sensor entity. Returns current watt draw."""
         from . import ha_client
-        entity = config_manager.get("energy_power_entity")
+        resolved = await resolve_runtime_energy_config(config_manager.load_config())
+        entity = resolved.power_entity
         if not entity:
             return self._watt_draw
 

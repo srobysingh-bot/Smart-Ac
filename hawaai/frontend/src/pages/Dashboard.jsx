@@ -1040,7 +1040,9 @@ export default function Dashboard() {
                 <>
                   <span className="text-2xl font-bold text-gray-600">— W</span>
                   <span className="text-xs text-gray-600 text-center">
-                    Configure Live Power Sensor in Settings
+                    {displayStatus?.energy_configured
+                      ? 'Waiting for live power reading'
+                      : 'Configure Live Power Sensor in Settings'}
                   </span>
                 </>
               )}
