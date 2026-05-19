@@ -346,6 +346,10 @@ class RoomRuntime:
     vacancy_hold: bool = False
     safety_vacant: bool = False
     pending_vacancy: bool = False
+    pending_vacancy_task: Optional[asyncio.Task] = None
+    pending_vacancy_deadline: Optional[float] = None
+    vacancy_generation: int = 0
+    vacancy_reason: str = ""
     thermostat_blocked: bool = False
     off_reason: Optional[str] = None
     stale_idle: bool = False
@@ -468,10 +472,16 @@ def _cancel_pending_delay_wakeup_task(st: RoomRuntime) -> None:
     if t is not None and not t.done():
         t.cancel()
     st.pending_delay_wakeup_task = None
+    if st.pending_vacancy_task is t:
+        st.pending_vacancy_task = None
 
 
 def _cancel_all_pending_wakeup_tasks(st: RoomRuntime) -> None:
     _cancel_pending_delay_wakeup_task(st)
+    t = st.pending_vacancy_task
+    if t is not None and not t.done():
+        t.cancel()
+    st.pending_vacancy_task = None
 
 
 def _clear_pending_command_state(st: RoomRuntime) -> None:
@@ -483,12 +493,83 @@ def _clear_pending_command_state(st: RoomRuntime) -> None:
     st.pending_on_ir_sent_at = None
 
 
+def _is_vacancy_off_reason(reason: Optional[str]) -> bool:
+    return str(reason or "") in {
+        "vacant",
+        "presence_vacant",
+        "safety_vacant",
+        "presence_vacancy_grace",
+        "vacancy_debounce",
+    }
+
+
+def _start_vacancy_cycle(
+    room_id: str,
+    st: RoomRuntime,
+    now: datetime,
+    *,
+    reason: str,
+    timeout_seconds: float,
+) -> None:
+    st.vacant_since = now
+    st.vacancy_generation += 1
+    st.vacancy_reason = reason
+    st.pending_vacancy_deadline = time.time() + max(0.0, float(timeout_seconds))
+    log_with_room(
+        "info",
+        room_id,
+        "[VACANCY] started timeout=%.0fs generation=%s reason=%s",
+        timeout_seconds,
+        st.vacancy_generation,
+        reason,
+    )
+
+
+def _cancel_pending_vacancy_shutdown(
+    room_id: str,
+    st: RoomRuntime,
+    *,
+    due_to: str,
+) -> bool:
+    had_pending = bool(
+        st.pending_vacancy
+        or st.pending_vacancy_task is not None
+        or st.pending_vacancy_deadline is not None
+        or _is_vacancy_off_reason(st.off_reason)
+        or st.vacant_since is not None
+        or st.vacancy_reason
+    )
+    t = st.pending_vacancy_task
+    if t is not None and not t.done():
+        t.cancel()
+    if st.pending_delay_wakeup_task is t:
+        st.pending_delay_wakeup_task = None
+    st.pending_vacancy_task = None
+    st.pending_vacancy_deadline = None
+    st.vacancy_reason = ""
+    if st.pending_action == "off" and _is_vacancy_off_reason(st.off_reason):
+        _clear_pending_command_state(st)
+        st.off_reason = None
+    st.pending_vacancy = False
+    if had_pending:
+        st.vacancy_generation += 1
+        log_with_room(
+            "info",
+            room_id,
+            "[VACANCY] cancelled due_to=%s generation=%s",
+            due_to,
+            st.vacancy_generation,
+        )
+    return had_pending
+
+
 def schedule_pending_completion_wakeup(
     *,
     rid_for_tick: str,
     room_canon: str,
     kind: str,
     delay_seconds: float,
+    vacancy_generation: Optional[int] = None,
 ) -> None:
     """
     Fire trigger_tick(delay_elapsed) after delay_seconds if pending_arm still matches.
@@ -516,10 +597,31 @@ def schedule_pending_completion_wakeup(
         else:
             if st2.pending_action != "off":
                 return
+            if vacancy_generation is not None:
+                if vacancy_generation != st2.vacancy_generation:
+                    log_with_room(
+                        "info",
+                        canon,
+                        "[VACANCY] stale_timer_ignored reason=generation_mismatch generation=%s current=%s",
+                        vacancy_generation,
+                        st2.vacancy_generation,
+                    )
+                    return
+                if st2.occupied or st2.stable_occupied:
+                    log_with_room(
+                        "info",
+                        canon,
+                        "[VACANCY] stale_timer_ignored reason=reoccupancy generation=%s",
+                        vacancy_generation,
+                    )
+                    return
         trigger_tick(rid_for_tick, reason="delay_elapsed", skip_debounce=True)
 
     _cancel_pending_delay_wakeup_task(st)
-    st.pending_delay_wakeup_task = loop.create_task(_alarm())
+    task = loop.create_task(_alarm())
+    st.pending_delay_wakeup_task = task
+    if vacancy_generation is not None:
+        st.pending_vacancy_task = task
 
 
 def trigger_tick(
@@ -807,6 +909,7 @@ def _clear_vacancy_state(
     st.last_known_presence = True
     st.presence_last_true_at = now
     st.presence_last_false_at = None
+    _cancel_pending_vacancy_shutdown(room_id, st, due_to=reason)
     st.vacant_since = None
     st.vacancy_confirmed_at = None
     st.vacancy_active = False
@@ -817,10 +920,10 @@ def _clear_vacancy_state(
     st.stale_idle = False
     st.presence_only_idle = False
 
-    if st.pending_action == "off" and st.off_reason == "vacant":
+    if st.pending_action == "off" and _is_vacancy_off_reason(st.off_reason):
         _clear_pending_command_state(st)
 
-    if st.last_command == "off" and st.off_reason == "vacant":
+    if st.last_command == "off" and _is_vacancy_off_reason(st.off_reason):
         st.last_command_time = None
         st.last_command = ""
         st.last_sent_command_key = None
@@ -901,7 +1004,13 @@ def _resolve_control_decision(
         st.vacancy_active = True
         st.thermostat_blocked = True
         if st.vacant_since is None:
-            st.vacant_since = now
+            _start_vacancy_cycle(
+                room_id,
+                st,
+                now,
+                reason="safety_vacant",
+                timeout_seconds=vacancy_timeout,
+            )
         elapsed = (now - st.vacant_since).total_seconds()
         if elapsed < float(VACANCY_CONFIRM_SECS):
             st.pending_vacancy = True
@@ -949,6 +1058,7 @@ def _resolve_control_decision(
         st.safety_vacant = True
         return ("hold_vacant", "safety_vacant", effective_target)
     if use_presence:
+        _cancel_pending_vacancy_shutdown(room_id, st, due_to="reoccupancy")
         st.vacant_since = None
 
     # ── PRIORITY 2: User authority — overrides thermostat and cooldown ───────────
@@ -1115,6 +1225,7 @@ def _resolve_presence_only_decision(
         else _stabilize_presence(st, presence_raw, now, room_id)
     )
     st.presence_only_last_invalid_log_at = None
+    st.occupied = bool(occupied)
 
     runtime = _presence_only_runtime_seconds(st, now)
     max_runtime = _presence_only_max_runtime_seconds(cfg)
@@ -1131,6 +1242,7 @@ def _resolve_presence_only_decision(
 
     if occupied:
         st.presence_only_idle = False
+        _cancel_pending_vacancy_shutdown(room_id, st, due_to="reoccupancy")
         st.vacant_since = None
         if ac_on:
             st.presence_only_present_since = now
@@ -1145,9 +1257,19 @@ def _resolve_presence_only_decision(
         return "on", "presence_only", occupied
 
     st.presence_only_present_since = None
+    vacancy_timeout = max(
+        _cfg_int(cfg, "vacancy_timeout_minutes", 5, lo=0) * 60,
+        float(VACANCY_CONFIRM_SECS),
+    )
     if ac_on:
         if st.vacant_since is None:
-            st.vacant_since = now
+            _start_vacancy_cycle(
+                room_id,
+                st,
+                now,
+                reason="presence_vacant",
+                timeout_seconds=vacancy_timeout,
+            )
         log_with_room(
             "info",
             room_id,
@@ -1157,10 +1279,6 @@ def _resolve_presence_only_decision(
         elapsed_vacant = (now - st.vacant_since).total_seconds()
         if elapsed_vacant < float(VACANCY_CONFIRM_SECS):
             return "hold", "vacancy_debounce", occupied
-        vacancy_timeout = max(
-            _cfg_int(cfg, "vacancy_timeout_minutes", 5, lo=0) * 60,
-            float(VACANCY_CONFIRM_SECS),
-        )
         if elapsed_vacant < vacancy_timeout:
             return "hold", "presence_vacancy_grace", occupied
         return "off", "presence_vacant", occupied
@@ -1169,7 +1287,13 @@ def _resolve_presence_only_decision(
         return "idle", "presence_idle", occupied
 
     if st.vacant_since is None:
-        st.vacant_since = now
+        _start_vacancy_cycle(
+            room_id,
+            st,
+            now,
+            reason="presence_idle",
+            timeout_seconds=vacancy_timeout,
+        )
     log_with_room(
         "info",
         room_id,
@@ -3939,8 +4063,13 @@ async def _tick_impl(rid_raw: str, room_id: str) -> None:
     if use_presence:
         if not bool(is_occupied_bool):
             if st.vacant_since is None:
-                st.vacant_since = now
-                logger.info("[HawaAI][%s] Room became vacant — vacancy timer started", room_id)
+                _start_vacancy_cycle(
+                    room_id,
+                    st,
+                    now,
+                    reason="presence_vacant",
+                    timeout_seconds=vacancy_timeout,
+                )
             vacancy_duration = (now - st.vacant_since).total_seconds()
             logger.info(
                 "[HawaAI][%s] Vacant %.0fs / timeout %ds | AC=%s",
@@ -3948,8 +4077,10 @@ async def _tick_impl(rid_raw: str, room_id: str) -> None:
                 vacancy_duration, vacancy_timeout, "ON" if ac_on else "OFF",
             )
         else:
+            _cancel_pending_vacancy_shutdown(room_id, st, due_to="reoccupancy")
             st.vacant_since = None
     else:
+        _cancel_pending_vacancy_shutdown(room_id, st, due_to="presence_disabled")
         st.vacant_since = None
 
     # Drop stale API "user" marker so thermostat lock still works after authority expires.
@@ -4634,6 +4765,18 @@ async def _handle_delayed_off(
 ) -> None:
     delay = _nonnegative_delay_seconds(cfg, "off_delay_seconds")
     ts = time.time()
+    vacancy_off = _is_vacancy_off_reason(reason)
+    vacancy_generation = st.vacancy_generation if vacancy_off else None
+
+    if vacancy_off and (st.occupied or st.stable_occupied):
+        log_with_room(
+            "info",
+            room_canon,
+            "[VACANCY] stale_timer_ignored reason=reoccupancy generation=%s",
+            st.vacancy_generation,
+        )
+        _clear_pending_command_state(st)
+        return
 
     if not st.physical_ac_on:
         _clear_pending_command_state(st)
@@ -4671,6 +4814,7 @@ async def _handle_delayed_off(
             room_canon=room_canon,
             kind="off",
             delay_seconds=delay,
+            vacancy_generation=vacancy_generation,
         )
         return
 
@@ -4688,6 +4832,20 @@ async def _handle_delayed_off(
         delay,
     )
     if elapsed >= delay:
+        if vacancy_off and (
+            vacancy_generation is not None
+            and vacancy_generation != st.vacancy_generation
+            or st.occupied
+            or st.stable_occupied
+        ):
+            log_with_room(
+                "info",
+                room_canon,
+                "[VACANCY] stale_timer_ignored reason=reoccupancy generation=%s",
+                st.vacancy_generation,
+            )
+            _clear_pending_command_state(st)
+            return
         if _decision_lock_blocks_delayed_emit(st, now):
             logger.info(
                 "[DECISION_LOCK][%s] delayed OFF held — elapsed=%.1fs pending_since=%.3f",

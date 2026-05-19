@@ -1478,6 +1478,86 @@ class TestLogicEngineHardening(unittest.TestCase):
             any("[RUNTIME] vacancy_cleared" in str(call.args) and "zone_reentry" in str(call.args) for call in log_with_room.call_args_list)
         )
 
+    def test_reoccupancy_cancels_pending_vacancy_shutdown_task(self):
+        st = logic_engine.RoomRuntime()
+        now = datetime.now(timezone.utc)
+        st.occupied = False
+        st.stable_occupied = False
+        st.last_known_presence = False
+        st.vacant_since = now - timedelta(seconds=30)
+        st.vacancy_active = True
+        st.pending_vacancy = True
+        st.pending_action = "off"
+        st.off_reason = "vacant"
+        st.vacancy_generation = 7
+
+        async def run_case():
+            task = asyncio.create_task(asyncio.sleep(60))
+            st.pending_vacancy_task = task
+            st.pending_delay_wakeup_task = task
+            with mock.patch.object(logic_engine, "log_with_room") as log_with_room:
+                recovered = logic_engine._clear_vacancy_state(
+                    "room-x",
+                    st,
+                    now,
+                    reason="presence_reentry",
+                )
+                await asyncio.sleep(0)
+            return task, recovered, log_with_room
+
+        task, recovered, log_with_room = asyncio.run(run_case())
+        self.assertTrue(recovered)
+        self.assertTrue(task.cancelled())
+        self.assertIsNone(st.pending_vacancy_task)
+        self.assertIsNone(st.pending_delay_wakeup_task)
+        self.assertIsNone(st.pending_action)
+        self.assertIsNone(st.pending_vacancy_deadline)
+        self.assertEqual(st.vacancy_generation, 8)
+        self.assertTrue(st.occupied)
+        self.assertFalse(st.pending_vacancy)
+        self.assertTrue(
+            any("[VACANCY] cancelled" in str(call.args) for call in log_with_room.call_args_list)
+        )
+
+    def test_stale_vacancy_delayed_off_ignored_after_reoccupancy(self):
+        st = logic_engine.RoomRuntime()
+        now = datetime.now(timezone.utc)
+        st.physical_ac_on = True
+        st.occupied = True
+        st.stable_occupied = True
+        st.last_known_presence = True
+        st.pending_action = "off"
+        st.off_reason = "vacant"
+        st.vacancy_generation = 3
+
+        async def run_case():
+            with (
+                mock.patch.object(
+                    logic_engine.ac_aerostate_adapter,
+                    "turn_off",
+                    new=mock.AsyncMock(return_value=True),
+                ) as turn_off,
+                mock.patch.object(logic_engine, "log_with_room") as log_with_room,
+            ):
+                await logic_engine._handle_delayed_off(
+                    "room-x",
+                    "room-x",
+                    {"climate_entity": "climate.x", "off_delay_seconds": 0},
+                    24.0,
+                    now,
+                    st,
+                    reason="vacant",
+                    force=True,
+                )
+            return turn_off, log_with_room
+
+        turn_off, log_with_room = asyncio.run(run_case())
+        turn_off.assert_not_awaited()
+        self.assertIsNone(st.pending_action)
+        self.assertTrue(
+            any("[VACANCY] stale_timer_ignored" in str(call.args) for call in log_with_room.call_args_list)
+        )
+
     def test_confirmed_zone_presence_overrides_vacancy_and_resumes_thermostat(self):
         logic_engine._runtime_by_room.clear()
         now = datetime.now(timezone.utc)
