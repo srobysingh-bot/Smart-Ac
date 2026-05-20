@@ -393,6 +393,7 @@ class RoomRuntime:
     presence_only_present_since: Optional[datetime] = None
     presence_only_last_invalid_log_at: Optional[datetime] = None
     presence_only_idle: bool = False
+    presence_control_disabled_logged: bool = False
 
     # ── Startup recovery flag ──
     startup_state_loaded: bool = False
@@ -1057,13 +1058,24 @@ def _clear_vacancy_state(
     return False
 
 
-def _configured_zone_presence(cfg: dict, st: RoomRuntime) -> Optional[bool]:
-    zone_e = (str(cfg.get("zone_entity_id") or "")).strip()
-    if not st.zone_sensor_usable:
-        return None
-    if not zone_e:
-        return None
-    return bool(st.zone_present)
+def _log_occupancy_sync_transition(
+    room_id: str,
+    st: RoomRuntime,
+    *,
+    ha_presence: Optional[bool],
+    source: str,
+) -> None:
+    vacant_since = st.vacant_since.isoformat() if st.vacant_since else None
+    logger.debug(
+        "[OCCUPANCY_SYNC] room=%s ha_presence=%s runtime_occupied=%s "
+        "stable_occupied=%s vacant_since=%s source=%s",
+        room_id,
+        ha_presence,
+        st.occupied,
+        st.stable_occupied,
+        vacant_since,
+        source,
+    )
 
 
 def _mark_runtime_vacant(
@@ -1096,22 +1108,67 @@ def _mark_runtime_vacant(
 
 def _sync_runtime_occupancy(
     room_id: str,
-    cfg: dict,
     st: RoomRuntime,
     is_occupied: bool,
     now: datetime,
+    *,
+    source: str = "ha_presence",
 ) -> bool:
-    zone_presence = _configured_zone_presence(cfg, st)
-    if zone_presence is True:
-        _clear_vacancy_state(room_id, st, now, reason="zone_reentry")
-        return True
+    before = (
+        st.occupied,
+        st.stable_occupied,
+        st.last_known_presence,
+        st.vacant_since,
+    )
 
     if is_occupied:
         _clear_vacancy_state(room_id, st, now, reason="presence_reentry")
-        return True
+        resolved = True
+    else:
+        _mark_runtime_vacant(room_id, st, now, reason="presence_exit")
+        resolved = False
 
-    _mark_runtime_vacant(room_id, st, now, reason="presence_exit")
-    return False
+    after = (
+        st.occupied,
+        st.stable_occupied,
+        st.last_known_presence,
+        st.vacant_since,
+    )
+    if after != before:
+        _log_occupancy_sync_transition(
+            room_id,
+            st,
+            ha_presence=bool(is_occupied),
+            source=source,
+        )
+    return resolved
+
+
+def _resolve_authoritative_room_presence(
+    presence_raw: object,
+    *,
+    use_presence: bool,
+) -> Tuple[bool, str]:
+    if not use_presence:
+        return True, "presence_disabled"
+    if _presence_raw_invalid(presence_raw):
+        return False, "presence_unavailable"
+    return bool(parse_presence(presence_raw)), "ha_presence"
+
+
+def normalize_use_presence(cfg: dict) -> bool:
+    raw = cfg.get("use_presence", True) if isinstance(cfg, dict) else True
+    if isinstance(raw, bool):
+        return raw
+    if raw is None:
+        return True
+    if isinstance(raw, str):
+        value = raw.strip().lower()
+        if value in {"false", "0", "off", "no"}:
+            return False
+        if value in {"true", "1", "on", "yes"}:
+            return True
+    return True
 
 
 def _resolve_control_decision(
@@ -1143,18 +1200,7 @@ def _resolve_control_decision(
         _cfg_int(cfg, "vacancy_timeout_minutes", 5, lo=0) * 60,
         float(VACANCY_CONFIRM_SECS),
     )
-    use_presence = cfg.get("use_presence", True)
-
-    if use_presence:
-        is_occupied = _sync_runtime_occupancy(
-            room_id,
-            cfg,
-            st,
-            bool(is_occupied),
-            now,
-        )
-    else:
-        st.occupied = True
+    use_presence = normalize_use_presence(cfg)
 
     # ── PRIORITY 1: Safety — vacancy (may issue OFF even during global cooldown) ─
     if use_presence and not is_occupied:
@@ -1360,8 +1406,7 @@ def _resolve_presence_only_decision(
     Presence-only control: occupancy drives ON/OFF; temperature and AI are ignored.
     Returns (action, source, occupied).
     """
-    zone_presence = _configured_zone_presence(cfg, st)
-    if _presence_raw_invalid(presence_raw) and zone_presence is not True:
+    if _presence_raw_invalid(presence_raw):
         st.presence_only_present_since = None
         if (
             st.presence_only_last_invalid_log_at is None
@@ -1377,16 +1422,12 @@ def _resolve_presence_only_decision(
             st.presence_only_last_invalid_log_at = now
         return "hold", "presence_unavailable", False
 
-    if zone_presence is True:
-        occupied = _sync_runtime_occupancy(room_id, cfg, st, True, now)
-    else:
-        occupied = (
-            bool(resolved_occupied)
-            if resolved_occupied is not None
-            else _stabilize_presence(st, presence_raw, now, room_id)
-        )
+    occupied = (
+        bool(resolved_occupied)
+        if resolved_occupied is not None
+        else _resolve_authoritative_room_presence(presence_raw, use_presence=True)[0]
+    )
     st.presence_only_last_invalid_log_at = None
-    st.occupied = bool(occupied)
 
     runtime = _presence_only_runtime_seconds(st, now)
     max_runtime = _presence_only_max_runtime_seconds(cfg)
@@ -3733,6 +3774,7 @@ async def _tick_impl(rid_raw: str, room_id: str) -> None:
     cfg = room_registry.merge_room_config(base_cfg, room_def)
     control_mode = normalize_control_mode(cfg)
     presence_only = control_mode == "presence_only"
+    use_presence = normalize_use_presence(cfg)
 
     sync_effective_mode_transition(st, room_id, cfg)
 
@@ -3744,7 +3786,7 @@ async def _tick_impl(rid_raw: str, room_id: str) -> None:
     presence_entity = cfg.get("presence_entity", "")
     indoor_temp_entity = cfg.get("indoor_temp_entity", "")
 
-    if not presence_entity or (not presence_only and not indoor_temp_entity):
+    if (use_presence and not presence_entity) or (not presence_only and not indoor_temp_entity):
         logger.warning(
             "[HawaAI][%s] Logic skipped — missing entity config (presence=%s, temp=%s)",
             room_id,
@@ -3797,40 +3839,33 @@ async def _tick_impl(rid_raw: str, room_id: str) -> None:
         except (TypeError, ValueError):
             indoor_temp = 24.0
 
-    presence_raw = await ha_client.get_state(presence_entity)
-    use_presence = cfg.get("use_presence", True)
-    is_occupied_bool: Optional[bool]
-
-    pres_invalid = presence_raw is None or str(presence_raw).lower() in (
-        "unavailable", "unknown", "",
+    presence_raw = await ha_client.get_state(presence_entity) if use_presence else None
+    is_occupied_bool, occupancy_source = _resolve_authoritative_room_presence(
+        presence_raw,
+        use_presence=bool(use_presence),
     )
-    if use_presence:
-        if pres_invalid:
-            if st.last_known_presence is not None:
-                is_occupied_bool = st.last_known_presence
-                logger.warning(
-                    "[HawaAI] Presence sensor unavailable (%r) — using last known occupied=%s",
-                    presence_raw, is_occupied_bool,
-                )
-            else:
-                is_occupied_bool = True
-                logger.warning(
-                    "[HawaAI] Presence unknown (no stale) — assuming occupied=TRUE (safe)",
-                )
-        else:
-            is_occupied_bool = _stabilize_presence(st, presence_raw, now, room_id)
+
+    if use_presence and occupancy_source == "presence_unavailable":
+        logger.warning(
+            "[HawaAI] Presence sensor unavailable (%r) - treating occupied=False "
+            "until a valid presence reading returns",
+            presence_raw,
+        )
+    if not use_presence:
+        if not st.presence_control_disabled_logged:
+            log_with_room("info", room_id, "[OCCUPANCY] presence_control_disabled")
+            st.presence_control_disabled_logged = True
     else:
-        is_occupied_bool = True
+        st.presence_control_disabled_logged = False
 
     await _fp2_zone_sensor_tick(room_id, cfg, now)
-    if use_presence and not presence_only:
-        is_occupied_bool = _sync_runtime_occupancy(
-            room_id,
-            cfg,
-            st,
-            bool(is_occupied_bool),
-            now,
-        )
+    is_occupied_bool = _sync_runtime_occupancy(
+        room_id,
+        st,
+        bool(is_occupied_bool),
+        now,
+        source=occupancy_source,
+    )
 
     logger.info(
         "[HawaAI] Presence: %r → occupied=%s",
@@ -4245,35 +4280,11 @@ async def _tick_impl(rid_raw: str, room_id: str) -> None:
         except (TypeError, ValueError):
             pass
 
-    if use_presence:
-        if not bool(is_occupied_bool):
-            if st.vacant_since is None:
-                _start_vacancy_cycle(
-                    room_id,
-                    st,
-                    now,
-                    reason="presence_vacant",
-                    timeout_seconds=vacancy_timeout,
-                )
-            vacancy_duration = (now - st.vacant_since).total_seconds()
-            logger.info(
-                "[HawaAI][%s] Vacant %.0fs / timeout %ds | AC=%s",
-                room_id,
-                vacancy_duration, vacancy_timeout, "ON" if ac_on else "OFF",
-            )
-        else:
-            _cancel_pending_vacancy_shutdown(room_id, st, due_to="reoccupancy")
-            st.vacant_since = None
-    else:
-        _cancel_pending_vacancy_shutdown(room_id, st, due_to="presence_disabled")
-        st.vacant_since = None
-
     # Drop stale API "user" marker so thermostat lock still works after authority expires.
     if st.last_command_source == "user" and not _is_user_authority_active(st, cfg, now):
         st.last_command_source = "system"
 
-    occ_res = True if not use_presence else bool(is_occupied_bool)
-    st.occupied = bool(occ_res)
+    occ_res = bool(is_occupied_bool)
 
     action, source, tgt = _resolve_control_decision(
         room_id, cfg, indoor_temp, et_eff,

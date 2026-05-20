@@ -33,7 +33,7 @@ class TestLogicEngineHardening(unittest.TestCase):
         self.assertIsNotNone(r)
         self.assertEqual(r["id"], "aBc123XYZ789")
 
-    def test_tick_impl_initializes_now_before_presence_stabilization(self):
+    def test_tick_impl_uses_live_presence_without_stabilized_runtime_fallback(self):
         logic_engine._runtime_by_room.clear()
         rid = "tick-now"
         cfg = {
@@ -76,7 +76,7 @@ class TestLogicEngineHardening(unittest.TestCase):
                 ) as stabilize_presence,
             ):
                 await logic_engine._tick_impl(rid, rid)
-            stabilize_presence.assert_called_once()
+            stabilize_presence.assert_not_called()
 
         asyncio.run(run_case())
 
@@ -970,6 +970,96 @@ class TestLogicEngineHardening(unittest.TestCase):
             "presence_only",
         )
 
+    def test_use_presence_defaults_to_enabled_for_missing_none_and_malformed(self):
+        self.assertTrue(logic_engine.normalize_use_presence({}))
+        self.assertTrue(logic_engine.normalize_use_presence({"use_presence": None}))
+        self.assertTrue(logic_engine.normalize_use_presence({"use_presence": "maybe"}))
+
+    def test_use_presence_explicit_false_disables_intentionally(self):
+        self.assertFalse(logic_engine.normalize_use_presence({"use_presence": False}))
+
+    def test_missing_presence_entity_defaults_to_presence_enabled_and_skips_tick(self):
+        logic_engine._runtime_by_room.clear()
+        rid = "missing-presence-defaults-enabled"
+        st = logic_engine._rt(rid)
+        st.occupied = False
+        cfg = {
+            "rooms": [
+                {
+                    "id": rid,
+                    "climate_entity": "climate.test",
+                    "indoor_temp_entity": "sensor.temp",
+                    "manual_override": True,
+                },
+            ],
+        }
+
+        async def run_case():
+            with (
+                mock.patch.object(logic_engine.config_manager, "load_config", return_value=cfg),
+                mock.patch.object(logic_engine, "_load_startup_state", new=mock.AsyncMock()),
+                mock.patch.object(logic_engine, "log_with_room") as log_with_room,
+            ):
+                await logic_engine._tick_impl(rid, rid)
+            return log_with_room
+
+        log_with_room = asyncio.run(run_case())
+        self.assertFalse(st.occupied)
+        self.assertFalse(
+            any("presence_control_disabled" in str(call.args) for call in log_with_room.call_args_list)
+        )
+
+    def test_explicit_use_presence_false_syncs_occupied_and_logs_once(self):
+        logic_engine._runtime_by_room.clear()
+        rid = "presence-disabled-explicit"
+        st = logic_engine._rt(rid)
+        st.occupied = False
+        st.stable_occupied = False
+        st.last_known_presence = False
+        st.vacant_since = datetime.now(timezone.utc) - timedelta(seconds=30)
+        cfg = {
+            "use_presence": False,
+            "rooms": [
+                {
+                    "id": rid,
+                    "climate_entity": "climate.test",
+                    "indoor_temp_entity": "sensor.temp",
+                    "manual_override": True,
+                },
+            ],
+        }
+
+        async def fake_get_state(entity_id):
+            self.assertEqual(entity_id, "sensor.temp")
+            return "25"
+
+        async def run_case():
+            with (
+                mock.patch.object(logic_engine.config_manager, "load_config", return_value=cfg),
+                mock.patch.object(logic_engine, "_load_startup_state", new=mock.AsyncMock()),
+                mock.patch.object(
+                    logic_engine.ha_client,
+                    "get_climate_state",
+                    new=mock.AsyncMock(return_value={"state": "off"}),
+                ),
+                mock.patch.object(logic_engine.ha_client, "get_state", side_effect=fake_get_state),
+                mock.patch.object(logic_engine, "log_with_room") as log_with_room,
+            ):
+                await logic_engine._tick_impl(rid, rid)
+                await logic_engine._tick_impl(rid, rid)
+            return log_with_room
+
+        log_with_room = asyncio.run(run_case())
+        self.assertTrue(st.occupied)
+        self.assertTrue(st.stable_occupied)
+        self.assertTrue(st.last_known_presence)
+        self.assertIsNone(st.vacant_since)
+        disabled_logs = [
+            call for call in log_with_room.call_args_list
+            if "presence_control_disabled" in str(call.args)
+        ]
+        self.assertEqual(len(disabled_logs), 1)
+
     def test_presence_only_missing_presence_holds_without_on(self):
         st = logic_engine.RoomRuntime()
         now = datetime.now(timezone.utc)
@@ -1075,7 +1165,7 @@ class TestLogicEngineHardening(unittest.TestCase):
             ac_on=True,
             now=now,
         )
-        self.assertEqual((action, source, occupied), ("hold", "presence_only", True))
+        self.assertEqual((action, source, occupied), ("hold", "vacancy_debounce", False))
 
         action, source, occupied = logic_engine._resolve_presence_only_decision(
             "room-x",
@@ -1085,7 +1175,7 @@ class TestLogicEngineHardening(unittest.TestCase):
             ac_on=True,
             now=now + timedelta(seconds=61),
         )
-        self.assertEqual((action, source, occupied), ("hold", "vacancy_debounce", False))
+        self.assertEqual((action, source, occupied), ("off", "presence_vacant", False))
 
     def test_presence_only_zone_absence_defers_to_room_presence(self):
         st = logic_engine.RoomRuntime()
@@ -1553,7 +1643,7 @@ class TestLogicEngineHardening(unittest.TestCase):
 
         self.assertEqual((action, source, target), ("off", "safety_vacant", 24.0))
 
-    def test_confirmed_zone_presence_clears_stale_vacancy_runtime(self):
+    def test_confirmed_zone_presence_does_not_clear_room_vacancy_runtime(self):
         logic_engine._runtime_by_room.clear()
         now = datetime.now(timezone.utc)
         rid = "zone-reentry"
@@ -1590,26 +1680,20 @@ class TestLogicEngineHardening(unittest.TestCase):
                 now=now,
             )
 
-        self.assertEqual((action, source, target), ("hold", "thermostat", 24.0))
-        self.assertTrue(st.occupied)
-        self.assertTrue(st.stable_occupied)
-        self.assertTrue(st.last_known_presence)
-        self.assertIsNone(st.vacant_since)
-        self.assertIsNone(st.vacancy_confirmed_at)
-        self.assertFalse(st.vacancy_active)
-        self.assertFalse(st.vacancy_hold)
-        self.assertFalse(st.safety_vacant)
-        self.assertFalse(st.pending_vacancy)
-        self.assertFalse(st.thermostat_blocked)
-        self.assertIsNone(st.last_command_time)
-        self.assertEqual(st.last_command, "")
-        self.assertIsNone(st.off_reason)
-        self.assertFalse(st.off_dispatch_pending)
-        self.assertTrue(
-            any("[OCCUPANCY]" in str(call.args) and "recovery_triggered" in str(call.args) for call in log_with_room.call_args_list)
-        )
-        self.assertTrue(
-            any("[RUNTIME] vacancy_cleared" in str(call.args) and "zone_reentry" in str(call.args) for call in log_with_room.call_args_list)
+        self.assertEqual((action, source, target), ("hold_vacant", "safety_vacant", 24.0))
+        self.assertFalse(st.occupied)
+        self.assertFalse(st.stable_occupied)
+        self.assertFalse(st.last_known_presence)
+        self.assertIsNotNone(st.vacant_since)
+        self.assertTrue(st.vacancy_active)
+        self.assertTrue(st.vacancy_hold)
+        self.assertTrue(st.safety_vacant)
+        self.assertTrue(st.thermostat_blocked)
+        self.assertEqual(st.last_command, "off")
+        self.assertEqual(st.off_reason, "vacant")
+        self.assertTrue(st.off_dispatch_pending)
+        self.assertFalse(
+            any("[RUNTIME] vacancy_cleared" in str(call.args) for call in log_with_room.call_args_list)
         )
 
     def test_reoccupancy_cancels_pending_vacancy_shutdown_task(self):
@@ -1692,7 +1776,7 @@ class TestLogicEngineHardening(unittest.TestCase):
             any("[VACANCY] stale_timer_ignored" in str(call.args) for call in log_with_room.call_args_list)
         )
 
-    def test_confirmed_zone_presence_overrides_vacancy_and_resumes_thermostat(self):
+    def test_confirmed_zone_presence_does_not_override_room_vacancy(self):
         logic_engine._runtime_by_room.clear()
         now = datetime.now(timezone.utc)
         rid = "zone-thermostat-reentry"
@@ -1701,25 +1785,37 @@ class TestLogicEngineHardening(unittest.TestCase):
         st.zone_confirmed = True
         st.zone_sensor_usable = True
         st.occupied = False
+        st.stable_occupied = False
+        st.last_known_presence = False
         st.vacant_since = now - timedelta(minutes=10)
         st.vacancy_active = True
         st.safety_vacant = True
         st.thermostat_blocked = True
+        st.ac_is_on = True
+        st.effective_on_since_ts = (
+            now - timedelta(seconds=logic_engine.RUNNING_OFF_BLOCK_SECS + 5)
+        ).timestamp()
 
         action, source, target = logic_engine._resolve_control_decision(
             rid,
-            {"zone_entity_id": "binary_sensor.zone", "vacancy_timeout_minutes": 0},
+            {
+                "zone_entity_id": "binary_sensor.zone",
+                "zone_required_for_on": True,
+                "vacancy_timeout_minutes": 0,
+            },
             indoor_temp=27.0,
             effective_target=24.0,
             is_occupied=False,
-            ac_on=False,
+            ac_on=True,
             now=now,
         )
 
-        self.assertEqual((action, source, target), ("on", "thermostat", 24.0))
-        self.assertTrue(st.occupied)
-        self.assertFalse(st.safety_vacant)
-        self.assertFalse(st.thermostat_blocked)
+        self.assertEqual((action, source, target), ("off", "safety_vacant", 24.0))
+        self.assertFalse(st.occupied)
+        self.assertFalse(st.stable_occupied)
+        self.assertFalse(st.last_known_presence)
+        self.assertTrue(st.safety_vacant)
+        self.assertTrue(st.thermostat_blocked)
 
     def test_zone_absence_does_not_start_vacancy_if_room_presence_reports_occupied(self):
         logic_engine._runtime_by_room.clear()
@@ -1734,6 +1830,13 @@ class TestLogicEngineHardening(unittest.TestCase):
         st.ac_is_on = True
 
         cfg = {"zone_entity_id": "binary_sensor.zone", "vacancy_timeout_minutes": 2}
+        logic_engine._sync_runtime_occupancy(
+            rid,
+            st,
+            True,
+            now,
+            source="test_presence",
+        )
         action, source, target = logic_engine._resolve_control_decision(
             rid,
             cfg,
@@ -1816,6 +1919,13 @@ class TestLogicEngineHardening(unittest.TestCase):
         st.ac_is_on = True
 
         cfg = {"zone_entity_id": "binary_sensor.zone", "vacancy_timeout_minutes": 2}
+        logic_engine._sync_runtime_occupancy(
+            rid,
+            st,
+            False,
+            now,
+            source="test_presence",
+        )
         action, source, target = logic_engine._resolve_control_decision(
             rid,
             cfg,
@@ -1827,6 +1937,13 @@ class TestLogicEngineHardening(unittest.TestCase):
         )
         first_vacant_since = st.vacant_since
 
+        logic_engine._sync_runtime_occupancy(
+            rid,
+            st,
+            False,
+            now + timedelta(seconds=30),
+            source="test_presence",
+        )
         action2, source2, target2 = logic_engine._resolve_control_decision(
             rid,
             cfg,
@@ -1841,6 +1958,92 @@ class TestLogicEngineHardening(unittest.TestCase):
         self.assertEqual((action2, source2, target2), ("hold", "vacancy_debounce", 24.0))
         self.assertIs(st.vacant_since, first_vacant_since)
         self.assertEqual(st.vacant_since, now)
+        self.assertFalse(st.occupied)
+        self.assertFalse(st.stable_occupied)
+
+    def test_live_presence_false_overrides_stale_stabilized_occupied_state(self):
+        logic_engine._runtime_by_room.clear()
+        now = datetime.now(timezone.utc)
+        rid = "presence-false-authoritative"
+        st = logic_engine._rt(rid)
+        logic_engine._stabilize_presence(st, "on", now)
+
+        stabilized = logic_engine._stabilize_presence(
+            st,
+            "off",
+            now + timedelta(seconds=5),
+            rid,
+        )
+        self.assertTrue(stabilized)
+
+        with mock.patch.object(logic_engine.logger, "debug") as debug:
+            occupied = logic_engine._sync_runtime_occupancy(
+                rid,
+                st,
+                bool(logic_engine.parse_presence("off")),
+                now + timedelta(seconds=5),
+                source="ha_presence",
+            )
+
+        self.assertFalse(occupied)
+        self.assertFalse(st.occupied)
+        self.assertFalse(st.stable_occupied)
+        self.assertFalse(st.last_known_presence)
+        self.assertTrue(
+            any("[OCCUPANCY_SYNC]" in str(call.args[0]) for call in debug.call_args_list)
+        )
+
+    def test_zone_presence_cannot_reset_monotonic_room_vacancy_timer(self):
+        logic_engine._runtime_by_room.clear()
+        now = datetime.now(timezone.utc)
+        rid = "zone-present-room-vacant-monotonic"
+        st = logic_engine._rt(rid)
+        st.zone_sensor_usable = True
+        st.zone_present = True
+        st.zone_confirmed = True
+        st.occupied = True
+        st.stable_occupied = True
+        st.last_known_presence = True
+        st.ac_is_on = True
+
+        cfg = {"zone_entity_id": "binary_sensor.zone", "vacancy_timeout_minutes": 2}
+        logic_engine._sync_runtime_occupancy(
+            rid,
+            st,
+            False,
+            now,
+            source="test_presence",
+        )
+        logic_engine._resolve_control_decision(
+            rid,
+            cfg,
+            indoor_temp=26.0,
+            effective_target=24.0,
+            is_occupied=False,
+            ac_on=True,
+            now=now,
+        )
+        first_vacant_since = st.vacant_since
+
+        logic_engine._sync_runtime_occupancy(
+            rid,
+            st,
+            False,
+            now + timedelta(seconds=30),
+            source="test_presence",
+        )
+        logic_engine._resolve_control_decision(
+            rid,
+            cfg,
+            indoor_temp=26.0,
+            effective_target=24.0,
+            is_occupied=False,
+            ac_on=True,
+            now=now + timedelta(seconds=30),
+        )
+
+        self.assertEqual(st.vacant_since, first_vacant_since)
+        self.assertEqual(first_vacant_since, now)
         self.assertFalse(st.occupied)
         self.assertFalse(st.stable_occupied)
 
@@ -1902,6 +2105,13 @@ class TestLogicEngineHardening(unittest.TestCase):
         st.vacancy_active = True
         st.pending_vacancy = True
 
+        logic_engine._sync_runtime_occupancy(
+            rid,
+            st,
+            True,
+            now,
+            source="test_presence",
+        )
         action, source, target = logic_engine._resolve_control_decision(
             rid,
             {
@@ -1922,7 +2132,7 @@ class TestLogicEngineHardening(unittest.TestCase):
         self.assertIsNone(st.vacant_since)
         self.assertFalse(st.pending_vacancy)
 
-    def test_zone_reentry_cancels_vacancy_before_timeout(self):
+    def test_zone_presence_does_not_cancel_vacancy_without_room_presence(self):
         logic_engine._runtime_by_room.clear()
         now = datetime.now(timezone.utc)
         rid = "zone-return-before-timeout"
@@ -1947,11 +2157,11 @@ class TestLogicEngineHardening(unittest.TestCase):
             now=now,
         )
 
-        self.assertEqual((action, source, target), ("hold", "thermostat", 24.0))
-        self.assertTrue(st.occupied)
-        self.assertTrue(st.stable_occupied)
-        self.assertIsNone(st.vacant_since)
-        self.assertFalse(st.pending_vacancy)
+        self.assertEqual((action, source, target), ("hold", "vacancy_debounce", 24.0))
+        self.assertFalse(st.occupied)
+        self.assertFalse(st.stable_occupied)
+        self.assertEqual(st.vacant_since, now - timedelta(seconds=30))
+        self.assertTrue(st.pending_vacancy)
 
     def test_zone_confirmed_while_occupied_allows_new_on(self):
         logic_engine._runtime_by_room.clear()
@@ -2038,7 +2248,7 @@ class TestLogicEngineHardening(unittest.TestCase):
         st.vacancy_active = True
         st.last_decision_at = now - timedelta(seconds=2)
 
-        logic_engine._clear_vacancy_state(rid, st, now, reason="zone_reentry")
+        logic_engine._clear_vacancy_state(rid, st, now, reason="presence_reentry")
 
         self.assertEqual(st.last_decision_at, now - timedelta(seconds=2))
         self.assertTrue(st.occupied)
