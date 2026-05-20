@@ -26,6 +26,10 @@ function formatAiTime(iso) {
   }
 }
 
+function normalizeRoomKey(id) {
+  return String(id || '').trim().toLowerCase()
+}
+
 /** Dim previous room content while fetching the next room — avoids blank flash. */
 function SoftLoadingOverlay({ show, children }) {
   if (!show) return children
@@ -745,7 +749,9 @@ function RoomLogsCard({ activeRoomId, rooms }) {
     const seen = new Set()
     const out = []
     for (const log of items || []) {
-      const key = `${log.ts}-${log.message}`
+      if (String(log?.scope || 'runtime').toLowerCase() !== 'runtime') continue
+      if (selectedRoomId && normalizeRoomKey(log?.room_id) !== normalizeRoomKey(selectedRoomId)) continue
+      const key = `${log.ts}-${log.room_id || selectedRoomId}-${log.message}`
       if (!seen.has(key)) {
         seen.add(key)
         out.push(log)
@@ -753,7 +759,7 @@ function RoomLogsCard({ activeRoomId, rooms }) {
     }
     out.sort((a, b) => (a?.ts || 0) - (b?.ts || 0))
     return out
-  }, [])
+  }, [selectedRoomId])
 
   const loadLogs = useCallback(async () => {
     if (!activeRoomId) return
@@ -762,19 +768,14 @@ function RoomLogsCard({ activeRoomId, rooms }) {
     setBusy(true)
     setErr('')
     try {
-      if (selectedRoomId === 'all') {
-        const out = await Promise.all(
-          rooms.map(async (r) => {
-            const res = await getRoomLogs(r.id, 120)
-            return (res?.logs || []).map((it) => ({ ...it, room_id: r.id, room_name: r.name || r.id }))
-          }),
-        )
-        const merged = dedupeAndSort(out.flat())
-        setLogs(merged.slice(-250))
-      } else if (selectedRoomId) {
+      if (selectedRoomId) {
         const res = await getRoomLogs(selectedRoomId, 250)
-        const roomName = rooms.find((r) => r.id === selectedRoomId)?.name || selectedRoomId
-        const oneRoom = (res?.logs || []).map((it) => ({ ...it, room_id: selectedRoomId, room_name: roomName }))
+        const roomName = rooms.find((r) => normalizeRoomKey(r.id) === normalizeRoomKey(selectedRoomId))?.name || selectedRoomId
+        const oneRoom = (res?.logs || []).map((it) => ({
+          ...it,
+          room_id: normalizeRoomKey(it?.room_id || selectedRoomId),
+          room_name: roomName,
+        }))
         setLogs(dedupeAndSort(oneRoom))
       } else {
         setLogs([])
@@ -803,7 +804,7 @@ function RoomLogsCard({ activeRoomId, rooms }) {
   }, [autoRefresh, loadLogs])
 
   const onClear = async () => {
-    if (!selectedRoomId || selectedRoomId === 'all') return
+    if (!selectedRoomId) return
     setBusy(true)
     setErr('')
     try {
@@ -842,7 +843,6 @@ function RoomLogsCard({ activeRoomId, rooms }) {
             onChange={(e) => setRoomFilter(e.target.value)}
           >
             <option value="active">Active Room</option>
-            <option value="all">All Rooms</option>
             {rooms.map((r) => (
               <option key={r.id} value={r.id}>{r.name || r.id}</option>
             ))}
@@ -854,7 +854,7 @@ function RoomLogsCard({ activeRoomId, rooms }) {
           <button
             type="button"
             onClick={onClear}
-            disabled={busy || !selectedRoomId || selectedRoomId === 'all'}
+            disabled={busy || !selectedRoomId}
             className="px-2 py-1.5 text-xs rounded bg-gray-800 border border-gray-600 disabled:opacity-40"
           >
             Clear
@@ -875,7 +875,6 @@ function RoomLogsCard({ activeRoomId, rooms }) {
         {logs.map((l, idx) => (
           <div key={`${l.ts}-${idx}`} className={`${levelClass(l.level)} break-words`}>
             <span className="text-gray-500">[{fmtTime(l.ts)}]</span>{' '}
-            {roomFilter === 'all' ? <span className="text-blue-300">[{l.room_name}] </span> : null}
             <span className="text-gray-500">[{String(l.level || 'INFO').toUpperCase()}] </span>
             <span>{l.message}</span>
           </div>

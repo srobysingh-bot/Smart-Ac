@@ -2,7 +2,7 @@ import asyncio
 import unittest
 from unittest import mock
 
-from backend import energy_config
+from backend import config_manager, energy_config
 
 
 class EnergyConfigResolverTests(unittest.TestCase):
@@ -40,6 +40,123 @@ class EnergyConfigResolverTests(unittest.TestCase):
         self.assertEqual(resolved.mode, energy_config.EnergyConfigMode.UNCONFIGURED)
         self.assertFalse(resolved.configured)
         self.assertTrue(resolved.device_lookup_skipped)
+
+    def test_power_normalization_passes_valid_watts_through(self):
+        result = energy_config.normalize_power_value(
+            "sensor.ac_power",
+            "611.5",
+            {
+                "device_class": "power",
+                "state_class": "measurement",
+                "unit_of_measurement": "W",
+            },
+        )
+
+        self.assertTrue(result.valid)
+        self.assertEqual(result.watts, 611.5)
+        self.assertEqual(result.confidence, "unit")
+        self.assertFalse(result.suspicious)
+
+    def test_power_normalization_uses_tuya_scale_metadata(self):
+        result = energy_config.normalize_power_value(
+            "sensor.tuya_power",
+            "8218",
+            {
+                "device_class": "power",
+                "state_class": "measurement",
+                "unit_of_measurement": "W",
+                "scale": 1,
+                "suggested_display_precision": 1,
+            },
+        )
+
+        self.assertTrue(result.valid)
+        self.assertEqual(result.watts, 821.8)
+        self.assertEqual(result.confidence, "metadata")
+        self.assertEqual(result.scale_source, "scale")
+
+    def test_power_normalization_uses_tuya_scaling_multiplier_metadata(self):
+        result = energy_config.normalize_power_value(
+            "sensor.tuya_power",
+            "8218",
+            {
+                "device_class": "power",
+                "state_class": "measurement",
+                "unit_of_measurement": "W",
+                "scaling": 0.1,
+            },
+        )
+
+        self.assertTrue(result.valid)
+        self.assertEqual(result.watts, 821.8)
+        self.assertEqual(result.confidence, "metadata")
+        self.assertEqual(result.scale_source, "scaling")
+
+    def test_power_normalization_safely_infers_scaled_integer_telemetry(self):
+        result = energy_config.normalize_power_value(
+            "sensor.tuya_power",
+            "16355",
+            {
+                "device_class": "power",
+                "state_class": "measurement",
+                "unit_of_measurement": "W",
+            },
+        )
+
+        self.assertTrue(result.valid)
+        self.assertEqual(result.watts, 1635.5)
+        self.assertEqual(result.confidence, "inferred")
+        self.assertEqual(result.reason, "inferred_decimal_scale_1")
+
+    def test_power_normalization_converts_kw_without_decimal_inference(self):
+        result = energy_config.normalize_power_value(
+            "sensor.ac_power_kw",
+            "1.2",
+            {
+                "device_class": "power",
+                "state_class": "measurement",
+                "unit_of_measurement": "kW",
+            },
+        )
+
+        self.assertTrue(result.valid)
+        self.assertEqual(result.watts, 1200.0)
+        self.assertEqual(result.confidence, "unit")
+
+    def test_power_normalization_rejects_unrecoverable_suspicious_power(self):
+        result = energy_config.normalize_power_value(
+            "sensor.bad_power",
+            "9999999",
+            {
+                "device_class": "power",
+                "state_class": "measurement",
+                "unit_of_measurement": "W",
+            },
+        )
+
+        self.assertFalse(result.valid)
+        self.assertTrue(result.suspicious)
+        self.assertEqual(result.reason, "suspicious_power")
+
+    def test_config_energy_log_summary_does_not_dump_nested_room_config(self):
+        summary = config_manager._energy_config_log_summary(
+            {
+                "energy_power_entity": "sensor.global_power",
+                "rooms": [
+                    {
+                        "id": "study-room",
+                        "energy_power_entity": "sensor.study_power",
+                        "settings": {"large_nested_blob": {"secret": "should-not-log"}},
+                    }
+                ],
+            }
+        )
+
+        rendered = str(summary)
+        self.assertEqual(summary["rooms"], 1)
+        self.assertEqual(summary["room_power_configured"], 1)
+        self.assertNotIn("sensor.study_power", rendered)
+        self.assertNotIn("large_nested_blob", rendered)
 
     def test_manual_runtime_resolution_never_calls_device_registry(self):
         async def run_case():

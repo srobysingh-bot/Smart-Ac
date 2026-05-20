@@ -202,6 +202,51 @@ class TestLogicEngineHardening(unittest.TestCase):
 
         asyncio.run(run_case())
 
+    def test_read_runtime_energy_uses_normalized_power_value(self):
+        st = logic_engine.RoomRuntime()
+
+        async def run_case():
+            states = [
+                {
+                    "state": "8218",
+                    "attributes": {
+                        "device_class": "power",
+                        "state_class": "measurement",
+                        "unit_of_measurement": "W",
+                        "scale": 1,
+                    },
+                },
+                {
+                    "state": "12.5",
+                    "attributes": {
+                        "device_class": "energy",
+                        "state_class": "total_increasing",
+                        "unit_of_measurement": "kWh",
+                    },
+                },
+            ]
+            with mock.patch.object(
+                logic_engine.ha_client,
+                "get_entity_state_full",
+                new=mock.AsyncMock(side_effect=states),
+            ):
+                return await logic_engine._read_runtime_energy(
+                    "room-x",
+                    {
+                        "energy_power_entity": "sensor.tuya_power",
+                        "energy_kwh_entity": "sensor.room_kwh",
+                    },
+                    st,
+                )
+
+        watts, kwh = asyncio.run(run_case())
+
+        self.assertEqual(watts, 821.8)
+        self.assertEqual(kwh, 12.5)
+        self.assertEqual(st.energy_watts, 821.8)
+        self.assertEqual(st.energy_power_confidence, "metadata")
+        self.assertEqual(st.energy_power_validation_reason, "ok")
+
     def test_sync_pending_clears_when_decision_not_on_off(self):
         st = logic_engine.RoomRuntime()
         st.pending_action = "on"

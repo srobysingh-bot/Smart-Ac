@@ -64,7 +64,7 @@ from .energy_config import (
     resolve_runtime_energy_config,
 )
 from . import room_registry
-from .room_log_store import room_log_store
+from .room_log_store import LOG_SCOPE_RUNTIME, room_log_store
 from .ai import (
     apply_ai_fan,
     ai_cache,
@@ -84,12 +84,18 @@ from .temperature_schedule import (
 logger = logging.getLogger(__name__)
 
 
-def log_with_room(level: str, room_id: str, msg: str, *args) -> None:
+def log_with_room(
+    level: str,
+    room_id: str,
+    msg: str,
+    *args,
+    scope: str = LOG_SCOPE_RUNTIME,
+) -> None:
     log_fn = getattr(logger, level, logger.info)
     log_fn(msg, *args)
     try:
         rendered = msg % args if args else msg
-        room_log_store.append(room_id, rendered, level=level)
+        room_log_store.append(room_id, rendered, level=level, scope=scope)
     except Exception:
         pass
 
@@ -136,6 +142,9 @@ def _log_energy_runtime_diagnostic(
     raw_kwh_state: object,
     parsed_power: Optional[float],
     parsed_kwh: Optional[float],
+    power_validation_reason: str = "",
+    power_confidence: str = "none",
+    power_suspicious: bool = False,
 ) -> None:
     power_status = _energy_runtime_status(power_entity, raw_power_state, parsed_power)
     kwh_status = _energy_runtime_status(kwh_entity, raw_kwh_state, parsed_kwh)
@@ -145,6 +154,9 @@ def _log_energy_runtime_diagnostic(
         device_lookup_skipped,
         power_entity,
         power_status,
+        power_validation_reason,
+        power_confidence,
+        power_suspicious,
         str(raw_power_state) if power_status in ("invalid", "unavailable") else "",
         kwh_entity,
         kwh_status,
@@ -174,10 +186,22 @@ def _log_energy_runtime_diagnostic(
         log_with_room(
             "warning",
             room_id,
-            "[ENERGY_RUNTIME] room=%s invalid_power_state entity=%s state=%r",
+            "[ENERGY_RUNTIME] room=%s invalid_power_state entity=%s state=%r reason=%s confidence=%s",
             room_id,
             power_entity,
             raw_power_state,
+            power_validation_reason or power_status,
+            power_confidence or "none",
+        )
+    elif power_confidence:
+        logger.debug(
+            "[ENERGY_RUNTIME] room=%s power_normalized entity=%s confidence=%s suspicious=%s reason=%s watts=%s",
+            room_id,
+            power_entity,
+            power_confidence,
+            power_suspicious,
+            power_validation_reason or "ok",
+            parsed_power,
         )
 
     if kwh_status == "missing":
@@ -254,6 +278,10 @@ async def _read_runtime_energy(
     st.energy_kwh_raw_state = raw_kwh_state
     st.energy_watts = parsed_power
     st.energy_kwh = parsed_kwh
+    st.energy_power_unit = _power_validation.unit
+    st.energy_power_confidence = _power_validation.confidence
+    st.energy_power_validation_reason = _power_validation.reason
+    st.energy_power_suspicious = bool(_power_validation.suspicious)
 
     if parsed_power is not None:
         st.last_valid_power_watts = parsed_power
@@ -272,6 +300,9 @@ async def _read_runtime_energy(
         raw_kwh_state=raw_kwh_state,
         parsed_power=parsed_power,
         parsed_kwh=parsed_kwh,
+        power_validation_reason=_power_validation.reason,
+        power_confidence=_power_validation.confidence,
+        power_suspicious=_power_validation.suspicious,
     )
     return parsed_power, parsed_kwh
 
@@ -418,6 +449,10 @@ class RoomRuntime:
     energy_kwh_raw_state: Optional[object] = None
     energy_watts: Optional[float] = None
     energy_kwh: Optional[float] = None
+    energy_power_unit: str = ""
+    energy_power_confidence: str = "none"
+    energy_power_validation_reason: str = ""
+    energy_power_suspicious: bool = False
     energy_runtime_log_sig: Optional[tuple] = None
     last_valid_power_watts: Optional[float] = None
     last_valid_energy_kwh: Optional[float] = None
@@ -5599,6 +5634,10 @@ def get_runtime_state(room_id: str) -> dict:
         "energy_kwh_raw_state": st.energy_kwh_raw_state,
         "energy_watts": st.energy_watts,
         "energy_kwh_total": st.energy_kwh,
+        "energy_power_unit": st.energy_power_unit,
+        "energy_power_confidence": st.energy_power_confidence,
+        "energy_power_validation_reason": st.energy_power_validation_reason,
+        "energy_power_suspicious": st.energy_power_suspicious,
         "last_valid_power_watts": st.last_valid_power_watts,
         "last_valid_energy_kwh": st.last_valid_energy_kwh,
         "ai_enabled":            bool(merged.get("ai_enabled", False)),

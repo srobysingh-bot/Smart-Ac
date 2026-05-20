@@ -140,6 +140,28 @@ def _energy_config_snapshot(cfg: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
+def _energy_config_log_summary(cfg: Dict[str, Any]) -> Dict[str, Any]:
+    rooms = room_registry.list_room_dicts(cfg) if isinstance(cfg, dict) else []
+    return {
+        "rooms": len(rooms),
+        "global_power_configured": bool(str(cfg.get("energy_power_entity") or "").strip())
+        if isinstance(cfg, dict)
+        else False,
+        "global_kwh_configured": bool(str(cfg.get("energy_kwh_entity") or "").strip())
+        if isinstance(cfg, dict)
+        else False,
+        "room_power_configured": sum(
+            1 for room in rooms if str(room.get("energy_power_entity") or "").strip()
+        ),
+        "room_kwh_configured": sum(
+            1 for room in rooms if str(room.get("energy_kwh_entity") or "").strip()
+        ),
+        "room_device_configured": sum(
+            1 for room in rooms if str(room.get("energy_device_id") or "").strip()
+        ),
+    }
+
+
 def _normalize_energy_fields_in_place(cfg: Dict[str, Any]) -> None:
     if not isinstance(cfg, dict):
         return
@@ -356,19 +378,7 @@ def load_config() -> Dict[str, Any]:
         saved = _read_json_dict(CONFIG_PATH)
         opts = _read_json_dict("/data/options.json")
         merged = _assemble_merged_config(saved, opts)
-        logger.info(
-            "[ENERGY_CONFIG] loaded_from_disk=%s",
-            {
-                "global": _energy_config_snapshot(merged),
-                "rooms": [
-                    {
-                        "id": r.get("id"),
-                        **_energy_config_snapshot(r),
-                    }
-                    for r in room_registry.list_room_dicts(merged)
-                ],
-            },
-        )
+        logger.info("[ENERGY_CONFIG] loaded %s", _energy_config_log_summary(merged))
         return _remember(merged)
 
     except Exception:
@@ -412,36 +422,10 @@ def save_config(data: Dict[str, Any]) -> bool:
     try:
         data = copy.deepcopy(data)
         data = {k: v for k, v in data.items() if k not in _LEGACY_IR_KEYS}
-        logger.info(
-            "[ENERGY_CONFIG] received_payload=%s",
-            {
-                "global": _energy_config_snapshot(data),
-                "rooms": [
-                    {
-                        "id": r.get("id"),
-                        **_energy_config_snapshot(r),
-                    }
-                    for r in data.get("rooms", [])
-                    if isinstance(r, dict)
-                ],
-            },
-        )
+        logger.info("[ENERGY_CONFIG] received %s", _energy_config_log_summary(data))
         _normalize_energy_fields_in_place(data)
         _normalize_room_energy_fields(data.get("rooms"))
-        logger.info(
-            "[ENERGY_CONFIG] normalized=%s",
-            {
-                "global": _energy_config_snapshot(data),
-                "rooms": [
-                    {
-                        "id": r.get("id"),
-                        **_energy_config_snapshot(r),
-                    }
-                    for r in data.get("rooms", [])
-                    if isinstance(r, dict)
-                ],
-            },
-        )
+        logger.info("[ENERGY_CONFIG] normalized %s", _energy_config_log_summary(data))
         current = load_config()
         current.update(data)
         _normalize_energy_fields_in_place(current)
@@ -453,19 +437,7 @@ def save_config(data: Dict[str, Any]) -> bool:
         os.makedirs(os.path.dirname(CONFIG_PATH), exist_ok=True)
         with open(CONFIG_PATH, "w", encoding="utf-8") as f:
             json.dump(current, f, indent=2, ensure_ascii=False)
-        logger.info(
-            "[ENERGY_CONFIG] persisted=%s",
-            {
-                "global": _energy_config_snapshot(current),
-                "rooms": [
-                    {
-                        "id": r.get("id"),
-                        **_energy_config_snapshot(r),
-                    }
-                    for r in room_registry.list_room_dicts(current)
-                ],
-            },
-        )
+        logger.info("[ENERGY_CONFIG] persisted %s", _energy_config_log_summary(current))
         logger.info("[HawaAI] Config saved to %s", CONFIG_PATH)
         return True
     except Exception as e:

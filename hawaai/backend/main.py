@@ -47,7 +47,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, HTMLResponse, Response
 
 from . import config_manager, database, ha_entity_events, live_broadcast, logic_engine, room_registry, scheduler, session_logger, weather_api
-from .room_log_store import room_log_store
+from .room_log_store import LOG_SCOPE_RUNTIME, room_log_store
 from . import ha_client
 from .ac_controller import get_brands
 from .ai import get_cached
@@ -810,6 +810,10 @@ async def _dashboard_status_payload(rid: str) -> Dict[str, Any]:
         "energy_device_lookup_skipped": energy_device_lookup_skipped,
         "energy_power_entity": effective_power_entity,
         "energy_kwh_entity": effective_kwh_entity,
+        "energy_power_unit": runtime.get("energy_power_unit"),
+        "energy_power_confidence": runtime.get("energy_power_confidence"),
+        "energy_power_validation_reason": runtime.get("energy_power_validation_reason"),
+        "energy_power_suspicious": runtime.get("energy_power_suspicious"),
         # ── Session ───────────────────────────────────────────────────────────
         "session_kwh":      runtime.get("session_start_kwh"),
         "session_id":       runtime.get("session_id"),
@@ -1383,7 +1387,11 @@ async def api_room_logs(
     limit: int = Query(200, ge=1, le=500),
 ):
     rid = logic_engine.normalize_room_id(_require_room_query(room_id))
-    return {"room_id": rid, "logs": room_log_store.get_logs(rid, limit)}
+    return {
+        "room_id": rid,
+        "scope": LOG_SCOPE_RUNTIME,
+        "logs": room_log_store.get_logs(rid, limit, scope=LOG_SCOPE_RUNTIME),
+    }
 
 
 @app.delete("/api/rooms/{room_id}/logs")
@@ -1773,10 +1781,10 @@ def _encode_room_tick_ws_payload_json(rid_canon: str) -> Optional[str]:
             "temperature_mode": merged.get("temperature_mode") or "manual",
             "room_id": rk,
         }
-        latest = room_log_store.latest_key(rk)
+        latest = room_log_store.latest_key(rk, scope=LOG_SCOPE_RUNTIME)
         prev = _ws_log_token_by_room.get(rk)
         if latest and latest != prev:
-            payload["recent_logs"] = room_log_store.get_logs(rk, 20)
+            payload["recent_logs"] = room_log_store.get_logs(rk, 20, scope=LOG_SCOPE_RUNTIME)
             _ws_log_token_by_room[rk] = latest
         return json.dumps(
             payload,

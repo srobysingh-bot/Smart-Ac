@@ -48,6 +48,24 @@ class EnergyEntityValidation:
     score: int = 0
     unit: str = ""
     numeric_state: Optional[float] = None
+    confidence: str = "none"
+    suspicious: bool = False
+
+
+@dataclass(frozen=True)
+class PowerNormalizationResult:
+    watts: Optional[float]
+    raw_value: Optional[float]
+    unit: str = ""
+    valid: bool = False
+    confidence: str = "none"
+    reason: str = "ok"
+    suspicious: bool = False
+    scale_source: str = ""
+
+
+SUSPICIOUS_POWER_WATTS = 5000.0
+_INFERRED_POWER_SCALE_DECIMALS = (1, 2, 3)
 
 
 def _clean(value: object) -> str:
@@ -119,6 +137,180 @@ def parse_numeric_state(value: object) -> Optional[float]:
     return parsed if math.isfinite(parsed) else None
 
 
+def _numeric_attr(attrs: Mapping[str, Any], names: Tuple[str, ...]) -> Tuple[str, Optional[float]]:
+    for name in names:
+        if name not in attrs:
+            continue
+        value = parse_numeric_state(attrs.get(name))
+        if value is not None:
+            return name, value
+    return "", None
+
+
+def _power_unit_multiplier(unit: str) -> Optional[float]:
+    unit_n = _normal_unit(unit)
+    if unit_n in {"w", "watt", "watts"}:
+        return 1.0
+    if unit_n in {"kw", "kilowatt", "kilowatts"}:
+        return 1000.0
+    return None
+
+
+def _is_power_unit(unit: str) -> bool:
+    return _power_unit_multiplier(unit) is not None
+
+
+def _metadata_power_scale(attrs: Mapping[str, Any]) -> Tuple[str, float]:
+    """
+    Return a metadata-derived multiplier for raw power telemetry.
+
+    Tuya integrations may expose decimal scale/divisor metadata with different
+    names. We only apply a transform when the metadata itself declares the scale.
+    """
+    key, value = _numeric_attr(
+        attrs,
+        (
+            "power_scale",
+            "tuya_power_scale",
+            "tuya_scale",
+            "dp_scale",
+            "decimal_scale",
+            "scale",
+        ),
+    )
+    if value is not None and float(value).is_integer() and 0 <= int(value) <= 6:
+        return key, 1.0 / (10 ** int(value))
+    if value is not None and 0 < value < 1:
+        return key, float(value)
+
+    key, value = _numeric_attr(
+        attrs,
+        (
+            "power_divisor",
+            "tuya_power_divisor",
+            "value_divisor",
+            "divisor",
+            "divider",
+        ),
+    )
+    if value is not None and value > 0:
+        return key, 1.0 / float(value)
+
+    key, value = _numeric_attr(
+        attrs,
+        (
+            "power_multiplier",
+            "power_scaling",
+            "tuya_power_multiplier",
+            "tuya_power_scaling",
+            "value_multiplier",
+            "multiplier",
+            "scaling",
+            "factor",
+            "scale_factor",
+        ),
+    )
+    if value is not None and value > 0:
+        return key, float(value)
+
+    return "", 1.0
+
+
+def _infer_decimal_scaled_power(watts: float) -> Tuple[str, Optional[float]]:
+    if watts <= SUSPICIOUS_POWER_WATTS:
+        return "", watts
+    for decimals in _INFERRED_POWER_SCALE_DECIMALS:
+        candidate = watts / (10 ** decimals)
+        if 0 <= candidate <= SUSPICIOUS_POWER_WATTS:
+            return f"inferred_decimal_scale_{decimals}", candidate
+    return "", None
+
+
+def normalize_power_value(
+    entity_id: str,
+    raw_state: object,
+    attrs: Optional[Mapping[str, Any]] = None,
+) -> PowerNormalizationResult:
+    attrs_map = attrs if isinstance(attrs, Mapping) else {}
+    unit = _normal_unit(attrs_map.get("unit_of_measurement"))
+    raw_value = parse_numeric_state(raw_state)
+    if raw_value is None:
+        return PowerNormalizationResult(
+            watts=None,
+            raw_value=None,
+            unit=unit,
+            valid=False,
+            confidence="none",
+            reason="non_numeric",
+        )
+
+    unit_multiplier = _power_unit_multiplier(unit)
+    if unit_multiplier is None:
+        return PowerNormalizationResult(
+            watts=None,
+            raw_value=raw_value,
+            unit=unit,
+            valid=False,
+            confidence="none",
+            reason="invalid_power_unit",
+        )
+
+    scale_source, metadata_multiplier = _metadata_power_scale(attrs_map)
+    watts = raw_value * metadata_multiplier * unit_multiplier
+    confidence = "metadata" if scale_source else "unit"
+
+    if watts < 0:
+        return PowerNormalizationResult(
+            watts=None,
+            raw_value=raw_value,
+            unit=unit,
+            valid=False,
+            confidence=confidence,
+            reason="negative_power",
+            scale_source=scale_source,
+        )
+
+    if watts > SUSPICIOUS_POWER_WATTS:
+        can_infer_decimal_scale = (
+            unit_multiplier == 1.0
+            and not scale_source
+            and float(raw_value).is_integer()
+        )
+        inferred_source, inferred_watts = _infer_decimal_scaled_power(watts)
+        if can_infer_decimal_scale and inferred_watts is not None and inferred_source:
+            return PowerNormalizationResult(
+                watts=round(float(inferred_watts), 3),
+                raw_value=raw_value,
+                unit=unit,
+                valid=True,
+                confidence="inferred",
+                reason=inferred_source,
+                suspicious=False,
+                scale_source=inferred_source,
+            )
+        return PowerNormalizationResult(
+            watts=round(float(watts), 3),
+            raw_value=raw_value,
+            unit=unit,
+            valid=False,
+            confidence=confidence,
+            reason="suspicious_power",
+            suspicious=True,
+            scale_source=scale_source,
+        )
+
+    return PowerNormalizationResult(
+        watts=round(float(watts), 3),
+        raw_value=raw_value,
+        unit=unit,
+        valid=True,
+        confidence=confidence,
+        reason="ok",
+        suspicious=False,
+        scale_source=scale_source,
+    )
+
+
 def _suffix_rank(entity_id: str, *, kind: str) -> int:
     object_id = entity_id.split(".", 1)[-1].lower()
     if kind == "power" and object_id.endswith("_power"):
@@ -153,21 +345,41 @@ def validate_energy_entity(
     device_class = _normal_class(attrs.get("device_class"))
     state_class = _normal_class(attrs.get("state_class"))
     unit = _normal_unit(attrs.get("unit_of_measurement"))
+    suggested_precision = parse_numeric_state(attrs.get("suggested_display_precision"))
     numeric_state = parse_numeric_state(state_obj.get("state"))
     if numeric_state is None:
         return EnergyEntityValidation(False, reason="non_numeric")
 
     if kind == "power":
-        if device_class != "power" and unit not in {"w", "kw"}:
+        if device_class != "power" and not _is_power_unit(unit):
             return EnergyEntityValidation(False, reason="invalid_power_metadata")
+        normalized = normalize_power_value(entity_id, state_obj.get("state"), attrs)
+        if not normalized.valid:
+            return EnergyEntityValidation(
+                False,
+                reason=normalized.reason,
+                unit=unit,
+                numeric_state=None,
+                confidence=normalized.confidence,
+                suspicious=normalized.suspicious,
+            )
         score = _suffix_rank(entity_id, kind=kind)
         if device_class == "power":
             score += 500
-        if unit in {"w", "kw"}:
+        if _is_power_unit(unit):
             score += 250
         if state_class in {"measurement", ""}:
             score += 25
-        return EnergyEntityValidation(True, score=score, unit=unit, numeric_state=numeric_state)
+        if suggested_precision is not None:
+            score += 5
+        return EnergyEntityValidation(
+            True,
+            score=score,
+            unit=unit,
+            numeric_state=normalized.watts,
+            confidence=normalized.confidence,
+            suspicious=normalized.suspicious,
+        )
 
     if device_class != "energy" and unit not in {"wh", "kwh"}:
         return EnergyEntityValidation(False, reason="invalid_energy_metadata")

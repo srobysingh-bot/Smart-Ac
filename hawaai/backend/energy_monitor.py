@@ -3,7 +3,7 @@
 import logging
 
 from . import config_manager
-from .energy_config import resolve_runtime_energy_config
+from .energy_config import normalize_power_value, resolve_runtime_energy_config
 
 logger = logging.getLogger(__name__)
 
@@ -71,13 +71,20 @@ class EnergyMonitor:
         if not entity:
             return self._watt_draw
 
-        state_str = await ha_client.get_state(entity)
-        if state_str is None:
+        state_obj = await ha_client.get_entity_state_full(entity)
+        if not state_obj:
             return self._watt_draw
 
-        try:
-            self._watt_draw = float(state_str)
-        except (ValueError, TypeError):
-            logger.debug("Could not parse watt draw from '%s'", state_str)
+        attrs = state_obj.get("attributes") or {}
+        normalized = normalize_power_value(entity, state_obj.get("state"), attrs)
+        if normalized.valid and normalized.watts is not None:
+            self._watt_draw = float(normalized.watts)
+        else:
+            logger.debug(
+                "Could not normalize watt draw from %s state=%r reason=%s",
+                entity,
+                state_obj.get("state"),
+                normalized.reason,
+            )
 
         return self._watt_draw
