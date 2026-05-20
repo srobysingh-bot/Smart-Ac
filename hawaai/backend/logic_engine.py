@@ -1015,9 +1015,6 @@ def _sync_runtime_occupancy(
     if zone_presence is True:
         _clear_vacancy_state(room_id, st, now, reason="zone_reentry")
         return True
-    if zone_presence is False:
-        _mark_runtime_vacant(room_id, st, now, reason="zone_exit")
-        return False
 
     if is_occupied:
         _clear_vacancy_state(room_id, st, now, reason="presence_reentry")
@@ -1274,7 +1271,7 @@ def _resolve_presence_only_decision(
     Returns (action, source, occupied).
     """
     zone_presence = _configured_zone_presence(cfg, st)
-    if _presence_raw_invalid(presence_raw) and zone_presence is None:
+    if _presence_raw_invalid(presence_raw) and zone_presence is not True:
         st.presence_only_present_since = None
         if (
             st.presence_only_last_invalid_log_at is None
@@ -1290,8 +1287,8 @@ def _resolve_presence_only_decision(
             st.presence_only_last_invalid_log_at = now
         return "hold", "presence_unavailable", False
 
-    if zone_presence is not None:
-        occupied = _sync_runtime_occupancy(room_id, cfg, st, zone_presence, now)
+    if zone_presence is True:
+        occupied = _sync_runtime_occupancy(room_id, cfg, st, True, now)
     else:
         occupied = (
             bool(resolved_occupied)
@@ -3728,7 +3725,7 @@ async def _tick_impl(rid_raw: str, room_id: str) -> None:
         is_occupied_bool = True
 
     await _fp2_zone_sensor_tick(room_id, cfg, now)
-    if use_presence:
+    if use_presence and not presence_only:
         is_occupied_bool = _sync_runtime_occupancy(
             room_id,
             cfg,
