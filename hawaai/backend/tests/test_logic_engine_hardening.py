@@ -1760,6 +1760,49 @@ class TestLogicEngineHardening(unittest.TestCase):
         self.assertTrue(st.occupied)
         self.assertTrue(st.stable_occupied)
 
+    def test_zone_absent_occupied_running_ac_does_not_enter_zone_gate_deadlock(self):
+        logic_engine._runtime_by_room.clear()
+        now = datetime.now(timezone.utc)
+        rid = "zone-absent-running-no-deadlock"
+        st = logic_engine._rt(rid)
+        st.zone_sensor_usable = True
+        st.zone_present = False
+        st.zone_confirmed = False
+        st.occupied = True
+        st.stable_occupied = True
+        st.last_known_presence = True
+        st.ac_is_on = False
+        st.physical_ac_on = True
+        st.effective_ac_on = True
+        st.ac_state = "on"
+
+        cfg = {
+            "zone_entity_id": "binary_sensor.zone",
+            "zone_required_for_on": True,
+            "vacancy_timeout_minutes": 2,
+        }
+        action, source, target = logic_engine._resolve_control_decision(
+            rid,
+            cfg,
+            indoor_temp=27.0,
+            effective_target=24.0,
+            is_occupied=True,
+            ac_on=False,
+            now=now,
+        )
+        action, source, blocked = logic_engine._fp2_zone_apply_on_gate(
+            rid,
+            cfg,
+            action,
+            source,
+        )
+
+        self.assertEqual((action, source, blocked), ("on", "thermostat", False))
+        self.assertEqual(target, 24.0)
+        self.assertTrue(st.occupied)
+        self.assertTrue(st.stable_occupied)
+        self.assertIsNone(st.vacant_since)
+
     def test_zone_absence_defers_vacancy_timer_to_room_presence(self):
         logic_engine._runtime_by_room.clear()
         now = datetime.now(timezone.utc)
@@ -1801,6 +1844,84 @@ class TestLogicEngineHardening(unittest.TestCase):
         self.assertFalse(st.occupied)
         self.assertFalse(st.stable_occupied)
 
+    def test_room_vacancy_timeout_off_ignores_zone_absence(self):
+        logic_engine._runtime_by_room.clear()
+        now = datetime.now(timezone.utc)
+        rid = "room-vacant-zone-absent-off"
+        st = logic_engine._rt(rid)
+        st.zone_sensor_usable = True
+        st.zone_present = False
+        st.zone_confirmed = False
+        st.occupied = False
+        st.stable_occupied = False
+        st.last_known_presence = False
+        st.vacant_since = now - timedelta(seconds=logic_engine.VACANCY_CONFIRM_SECS + 30)
+        st.ac_is_on = True
+        st.effective_on_since_ts = (
+            now - timedelta(seconds=logic_engine.RUNNING_OFF_BLOCK_SECS + 30)
+        ).timestamp()
+
+        cfg = {
+            "zone_entity_id": "binary_sensor.zone",
+            "zone_required_for_on": True,
+            "vacancy_timeout_minutes": 0,
+        }
+        action, source, target = logic_engine._resolve_control_decision(
+            rid,
+            cfg,
+            indoor_temp=26.0,
+            effective_target=24.0,
+            is_occupied=False,
+            ac_on=True,
+            now=now,
+        )
+        action, source, blocked = logic_engine._fp2_zone_apply_on_gate(
+            rid,
+            cfg,
+            action,
+            source,
+        )
+
+        self.assertEqual((action, source, blocked), ("off", "safety_vacant", False))
+        self.assertEqual(target, 24.0)
+        self.assertFalse(st.occupied)
+        self.assertFalse(st.stable_occupied)
+
+    def test_room_presence_return_clears_vacancy_timer_without_zone(self):
+        logic_engine._runtime_by_room.clear()
+        now = datetime.now(timezone.utc)
+        rid = "room-return-zone-absent"
+        st = logic_engine._rt(rid)
+        st.zone_sensor_usable = True
+        st.zone_present = False
+        st.zone_confirmed = False
+        st.occupied = False
+        st.stable_occupied = False
+        st.last_known_presence = False
+        st.vacant_since = now - timedelta(seconds=30)
+        st.vacancy_active = True
+        st.pending_vacancy = True
+
+        action, source, target = logic_engine._resolve_control_decision(
+            rid,
+            {
+                "zone_entity_id": "binary_sensor.zone",
+                "zone_required_for_on": True,
+                "vacancy_timeout_minutes": 2,
+            },
+            indoor_temp=26.0,
+            effective_target=24.0,
+            is_occupied=True,
+            ac_on=True,
+            now=now,
+        )
+
+        self.assertEqual((action, source, target), ("hold", "thermostat", 24.0))
+        self.assertTrue(st.occupied)
+        self.assertTrue(st.stable_occupied)
+        self.assertIsNone(st.vacant_since)
+        self.assertFalse(st.pending_vacancy)
+
     def test_zone_reentry_cancels_vacancy_before_timeout(self):
         logic_engine._runtime_by_room.clear()
         now = datetime.now(timezone.utc)
@@ -1831,6 +1952,47 @@ class TestLogicEngineHardening(unittest.TestCase):
         self.assertTrue(st.stable_occupied)
         self.assertIsNone(st.vacant_since)
         self.assertFalse(st.pending_vacancy)
+
+    def test_zone_confirmed_while_occupied_allows_new_on(self):
+        logic_engine._runtime_by_room.clear()
+        now = datetime.now(timezone.utc)
+        rid = "zone-confirmed-new-on"
+        st = logic_engine._rt(rid)
+        st.zone_sensor_usable = True
+        st.zone_present = True
+        st.zone_confirmed = True
+        st.occupied = True
+        st.stable_occupied = True
+        st.last_known_presence = True
+        st.ac_is_on = False
+        st.physical_ac_on = False
+        st.effective_ac_on = False
+        st.ac_state = "off"
+
+        cfg = {
+            "zone_entity_id": "binary_sensor.zone",
+            "zone_required_for_on": True,
+            "vacancy_timeout_minutes": 2,
+        }
+        action, source, target = logic_engine._resolve_control_decision(
+            rid,
+            cfg,
+            indoor_temp=27.0,
+            effective_target=24.0,
+            is_occupied=True,
+            ac_on=False,
+            now=now,
+        )
+        action, source, blocked = logic_engine._fp2_zone_apply_on_gate(
+            rid,
+            cfg,
+            action,
+            source,
+        )
+
+        self.assertEqual((action, source, blocked), ("on", "thermostat", False))
+        self.assertEqual(target, 24.0)
+        self.assertTrue(st.occupied)
 
     def test_zone_absence_does_not_allow_vacancy_off_if_room_presence_is_occupied(self):
         logic_engine._runtime_by_room.clear()
@@ -2818,6 +2980,8 @@ class TestLogicEngineHardening(unittest.TestCase):
         st.zone_sensor_usable = True
         st.zone_confirmed = False
         block0 = st.zone_block_count
+        st.ac_is_on = False
+        st.physical_ac_on = False
         logic_engine._fp2_zone_apply_on_gate(rid, cfg, "on", "thermostat")
         self.assertGreater(st.zone_block_count, block0)
 
@@ -2849,11 +3013,12 @@ class TestLogicEngineHardening(unittest.TestCase):
         a, s, blocked = logic_engine._fp2_zone_apply_on_gate(rid, cfg, "on", "thermostat")
         self.assertEqual((a, s, blocked), ("on", "thermostat", False))
 
-    def test_fp2_zone_gate_blocks_until_confirmed(self):
+    def test_fp2_zone_gate_blocks_new_start_until_confirmed(self):
         logic_engine._runtime_by_room.clear()
         rid = "z-g3"
         st = logic_engine._rt(rid)
-        st.ac_is_on = True
+        st.ac_is_on = False
+        st.physical_ac_on = False
         st.zone_sensor_usable = True
         st.zone_confirmed = False
         cfg = {
@@ -2866,7 +3031,7 @@ class TestLogicEngineHardening(unittest.TestCase):
         a2, s2, b2 = logic_engine._fp2_zone_apply_on_gate(rid, cfg, "on", "thermostat")
         self.assertEqual((a2, s2, b2), ("on", "thermostat", False))
 
-    def test_fp2_zone_gate_does_not_block_initial_on(self):
+    def test_fp2_zone_gate_blocks_initial_on_until_zone_confirmed(self):
         logic_engine._runtime_by_room.clear()
         rid = "z-initial"
         st = logic_engine._rt(rid)
@@ -2879,7 +3044,32 @@ class TestLogicEngineHardening(unittest.TestCase):
             "zone_required_for_on": True,
         }
         a, s, blocked = logic_engine._fp2_zone_apply_on_gate(rid, cfg, "on", "thermostat")
+        self.assertEqual((a, s, blocked), ("hold", "zone_gate", True))
+
+    def test_fp2_zone_gate_does_not_block_running_ac_when_zone_absent(self):
+        logic_engine._runtime_by_room.clear()
+        rid = "z-running"
+        st = logic_engine._rt(rid)
+        st.ac_is_on = True
+        st.physical_ac_on = True
+        st.effective_ac_on = True
+        st.zone_sensor_usable = True
+        st.zone_present = False
+        st.zone_confirmed = False
+        st.occupied = True
+        st.stable_occupied = True
+        st.last_known_presence = True
+        cfg = {
+            "zone_entity_id": "binary_sensor.z",
+            "zone_required_for_on": True,
+        }
+
+        a, s, blocked = logic_engine._fp2_zone_apply_on_gate(rid, cfg, "on", "thermostat")
+
         self.assertEqual((a, s, blocked), ("on", "thermostat", False))
+        self.assertTrue(st.occupied)
+        self.assertTrue(st.stable_occupied)
+        self.assertIsNone(st.vacant_since)
 
     def test_fp2_zone_gate_never_changes_off(self):
         logic_engine._runtime_by_room.clear()

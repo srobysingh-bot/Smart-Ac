@@ -603,7 +603,7 @@ def _log_dashboard_energy_trace(
     if _dashboard_energy_trace_sig_by_room.get(rid) == sig:
         return
     _dashboard_energy_trace_sig_by_room[rid] = sig
-    logger.info(
+    logger.debug(
         "[ENERGY_RUNTIME] room=%s power_entity=%s kwh_entity=%s "
         "resolved_power_state=%r resolved_kwh_state=%r watts=%s kwh=%s status=%s",
         rid,

@@ -19,10 +19,72 @@ _LOG_SCOPES = {
     LOG_SCOPE_DIAGNOSTIC,
 }
 
+RUNTIME_LOG_PREFIXES = (
+    "[CONTROL]",
+    "[TICK]",
+    "[ZONE]",
+    "[VACANCY]",
+    "[SESSION]",
+    "[TARGET_SYNC]",
+    "[POWER]",
+    "[OVERRIDE]",
+)
+
+_RUNTIME_TAG_ALIASES = {
+    "[ENERGY_RUNTIME]": "[POWER]",
+    "[OCCUPANCY]": "[ZONE]",
+    "[RUNTIME]": "[CONTROL]",
+    "[PRESENCE_ONLY]": "[CONTROL]",
+    "[DELAY_ON]": "[CONTROL]",
+    "[DELAY_OFF]": "[CONTROL]",
+    "[DECISION_LOCK]": "[CONTROL]",
+    "[IR]": "[CONTROL]",
+    "[SESSION_START]": "[SESSION]",
+    "[SESSION_END]": "[SESSION]",
+    "[SESSION_INVALID]": "[SESSION]",
+    "[SESSION_PROVISIONAL_TIMEOUT]": "[SESSION]",
+}
+
+_BACKEND_LOG_MARKERS = (
+    "backend.",
+    "uvicorn.",
+    "HTTP ",
+    "GET /",
+    "POST /",
+    "PUT /",
+    "DELETE /",
+    "[ENERGY_CONFIG]",
+    "[WS]",
+    "[ROOM]",
+    "[TICK_TRIGGER]",
+    "[SNAPSHOT]",
+)
+
 
 def normalize_log_scope(scope: object) -> str:
     value = str(scope or LOG_SCOPE_RUNTIME).strip().lower()
     return value if value in _LOG_SCOPES else LOG_SCOPE_DIAGNOSTIC
+
+
+def _runtime_message_for_ui(message: object) -> Optional[str]:
+    text = str(message or "").strip()
+    if not text:
+        return None
+
+    upper = text.upper()
+    lower = text.lower()
+    if any(marker.lower() in lower for marker in _BACKEND_LOG_MARKERS):
+        return None
+
+    for prefix in RUNTIME_LOG_PREFIXES:
+        if upper.startswith(prefix):
+            return text
+
+    for raw_prefix, public_prefix in _RUNTIME_TAG_ALIASES.items():
+        if upper.startswith(raw_prefix):
+            return public_prefix + text[len(raw_prefix):]
+
+    return None
 
 
 class RoomLogStore:
@@ -47,11 +109,16 @@ class RoomLogStore:
         *,
         level: str = "INFO",
         scope: str = LOG_SCOPE_RUNTIME,
-    ) -> None:
+    ) -> bool:
         rid = (room_id or "").strip().lower()
         if not rid:
-            return
+            return False
         log_scope = normalize_log_scope(scope)
+        if log_scope != LOG_SCOPE_RUNTIME:
+            return False
+        clean_message = _runtime_message_for_ui(message)
+        if clean_message is None:
+            return False
         with self._lock:
             if rid not in self._logs:
                 self._logs[rid] = deque(maxlen=self._max_lines_per_room)
@@ -61,9 +128,10 @@ class RoomLogStore:
                     "room_id": rid,
                     "scope": log_scope,
                     "level": str(level or "INFO").upper(),
-                    "message": str(message),
+                    "message": clean_message,
                 }
             )
+        return True
 
     def get_logs(
         self,
@@ -78,6 +146,7 @@ class RoomLogStore:
             if rid not in self._logs:
                 return []
             logs = list(self._logs[rid])
+            logs = [entry for entry in logs if entry.get("room_id") == rid]
             if scope is not None:
                 log_scope = normalize_log_scope(scope)
                 logs = [
@@ -98,6 +167,7 @@ class RoomLogStore:
             if rid not in self._logs:
                 return None
             logs = list(self._logs[rid])
+            logs = [entry for entry in logs if entry.get("room_id") == rid]
             if scope is not None:
                 log_scope = normalize_log_scope(scope)
                 logs = [

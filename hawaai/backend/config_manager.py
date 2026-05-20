@@ -18,6 +18,7 @@ CONFIG_PATH = "/data/hawaai_config.json"
 # Last successful merged config (survives single bad load so rooms are not silently wiped).
 _last_known_good_config: Optional[Dict[str, Any]] = None
 _last_load_sanitized_energy_entities = False
+_last_logged_config_load_sig: Optional[tuple] = None
 
 # Default matches Ollama add-on pull (gemma:2b); override in Settings if needed.
 DEFAULT_OLLAMA_MODEL = "gemma:2b"
@@ -160,6 +161,21 @@ def _energy_config_log_summary(cfg: Dict[str, Any]) -> Dict[str, Any]:
             1 for room in rooms if str(room.get("energy_device_id") or "").strip()
         ),
     }
+
+
+def _energy_config_log_signature(summary: Dict[str, Any]) -> tuple:
+    return tuple(sorted(summary.items()))
+
+
+def _log_loaded_config_summary_if_changed(cfg: Dict[str, Any]) -> None:
+    global _last_logged_config_load_sig
+    summary = _energy_config_log_summary(cfg)
+    sig = _energy_config_log_signature(summary)
+    if sig == _last_logged_config_load_sig:
+        logger.debug("[ENERGY_CONFIG] load unchanged")
+        return
+    _last_logged_config_load_sig = sig
+    logger.info("[ENERGY_CONFIG] loaded %s", summary)
 
 
 def _normalize_energy_fields_in_place(cfg: Dict[str, Any]) -> None:
@@ -378,7 +394,7 @@ def load_config() -> Dict[str, Any]:
         saved = _read_json_dict(CONFIG_PATH)
         opts = _read_json_dict("/data/options.json")
         merged = _assemble_merged_config(saved, opts)
-        logger.info("[ENERGY_CONFIG] loaded %s", _energy_config_log_summary(merged))
+        _log_loaded_config_summary_if_changed(merged)
         return _remember(merged)
 
     except Exception:

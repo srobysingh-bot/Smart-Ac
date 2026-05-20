@@ -34,17 +34,17 @@ class TestRoomLogStore(unittest.TestCase):
     def test_limit_applies_to_tail(self):
         s = RoomLogStore()
         for i in range(5):
-            s.append("room-a", f"m{i}")
+            s.append("room-a", f"[TICK] m{i}")
         tail = s.get_logs("room-a", 2)
-        self.assertEqual([x["message"] for x in tail], ["m3", "m4"])
+        self.assertEqual([x["message"] for x in tail], ["[TICK] m3", "[TICK] m4"])
 
     def test_latest_key_and_resize(self):
         s = RoomLogStore()
-        s.append("r", "a", level="info")
+        s.append("r", "[TICK] a", level="info")
         self.assertIsNotNone(s.latest_key("r"))
         s.set_max_lines_per_room(50)
         for i in range(70):
-            s.append("r", f"n{i}", level="error")
+            s.append("r", f"[CONTROL] n{i}", level="error")
         logs = s.get_logs("r", 1000)
         self.assertEqual(len(logs), 50)
         self.assertEqual(logs[-1]["level"], "ERROR")
@@ -59,6 +59,35 @@ class TestRoomLogStore(unittest.TestCase):
 
         self.assertEqual([x["message"] for x in logs], ["[TICK] runtime"])
         self.assertEqual(s.latest_key("study"), logs[-1]["ts"].__str__() + "-runtime-INFO-[TICK] runtime")
+
+    def test_runtime_stream_rejects_backend_and_http_logs_even_if_misrouted(self):
+        s = RoomLogStore()
+        self.assertFalse(
+            s.append("study", "backend.config_manager:[ENERGY_CONFIG] loaded {'rooms': 1}")
+        )
+        self.assertFalse(s.append("study", "HTTP GET /api/status 200"))
+        self.assertFalse(s.append("study", "[WS] subscribe rejected"))
+        self.assertTrue(s.append("study", "[CONTROL] clean runtime event"))
+
+        self.assertEqual(
+            [x["message"] for x in s.get_logs("study", 10)],
+            ["[CONTROL] clean runtime event"],
+        )
+
+    def test_runtime_stream_aliases_internal_tags_to_public_runtime_tags(self):
+        s = RoomLogStore()
+        self.assertTrue(s.append("study", "[ENERGY_RUNTIME] room=study watts=821.8"))
+        self.assertTrue(s.append("study", "[OCCUPANCY] recovery_triggered"))
+        self.assertTrue(s.append("study", "[DELAY_ON] wait"))
+
+        self.assertEqual(
+            [x["message"] for x in s.get_logs("study", 10)],
+            [
+                "[POWER] room=study watts=821.8",
+                "[ZONE] recovery_triggered",
+                "[CONTROL] wait",
+            ],
+        )
 
     def test_room_logs_are_strictly_room_scoped(self):
         s = RoomLogStore()

@@ -62,6 +62,47 @@ class TestConfigLoad(unittest.TestCase):
             self.assertGreaterEqual(len(merged["rooms"]), 1)
             self.assertEqual(merged["rooms"][0]["id"], "abc123def456")
 
+    def test_load_config_logs_energy_summary_only_when_changed(self):
+        import backend.config_manager as cm
+
+        initial = {
+            "rooms": [
+                {
+                    "id": "roomlog12345",
+                    "name": "Study",
+                    "climate_entity": "climate.study",
+                    "settings": {"large_nested_blob": {"not": "for logs"}},
+                }
+            ]
+        }
+
+        with tempfile.TemporaryDirectory() as td:
+            primary = os.path.join(td, "hawaai_config.json")
+            with open(primary, "w", encoding="utf-8") as f:
+                json.dump(initial, f)
+
+            cm._last_known_good_config = None
+            cm._last_logged_config_load_sig = None
+            with (
+                mock.patch.object(cm, "CONFIG_PATH", primary),
+                mock.patch.object(cm.logger, "info") as info,
+            ):
+                cm.load_config()
+                cm.load_config()
+
+            loaded_calls = [
+                call for call in info.call_args_list
+                if call.args and call.args[0] == "[ENERGY_CONFIG] loaded %s"
+            ]
+
+        cm._last_logged_config_load_sig = None
+
+        self.assertEqual(len(loaded_calls), 1)
+        rendered = str(loaded_calls[0].args[1])
+        self.assertIn("'rooms': 1", rendered)
+        self.assertNotIn("climate.study", rendered)
+        self.assertNotIn("large_nested_blob", rendered)
+
     def test_room_energy_config_persists_through_update_reload_and_merge(self):
         import backend.config_manager as cm
         import backend.main as main

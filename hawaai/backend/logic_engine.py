@@ -169,7 +169,7 @@ def _log_energy_runtime_diagnostic(
     log_with_room(
         "info",
         room_id,
-        "[ENERGY_RUNTIME] room=%s mode=%s power_entity=%s kwh_entity=%s device_lookup_skipped=%s",
+        "[POWER] room=%s mode=%s power_entity=%s kwh_entity=%s device_lookup_skipped=%s",
         room_id,
         mode,
         power_entity or "none",
@@ -181,12 +181,12 @@ def _log_energy_runtime_diagnostic(
         return
 
     if power_status == "missing":
-        log_with_room("info", room_id, "[ENERGY_RUNTIME] room=%s entity_missing kind=power", room_id)
+        log_with_room("info", room_id, "[POWER] room=%s entity_missing kind=power", room_id)
     elif power_status != "ok":
         log_with_room(
             "warning",
             room_id,
-            "[ENERGY_RUNTIME] room=%s invalid_power_state entity=%s state=%r reason=%s confidence=%s",
+            "[POWER] room=%s invalid_power_state entity=%s state=%r reason=%s confidence=%s",
             room_id,
             power_entity,
             raw_power_state,
@@ -208,14 +208,14 @@ def _log_energy_runtime_diagnostic(
         log_with_room(
             "info",
             room_id,
-            "[ENERGY_RUNTIME] room=%s entity_missing kind=kwh optional=true",
+            "[POWER] room=%s entity_missing kind=kwh optional=true",
             room_id,
         )
     elif kwh_status != "ok":
         log_with_room(
             "warning",
             room_id,
-            "[ENERGY_RUNTIME] room=%s invalid_kwh_state entity=%s state=%r",
+            "[POWER] room=%s invalid_kwh_state entity=%s state=%r",
             room_id,
             kwh_entity,
             raw_kwh_state,
@@ -1692,9 +1692,19 @@ def _fp2_zone_apply_on_gate(
     required = bool(cfg.get("zone_required_for_on", False))
     if not required or not zone_e:
         return action, source, False
-    if not (st.ac_is_on or st.physical_ac_on):
+
+    already_running_or_starting = bool(
+        st.ac_is_on
+        or st.physical_ac_on
+        or st.effective_ac_on
+        or st.ac_state in ("on", "pending_on")
+        or st.pending_action == "on"
+        or st.pending_on_ir_sent
+    )
+    if already_running_or_starting:
         st.zone_allow_count += 1
         return action, source, False
+
     if not st.zone_sensor_usable:
         st.zone_allow_count += 1
         return action, source, False
