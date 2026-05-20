@@ -387,6 +387,7 @@ async def get_config():
 @app.post("/api/config")
 async def save_config(data: Dict[str, Any] = Body(...)):
     """Frontend POSTs full config on Save. Persists to /data/hawaai_config.json."""
+    previous_cfg = config_manager.load_config()
     # Don't overwrite secrets with masked placeholder
     for secret_key in ("weather_api_key", "ai_api_key"):
         if data.get(secret_key) == "***" or data.get(secret_key) == "":
@@ -395,6 +396,22 @@ async def save_config(data: Dict[str, Any] = Body(...)):
     ok = config_manager.save_config(data)
     if ok:
         logger.info("[HawaAI] Config updated: %s", list(data.keys()))
+        if "manual_override" in data and data.get("manual_override") is False:
+            new_cfg = config_manager.load_config()
+            for room in room_registry.list_room_dicts(new_cfg):
+                rid = str(room.get("id") or "").strip()
+                if not rid:
+                    continue
+                old_room = room_registry.get_room(previous_cfg, rid) or room
+                old_eff = room_registry.merge_room_config(previous_cfg, old_room)
+                new_eff = room_registry.merge_room_config(new_cfg, room)
+                if bool(old_eff.get("manual_override", False)) and not bool(
+                    new_eff.get("manual_override", False)
+                ):
+                    await logic_engine.clear_manual_override_and_resume(
+                        rid,
+                        reason="manual_override_cleared",
+                    )
         return {"success": True, "message": "Settings saved — logic engine will use new values on next tick."}
     return {"success": False, "message": "Failed to save config"}, 500
 
@@ -1189,6 +1206,8 @@ async def api_update_room(room_id: str, body: Dict[str, Any] = Body(...)):
     if idx is None:
         raise HTTPException(status_code=404, detail="room not found")
     r = rooms[idx]
+    old_effective = room_registry.merge_room_config(base, r)
+    old_manual_override = bool(old_effective.get("manual_override", False))
     if "name" in body and body["name"] is not None:
         r["name"] = str(body["name"]).strip() or r.get("name", "Room")
     if "climate_entity" in body and body["climate_entity"] is not None:
@@ -1246,7 +1265,17 @@ async def api_update_room(room_id: str, body: Dict[str, Any] = Body(...)):
     if not config_manager.save_config({"rooms": rooms}):
         raise HTTPException(status_code=500, detail="failed to save rooms")
     logger.info("[ENERGY_CONFIG] persisted=%s", _energy_config_snapshot(r))
-    logic_engine.trigger_tick(rid, reason="config_updated", skip_debounce=True)
+    new_base = dict(base)
+    new_base["rooms"] = rooms
+    new_effective = room_registry.merge_room_config(new_base, r)
+    new_manual_override = bool(new_effective.get("manual_override", False))
+    if old_manual_override and not new_manual_override:
+        await logic_engine.clear_manual_override_and_resume(
+            rid,
+            reason="manual_override_cleared",
+        )
+    else:
+        logic_engine.trigger_tick(rid, reason="config_updated", skip_debounce=True)
     out = room_registry.public_room_view(r)
     if warnings:
         out["config_warnings"] = warnings

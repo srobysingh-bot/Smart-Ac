@@ -337,6 +337,7 @@ class RoomRuntime:
     # ── Command authority lock ──
     last_user_command_time: Optional[datetime] = None
     last_command_source: str = "system"                  # "user" | "system"
+    manual_override_config_active: bool = False
 
     # Last trusted occupancy reading when presence sensor is flaky (None/unavailable).
     last_known_presence: Optional[bool] = None
@@ -870,6 +871,60 @@ def _is_user_authority_active(st: RoomRuntime, cfg: dict, now: datetime) -> bool
     lock_secs = _cfg_int(cfg, "user_authority_lock_secs", 120, lo=0)
     elapsed = (now - st.last_user_command_time).total_seconds()
     return elapsed < lock_secs
+
+
+def clear_manual_override(
+    room_id: str,
+    *,
+    reason: str = "manual_override_cleared",
+) -> bool:
+    """
+    Clear runtime-only manual override/user-authority latches immediately.
+
+    This does not send IR or alter thermostat math; it only releases state that
+    can keep automation paused after the persisted manual_override flag is false.
+    """
+    canon = normalize_room_id(room_id)
+    st = _rt(canon)
+    had_override_state = bool(
+        st.manual_override_config_active
+        or st.manual_override_until is not None
+        or st.manual_override_temp is not None
+        or st.prev_ha_setpoint_seen is not None
+        or st.last_user_command_time is not None
+        or st.last_command_source == "user"
+        or st.effective_control_source == "manual"
+    )
+
+    st.manual_override_config_active = False
+    st.manual_override_until = None
+    st.manual_override_temp = None
+    st.prev_ha_setpoint_seen = None
+    st.last_user_command_time = None
+    st.last_command_source = "system"
+    if st.effective_control_source == "manual":
+        st.effective_control_source = "none"
+
+    if had_override_state:
+        log_with_room("info", canon, "[OVERRIDE] cleared reason=%s", reason)
+        log_with_room("info", canon, "[OVERRIDE] runtime_resumed")
+    return had_override_state
+
+
+async def clear_manual_override_and_resume(
+    room_id: str,
+    *,
+    reason: str = "manual_override_cleared",
+) -> bool:
+    """Clear override latches, publish runtime, and request an immediate tick."""
+    canon = normalize_room_id(room_id)
+    cleared = clear_manual_override(canon, reason=reason)
+    try:
+        await live_broadcast.broadcast_room_update(canon)
+    except Exception:
+        logger.debug("[OVERRIDE][%s] runtime broadcast failed", canon, exc_info=True)
+    trigger_tick(canon, reason=reason, skip_debounce=True)
+    return cleared
 
 
 def _has_vacancy_runtime_state(st: RoomRuntime) -> bool:
@@ -2641,8 +2696,7 @@ def _manual_override_resolve(
                 room_id,
                 temperature_mode,
             )
-        st.manual_override_until = None
-        st.manual_override_temp = None
+        clear_manual_override(room_id, reason="temperature_mode_changed")
         if ct is not None:
             st.prev_ha_setpoint_seen = ct
         return False, engine_planned_target
@@ -2652,8 +2706,7 @@ def _manual_override_resolve(
             "[HawaAI][%s] Timed manual override expired",
             room_id,
         )
-        st.manual_override_until = None
-        st.manual_override_temp = None
+        clear_manual_override(room_id, reason="manual_override_expired")
 
     if (
         st.manual_override_until is not None
@@ -2666,8 +2719,7 @@ def _manual_override_resolve(
                 "[HawaAI][%s] Skip: manual override active — exited (near target)",
                 room_id,
             )
-            st.manual_override_until = None
-            st.manual_override_temp = None
+            clear_manual_override(room_id, reason="manual_override_target_reached")
 
     if (
         st.manual_override_until is not None
@@ -2699,6 +2751,7 @@ def _manual_override_resolve(
             engine_planned_target,
             int(dur_min),
         )
+        log_with_room("info", room_id, "[OVERRIDE] enabled")
         return True, float(ct)
 
     return False, engine_planned_target
@@ -3740,8 +3793,14 @@ async def _tick_impl(rid_raw: str, room_id: str) -> None:
     )
 
     if cfg.get("manual_override", False):
+        if not st.manual_override_config_active:
+            log_with_room("info", room_id, "[OVERRIDE] enabled")
+        st.manual_override_config_active = True
+        st.effective_control_source = "manual"
         logger.info("[HawaAI] Manual override active — skipping logic")
         return
+    if st.manual_override_config_active:
+        clear_manual_override(room_id, reason="manual_override_config_false")
 
     if presence_only:
         await _tick_presence_only_mode(

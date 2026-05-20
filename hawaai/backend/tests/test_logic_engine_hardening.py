@@ -446,6 +446,70 @@ class TestLogicEngineHardening(unittest.TestCase):
         self.assertIsNone(st.pending_since)
         self.assertEqual(st.last_effective_mode, "manual")
 
+    def test_clear_manual_override_releases_all_runtime_latches(self):
+        logic_engine._runtime_by_room.clear()
+        rid = "override-clear"
+        st = logic_engine._rt(rid)
+        now = datetime.now(timezone.utc)
+        st.manual_override_config_active = True
+        st.manual_override_until = now + timedelta(minutes=5)
+        st.manual_override_temp = 26.0
+        st.prev_ha_setpoint_seen = 26.0
+        st.last_user_command_time = now
+        st.last_command_source = "user"
+        st.effective_control_source = "manual"
+
+        with mock.patch.object(logic_engine, "log_with_room") as log_with_room:
+            cleared = logic_engine.clear_manual_override(rid, reason="manual_override_cleared")
+
+        self.assertTrue(cleared)
+        self.assertFalse(st.manual_override_config_active)
+        self.assertIsNone(st.manual_override_until)
+        self.assertIsNone(st.manual_override_temp)
+        self.assertIsNone(st.prev_ha_setpoint_seen)
+        self.assertIsNone(st.last_user_command_time)
+        self.assertEqual(st.last_command_source, "system")
+        self.assertEqual(st.effective_control_source, "none")
+        self.assertTrue(
+            any("[OVERRIDE] cleared" in str(call.args) for call in log_with_room.call_args_list)
+        )
+        self.assertTrue(
+            any("[OVERRIDE] runtime_resumed" in str(call.args) for call in log_with_room.call_args_list)
+        )
+
+    def test_clear_manual_override_resume_broadcasts_and_triggers_tick(self):
+        logic_engine._runtime_by_room.clear()
+        rid = "override-resume"
+        st = logic_engine._rt(rid)
+        st.manual_override_config_active = True
+        st.manual_override_until = datetime.now(timezone.utc) + timedelta(minutes=5)
+        st.manual_override_temp = 25.0
+
+        async def run_case():
+            with (
+                mock.patch.object(
+                    logic_engine.live_broadcast,
+                    "broadcast_room_update",
+                    new=mock.AsyncMock(),
+                ) as broadcast,
+                mock.patch.object(logic_engine, "trigger_tick") as trigger_tick,
+            ):
+                cleared = await logic_engine.clear_manual_override_and_resume(
+                    rid,
+                    reason="manual_override_cleared",
+                )
+            return cleared, broadcast, trigger_tick
+
+        cleared, broadcast, trigger_tick = asyncio.run(run_case())
+
+        self.assertTrue(cleared)
+        broadcast.assert_awaited_once_with(rid)
+        trigger_tick.assert_called_once_with(
+            rid,
+            reason="manual_override_cleared",
+            skip_debounce=True,
+        )
+
     def test_schedule_target_sync_ignores_stale_manual_setpoint(self):
         logic_engine._runtime_by_room.clear()
         rid = "targetsync"
