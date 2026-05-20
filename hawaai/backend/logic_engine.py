@@ -393,7 +393,7 @@ class RoomRuntime:
     # Pending ON cleared early on soft power (below compressor threshold) — UI only, not sessions.
     soft_start_ui: bool = False
     on_failed_retry_used: bool = False
-    # FP2 zone (optional): dwell + confirmation for ON-only gating; never used for OFF.
+    # FP2 zone (optional): live occupancy reconciliation plus dwell/confirmation for ON gating.
     zone_present: bool = False
     zone_entered_at: Optional[datetime] = None
     zone_confirmed: bool = False
@@ -511,6 +511,14 @@ def _start_vacancy_cycle(
     reason: str,
     timeout_seconds: float,
 ) -> None:
+    if st.vacant_since is not None:
+        if not st.vacancy_reason:
+            st.vacancy_reason = reason
+        if st.pending_vacancy_deadline is None:
+            elapsed = max(0.0, (now - st.vacant_since).total_seconds())
+            remaining = max(0.0, float(timeout_seconds) - elapsed)
+            st.pending_vacancy_deadline = time.time() + remaining
+        return
     st.vacant_since = now
     st.vacancy_generation += 1
     st.vacancy_reason = reason
@@ -959,6 +967,66 @@ def _clear_vacancy_state(
     return False
 
 
+def _configured_zone_presence(cfg: dict, st: RoomRuntime) -> Optional[bool]:
+    zone_e = (str(cfg.get("zone_entity_id") or "")).strip()
+    if not st.zone_sensor_usable:
+        return None
+    if not zone_e:
+        return None
+    return bool(st.zone_present)
+
+
+def _mark_runtime_vacant(
+    room_id: str,
+    st: RoomRuntime,
+    now: datetime,
+    *,
+    reason: str,
+) -> None:
+    was_occupied = bool(st.occupied or st.stable_occupied or st.last_known_presence)
+    st.occupied = False
+    st.stable_occupied = False
+    st.last_known_presence = False
+    if (
+        st.presence_last_false_at is None
+        or (
+            st.presence_last_true_at is not None
+            and st.presence_last_false_at < st.presence_last_true_at
+        )
+    ):
+        st.presence_last_false_at = now
+    if reason == "zone_exit" and was_occupied:
+        log_with_room(
+            "info",
+            room_id,
+            "[OCCUPANCY] zone_present=%s runtime_occupied=False vacancy_pending=True",
+            st.zone_present,
+        )
+
+
+def _sync_runtime_occupancy(
+    room_id: str,
+    cfg: dict,
+    st: RoomRuntime,
+    is_occupied: bool,
+    now: datetime,
+) -> bool:
+    zone_presence = _configured_zone_presence(cfg, st)
+    if zone_presence is True:
+        _clear_vacancy_state(room_id, st, now, reason="zone_reentry")
+        return True
+    if zone_presence is False:
+        _mark_runtime_vacant(room_id, st, now, reason="zone_exit")
+        return False
+
+    if is_occupied:
+        _clear_vacancy_state(room_id, st, now, reason="presence_reentry")
+        return True
+
+    _mark_runtime_vacant(room_id, st, now, reason="presence_exit")
+    return False
+
+
 def _resolve_control_decision(
     room_id: str,
     cfg: dict,
@@ -990,17 +1058,19 @@ def _resolve_control_decision(
     )
     use_presence = cfg.get("use_presence", True)
 
-    if use_presence and st.zone_present and st.zone_confirmed and not is_occupied:
-        _clear_vacancy_state(room_id, st, now, reason="zone_reentry")
-        is_occupied = True
-    elif use_presence and is_occupied:
-        _clear_vacancy_state(room_id, st, now, reason="presence_reentry")
+    if use_presence:
+        is_occupied = _sync_runtime_occupancy(
+            room_id,
+            cfg,
+            st,
+            bool(is_occupied),
+            now,
+        )
     else:
-        st.occupied = bool(is_occupied)
+        st.occupied = True
 
     # ── PRIORITY 1: Safety — vacancy (may issue OFF even during global cooldown) ─
     if use_presence and not is_occupied:
-        st.occupied = False
         st.vacancy_active = True
         st.thermostat_blocked = True
         if st.vacant_since is None:
@@ -1203,7 +1273,8 @@ def _resolve_presence_only_decision(
     Presence-only control: occupancy drives ON/OFF; temperature and AI are ignored.
     Returns (action, source, occupied).
     """
-    if _presence_raw_invalid(presence_raw):
+    zone_presence = _configured_zone_presence(cfg, st)
+    if _presence_raw_invalid(presence_raw) and zone_presence is None:
         st.presence_only_present_since = None
         if (
             st.presence_only_last_invalid_log_at is None
@@ -1219,11 +1290,14 @@ def _resolve_presence_only_decision(
             st.presence_only_last_invalid_log_at = now
         return "hold", "presence_unavailable", False
 
-    occupied = (
-        bool(resolved_occupied)
-        if resolved_occupied is not None
-        else _stabilize_presence(st, presence_raw, now, room_id)
-    )
+    if zone_presence is not None:
+        occupied = _sync_runtime_occupancy(room_id, cfg, st, zone_presence, now)
+    else:
+        occupied = (
+            bool(resolved_occupied)
+            if resolved_occupied is not None
+            else _stabilize_presence(st, presence_raw, now, room_id)
+        )
     st.presence_only_last_invalid_log_at = None
     st.occupied = bool(occupied)
 
@@ -3653,6 +3727,16 @@ async def _tick_impl(rid_raw: str, room_id: str) -> None:
     else:
         is_occupied_bool = True
 
+    await _fp2_zone_sensor_tick(room_id, cfg, now)
+    if use_presence:
+        is_occupied_bool = _sync_runtime_occupancy(
+            room_id,
+            cfg,
+            st,
+            bool(is_occupied_bool),
+            now,
+        )
+
     logger.info(
         "[HawaAI] Presence: %r → occupied=%s",
         presence_raw, is_occupied_bool,
@@ -4087,15 +4171,8 @@ async def _tick_impl(rid_raw: str, room_id: str) -> None:
     if st.last_command_source == "user" and not _is_user_authority_active(st, cfg, now):
         st.last_command_source = "system"
 
-    await _fp2_zone_sensor_tick(room_id, cfg, now)
     occ_res = True if not use_presence else bool(is_occupied_bool)
-    if use_presence and st.zone_present and st.zone_confirmed:
-        recovered = _clear_vacancy_state(room_id, st, now, reason="zone_reentry")
-        if recovered or not occ_res:
-            is_occupied_bool = True
-            occ_res = True
-    else:
-        st.occupied = bool(occ_res)
+    st.occupied = bool(occ_res)
 
     action, source, tgt = _resolve_control_decision(
         room_id, cfg, indoor_temp, et_eff,

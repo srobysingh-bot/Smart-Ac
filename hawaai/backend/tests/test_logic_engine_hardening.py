@@ -1448,7 +1448,7 @@ class TestLogicEngineHardening(unittest.TestCase):
         with mock.patch.object(logic_engine, "log_with_room") as log_with_room:
             action, source, target = logic_engine._resolve_control_decision(
                 rid,
-                {"vacancy_timeout_minutes": 0},
+                {"zone_entity_id": "binary_sensor.zone", "vacancy_timeout_minutes": 0},
                 indoor_temp=24.0,
                 effective_target=24.0,
                 is_occupied=False,
@@ -1574,7 +1574,7 @@ class TestLogicEngineHardening(unittest.TestCase):
 
         action, source, target = logic_engine._resolve_control_decision(
             rid,
-            {"vacancy_timeout_minutes": 0},
+            {"zone_entity_id": "binary_sensor.zone", "vacancy_timeout_minutes": 0},
             indoor_temp=27.0,
             effective_target=24.0,
             is_occupied=False,
@@ -1586,6 +1586,109 @@ class TestLogicEngineHardening(unittest.TestCase):
         self.assertTrue(st.occupied)
         self.assertFalse(st.safety_vacant)
         self.assertFalse(st.thermostat_blocked)
+
+    def test_zone_absence_starts_vacancy_once_even_if_presence_reports_occupied(self):
+        logic_engine._runtime_by_room.clear()
+        now = datetime.now(timezone.utc)
+        rid = "zone-absence-timer"
+        st = logic_engine._rt(rid)
+        st.zone_sensor_usable = True
+        st.zone_present = False
+        st.occupied = True
+        st.stable_occupied = True
+        st.last_known_presence = True
+        st.ac_is_on = True
+
+        cfg = {"zone_entity_id": "binary_sensor.zone", "vacancy_timeout_minutes": 2}
+        action, source, target = logic_engine._resolve_control_decision(
+            rid,
+            cfg,
+            indoor_temp=26.0,
+            effective_target=24.0,
+            is_occupied=True,
+            ac_on=True,
+            now=now,
+        )
+        first_vacant_since = st.vacant_since
+
+        action2, source2, target2 = logic_engine._resolve_control_decision(
+            rid,
+            cfg,
+            indoor_temp=26.0,
+            effective_target=24.0,
+            is_occupied=True,
+            ac_on=True,
+            now=now + timedelta(seconds=30),
+        )
+
+        self.assertEqual((action, source, target), ("hold", "vacancy_debounce", 24.0))
+        self.assertEqual((action2, source2, target2), ("hold", "vacancy_debounce", 24.0))
+        self.assertIs(st.vacant_since, first_vacant_since)
+        self.assertEqual(st.vacant_since, now)
+        self.assertFalse(st.occupied)
+        self.assertFalse(st.stable_occupied)
+
+    def test_zone_reentry_cancels_vacancy_before_timeout(self):
+        logic_engine._runtime_by_room.clear()
+        now = datetime.now(timezone.utc)
+        rid = "zone-return-before-timeout"
+        st = logic_engine._rt(rid)
+        st.zone_sensor_usable = True
+        st.zone_present = True
+        st.zone_confirmed = False
+        st.occupied = False
+        st.stable_occupied = False
+        st.last_known_presence = False
+        st.vacant_since = now - timedelta(seconds=30)
+        st.vacancy_active = True
+        st.pending_vacancy = True
+
+        action, source, target = logic_engine._resolve_control_decision(
+            rid,
+            {"zone_entity_id": "binary_sensor.zone", "vacancy_timeout_minutes": 2},
+            indoor_temp=26.0,
+            effective_target=24.0,
+            is_occupied=False,
+            ac_on=True,
+            now=now,
+        )
+
+        self.assertEqual((action, source, target), ("hold", "thermostat", 24.0))
+        self.assertTrue(st.occupied)
+        self.assertTrue(st.stable_occupied)
+        self.assertIsNone(st.vacant_since)
+        self.assertFalse(st.pending_vacancy)
+
+    def test_zone_absence_allows_vacancy_off_after_timeout(self):
+        logic_engine._runtime_by_room.clear()
+        now = datetime.now(timezone.utc)
+        rid = "zone-absence-timeout"
+        st = logic_engine._rt(rid)
+        st.zone_sensor_usable = True
+        st.zone_present = False
+        st.occupied = True
+        st.stable_occupied = True
+        st.last_known_presence = True
+        st.ac_is_on = True
+        st.physical_ac_on = True
+        st.vacant_since = now - timedelta(seconds=logic_engine.VACANCY_CONFIRM_SECS + 5)
+        st.effective_on_since_ts = (
+            now - timedelta(seconds=logic_engine.RUNNING_OFF_BLOCK_SECS + 5)
+        ).timestamp()
+
+        action, source, target = logic_engine._resolve_control_decision(
+            rid,
+            {"zone_entity_id": "binary_sensor.zone", "vacancy_timeout_minutes": 0},
+            indoor_temp=26.0,
+            effective_target=24.0,
+            is_occupied=True,
+            ac_on=True,
+            now=now,
+        )
+
+        self.assertEqual((action, source, target), ("off", "safety_vacant", 24.0))
+        self.assertFalse(st.occupied)
+        self.assertFalse(st.stable_occupied)
 
     def test_recovery_does_not_clear_recent_decision_lock(self):
         logic_engine._runtime_by_room.clear()
