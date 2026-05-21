@@ -359,7 +359,7 @@ async def lifespan(app: FastAPI):
     logger.info("[HawaAI] Add-on stopped")
 
 
-app = FastAPI(title="HawaAI API", version="1.4.66", lifespan=lifespan)
+app = FastAPI(title="HawaAI API", version="1.4.73", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -654,6 +654,8 @@ async def _dashboard_status_payload(rid: str) -> Dict[str, Any]:
     runtime = logic_engine.get_runtime_state(rid)
     energy_watts = runtime.get("energy_watts")
     energy_kwh = runtime.get("energy_kwh_total")
+    telemetry_status = str(runtime.get("telemetry_status") or "unconfigured")
+    telemetry_gap = bool(runtime.get("telemetry_gap"))
     energy_power_raw = runtime.get("energy_power_raw_state")
     energy_kwh_raw = runtime.get("energy_kwh_raw_state")
     configured_energy = resolve_energy_config(cfg)
@@ -675,10 +677,10 @@ async def _dashboard_status_payload(rid: str) -> Dict[str, Any]:
     effective_kwh_entity = str(
         runtime.get("energy_kwh_entity") or configured_energy.kwh_entity or ""
     ).strip()
-    energy_live_available = energy_watts is not None
+    telemetry_live_available = bool(runtime.get("telemetry_power_live_valid"))
     energy_status = (
         "ok"
-        if energy_live_available
+        if telemetry_status == "healthy"
         else ("unconfigured" if not energy_configured else "unavailable")
     )
     _log_dashboard_energy_trace(
@@ -762,12 +764,12 @@ async def _dashboard_status_payload(rid: str) -> Dict[str, Any]:
             "energy_power": (
                 None
                 if not energy_configured
-                else energy_watts is not None
+                else telemetry_status in ("healthy", "recovering")
             ),
             "energy_kwh": (
                 None
                 if not effective_kwh_entity
-                else energy_kwh is not None
+                else bool(runtime.get("telemetry_kwh_live_valid")) or telemetry_status in ("recovering", "stale")
             ),
             "humidity": (
                 None if not humidity_entity else runtime.get("humidity_percent") is not None
@@ -791,8 +793,8 @@ async def _dashboard_status_payload(rid: str) -> Dict[str, Any]:
         "ac_state":          ac_state,
         "effective_ac_on":   effective_ac_on,
         "ac_state_source":  runtime.get("ac_state_source", "system"),
-        "ac_idle":          ac_idle,       # fan running, compressor off (50–500 W)
-        "power_source":     power_source,  # "watts" | "watts_idle" | "cooldown" | "internal"
+        "ac_idle":          ac_idle,
+        "power_source":     power_source,  # "cooldown" | "internal"
         "indoor_temp":      indoor_temp,
         "outdoor_temp":     outdoor_temp_val,
         "outdoor_humidity": weather.get("humidity") if weather else None,
@@ -801,8 +803,18 @@ async def _dashboard_status_payload(rid: str) -> Dict[str, Any]:
         "watt_draw":        energy_watts or 0.0,
         "energy_watts":     energy_watts,
         "energy_kwh_total": energy_kwh,
-        "energy_live_available": energy_live_available,
+        "energy_live_available": telemetry_live_available,
         "energy_status": energy_status,
+        "telemetry_status": telemetry_status,
+        "telemetry_confidence": runtime.get("telemetry_confidence"),
+        "telemetry_gap": telemetry_gap,
+        "telemetry_invalid_since": runtime.get("telemetry_invalid_since"),
+        "telemetry_stale_after_seconds": runtime.get("telemetry_stale_after_seconds"),
+        "telemetry_offline_after_seconds": runtime.get("telemetry_offline_after_seconds"),
+        "last_valid_power_watts": runtime.get("last_valid_power_watts"),
+        "last_valid_energy_kwh": runtime.get("last_valid_energy_kwh"),
+        "last_valid_timestamp": runtime.get("last_valid_timestamp"),
+        "hvac_control_confidence": runtime.get("hvac_control_confidence"),
         "energy_config_mode": energy_mode,
         "energy_configured": energy_configured,
         "energy_device_id": runtime.get("energy_device_id") or configured_energy.device_id,
@@ -831,8 +843,6 @@ async def _dashboard_status_payload(rid: str) -> Dict[str, Any]:
         "secs_since_cmd":   runtime.get("secs_since_cmd"),
         "last_ac_on_at":    runtime.get("last_ac_on_at"),
         "last_ac_off_at":   runtime.get("last_ac_off_at"),
-        "last_power_confirmed_on":  runtime.get("last_power_confirmed_on"),
-        "last_power_confirmed_off": runtime.get("last_power_confirmed_off"),
         "control_source":           runtime.get("control_source", "none"),
         "last_command_source":      runtime.get("last_command_source", "system"),
         "on_delay_seconds":         runtime.get("on_delay_seconds", 0),

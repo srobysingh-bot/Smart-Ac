@@ -324,6 +324,25 @@ function ConfigWarning({ roomId }) {
 }
 
 // ── Live status bar ───────────────────────────────────────────────────────────
+const TELEMETRY_STYLE = {
+  healthy: 'text-emerald-300 bg-emerald-950/35 border-emerald-800/55',
+  recovering: 'text-sky-200 bg-sky-950/35 border-sky-800/55',
+  stale: 'text-amber-200 bg-amber-950/35 border-amber-800/55',
+  offline: 'text-red-200 bg-red-950/35 border-red-800/55',
+  unconfigured: 'text-gray-400 bg-gray-900/55 border-gray-800',
+}
+
+function telemetryLabel(status) {
+  const key = String(status || 'unconfigured').toLowerCase()
+  return {
+    healthy: 'Healthy',
+    recovering: 'Recovering',
+    stale: 'Stale',
+    offline: 'Offline',
+    unconfigured: 'Unconfigured',
+  }[key] || 'Unknown'
+}
+
 function LiveStatusBar({ status }) {
   const {
     indoor_temp, outdoor_temp, presence, ac_on, ac_idle, watt_draw,
@@ -390,23 +409,18 @@ function LiveStatusBar({ status }) {
       <span className="hidden sm:inline text-gray-700" aria-hidden>|</span>
       <PresenceBadge present={presence} />
       <span className="hidden sm:inline text-gray-700" aria-hidden>|</span>
-      {/* AC state — from power sensor (watts) or internal flag */}
+      {/* AC state comes from HVAC runtime; telemetry health is shown separately. */}
       <span className="flex items-center gap-1.5">
         <Zap size={15} className={acColor} />
         AC:{' '}
         <strong className={acColor}>{acLabel}</strong>
-        {ac_state_source === 'power' && physicalCore && (
-          <span className="text-xs text-yellow-400/90 ml-1" title="Watts crossed compressor threshold">
-            ⚡ confirmed
-          </span>
-        )}
         {ac_state_source === 'inferred' && physicalCore && (
-          <span className="text-xs text-purple-400/90 ml-1" title="Room hotter than target with no watt spike yet">
+          <span className="text-xs text-purple-400/90 ml-1" title="Room hotter than target while runtime settles">
             🧠 est.
           </span>
         )}
         {ac_state_source === 'system' && physicalCore && (
-          <span className="text-xs text-gray-500 ml-1" title="Cooldown or no power meter — trusting command state">
+          <span className="text-xs text-gray-500 ml-1" title="Runtime state from IR/control path">
             🎛 system
           </span>
         )}
@@ -414,7 +428,7 @@ function LiveStatusBar({ status }) {
           <span className="text-gray-400">· {Number(watt_draw).toFixed(0)} W</span>
         )}
         {power_source === 'internal' && !physicalCore && phase !== 'pending_on' && phase !== 'on_failed' && (
-          <span className="text-xs text-gray-600 ml-1" title="No power sensor — state from IR command flag">
+          <span className="text-xs text-gray-600 ml-1" title="Runtime state from IR/control path">
             (flag)
           </span>
         )}
@@ -1018,13 +1032,29 @@ export default function Dashboard() {
           />
           <div className="card flex flex-col gap-3">
             <p className="text-xs text-gray-500 uppercase tracking-wide">Energy Now</p>
+            {displayStatus && (
+              <div className="flex items-center justify-between gap-2">
+                <span className="text-xs text-gray-500">Telemetry</span>
+                <span
+                  className={`inline-flex items-center gap-1 rounded border px-2 py-0.5 text-[11px] ${
+                    TELEMETRY_STYLE[String(displayStatus.telemetry_status || 'unconfigured').toLowerCase()]
+                    || TELEMETRY_STYLE.unconfigured
+                  }`}
+                >
+                  <Zap size={11} aria-hidden />
+                  {telemetryLabel(displayStatus.telemetry_status)}
+                </span>
+              </div>
+            )}
             <div className="flex-1 flex flex-col justify-center items-center gap-1">
               {displayStatus?.energy_watts != null ? (
                 <>
                   <span className="text-4xl font-bold text-yellow-400">
                     {displayStatus.energy_watts.toFixed(0)} W
                   </span>
-                  <span className="text-xs text-gray-500">Room total consumption</span>
+                  <span className="text-xs text-gray-500">
+                    {displayStatus.telemetry_gap ? 'Last valid power reading' : 'Room total consumption'}
+                  </span>
                   {displayStatus.energy_kwh_total != null && (
                     <span className="text-xs text-gray-400 mt-1">
                       Meter: {displayStatus.energy_kwh_total.toFixed(2)} kWh

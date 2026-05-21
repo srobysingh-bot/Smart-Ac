@@ -1,5 +1,12 @@
 # HawaAI add-on — release notes
 
+## 1.4.73
+
+- **Telemetry isolation:** Finalized breaker telemetry as an observational-only layer with independent telemetry confidence, cache, stale/offline status, and debounced invalid-state logging.
+- **Runtime authority:** Preserved IR/runtime state as the AC ON/OFF authority; breaker watts no longer affect occupancy, vacancy, thermostat decisions, pending actions, or runtime state.
+- **UI/API:** Added telemetry health fields and dashboard status while keeping HVAC runtime state separate from telemetry health.
+- **Cleanup:** Removed legacy watt-authority remnants, duplicate runtime fields, and mixed telemetry naming.
+
 ## 1.4.61
 
 - **Energy runtime:** Removed the remaining duplicate dashboard/status energy read path so runtime energy has one canonical source: `_read_runtime_energy()`.

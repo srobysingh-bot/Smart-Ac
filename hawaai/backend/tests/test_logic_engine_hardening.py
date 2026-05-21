@@ -193,12 +193,17 @@ class TestLogicEngineHardening(unittest.TestCase):
                     },
                     st,
                 )
-            self.assertIsNone(watts2)
-            self.assertIsNone(kwh2)
-            self.assertIsNone(st.energy_watts)
-            self.assertIsNone(st.energy_kwh)
+            self.assertEqual(watts2, 611.5)
+            self.assertEqual(kwh2, 42.25)
+            self.assertEqual(st.energy_watts, 611.5)
+            self.assertEqual(st.energy_kwh, 42.25)
+            self.assertFalse(st.telemetry_power_live_valid)
+            self.assertFalse(st.telemetry_kwh_live_valid)
+            self.assertTrue(st.telemetry_gap)
+            self.assertEqual(st.telemetry_status, "recovering")
             self.assertEqual(st.last_valid_power_watts, 611.5)
             self.assertEqual(st.last_valid_energy_kwh, 42.25)
+            self.assertIsNotNone(st.last_valid_timestamp)
 
         asyncio.run(run_case())
 
@@ -246,6 +251,84 @@ class TestLogicEngineHardening(unittest.TestCase):
         self.assertEqual(st.energy_watts, 821.8)
         self.assertEqual(st.energy_power_confidence, "metadata")
         self.assertEqual(st.energy_power_validation_reason, "ok")
+
+    def test_telemetry_cache_stales_offline_without_hvac_state_changes(self):
+        st = logic_engine.RoomRuntime()
+        st.ac_is_on = True
+        st.physical_ac_on = True
+        st.effective_ac_on = True
+        st.ac_state = "on"
+        now = datetime(2026, 5, 21, 12, 0, tzinfo=timezone.utc)
+
+        watts, kwh = logic_engine._apply_telemetry_cache(
+            st,
+            now=now,
+            configured=True,
+            power_entity="sensor.room_power",
+            kwh_entity="sensor.room_kwh",
+            parsed_power=700.0,
+            parsed_kwh=10.0,
+        )
+        self.assertEqual((watts, kwh), (700.0, 10.0))
+        self.assertEqual(st.telemetry_status, "healthy")
+        self.assertFalse(st.telemetry_gap)
+
+        recovering_watts, recovering_kwh = logic_engine._apply_telemetry_cache(
+            st,
+            now=now + timedelta(seconds=1),
+            configured=True,
+            power_entity="sensor.room_power",
+            kwh_entity="sensor.room_kwh",
+            parsed_power=None,
+            parsed_kwh=None,
+        )
+        self.assertEqual((recovering_watts, recovering_kwh), (700.0, 10.0))
+        self.assertEqual(st.telemetry_status, "recovering")
+
+        stale_watts, stale_kwh = logic_engine._apply_telemetry_cache(
+            st,
+            now=now + timedelta(seconds=62),
+            configured=True,
+            power_entity="sensor.room_power",
+            kwh_entity="sensor.room_kwh",
+            parsed_power=None,
+            parsed_kwh=None,
+        )
+        self.assertEqual((stale_watts, stale_kwh), (700.0, 10.0))
+        self.assertEqual(st.telemetry_status, "stale")
+        self.assertTrue(st.telemetry_gap)
+        self.assertTrue(st.ac_is_on)
+        self.assertTrue(st.physical_ac_on)
+        self.assertEqual(st.ac_state, "on")
+
+        offline_watts, offline_kwh = logic_engine._apply_telemetry_cache(
+            st,
+            now=now + timedelta(seconds=181),
+            configured=True,
+            power_entity="sensor.room_power",
+            kwh_entity="sensor.room_kwh",
+            parsed_power=None,
+            parsed_kwh=None,
+        )
+        self.assertEqual((offline_watts, offline_kwh), (None, None))
+        self.assertEqual(st.telemetry_status, "offline")
+        self.assertTrue(st.ac_is_on)
+        self.assertTrue(st.physical_ac_on)
+
+        recovered_watts, recovered_kwh = logic_engine._apply_telemetry_cache(
+            st,
+            now=now + timedelta(seconds=182),
+            configured=True,
+            power_entity="sensor.room_power",
+            kwh_entity="sensor.room_kwh",
+            parsed_power=710.0,
+            parsed_kwh=10.2,
+        )
+        self.assertEqual((recovered_watts, recovered_kwh), (710.0, 10.2))
+        self.assertEqual(st.telemetry_status, "healthy")
+        self.assertFalse(st.telemetry_gap)
+        self.assertEqual(st.last_valid_power_watts, 710.0)
+        self.assertEqual(st.last_valid_energy_kwh, 10.2)
 
     def test_sync_pending_clears_when_decision_not_on_off(self):
         st = logic_engine.RoomRuntime()
@@ -369,29 +452,6 @@ class TestLogicEngineHardening(unittest.TestCase):
             physical_ac_on=False,
         )
         self.assertIsNone(st.pending_action)
-
-    def test_power_band_treats_fan_only_as_on(self):
-        self.assertTrue(
-            logic_engine._power_band_indicates_on(
-                True,
-                False,
-                logic_engine._WATTS_FAN_ONLY + 109,
-            )
-        )
-        self.assertFalse(
-            logic_engine._power_band_indicates_on(
-                True,
-                False,
-                logic_engine._WATTS_FAN_ONLY - 1,
-            )
-        )
-        self.assertFalse(
-            logic_engine._power_band_indicates_on(
-                True,
-                True,
-                logic_engine._WATTS_FAN_ONLY + 109,
-            )
-        )
 
     def test_sync_ac_display_pending_on_masks_effective(self):
         st = logic_engine.RoomRuntime()
@@ -1315,6 +1375,7 @@ class TestLogicEngineHardening(unittest.TestCase):
         st.last_confirmed_on_at = base - timedelta(minutes=10)
         st.session_start_time = base - timedelta(minutes=10)
         st.session_state = "confirmed"
+        st.startup_state_loaded = True
         cfg = {
             "control_mode": "presence_only",
             "climate_entity": "climate.test",
@@ -1405,9 +1466,9 @@ class TestLogicEngineHardening(unittest.TestCase):
         )
         turn_off.assert_not_awaited()
         close_session_mock.assert_not_called()
-        self.assertEqual(st.pending_action, "off")
-        self.assertFalse(st.presence_only_idle)
-        self.assertFalse(
+        self.assertIsNone(st.pending_action)
+        self.assertTrue(st.presence_only_idle)
+        self.assertTrue(
             any("[PRESENCE_ONLY] off_finalize" in str(call.args) for call in second_logs.call_args_list)
         )
 
@@ -1416,18 +1477,18 @@ class TestLogicEngineHardening(unittest.TestCase):
             run_once(0, datetime.now(timezone.utc) + timedelta(seconds=2), third_logs)
         )
         turn_off.assert_not_awaited()
-        close_session_mock.assert_awaited_once()
+        close_session_mock.assert_not_called()
         self.assertTrue(st.presence_only_idle)
         self.assertFalse(st.physical_ac_on)
         self.assertIsNone(st.pending_action)
         self.assertEqual(st.ac_state, "off")
-        self.assertTrue(
+        self.assertFalse(
             any("[PRESENCE_ONLY] off_finalize" in str(call.args) for call in third_logs.call_args_list)
         )
-        self.assertTrue(
+        self.assertFalse(
             any("[PRESENCE_ONLY] runtime_reset" in str(call.args) for call in third_logs.call_args_list)
         )
-        self.assertTrue(
+        self.assertFalse(
             any("[PRESENCE_ONLY] idle_entered" in str(call.args) for call in third_logs.call_args_list)
         )
 
@@ -2473,8 +2534,6 @@ class TestLogicEngineHardening(unittest.TestCase):
                 st,
                 now,
                 climate_data={"mode": "off"},
-                energy_watts_valid=True,
-                energy_watts=120.0,
                 in_cooldown=False,
             )
 
@@ -2505,15 +2564,13 @@ class TestLogicEngineHardening(unittest.TestCase):
                 st,
                 now,
                 climate_data={"state": "off"},
-                energy_watts_valid=True,
-                energy_watts=75.0,
                 in_cooldown=False,
             )
 
         self.assertEqual(st.ac_state, "off")
         self.assertFalse(st.physical_ac_on)
         self.assertFalse(st.effective_ac_idle)
-        self.assertEqual(st.effective_power_source, "watts")
+        self.assertEqual(st.effective_power_source, "internal")
 
     def test_tuya_delayed_power_drop_keeps_idle_until_reconciled(self):
         logic_engine._runtime_by_room.clear()
@@ -2532,8 +2589,6 @@ class TestLogicEngineHardening(unittest.TestCase):
                 st,
                 now,
                 climate_data={"mode": "off"},
-                energy_watts_valid=True,
-                energy_watts=130.0,
                 in_cooldown=True,
             )
             late = logic_engine._maybe_finalize_terminal_off(
@@ -2541,8 +2596,6 @@ class TestLogicEngineHardening(unittest.TestCase):
                 st,
                 now + timedelta(seconds=90),
                 climate_data={"mode": "off"},
-                energy_watts_valid=True,
-                energy_watts=80.0,
                 in_cooldown=False,
             )
 
@@ -2569,8 +2622,6 @@ class TestLogicEngineHardening(unittest.TestCase):
                     st,
                     now + timedelta(seconds=20),
                     climate_data={"mode": "off"},
-                    energy_watts_valid=True,
-                    energy_watts=100.0,
                     in_cooldown=True,
                 )
             )
@@ -2580,8 +2631,6 @@ class TestLogicEngineHardening(unittest.TestCase):
                     st,
                     now + timedelta(seconds=70),
                     climate_data={"mode": "off"},
-                    energy_watts_valid=True,
-                    energy_watts=100.0,
                     in_cooldown=False,
                 )
             )
@@ -2601,7 +2650,6 @@ class TestLogicEngineHardening(unittest.TestCase):
         st.effective_ac_idle = True
         st.session_state = "idle"
         st.session_runtime_confirmed = True
-        st.session_power_confirmed = True
         st.last_confirmed_on_at = now - timedelta(minutes=15)
         st.last_command = "off"
         st.last_command_time = now - timedelta(seconds=90)
@@ -2612,13 +2660,10 @@ class TestLogicEngineHardening(unittest.TestCase):
                 st,
                 now,
                 climate_data={"mode": "off"},
-                energy_watts_valid=True,
-                energy_watts=90.0,
                 in_cooldown=False,
             )
 
         self.assertFalse(st.session_runtime_confirmed)
-        self.assertFalse(st.session_power_confirmed)
         self.assertIsNone(st.last_confirmed_on_at)
         self.assertFalse(st.physical_ac_on)
 
@@ -2640,8 +2685,6 @@ class TestLogicEngineHardening(unittest.TestCase):
                 st,
                 now,
                 climate_data={"mode": "off"},
-                energy_watts_valid=False,
-                energy_watts=0.0,
                 in_cooldown=False,
             )
 
@@ -2664,7 +2707,6 @@ class TestLogicEngineHardening(unittest.TestCase):
         st.possible_on_since = (now - timedelta(minutes=10)).timestamp()
         st.soft_start_ui = True
         st.compressor_on_since = now - timedelta(minutes=20)
-        st.compressor_watts_high_since = now - timedelta(minutes=20)
         st.last_confirmed_on_at = now - timedelta(minutes=20)
         st.last_command = "off"
         st.last_command_time = now - timedelta(seconds=100)
@@ -2675,8 +2717,6 @@ class TestLogicEngineHardening(unittest.TestCase):
                 st,
                 now,
                 climate_data={"mode": "off"},
-                energy_watts_valid=True,
-                energy_watts=30.0,
                 in_cooldown=False,
             )
 
@@ -2689,7 +2729,6 @@ class TestLogicEngineHardening(unittest.TestCase):
         self.assertIsNone(st.possible_on_since)
         self.assertFalse(st.soft_start_ui)
         self.assertIsNone(st.compressor_on_since)
-        self.assertIsNone(st.compressor_watts_high_since)
 
     def test_vacancy_off_sends_off_only_once_during_reconciliation(self):
         logic_engine._runtime_by_room.clear()
@@ -2702,6 +2741,7 @@ class TestLogicEngineHardening(unittest.TestCase):
         st.vacant_since = base - timedelta(minutes=6)
         st.effective_on_since_ts = (base - timedelta(minutes=10)).timestamp()
         st.last_ac_on_at = st.effective_on_since_ts
+        st.startup_state_loaded = True
         cfg = {
             "control_mode": "presence_only",
             "climate_entity": "climate.test",
@@ -2749,8 +2789,9 @@ class TestLogicEngineHardening(unittest.TestCase):
 
         first.assert_awaited_once()
         second.assert_not_awaited()
-        self.assertTrue(st.off_dispatch_pending)
-        self.assertEqual(st.last_command, "off")
+        self.assertFalse(st.off_dispatch_pending)
+        self.assertEqual(st.last_command, "")
+        self.assertTrue(st.presence_only_idle)
 
     def test_aerostate_duplicate_off_does_not_repeat(self):
         logic_engine._runtime_by_room.clear()
@@ -2844,12 +2885,10 @@ class TestLogicEngineHardening(unittest.TestCase):
         ):
             suppressed = logic_engine._should_suppress_duplicate_off(
                 rid,
-                st,
-                now,
-                climate_data={"mode": "off"},
-                energy_watts_valid=True,
-                energy_watts=101.0,
-            )
+            st,
+            now,
+            climate_data={"mode": "off"},
+        )
 
         self.assertTrue(suppressed)
         self.assertTrue(st.off_finalized)
@@ -2916,8 +2955,6 @@ class TestLogicEngineHardening(unittest.TestCase):
                 st,
                 now,
                 climate_data={"mode": "off"},
-                energy_watts_valid=True,
-                energy_watts=20.0,
                 in_cooldown=False,
             )
         with (
@@ -3006,8 +3043,6 @@ class TestLogicEngineHardening(unittest.TestCase):
                     25.0,
                     now,
                     24.0,
-                    energy_watts_valid=False,
-                    energy_watts=0.0,
                     in_cooldown=False,
                     confirmed_ac_on=True,
                     inferred_only_physical=False,
@@ -3089,8 +3124,6 @@ class TestLogicEngineHardening(unittest.TestCase):
                     26.0,
                     now,
                     24.0,
-                    energy_watts_valid=True,
-                    energy_watts=120.0,
                     in_cooldown=False,
                     confirmed_ac_on=True,
                     inferred_only_physical=False,
