@@ -1,5 +1,11 @@
 # HawaAI add-on — release notes
 
+## 1.4.74
+
+- **Zone authority:** In zone-gated rooms, generic presence can hold vacancy escalation but cannot promote runtime occupancy or arm thermostat ON until FP2 zone presence is confirmed.
+- **Safety:** Required zone-gated thermostat ON now waits for confirmed zone presence, including during transient unusable zone sensor states.
+- **Tests:** Added regressions for the UI/runtime split where the dashboard showed vacant while HVAC runtime could still treat the room as occupied.
+
 ## 1.4.73
 
 - **Telemetry isolation:** Finalized breaker telemetry as an observational-only layer with independent telemetry confidence, cache, stale/offline status, and debounced invalid-state logging.

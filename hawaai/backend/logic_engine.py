@@ -1227,12 +1227,31 @@ def _mark_runtime_vacant(
         )
 
 
+def _zone_required_for_on_active(cfg: dict) -> bool:
+    return bool(cfg.get("zone_required_for_on", False)) and bool(
+        str(cfg.get("zone_entity_id") or "").strip()
+    )
+
+
+def _zone_waiting_for_confirmation(cfg: dict, st: RoomRuntime, is_occupied: bool) -> bool:
+    return bool(is_occupied and _zone_required_for_on_active(cfg) and not st.zone_confirmed)
+
+
+def _zone_presence_holds_vacancy(cfg: dict, st: RoomRuntime) -> bool:
+    return bool(
+        _zone_required_for_on_active(cfg)
+        and not st.zone_confirmed
+        and st.last_known_presence
+    )
+
+
 def _sync_runtime_occupancy(
     room_id: str,
     st: RoomRuntime,
     is_occupied: bool,
     now: datetime,
     *,
+    cfg: Optional[dict] = None,
     source: str = "ha_presence",
 ) -> bool:
     before = (
@@ -1242,7 +1261,16 @@ def _sync_runtime_occupancy(
         st.vacant_since,
     )
 
-    if is_occupied:
+    if _zone_waiting_for_confirmation(cfg or {}, st, is_occupied):
+        st.occupied = False
+        st.stable_occupied = False
+        st.last_known_presence = True
+        st.presence_last_true_at = now
+        st.presence_last_false_at = None
+        st.presence_only_present_since = None
+        _cancel_pending_vacancy_shutdown(room_id, st, due_to="zone_wait_presence")
+        resolved = False
+    elif is_occupied:
         _clear_vacancy_state(room_id, st, now, reason="presence_reentry")
         resolved = True
     else:
@@ -1324,6 +1352,9 @@ def _resolve_control_decision(
     use_presence = normalize_use_presence(cfg)
 
     # â”€â”€ PRIORITY 1: Safety â€” vacancy (may issue OFF even during global cooldown) â”€
+    if use_presence and not is_occupied and _zone_presence_holds_vacancy(cfg, st):
+        return ("hold", "zone_wait", effective_target)
+
     if use_presence and not is_occupied:
         st.vacancy_active = True
         st.thermostat_blocked = True
@@ -1562,6 +1593,10 @@ def _resolve_presence_only_decision(
             max_runtime,
         )
         return "off", "presence_max_runtime", occupied
+
+    if _zone_presence_holds_vacancy(cfg, st):
+        st.presence_only_present_since = None
+        return "hold", "zone_wait", False
 
     if occupied:
         st.presence_only_idle = False
@@ -1841,7 +1876,7 @@ def _fp2_zone_apply_on_gate(
 ) -> Tuple[str, str, bool]:
     """
     ON-only: block thermostat ON until FP2 zone dwell confirms, when enabled.
-    Never blocks OFF, safety, cooldown, or user paths. Missing/unusable zone â†’ allow (fallback).
+    Never blocks OFF, safety, cooldown, or user paths. Required zone-gated ON needs confirmed zone presence.
     Returns (action, source, zone_gate_blocked).
     """
     st = _rt(room_id)
@@ -1864,9 +1899,6 @@ def _fp2_zone_apply_on_gate(
         st.zone_allow_count += 1
         return action, source, False
 
-    if not st.zone_sensor_usable:
-        st.zone_allow_count += 1
-        return action, source, False
     if st.zone_confirmed:
         st.zone_allow_count += 1
         return action, source, False
@@ -3851,6 +3883,7 @@ async def _tick_impl(rid_raw: str, room_id: str) -> None:
         st,
         bool(is_occupied_bool),
         now,
+        cfg=cfg,
         source=occupancy_source,
     )
 
