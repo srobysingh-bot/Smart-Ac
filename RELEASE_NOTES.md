@@ -1,5 +1,10 @@
 # HawaAI add-on — release notes
 
+## 1.4.76
+
+- **OFF reliability:** Vacancy shutdown now enters OFF confirmation, verifies physical OFF by power/climate state, retries missed IR sends with a cap, and only finalizes runtime/session after confirmation.
+- **Safety:** Re-entry cancels pending OFF retries, max retry failure leaves runtime ON instead of faking idle, and duplicate OFF dispatches are suppressed once pending, failed, or confirmed.
+
 ## 1.4.75
 
 - **Energy config:** Broadened cumulative energy sensor discovery so kWh/usage/consumption entities can be selected even when Home Assistant metadata is incomplete.

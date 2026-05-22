@@ -532,6 +532,11 @@ class RoomRuntime:
     off_dispatched_at: Optional[datetime] = None
     off_finalized: bool = False
     off_settled_at: Optional[datetime] = None
+    pending_off_confirmation: bool = False
+    pending_off_sent_at: Optional[datetime] = None
+    pending_off_retry_count: int = 0
+    off_confirmation_failed: bool = False
+    last_confirmed_off_at: Optional[datetime] = None
     # First tick we believe the room is actively being cooled (effective ON); used for vacancy grace
     effective_on_since_ts: Optional[float] = None
     # Last IR / control ON or OFF command applied (wall time, UTC)
@@ -663,6 +668,13 @@ def _clear_pending_command_state(st: RoomRuntime) -> None:
     st.pending_since = None
     st.pending_on_ir_sent = False
     st.pending_on_ir_sent_at = None
+
+
+def _clear_pending_off_confirmation(st: RoomRuntime, *, failed: bool = False) -> None:
+    st.pending_off_confirmation = False
+    st.pending_off_sent_at = None
+    st.pending_off_retry_count = 0
+    st.off_confirmation_failed = bool(failed)
 
 
 def _is_vacancy_off_reason(reason: Optional[str]) -> bool:
@@ -921,6 +933,9 @@ SESSION_FINALIZATION_GRACE_SECONDS: float = 20.0
 MEANINGFUL_SESSION_SECONDS: float = 180.0
 MIN_SESSION_ENERGY_KWH: float = 0.001
 OFF_TERMINAL_RECONCILE_SECONDS: float = 60.0
+OFF_CONFIRM_WATTS: float = 120.0
+OFF_CONFIRM_RETRY_SECONDS: float = 25.0
+MAX_OFF_CONFIRM_RETRIES: int = 2
 VACANCY_CONFIRM_SECS: float = 60.0
 PRESENCE_STABILIZATION_SECS: float = 60.0
 DECISION_LOCK_SECONDS: float = 65.0
@@ -1151,6 +1166,7 @@ def _clear_vacancy_state(
         st.off_dispatched_at = None
         st.off_finalized = False
         st.off_settled_at = None
+        _clear_pending_off_confirmation(st)
         st.off_reason = None
 
     if st.effective_control_source in (
@@ -1766,6 +1782,8 @@ async def _finalize_presence_only_idle(
     st.off_dispatched_at = None
     st.off_finalized = True
     st.off_settled_at = now
+    st.last_confirmed_off_at = now
+    _clear_pending_off_confirmation(st)
     st.presence_only_idle = True
 
     if entering_idle:
@@ -2310,6 +2328,12 @@ def _sync_pending_for_action(st: RoomRuntime, decision_action: str) -> None:
     Always cancels delay wakeup before clearing pending so stale ``delay_elapsed``
     triggers cannot fire after intent changed.
     """
+    if (
+        st.pending_off_confirmation
+        and st.pending_action == "off"
+        and decision_action in ("off", "hold", "hold_vacant")
+    ):
+        return
     if decision_action not in ("on", "off"):
         _clear_pending_command_state(st)
         return
@@ -2415,7 +2439,7 @@ def _pending_on_emit_hold_in_progress(st: RoomRuntime, action: str) -> bool:
 
 def _presence_only_awaiting_off_confirmation(st: RoomRuntime) -> bool:
     return (
-        st.pending_action == "off"
+        (st.pending_action == "off" or st.pending_off_confirmation)
         and st.last_command == "off"
         and not st.presence_only_idle
     )
@@ -2487,6 +2511,8 @@ def _clear_pending_when_physically_satisfied(
             _clear_pending_command_state(st)
             return
     elif st.pending_action == "off":
+        if st.pending_off_confirmation:
+            return
         if not physical_ac_on:
             _clear_pending_command_state(st)
 
@@ -2511,7 +2537,7 @@ def _sync_ac_display_fields(st: RoomRuntime) -> None:
 
     st.effective_ac_on = st.physical_ac_on
 
-    if st.pending_action == "off" and st.physical_ac_on:
+    if (st.pending_action == "off" or st.pending_off_confirmation) and st.physical_ac_on:
         st.ac_state = "pending_off"
     elif st.ac_state == "on_failed":
         st.effective_ac_on = False
@@ -2524,10 +2550,60 @@ def _sync_ac_display_fields(st: RoomRuntime) -> None:
 def _climate_reports_off(climate_data: dict) -> bool:
     mode = str(
         (climate_data or {}).get("mode")
+        or (climate_data or {}).get("hvac_mode")
         or (climate_data or {}).get("state")
         or ""
     ).strip().lower()
     return mode in ("off", "idle")
+
+
+def _off_confirm_watts_threshold(cfg: dict) -> float:
+    return _cfg_float(cfg, "off_confirm_watts", OFF_CONFIRM_WATTS, lo=0.0, hi=500.0)
+
+
+def _off_confirmation_status(
+    cfg: dict,
+    *,
+    power_watts: Optional[float],
+    climate_data: dict,
+) -> Tuple[bool, str]:
+    threshold = _off_confirm_watts_threshold(cfg)
+    if power_watts is not None:
+        if float(power_watts) < threshold:
+            return True, "power_below_threshold"
+        return False, "power_high"
+    if _climate_reports_off(climate_data):
+        return True, "climate_off"
+    return False, "no_confirmation"
+
+
+def _pending_off_still_vacant(st: RoomRuntime) -> bool:
+    return _is_vacancy_off_reason(st.off_reason) and not st.occupied and not st.stable_occupied
+
+
+def _cancel_pending_off_due_to_reentry(room_id: str, st: RoomRuntime) -> None:
+    log_with_room("info", room_id, "[OFF_CONFIRM] canceled reason=reoccupancy")
+    _clear_pending_command_state(st)
+    st.off_dispatch_pending = False
+    st.off_dispatched_at = None
+    st.off_finalized = False
+    st.off_settled_at = None
+    st.off_reason = None
+    st.last_command = ""
+    st.last_command_time = None
+    st.last_sent_command_key = None
+    st.last_decision_at = None
+    _clear_pending_off_confirmation(st)
+
+
+async def _dispatch_off_ir(room_id: str, cfg: dict, climate_entity: str) -> bool:
+    ir_backend = await resolve_ir_backend(room_id, cfg, climate_entity)
+    if ir_backend == "tuya":
+        return bool(await ac_tuya_adapter.turn_off(climate_entity))
+    if ir_backend == "aerostate":
+        return bool(await ac_aerostate_adapter.turn_off(climate_entity))
+    logger.error("[HawaAI][%s] AC OFF FAILED: unsupported ir_backend=%s", room_id, ir_backend)
+    return False
 
 
 def _runtime_has_open_session(room_id: str, st: RoomRuntime) -> bool:
@@ -2584,6 +2660,8 @@ def _finalize_runtime_off_state(
     st.off_dispatched_at = None
     st.off_finalized = True
     st.off_settled_at = now
+    st.last_confirmed_off_at = now
+    _clear_pending_off_confirmation(st)
 
     if had_stale_idle or first_finalized:
         log_with_room("info", room_id, "[RUNTIME] reconciliation_complete reason=%s", reason)
@@ -2603,6 +2681,8 @@ def _maybe_finalize_terminal_off(
     in_cooldown: bool,
 ) -> bool:
     if in_cooldown:
+        return False
+    if st.pending_off_confirmation:
         return False
     if st.pending_action == "on" or st.pending_on_ir_sent:
         return False
@@ -2625,6 +2705,116 @@ def _maybe_finalize_terminal_off(
     return True
 
 
+async def _finalize_confirmed_pending_off(
+    room_id: str,
+    cfg: dict,
+    indoor_temp: float,
+    st: RoomRuntime,
+    now: datetime,
+    *,
+    confirmation_source: str,
+) -> None:
+    reason = st.off_reason or "vacant"
+    if session_logger.current_session_id(room_id) is not None:
+        await _close_session(room_id, cfg, indoor_temp, reason)
+    _clear_pending_command_state(st)
+    _finalize_runtime_off_state(
+        room_id,
+        st,
+        now,
+        reason=f"off_confirmed_{confirmation_source}",
+    )
+
+
+async def _handle_pending_off_confirmation(
+    room_id: str,
+    cfg: dict,
+    indoor_temp: float,
+    st: RoomRuntime,
+    now: datetime,
+    *,
+    telemetry_power_reading: Optional[float],
+    climate_data: dict,
+    room_is_occupied: Optional[bool] = None,
+) -> bool:
+    if not st.pending_off_confirmation:
+        return False
+
+    still_vacant = (
+        not bool(room_is_occupied)
+        if room_is_occupied is not None
+        else _pending_off_still_vacant(st)
+    )
+
+    if _is_vacancy_off_reason(st.off_reason) and not still_vacant:
+        _cancel_pending_off_due_to_reentry(room_id, st)
+        return False
+
+    confirmed, source = _off_confirmation_status(
+        cfg,
+        power_watts=telemetry_power_reading,
+        climate_data=climate_data or {},
+    )
+    if confirmed:
+        log_with_room("info", room_id, "[OFF_CONFIRM] confirmed source=%s", source)
+        await _finalize_confirmed_pending_off(
+            room_id,
+            cfg,
+            indoor_temp,
+            st,
+            now,
+            confirmation_source=source,
+        )
+        return True
+
+    if source != "power_high" or not still_vacant:
+        return False
+
+    sent_at = st.pending_off_sent_at or st.off_dispatched_at
+    if sent_at is None:
+        st.pending_off_sent_at = now
+        return False
+    elapsed = (now - sent_at).total_seconds()
+    if elapsed < float(OFF_CONFIRM_RETRY_SECONDS):
+        return False
+
+    if st.pending_off_retry_count >= int(MAX_OFF_CONFIRM_RETRIES):
+        log_with_room(
+            "error",
+            room_id,
+            "[OFF_CONFIRM] failed retries=%s power=%.1fW threshold=%.1fW",
+            st.pending_off_retry_count,
+            float(telemetry_power_reading),
+            _off_confirm_watts_threshold(cfg),
+        )
+        _clear_pending_command_state(st)
+        st.off_dispatch_pending = False
+        st.off_dispatched_at = None
+        st.off_finalized = False
+        st.off_settled_at = None
+        _clear_pending_off_confirmation(st, failed=True)
+        st.ac_state = "on" if st.physical_ac_on or st.ac_is_on else "off"
+        return False
+
+    climate_entity = (cfg.get("climate_entity") or "").strip()
+    st.pending_off_retry_count += 1
+    log_with_room(
+        "warning",
+        room_id,
+        "[OFF_CONFIRM] retry_off attempt=%s power=%.1fW threshold=%.1fW",
+        st.pending_off_retry_count,
+        float(telemetry_power_reading),
+        _off_confirm_watts_threshold(cfg),
+    )
+    if await _dispatch_off_ir(room_id, cfg, climate_entity):
+        st.ir_last_sent_ts = now
+        st.last_command_time = now
+        st.last_decision_at = now
+        st.off_dispatched_at = now
+        st.pending_off_sent_at = now
+    return False
+
+
 def _off_dispatch_elapsed(st: RoomRuntime, now: datetime) -> float:
     if st.off_dispatched_at is None:
         return float("inf")
@@ -2640,6 +2830,13 @@ def _should_suppress_duplicate_off(
 ) -> bool:
     if st.last_command != "off":
         return False
+
+    if st.pending_off_confirmation:
+        log_with_room("info", room_id, "[RUNTIME] duplicate_off_suppressed reason=off_confirmation_pending")
+        return True
+    if st.off_confirmation_failed and _is_vacancy_off_reason(st.off_reason):
+        log_with_room("info", room_id, "[RUNTIME] duplicate_off_suppressed reason=off_confirmation_failed")
+        return True
 
     ha_off = _climate_reports_off(climate_data)
 
@@ -3376,6 +3573,7 @@ async def _apply_runtime_self_heal(
         elif (
             action == runtime_self_heal.RecoveryAction.CLEAR_STALE_PENDING_OFF
             and st.pending_action == "off"
+            and not st.pending_off_confirmation
         ):
             _clear_pending_command_state(st)
             if st.ac_state == "pending_off":
@@ -3538,6 +3736,18 @@ async def _tick_presence_only_mode(
 
     st.physical_ac_on = bool(ac_on)
     confirmed_ac_on = bool(ac_on)
+    if await _handle_pending_off_confirmation(
+        room_id,
+        cfg,
+        indoor_temp,
+        st,
+        now,
+        telemetry_power_reading=telemetry_power_reading,
+        climate_data=climate_data or {},
+        room_is_occupied=bool(resolved_occupied),
+    ):
+        ac_on = False
+        confirmed_ac_on = False
     if _maybe_finalize_terminal_off(
         room_id,
         st,
@@ -3729,7 +3939,8 @@ async def _tick_presence_only_mode(
             )
         elif bypass_actuation_delay:
             await _turn_ac_off(room_id, cfg, indoor_temp, reason_off, now=now, force=force_off)
-            _clear_pending_command_state(st)
+            if not st.pending_off_confirmation:
+                _clear_pending_command_state(st)
         else:
             await _handle_delayed_off(
                 rid_raw,
@@ -4162,6 +4373,19 @@ async def _tick_impl(rid_raw: str, room_id: str) -> None:
     else:
         st.effective_on_since_ts = None
 
+    if await _handle_pending_off_confirmation(
+        room_id,
+        cfg,
+        indoor_temp,
+        st,
+        now,
+        telemetry_power_reading=telemetry_power_reading,
+        climate_data=climate_data or {},
+        room_is_occupied=bool(is_occupied_bool),
+    ):
+        ac_on = False
+        confirmed_ac_on = False
+
     if st.ac_state == "on_failed":
         st.soft_start_ui = False
     if st.soft_start_ui:
@@ -4385,7 +4609,8 @@ async def _tick_impl(rid_raw: str, room_id: str) -> None:
             await _turn_ac_off(
                 room_id, cfg, indoor_temp, reason_off, now=now, force=force_off,
             )
-            _clear_pending_command_state(st)
+            if not st.pending_off_confirmation:
+                _clear_pending_command_state(st)
         else:
             await _handle_delayed_off(
                 rid_raw, room_id, cfg, indoor_temp, now, st,
@@ -4876,7 +5101,8 @@ async def _handle_delayed_off(
             session_logger.mark_cooled(room_canon)
         logger.info("[DELAY_OFF][%s] TRIGGER _turn_ac_off (delay=0)", room_canon)
         await _turn_ac_off(room_canon, cfg, indoor_temp, reason, now=now, force=force)
-        _clear_pending_command_state(st)
+        if not st.pending_off_confirmation:
+            _clear_pending_command_state(st)
         return
 
     if st.pending_action != "off":
@@ -4947,7 +5173,8 @@ async def _handle_delayed_off(
             st.pending_since,
         )
         await _turn_ac_off(room_canon, cfg, indoor_temp, reason, now=now, force=force)
-        _clear_pending_command_state(st)
+        if not st.pending_off_confirmation:
+            _clear_pending_command_state(st)
 
 
 # â”€â”€ Turn AC ON â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
@@ -5059,6 +5286,8 @@ async def _turn_ac_on(
     st.off_dispatched_at = None
     st.off_finalized = False
     st.off_settled_at = None
+    st.last_confirmed_off_at = None
+    _clear_pending_off_confirmation(st)
     logger.info(
         "[HawaAI][%s] AC ON accepted; provisional session opens on next lifecycle sync",
         room_id,
@@ -5330,22 +5559,29 @@ async def _turn_ac_off(
     *,
     force: bool = False,
     close_session_on_send: bool = True,
-) -> None:
+) -> bool:
     st = _rt(room_id)
     climate_entity = (cfg.get("climate_entity") or "").strip()
 
     tnow = now if now is not None else datetime.now(timezone.utc)
+    vacancy_off = _is_vacancy_off_reason(reason)
 
     if st.last_command == "off":
         if st.off_finalized:
             log_with_room("info", room_id, "[RUNTIME] duplicate_off_suppressed reason=settled_off")
-            return
+            return False
+        if st.pending_off_confirmation:
+            log_with_room("info", room_id, "[RUNTIME] duplicate_off_suppressed reason=off_confirmation_pending")
+            return False
+        if st.off_confirmation_failed and vacancy_off:
+            log_with_room("info", room_id, "[RUNTIME] duplicate_off_suppressed reason=off_confirmation_failed")
+            return False
         if (
             st.off_dispatch_pending
             and _off_dispatch_elapsed(st, tnow) < float(OFF_TERMINAL_RECONCILE_SECONDS)
         ):
             log_with_room("info", room_id, "[RUNTIME] duplicate_off_suppressed reason=reconciliation_active")
-            return
+            return False
 
     if reason not in (
         "manual",
@@ -5361,36 +5597,31 @@ async def _turn_ac_off(
                 on_secs,
                 MIN_ON_TIME_SECONDS,
             )
-            return
+            return False
 
     if not force:
         if not st.ac_is_on:
-            return
+            return False
         if not _gate_turn_ac_off(room_id, cfg, tnow, force=False):
-            return
+            return False
     elif not _gate_turn_ac_off(room_id, cfg, tnow, force=True):
-        return
+        return False
     elif reason == "vacant":
         # Hard policy: vacancy must not be skipped for duplicate/cooldown â€” still log once.
         log_with_room("info", room_id, "[VACANCY] AC OFF forced")
 
-    ir_backend = await resolve_ir_backend(room_id, cfg, climate_entity)
-    if ir_backend == "tuya":
-        await ac_tuya_adapter.turn_off(climate_entity)
-    elif ir_backend == "aerostate":
-        await ac_aerostate_adapter.turn_off(climate_entity)
-    else:
-        logger.error("[HawaAI][%s] AC OFF FAILED: unsupported ir_backend=%s", room_id, ir_backend)
-        return
+    if not await _dispatch_off_ir(room_id, cfg, climate_entity):
+        return False
 
     st.ir_last_sent_ts = tnow
 
     clear_setpoint_command_tracking(room_id)
 
     ts_off = time.time()
-    st.ac_is_on = False
-    st.last_ac_off_at = ts_off
     cmd_ts = datetime.now(timezone.utc)
+    if not vacancy_off:
+        st.ac_is_on = False
+        st.last_ac_off_at = ts_off
     if force:
         # Forced vacancy/safety OFF always anchors IR cooldown window (explicit command intent).
         st.last_command_time = cmd_ts
@@ -5399,18 +5630,30 @@ async def _turn_ac_off(
     st.last_command = "off"
     st.off_reason = reason
     st.last_sent_command_key = _fingerprint_turn_off()
-    st.compressor_off_since = cmd_ts
-    st.compressor_on_since = None
+    if not vacancy_off:
+        st.compressor_off_since = cmd_ts
+        st.compressor_on_since = None
     st.just_turned_on_until = None
     st.last_decision_at = cmd_ts
     st.off_dispatch_pending = True
     st.off_dispatched_at = cmd_ts
     st.off_finalized = False
     st.off_settled_at = None
-    log_with_room("info", room_id, "[RUNTIME] entering_idle reason=%s", reason)
+    st.off_confirmation_failed = False
+    if vacancy_off:
+        st.pending_off_confirmation = True
+        st.pending_off_sent_at = cmd_ts
+        st.pending_off_retry_count = 0
+        st.pending_action = "off"
+        st.pending_since = st.pending_since or time.time()
+        st.ac_state = "pending_off"
+        log_with_room("info", room_id, "[OFF_CONFIRM] pending reason=%s", reason)
+    else:
+        log_with_room("info", room_id, "[RUNTIME] entering_idle reason=%s", reason)
 
-    if close_session_on_send:
+    if close_session_on_send and not vacancy_off:
         await _close_session(room_id, cfg, indoor_temp, reason)
+    return True
 
 
 def get_runtime_state(room_id: str) -> dict:
@@ -5597,6 +5840,17 @@ def get_runtime_state(room_id: str) -> dict:
             st.pending_on_ir_sent_at.isoformat() if st.pending_on_ir_sent_at else None
         ),
         "pending_on_confirm_timeout_seconds": float(PENDING_ON_CONFIRM_TIMEOUT_SECS),
+        "pending_off_confirmation": bool(st.pending_off_confirmation),
+        "pending_off_sent_at": (
+            st.pending_off_sent_at.isoformat() if st.pending_off_sent_at else None
+        ),
+        "pending_off_retry_count": int(st.pending_off_retry_count),
+        "max_off_retries": int(MAX_OFF_CONFIRM_RETRIES),
+        "off_confirmation_failed": bool(st.off_confirmation_failed),
+        "last_confirmed_off_at": (
+            st.last_confirmed_off_at.isoformat() if st.last_confirmed_off_at else None
+        ),
+        "off_confirm_watts": _off_confirm_watts_threshold(merged),
         "running_off_block_seconds": float(RUNNING_OFF_BLOCK_SECS),
         "zone_entity_id": (str(merged.get("zone_entity_id") or "").strip() or None),
         "zone_dwell_seconds": zdwell,

@@ -1466,9 +1466,10 @@ class TestLogicEngineHardening(unittest.TestCase):
         )
         turn_off.assert_not_awaited()
         close_session_mock.assert_not_called()
-        self.assertIsNone(st.pending_action)
-        self.assertTrue(st.presence_only_idle)
-        self.assertTrue(
+        self.assertEqual(st.pending_action, "off")
+        self.assertTrue(st.pending_off_confirmation)
+        self.assertFalse(st.presence_only_idle)
+        self.assertFalse(
             any("[PRESENCE_ONLY] off_finalize" in str(call.args) for call in second_logs.call_args_list)
         )
 
@@ -1482,13 +1483,13 @@ class TestLogicEngineHardening(unittest.TestCase):
         self.assertFalse(st.physical_ac_on)
         self.assertIsNone(st.pending_action)
         self.assertEqual(st.ac_state, "off")
-        self.assertFalse(
+        self.assertTrue(
             any("[PRESENCE_ONLY] off_finalize" in str(call.args) for call in third_logs.call_args_list)
         )
-        self.assertFalse(
+        self.assertTrue(
             any("[PRESENCE_ONLY] runtime_reset" in str(call.args) for call in third_logs.call_args_list)
         )
-        self.assertFalse(
+        self.assertTrue(
             any("[PRESENCE_ONLY] idle_entered" in str(call.args) for call in third_logs.call_args_list)
         )
 
@@ -2804,13 +2805,208 @@ class TestLogicEngineHardening(unittest.TestCase):
             return turn_off
 
         first = asyncio.run(run_once(800, base))
-        second = asyncio.run(run_once(120, base + timedelta(seconds=20)))
+        second = asyncio.run(run_once(50, base + timedelta(seconds=20)))
 
         first.assert_awaited_once()
         second.assert_not_awaited()
         self.assertFalse(st.off_dispatch_pending)
         self.assertEqual(st.last_command, "")
         self.assertTrue(st.presence_only_idle)
+
+    def test_vacancy_off_dispatch_enters_pending_confirmation(self):
+        logic_engine._runtime_by_room.clear()
+        rid = "vacancy-off-pending"
+        st = logic_engine._rt(rid)
+        now = datetime.now(timezone.utc)
+        st.ac_is_on = True
+        st.physical_ac_on = True
+        st.effective_ac_on = True
+        st.occupied = False
+        st.stable_occupied = False
+        st.effective_on_since_ts = (now - timedelta(minutes=10)).timestamp()
+
+        async def run_case():
+            with (
+                mock.patch.object(logic_engine.ac_tuya_adapter, "turn_off", new=mock.AsyncMock(return_value=True)) as turn_off,
+                mock.patch.object(logic_engine, "_close_session", new=mock.AsyncMock()) as close_session,
+            ):
+                sent = await logic_engine._turn_ac_off(
+                    rid,
+                    {"climate_entity": "climate.test", "ir_backend": "tuya"},
+                    24.0,
+                    "vacant",
+                    now=now,
+                    force=True,
+                )
+            self.assertTrue(sent)
+            turn_off.assert_awaited_once()
+            close_session.assert_not_awaited()
+
+        asyncio.run(run_case())
+
+        self.assertTrue(st.pending_off_confirmation)
+        self.assertEqual(st.pending_action, "off")
+        self.assertEqual(st.ac_state, "pending_off")
+        self.assertTrue(st.ac_is_on)
+        self.assertTrue(st.physical_ac_on)
+        self.assertFalse(st.off_finalized)
+
+    def test_pending_off_power_high_retries_without_finalizing(self):
+        logic_engine._runtime_by_room.clear()
+        rid = "vacancy-off-retry"
+        st = logic_engine._rt(rid)
+        now = datetime.now(timezone.utc)
+        st.ac_is_on = True
+        st.physical_ac_on = True
+        st.pending_action = "off"
+        st.pending_off_confirmation = True
+        st.pending_off_sent_at = now - timedelta(seconds=30)
+        st.off_dispatched_at = st.pending_off_sent_at
+        st.last_command = "off"
+        st.off_reason = "vacant"
+        st.occupied = False
+        st.stable_occupied = False
+
+        async def run_case():
+            with mock.patch.object(logic_engine.ac_tuya_adapter, "turn_off", new=mock.AsyncMock(return_value=True)) as turn_off:
+                finalized = await logic_engine._handle_pending_off_confirmation(
+                    rid,
+                    {"climate_entity": "climate.test", "ir_backend": "tuya"},
+                    24.0,
+                    st,
+                    now,
+                    telemetry_power_reading=800.0,
+                    climate_data={"mode": "off"},
+                )
+            self.assertFalse(finalized)
+            turn_off.assert_awaited_once()
+
+        asyncio.run(run_case())
+
+        self.assertTrue(st.pending_off_confirmation)
+        self.assertEqual(st.pending_off_retry_count, 1)
+        self.assertTrue(st.ac_is_on)
+        self.assertFalse(st.off_finalized)
+
+    def test_pending_off_power_drop_finalizes_session_and_runtime(self):
+        logic_engine._runtime_by_room.clear()
+        rid = "vacancy-off-confirmed"
+        st = logic_engine._rt(rid)
+        now = datetime.now(timezone.utc)
+        st.ac_is_on = True
+        st.physical_ac_on = True
+        st.effective_ac_on = True
+        st.pending_action = "off"
+        st.pending_off_confirmation = True
+        st.pending_off_sent_at = now - timedelta(seconds=10)
+        st.last_command = "off"
+        st.off_reason = "vacant"
+        st.occupied = False
+        st.stable_occupied = False
+        st.session_state = "confirmed"
+        st.session_start_time = now - timedelta(minutes=10)
+
+        async def run_case():
+            with (
+                mock.patch.object(logic_engine.session_logger, "current_session_id", return_value=42),
+                mock.patch.object(logic_engine, "_close_session", new=mock.AsyncMock()) as close_session,
+            ):
+                finalized = await logic_engine._handle_pending_off_confirmation(
+                    rid,
+                    {"climate_entity": "climate.test"},
+                    24.0,
+                    st,
+                    now,
+                    telemetry_power_reading=40.0,
+                    climate_data={"mode": "cool"},
+                )
+            self.assertTrue(finalized)
+            close_session.assert_awaited_once()
+
+        asyncio.run(run_case())
+
+        self.assertFalse(st.pending_off_confirmation)
+        self.assertIsNone(st.pending_action)
+        self.assertEqual(st.ac_state, "off")
+        self.assertFalse(st.ac_is_on)
+        self.assertFalse(st.physical_ac_on)
+        self.assertEqual(st.last_confirmed_off_at, now)
+
+    def test_pending_off_reentry_cancels_retry_and_keeps_runtime_on(self):
+        logic_engine._runtime_by_room.clear()
+        rid = "vacancy-off-reentry"
+        st = logic_engine._rt(rid)
+        now = datetime.now(timezone.utc)
+        st.ac_is_on = True
+        st.physical_ac_on = True
+        st.pending_action = "off"
+        st.pending_off_confirmation = True
+        st.pending_off_sent_at = now - timedelta(seconds=30)
+        st.last_command = "off"
+        st.off_reason = "vacant"
+        st.occupied = True
+        st.stable_occupied = True
+
+        async def run_case():
+            with mock.patch.object(logic_engine.ac_tuya_adapter, "turn_off", new=mock.AsyncMock(return_value=True)) as turn_off:
+                finalized = await logic_engine._handle_pending_off_confirmation(
+                    rid,
+                    {"climate_entity": "climate.test", "ir_backend": "tuya"},
+                    24.0,
+                    st,
+                    now,
+                    telemetry_power_reading=850.0,
+                    climate_data={"mode": "cool"},
+                )
+            self.assertFalse(finalized)
+            turn_off.assert_not_awaited()
+
+        asyncio.run(run_case())
+
+        self.assertFalse(st.pending_off_confirmation)
+        self.assertIsNone(st.pending_action)
+        self.assertTrue(st.ac_is_on)
+        self.assertTrue(st.physical_ac_on)
+        self.assertEqual(st.last_command, "")
+
+    def test_pending_off_max_retries_marks_failed_without_idle(self):
+        logic_engine._runtime_by_room.clear()
+        rid = "vacancy-off-failed"
+        st = logic_engine._rt(rid)
+        now = datetime.now(timezone.utc)
+        st.ac_is_on = True
+        st.physical_ac_on = True
+        st.pending_action = "off"
+        st.pending_off_confirmation = True
+        st.pending_off_sent_at = now - timedelta(seconds=30)
+        st.pending_off_retry_count = logic_engine.MAX_OFF_CONFIRM_RETRIES
+        st.last_command = "off"
+        st.off_reason = "vacant"
+        st.occupied = False
+        st.stable_occupied = False
+
+        async def run_case():
+            with mock.patch.object(logic_engine.ac_tuya_adapter, "turn_off", new=mock.AsyncMock(return_value=True)) as turn_off:
+                finalized = await logic_engine._handle_pending_off_confirmation(
+                    rid,
+                    {"climate_entity": "climate.test", "ir_backend": "tuya"},
+                    24.0,
+                    st,
+                    now,
+                    telemetry_power_reading=900.0,
+                    climate_data={"mode": "off"},
+                )
+            self.assertFalse(finalized)
+            turn_off.assert_not_awaited()
+
+        asyncio.run(run_case())
+
+        self.assertFalse(st.pending_off_confirmation)
+        self.assertTrue(st.off_confirmation_failed)
+        self.assertTrue(st.ac_is_on)
+        self.assertTrue(st.physical_ac_on)
+        self.assertEqual(st.ac_state, "on")
+        self.assertFalse(st.off_finalized)
 
     def test_aerostate_duplicate_off_does_not_repeat(self):
         logic_engine._runtime_by_room.clear()
@@ -2950,7 +3146,12 @@ class TestLogicEngineHardening(unittest.TestCase):
                 c for c in log_with_room.call_args_list
                 if "[RUNTIME] entering_idle" in str(c.args)
             ]
-            self.assertEqual(len(entering), 1)
+            pending = [
+                c for c in log_with_room.call_args_list
+                if "[OFF_CONFIRM] pending" in str(c.args)
+            ]
+            self.assertEqual(len(entering), 0)
+            self.assertEqual(len(pending), 1)
 
         asyncio.run(run_case())
 
