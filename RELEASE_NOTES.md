@@ -1,5 +1,10 @@
 # HawaAI add-on — release notes
 
+## 1.4.75
+
+- **Energy config:** Broadened cumulative energy sensor discovery so kWh/usage/consumption entities can be selected even when Home Assistant metadata is incomplete.
+- **Selection:** Added deterministic ranking for energy sensors, preferring explicit total-energy style entities while keeping entity id ordering stable for ties.
+
 ## 1.4.74
 
 - **Zone authority:** In zone-gated rooms, generic presence can hold vacancy escalation but cannot promote runtime occupancy or arm thermostat ON until FP2 zone presence is confirmed.

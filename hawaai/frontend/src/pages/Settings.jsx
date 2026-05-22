@@ -533,6 +533,8 @@ export default function Settings() {
   const allSensors = entities.filter(e => e.entity_id.startsWith('sensor.'))
   const entityUnit = e => String(e?.unit || e?.unit_of_measurement || '').trim().toLowerCase().replace(/\s+/g, '')
   const entityClass = (e, key) => String(e?.[key] || '').trim().toLowerCase()
+  const entitySearchText = e =>
+    `${e?.entity_id || ''} ${e?.friendly_name || ''}`.toLowerCase().replace(/[\s-]+/g, '_')
   const numericState = e => {
     const raw = e?.state
     if (raw == null) return false
@@ -551,14 +553,25 @@ export default function Settings() {
   }
   const isKwhSensor = e => {
     const unit = entityUnit(e)
-    return isRuntimeSensorCandidate(e) &&
-      (entityClass(e, 'device_class') === 'energy' || unit === 'kwh' || unit === 'wh')
+    const text = entitySearchText(e)
+    const hasEnergyMetadata =
+      entityClass(e, 'device_class') === 'energy' || unit === 'kwh' || unit === 'wh'
+    const looksLikeEnergyTotal =
+      text.includes('energy') ||
+      text.includes('kwh') ||
+      text.includes('kw_h') ||
+      text.includes('kilowatt') ||
+      text.includes('consumption') ||
+      text.includes('usage') ||
+      (text.includes('total') && (text.includes('breaker') || text.includes('meter') || text.includes('power')))
+    return isRuntimeSensorCandidate(e) && (hasEnergyMetadata || looksLikeEnergyTotal)
   }
   const energyEntityRank = (e, kind) => {
     const id = String(e?.entity_id || '').toLowerCase()
     const unit = entityUnit(e)
     const dc = entityClass(e, 'device_class')
     const sc = entityClass(e, 'state_class')
+    const text = entitySearchText(e)
     let score = 0
     if (kind === 'power') {
       if (id.endsWith('_power')) score += 1000
@@ -566,19 +579,23 @@ export default function Settings() {
       if (unit === 'w' || unit === 'kw') score += 250
       return score
     }
-    if (id.endsWith('_total_energy')) score += 1000
+    if (id.endsWith('_total_energy') || id.endsWith('_energy_total')) score += 1000
     if (dc === 'energy') score += 500
     if (unit === 'kwh' || unit === 'wh') score += 250
     if (sc === 'total_increasing') score += 100
     else if (sc === 'total') score += 75
+    if (text.includes('energy') || text.includes('kwh')) score += 25
     return score
   }
+  const compareEnergyEntities = kind => (a, b) =>
+    energyEntityRank(b, kind) - energyEntityRank(a, kind) ||
+    String(a?.entity_id || '').localeCompare(String(b?.entity_id || ''))
 
   // Live power sensors — watts / current / breaker / circuit
   const powerSensors = allSensors.filter(isPowerSensor)
 
   // Cumulative kWh sensors — energy / usage / total / consumption
-  const kwhSensors = allSensors.filter(isKwhSensor)
+  const kwhSensors = allSensors.filter(isKwhSensor).sort(compareEnergyEntities('energy'))
 
   const onDeviceSelect = async (device) => {
     setSelectedDevice(device)
@@ -607,7 +624,7 @@ export default function Settings() {
         .sort((a, b) => energyEntityRank(b, 'power') - energyEntityRank(a, 'power'))
       const sortedKwh = devEnts
         .filter(isKwhSensor)
-        .sort((a, b) => energyEntityRank(b, 'energy') - energyEntityRank(a, 'energy'))
+        .sort(compareEnergyEntities('energy'))
       const powerEnt = sortedPower[0]
       const kwhEnt = sortedKwh[0]
 
