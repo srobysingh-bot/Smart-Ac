@@ -209,6 +209,38 @@ class TestConfigLoad(unittest.TestCase):
         self.assertNotIn("live_power_sensor", room.get("settings", {}))
         self.assertNotIn("energy_usage_sensor", room.get("settings", {}))
 
+    def test_config_migration_preserves_entities_and_drops_runtime_state(self):
+        import backend.config_manager as cm
+
+        migrated = cm.migrate_config(
+            {
+                "rooms": [
+                    {
+                        "id": "roommig12345",
+                        "name": "Study",
+                        "climate_entity": "climate.study",
+                        "energy_power_entity": "sensor.study_power",
+                        "effective_on_since_ts": 12345,
+                        "pending_off_confirmation": True,
+                        "settings": {
+                            "energy_usage_sensor": "sensor.study_kwh",
+                            "watt_draw": 900,
+                        },
+                    }
+                ],
+                "runtime": {"roommig12345": {"ac_state": "on"}},
+            }
+        )
+
+        room = migrated["rooms"][0]
+        self.assertEqual(migrated["schema_version"], cm.CONFIG_SCHEMA_VERSION)
+        self.assertEqual(room["energy_power_entity"], "sensor.study_power")
+        self.assertEqual(room["energy_kwh_entity"], "sensor.study_kwh")
+        self.assertNotIn("runtime", migrated)
+        self.assertNotIn("effective_on_since_ts", room)
+        self.assertNotIn("pending_off_confirmation", room)
+        self.assertNotIn("watt_draw", room.get("settings", {}))
+
 
 if __name__ == "__main__":
     unittest.main()

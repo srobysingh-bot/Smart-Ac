@@ -14,6 +14,7 @@ from .temperature_schedule import validate_timezone_optional
 logger = logging.getLogger(__name__)
 
 CONFIG_PATH = "/data/hawaai_config.json"
+CONFIG_SCHEMA_VERSION = 3
 
 # Last successful merged config (survives single bad load so rooms are not silently wiped).
 _last_known_good_config: Optional[Dict[str, Any]] = None
@@ -29,6 +30,7 @@ _LEGACY_IR_KEYS = frozenset({
 })
 
 DEFAULT_CONFIG: Dict[str, Any] = {
+    "schema_version": CONFIG_SCHEMA_VERSION,
     "presence_entity": "",
     "indoor_temp_entity": "",
     "ac_entity": "",
@@ -100,6 +102,45 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "timezone": "",
     "rooms": [],
 }
+
+_RUNTIME_TRANSIENT_KEYS = frozenset({
+    "ac_is_on",
+    "ac_phase",
+    "ac_state",
+    "ac_state_source",
+    "comfort_level",
+    "effective_ac_on",
+    "energy_config_mode",
+    "energy_configured",
+    "energy_kwh_total",
+    "energy_power_unit",
+    "energy_watts",
+    "health",
+    "humidity_band",
+    "last_command",
+    "pending_action",
+    "pending_off_confirmation",
+    "pending_remaining_seconds",
+    "pending_since_ts",
+    "physical_ac_on",
+    "runtime",
+    "runtime_energy_mode",
+    "session_kwh",
+    "status",
+    "telemetry_status",
+    "watt_draw",
+    "zone_status",
+})
+
+_ROOM_RUNTIME_TRANSIENT_KEYS = _RUNTIME_TRANSIENT_KEYS | frozenset({
+    "effective_on_since_ts",
+    "last_ac_on_at",
+    "off_dispatched_at",
+    "pending_off_sent_at",
+    "pending_off_retry_count",
+    "session_start_time",
+    "session_state",
+})
 
 _ENERGY_FIELD_ALIASES = {
     "energy_power_entity": (
@@ -211,7 +252,91 @@ def _normalize_room_energy_fields(rooms: Any) -> None:
                     room[key] = settings.pop(key)
 
 
+def _strip_transient_state_in_place(cfg: Dict[str, Any]) -> bool:
+    """Remove runtime/UI state that must never be persisted as configuration."""
+    if not isinstance(cfg, dict):
+        return False
+    changed = False
+    for key in tuple(_RUNTIME_TRANSIENT_KEYS):
+        if key in cfg:
+            cfg.pop(key, None)
+            changed = True
+    rooms = cfg.get("rooms")
+    if isinstance(rooms, list):
+        for room in rooms:
+            if not isinstance(room, dict):
+                continue
+            for key in tuple(_ROOM_RUNTIME_TRANSIENT_KEYS):
+                if key in room:
+                    room.pop(key, None)
+                    changed = True
+            settings = room.get("settings")
+            if isinstance(settings, dict):
+                for key in tuple(_ROOM_RUNTIME_TRANSIENT_KEYS):
+                    if key in settings:
+                        settings.pop(key, None)
+                        changed = True
+    return changed
+
+
+def _coerce_schema_version(raw: Any) -> int:
+    try:
+        n = int(raw)
+    except (TypeError, ValueError):
+        return 1
+    return max(1, min(n, CONFIG_SCHEMA_VERSION))
+
+
+def migrate_v1_to_v2(cfg: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    v2 canonicalizes energy fields and promotes room-scoped energy aliases out of
+    settings. It never validates against HA and never drops selected entities.
+    """
+    out = copy.deepcopy(cfg) if isinstance(cfg, dict) else {}
+    _normalize_energy_fields_in_place(out)
+    _normalize_room_energy_fields(out.get("rooms"))
+    out["schema_version"] = 2
+    return out
+
+
+def migrate_v2_to_v3(cfg: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    v3 makes persisted config authoritative by scrubbing transient runtime/status
+    keys that can leak in from API payloads or UI caches.
+    """
+    out = copy.deepcopy(cfg) if isinstance(cfg, dict) else {}
+    _strip_transient_state_in_place(out)
+    out["schema_version"] = 3
+    return out
+
+
+def migrate_config(saved: Dict[str, Any]) -> Dict[str, Any]:
+    """Apply idempotent migrations without consulting Home Assistant."""
+    cfg = copy.deepcopy(saved) if isinstance(saved, dict) else {}
+    if not cfg:
+        cfg["schema_version"] = CONFIG_SCHEMA_VERSION
+        return cfg
+    original_version = _coerce_schema_version(cfg.get("schema_version"))
+    version = original_version
+
+    if version < 2:
+        cfg = migrate_v1_to_v2(cfg)
+        logger.info("[CONFIG] migration_applied from=%s to=2", version)
+        version = 2
+    if version < 3:
+        cfg = migrate_v2_to_v3(cfg)
+        logger.info("[CONFIG] migration_applied from=%s to=3", version)
+        version = 3
+
+    _strip_transient_state_in_place(cfg)
+    cfg["schema_version"] = CONFIG_SCHEMA_VERSION
+    if original_version == CONFIG_SCHEMA_VERSION:
+        logger.debug("[CONFIG] migration_check schema_version=%s", CONFIG_SCHEMA_VERSION)
+    return cfg
+
+
 def _sanitize_energy_entities_in_place(cfg: Dict[str, Any], *, room_id: str = "global") -> bool:
+    """Legacy compatibility wrapper: preserve entity ids; only trim device ids."""
     changed = False
     for key, kind in (
         ("energy_power_entity", "power"),
@@ -224,13 +349,12 @@ def _sanitize_energy_entities_in_place(cfg: Dict[str, Any], *, room_id: str = "g
         if not reason:
             continue
         logger.warning(
-            "[ENERGY_VALIDATE] room=%s entity=%s reason=%s action=clear_saved_field",
+            "[CONFIG] preserved_entity despite unavailable state room=%s field=%s entity=%s reason=%s",
             room_id,
+            key,
             entity_id,
             reason,
         )
-        cfg[key] = ""
-        changed = True
 
     device_id = str(cfg.get("energy_device_id") or "").strip()
     if cfg.get("energy_device_id") != device_id:
@@ -240,7 +364,7 @@ def _sanitize_energy_entities_in_place(cfg: Dict[str, Any], *, room_id: str = "g
 
 
 def sanitize_energy_entities(config: Dict[str, Any]) -> Dict[str, Any]:
-    """Clear statically-invalid saved energy entity ids without touching valid fields."""
+    """Compatibility helper that preserves saved entity ids while normalizing whitespace."""
     clean = copy.deepcopy(config) if isinstance(config, dict) else {}
     _sanitize_energy_entities_in_place(clean)
     rooms = clean.get("rooms")
@@ -270,11 +394,7 @@ def _read_json_dict(path: str) -> Dict[str, Any]:
             raw = json.load(f)
         if not isinstance(raw, dict):
             return {}
-        clean = sanitize_energy_entities(raw)
-        global _last_load_sanitized_energy_entities
-        if clean != raw:
-            _last_load_sanitized_energy_entities = True
-        return clean
+        return raw
     except json.JSONDecodeError as e:
         logger.error("[HawaAI] Invalid JSON at %s: %s", path, e)
         return {}
@@ -332,9 +452,12 @@ def _assemble_merged_config(saved: Dict[str, Any], options: Dict[str, Any]) -> D
     Deep-copy defaults, then layer supervisor options and saved UI config.
     Never mutate DEFAULT_CONFIG in place.
     """
+    saved_migrated = migrate_config(saved)
+
     merged: Dict[str, Any] = copy.deepcopy(DEFAULT_CONFIG)
     merged.update(options or {})
-    merged.update(saved or {})
+    merged.update(saved_migrated or {})
+    merged["schema_version"] = CONFIG_SCHEMA_VERSION
 
     merged["timezone"] = validate_timezone_optional(merged.get("timezone"))
 
@@ -343,6 +466,7 @@ def _assemble_merged_config(saved: Dict[str, Any], options: Dict[str, Any]) -> D
 
     _normalize_energy_fields_in_place(merged)
     _normalize_room_energy_fields(merged.get("rooms"))
+    _strip_transient_state_in_place(merged)
 
     if merged.get("ai_enabled") is None:
         merged["ai_enabled"] = False
@@ -375,6 +499,7 @@ def _assemble_merged_config(saved: Dict[str, Any], options: Dict[str, Any]) -> D
     merged["climate_entity"] = _ace
 
     room_registry.ensure_migrated(merged)
+    merged["schema_version"] = CONFIG_SCHEMA_VERSION
     return merged
 
 
@@ -438,14 +563,18 @@ def save_config(data: Dict[str, Any]) -> bool:
     try:
         data = copy.deepcopy(data)
         data = {k: v for k, v in data.items() if k not in _LEGACY_IR_KEYS}
+        _strip_transient_state_in_place(data)
         logger.info("[ENERGY_CONFIG] received %s", _energy_config_log_summary(data))
         _normalize_energy_fields_in_place(data)
         _normalize_room_energy_fields(data.get("rooms"))
         logger.info("[ENERGY_CONFIG] normalized %s", _energy_config_log_summary(data))
         current = load_config()
         current.update(data)
+        current = migrate_config(current)
         _normalize_energy_fields_in_place(current)
         _normalize_room_energy_fields(current.get("rooms"))
+        _strip_transient_state_in_place(current)
+        current["schema_version"] = CONFIG_SCHEMA_VERSION
         current["timezone"] = validate_timezone_optional(current.get("timezone"))
         _ace = (current.get("ac_entity") or current.get("climate_entity") or "").strip()
         current["ac_entity"] = _ace

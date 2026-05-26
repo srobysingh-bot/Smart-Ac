@@ -13,6 +13,12 @@ function formatDuration(start, end) {
   return `${Math.floor(diff / 60)}h ${Math.round(diff % 60)}m`
 }
 
+function finalizedDurationMinutes(s) {
+  if (!s.start_time || !s.end_time) return null
+  const mins = (new Date(s.end_time) - new Date(s.start_time)) / 60000
+  return Number.isFinite(mins) && mins >= 0 ? mins : null
+}
+
 function formatDateTime(iso) {
   if (!iso) return '--'
   const d = new Date(iso)
@@ -42,10 +48,7 @@ function sessionQuality(s) {
   if (s.valid === true) return 'good'
   if (s.valid === false) return (dt != null && dt >= 0.3) ? 'weak' : 'invalid'
 
-  const dur = s.duration_minutes ??
-    (s.start_time && s.end_time
-      ? (new Date(s.end_time) - new Date(s.start_time)) / 60000
-      : null)
+  const dur = finalizedDurationMinutes(s)
   if (dur != null && dur >= 3 && dt != null && dt >= 0.3) return 'good'
   if (dt != null && dt >= 0.3) return 'weak'
   return 'invalid'
@@ -58,10 +61,7 @@ function isFastCooling(s) {
     (s.indoor_temp_start != null && s.indoor_temp_end != null
       ? s.indoor_temp_start - s.indoor_temp_end
       : null)
-  const dur = s.duration_minutes ??
-    (s.start_time && s.end_time
-      ? (new Date(s.end_time) - new Date(s.start_time)) / 60000
-      : null)
+  const dur = finalizedDurationMinutes(s)
   return dt != null && dur != null && dur > 0 && (dt / dur) > 0.5
 }
 
@@ -107,9 +107,19 @@ function StorageBadge({ session }) {
   )
 }
 
-function costDisplay(session) {
-  if (session.energy_consumed_kwh == null || session.cost_estimate == null) return '--'
-  return `₹${Number(session.cost_estimate).toFixed(2)}`
+function costDisplay(session, tariffPerKwh = 8.0) {
+  const kwh = Number(session.energy_consumed_kwh ?? session.kwh ?? 0)
+  if (!Number.isFinite(kwh) || kwh <= 0) return '\u20b90.00'
+
+  const tariff = Number(
+    tariffPerKwh
+      ?? session.power_tariff_per_kwh
+      ?? session.energy_tariff_per_kwh
+      ?? 8.0,
+  )
+  const safeTariff = Number.isFinite(tariff) && tariff >= 0 ? tariff : 8.0
+  const cost = kwh * safeTariff
+  return `\u20b9${cost.toFixed(2)}`
 }
 
 function groupByDate(rows) {
@@ -163,6 +173,7 @@ export default function SessionHistory() {
   const [filter, setFilter] = useState('all')
   const [showInvalid, setShowInvalid] = useState(false)
   const [loading, setLoading] = useState(false)
+  const [tariffPerKwh, setTariffPerKwh] = useState(8.0)
 
   useEffect(() => {
     setPage(0)
@@ -172,6 +183,7 @@ export default function SessionHistory() {
     if (!activeRoomId) {
       setSessions([])
       setTotal(0)
+      setTariffPerKwh(8.0)
       setLoading(false)
       return
     }
@@ -183,6 +195,7 @@ export default function SessionHistory() {
       .then(r => {
         setSessions(r.sessions || [])
         setTotal(r.total || 0)
+        setTariffPerKwh(Number(r.tariff_per_kwh ?? 8.0))
       })
       .catch(console.error)
       .finally(() => setLoading(false))
@@ -296,7 +309,7 @@ export default function SessionHistory() {
                   </td>
                 </tr>
               ) : groupedRows.map(group => (
-                <TableGroup key={group.key} group={group} />
+                <TableGroup key={group.key} group={group} tariffPerKwh={tariffPerKwh} />
               ))}
             </tbody>
           </table>
@@ -338,7 +351,7 @@ export default function SessionHistory() {
   )
 }
 
-function TableGroup({ group }) {
+function TableGroup({ group, tariffPerKwh }) {
   return (
     <>
       <tr className="bg-gray-900/40">
@@ -369,7 +382,7 @@ function TableGroup({ group }) {
             <td className="py-2.5 pr-4">
               {s.energy_consumed_kwh != null ? `${Number(s.energy_consumed_kwh).toFixed(3)}` : '--'}
             </td>
-            <td className="py-2.5 pr-4 text-yellow-400">{costDisplay(s)}</td>
+            <td className="py-2.5 pr-4 text-yellow-400">{costDisplay(s, tariffPerKwh)}</td>
             <td className="py-2.5 pr-4"><StorageBadge session={s} /></td>
             <td className="py-2.5 pr-4">
               <QualityBadge quality={s._quality} />

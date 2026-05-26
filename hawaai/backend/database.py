@@ -231,13 +231,6 @@ def _enrich_session(row: Dict[str, Any]) -> Dict[str, Any]:
             duration_min = max(0.0, secs / 60.0)
     except Exception:
         pass
-    # Fall back to stored time_to_cool_minutes if timestamps unparseable
-    if duration_min is None and s.get("time_to_cool_minutes") is not None:
-        try:
-            duration_min = max(0.0, float(s["time_to_cool_minutes"]))
-        except (TypeError, ValueError):
-            pass
-
     s["duration_minutes"] = round(duration_min, 2) if duration_min is not None else None
 
     # ── Delta temperature ─────────────────────────────────────────────────────
@@ -430,7 +423,7 @@ async def get_sessions(
     rid = (room_id or "").strip()
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
-        query = "SELECT * FROM sessions WHERE is_archived = 0 AND room_id = ?"
+        query = "SELECT * FROM sessions WHERE is_archived = 0 AND end_time IS NOT NULL AND room_id = ?"
         params: list = [rid]
         if date_from:
             query += " AND start_time >= ?"
@@ -453,7 +446,7 @@ async def get_session_count(
 ) -> int:
     rid = (room_id or "").strip()
     async with aiosqlite.connect(DB_PATH) as db:
-        query = "SELECT COUNT(*) FROM sessions WHERE is_archived = 0 AND room_id = ?"
+        query = "SELECT COUNT(*) FROM sessions WHERE is_archived = 0 AND end_time IS NOT NULL AND room_id = ?"
         params: list = [rid]
         if date_from:
             query += " AND start_time >= ?"
@@ -787,8 +780,14 @@ async def get_snapshots_for_ml(room_id: str, limit: int = 10000) -> List[Dict[st
 # Stats
 # ─────────────────────────────────────────────────────────────────────────────
 
-async def get_today_stats(room_id: str) -> Dict[str, Any]:
+async def get_today_stats(room_id: str, tariff_per_kwh: float = 8.0) -> Dict[str, Any]:
     rid = (room_id or "").strip()
+    try:
+        tariff = float(tariff_per_kwh)
+        if tariff < 0:
+            tariff = 8.0
+    except (TypeError, ValueError):
+        tariff = 8.0
     today = datetime.utcnow().date().isoformat()
     tomorrow = (datetime.utcnow().date() + timedelta(days=1)).isoformat()
     async with aiosqlite.connect(DB_PATH) as db:
@@ -797,31 +796,37 @@ async def get_today_stats(room_id: str) -> Dict[str, Any]:
             SELECT
                 COUNT(*)                              AS session_count,
                 COALESCE(SUM(energy_consumed_kwh), 0) AS total_kwh,
-                COALESCE(SUM(cost_estimate), 0)       AS total_cost,
                 COALESCE(SUM(
-                    CASE WHEN end_time IS NOT NULL
-                    THEN (JULIANDAY(end_time) - JULIANDAY(start_time)) * 1440
-                    ELSE (JULIANDAY('now')    - JULIANDAY(start_time)) * 1440
-                    END
+                    (JULIANDAY(end_time) - JULIANDAY(start_time)) * 1440
                 ), 0)                                 AS total_ac_minutes
             FROM sessions
-            WHERE start_time >= ? AND start_time < ? AND is_archived = 0 AND room_id = ?
+            WHERE start_time >= ? AND start_time < ?
+              AND is_archived = 0
+              AND end_time IS NOT NULL
+              AND room_id = ?
             """,
             (today, tomorrow, rid),
         ) as cursor:
             row = await cursor.fetchone()
             if row:
+                total_kwh = max(0.0, float(row[1] or 0.0))
                 return {
                     "session_count": row[0],
-                    "total_kwh": round(row[1], 3),
-                    "total_cost": round(row[2], 2),
-                    "total_ac_minutes": round(row[3], 1),
+                    "total_kwh": round(total_kwh, 3),
+                    "total_cost": round(total_kwh * tariff, 2),
+                    "total_ac_minutes": round(row[2], 1),
                 }
     return {"session_count": 0, "total_kwh": 0.0, "total_cost": 0.0, "total_ac_minutes": 0.0}
 
 
-async def get_daily_stats(days: int = 7, room_id: str = "") -> List[Dict]:
+async def get_daily_stats(days: int = 7, room_id: str = "", tariff_per_kwh: float = 8.0) -> List[Dict]:
     rid = (room_id or "").strip()
+    try:
+        tariff = float(tariff_per_kwh)
+        if tariff < 0:
+            tariff = 8.0
+    except (TypeError, ValueError):
+        tariff = 8.0
     async with aiosqlite.connect(DB_PATH) as db:
         async with db.execute(
             """
@@ -829,10 +834,14 @@ async def get_daily_stats(days: int = 7, room_id: str = "") -> List[Dict]:
                 DATE(start_time)                       AS date,
                 COUNT(*)                               AS sessions,
                 COALESCE(SUM(energy_consumed_kwh), 0)  AS kwh,
-                COALESCE(SUM(cost_estimate), 0)        AS cost,
-                COALESCE(AVG(time_to_cool_minutes), 0) AS avg_cool_time
+                COALESCE(AVG(
+                    (JULIANDAY(end_time) - JULIANDAY(start_time)) * 1440
+                ), 0)                                  AS avg_cool_time
             FROM sessions
-            WHERE start_time >= DATE('now', ?) AND is_archived = 0 AND room_id = ?
+            WHERE start_time >= DATE('now', ?)
+              AND is_archived = 0
+              AND end_time IS NOT NULL
+              AND room_id = ?
             GROUP BY DATE(start_time)
             ORDER BY date ASC
             """,
@@ -843,9 +852,9 @@ async def get_daily_stats(days: int = 7, room_id: str = "") -> List[Dict]:
                 {
                     "date": r[0],
                     "sessions": r[1],
-                    "kwh": round(r[2], 3),
-                    "cost": round(r[3], 2),
-                    "avg_cool_time": round(r[4], 1),
+                    "kwh": round(max(0.0, float(r[2] or 0.0)), 3),
+                    "cost": round(max(0.0, float(r[2] or 0.0)) * tariff, 2),
+                    "avg_cool_time": round(r[3], 1),
                 }
                 for r in rows
             ]
@@ -1076,10 +1085,11 @@ async def get_ml_stats(room_id: str) -> Dict[str, Any]:
             """
             SELECT
                 COUNT(*) AS total,
-                AVG(time_to_cool_minutes) AS avg_cool,
-                COUNT(CASE WHEN end_time IS NOT NULL THEN 1 END) * 100.0 / MAX(COUNT(*), 1) AS completeness
+                AVG((JULIANDAY(end_time) - JULIANDAY(start_time)) * 1440) AS avg_cool,
+                COUNT(CASE WHEN COALESCE(is_record_valid, 1) != 0 AND COALESCE(provisional, 0) != 1 THEN 1 END) * 100.0 / MAX(COUNT(*), 1) AS completeness
             FROM sessions
             WHERE room_id = ?
+              AND end_time IS NOT NULL
             """,
             (rid,),
         ) as cursor:

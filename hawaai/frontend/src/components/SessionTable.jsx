@@ -34,6 +34,12 @@ function formatDuration(startIso, endIso) {
   return `${Math.floor(mins / 60)}h ${Math.round(mins % 60)}m`
 }
 
+function finalizedDurationMinutes(s) {
+  if (!s.start_time || !s.end_time) return null
+  const mins = (new Date(s.end_time) - new Date(s.start_time)) / 60000
+  return Number.isFinite(mins) && mins >= 0 ? mins : null
+}
+
 const REASON_COLORS = {
   cooled: 'text-green-400',
   vacant: 'text-yellow-400',
@@ -51,10 +57,7 @@ function sessionQuality(s) {
   if (s.valid === true) return 'good'
   if (s.valid === false) return (dt != null && dt >= 0.3) ? 'weak' : 'invalid'
 
-  const dur = s.duration_minutes ??
-    (s.start_time && s.end_time
-      ? (new Date(s.end_time) - new Date(s.start_time)) / 60000
-      : null)
+  const dur = finalizedDurationMinutes(s)
   if (dur != null && dur >= 3 && dt != null && dt >= 0.3) return 'good'
   if (dt != null && dt >= 0.3) return 'weak'
   return 'invalid'
@@ -87,9 +90,19 @@ function StorageBadge({ session }) {
   )
 }
 
-function costDisplay(session) {
-  if (session.energy_consumed_kwh == null || session.cost_estimate == null) return '--'
-  return `₹${Number(session.cost_estimate).toFixed(2)}`
+function costDisplay(session, tariffPerKwh = 8.0) {
+  const kwh = Number(session.energy_consumed_kwh ?? session.kwh ?? 0)
+  if (!Number.isFinite(kwh) || kwh <= 0) return '\u20b90.00'
+
+  const tariff = Number(
+    tariffPerKwh
+      ?? session.power_tariff_per_kwh
+      ?? session.energy_tariff_per_kwh
+      ?? 8.0,
+  )
+  const safeTariff = Number.isFinite(tariff) && tariff >= 0 ? tariff : 8.0
+  const cost = kwh * safeTariff
+  return `\u20b9${cost.toFixed(2)}`
 }
 
 function groupByDate(rows) {
@@ -110,16 +123,21 @@ export default function SessionTable({ limit = 10, roomId }) {
   const [sessions, setSessions] = useState([])
   const [loading, setLoading] = useState(true)
   const [showInvalid, setShowInvalid] = useState(false)
+  const [tariffPerKwh, setTariffPerKwh] = useState(8.0)
 
   useEffect(() => {
     if (!roomId) {
       setSessions([])
+      setTariffPerKwh(8.0)
       setLoading(false)
       return
     }
     setLoading(true)
     getSessions({ limit, room_id: roomId })
-      .then(r => setSessions(r.sessions || []))
+      .then(r => {
+        setSessions(r.sessions || [])
+        setTariffPerKwh(Number(r.tariff_per_kwh ?? 8.0))
+      })
       .catch(console.error)
       .finally(() => setLoading(false))
   }, [limit, roomId])
@@ -165,7 +183,7 @@ export default function SessionTable({ limit = 10, roomId }) {
           </thead>
           <tbody className="divide-y divide-gray-800/50">
             {grouped.map(group => (
-              <FragmentRows key={group.key} group={group} />
+              <FragmentRows key={group.key} group={group} tariffPerKwh={tariffPerKwh} />
             ))}
           </tbody>
         </table>
@@ -186,7 +204,7 @@ export default function SessionTable({ limit = 10, roomId }) {
   )
 }
 
-function FragmentRows({ group }) {
+function FragmentRows({ group, tariffPerKwh }) {
   return (
     <>
       <tr className="bg-gray-900/40">
@@ -200,8 +218,7 @@ function FragmentRows({ group }) {
             ? s.indoor_temp_start - s.indoor_temp_end
             : null)
         const isInvalid = s._quality === 'invalid'
-        const duration = formatDuration(s.start_time, s.end_time) ??
-          (s.time_to_cool_minutes != null ? `${Math.round(s.time_to_cool_minutes)}m` : null)
+        const duration = formatDuration(s.start_time, s.end_time)
         return (
           <tr
             key={s.session_id}
@@ -214,7 +231,7 @@ function FragmentRows({ group }) {
               {delta != null ? <span className="text-blue-400">-{Number(delta).toFixed(1)}°C</span> : '--'}
             </td>
             <td className="py-2 pr-3">{fmt(s.energy_consumed_kwh, 3)}</td>
-            <td className="py-2 pr-3 text-yellow-400">{costDisplay(s)}</td>
+            <td className="py-2 pr-3 text-yellow-400">{costDisplay(s, tariffPerKwh)}</td>
             <td className="py-2 pr-3"><StorageBadge session={s} /></td>
             <td className={`py-2 pr-3 text-xs font-medium ${REASON_COLORS[s.reason_stopped] || 'text-gray-500'}`}>
               {s.reason_stopped || '--'}

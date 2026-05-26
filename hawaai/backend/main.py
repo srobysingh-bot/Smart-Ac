@@ -54,7 +54,6 @@ from .ai import get_cached
 from .ai.ai_worker import get_ai_status, init_ai_worker
 from .energy_config import (
     EnergyConfigMode,
-    discover_energy_entities_for_device,
     resolve_energy_config,
     validate_energy_entity,
 )
@@ -74,16 +73,42 @@ _CLIMATE_COMMAND_DEBOUNCE_SECS = 1.2
 _CLIMATE_DUPLICATE_WINDOW_SECS = 2.0
 
 
-async def _repair_persisted_energy_config(cfg: Dict[str, Any]) -> bool:
-    """HA-aware startup repair for poisoned/stale saved energy entities."""
+async def _wait_for_ha_hydration(timeout_seconds: float = 25.0) -> None:
+    """Give HA entity/device registries a brief chance to hydrate before audits."""
+    logger.info("[CONFIG] hydration_wait_started")
+    deadline = time.monotonic() + max(0.0, timeout_seconds)
+    last_error = ""
+    while time.monotonic() < deadline:
+        try:
+            entities, devices = await asyncio.gather(
+                ha_client.get_all_entities(),
+                ha_client.get_device_registry(),
+            )
+            entity_count = len(entities) if isinstance(entities, list) else 0
+            device_count = len(devices) if isinstance(devices, list) else 0
+            if entity_count > 0 or device_count > 0:
+                logger.info(
+                    "[CONFIG] hydration_complete entities=%s devices=%s",
+                    entity_count,
+                    device_count,
+                )
+                return
+        except Exception as exc:
+            last_error = str(exc)
+        await asyncio.sleep(1.0)
+    logger.warning("[CONFIG] hydration_complete timeout=true last_error=%s", last_error)
+
+
+async def _audit_persisted_energy_config(cfg: Dict[str, Any]) -> None:
+    """Non-mutating startup audit: saved entity ids remain authoritative."""
     rooms = [copy.deepcopy(r) for r in room_registry.list_room_dicts(cfg)]
     if not rooms:
-        return False
+        return
 
     try:
         registry_devices = await ha_client.get_device_registry()
     except Exception:
-        logger.debug("[ENERGY_CONFIG] device registry unavailable during startup repair", exc_info=True)
+        logger.debug("[CONFIG] device registry unavailable during config audit", exc_info=True)
         registry_devices = []
     known_device_ids = {
         str(d.get("id") or "").strip()
@@ -91,23 +116,16 @@ async def _repair_persisted_energy_config(cfg: Dict[str, Any]) -> bool:
         if str(d.get("id") or "").strip()
     }
 
-    changed = config_manager.consume_energy_sanitized_load_flag()
     for room in rooms:
         room_id = str(room.get("id") or room.get("name") or "unknown").strip()
         device_id = str(room.get("energy_device_id") or "").strip()
         if device_id and known_device_ids and device_id not in known_device_ids:
             logger.warning(
-                "[ENERGY_VALIDATE] room=%s entity=%s reason=invalid_device_id action=clear_saved_field",
+                "[CONFIG] preserved_entity despite unavailable state room=%s field=energy_device_id entity=%s reason=device_not_in_registry",
                 room_id,
                 device_id,
             )
-            room["energy_device_id"] = ""
-            room["energy_device_name"] = ""
-            device_id = ""
-            changed = True
 
-        missing_power = not str(room.get("energy_power_entity") or "").strip()
-        missing_kwh = not str(room.get("energy_kwh_entity") or "").strip()
         for key, kind in (
             ("energy_power_entity", "power"),
             ("energy_kwh_entity", "energy"),
@@ -120,36 +138,12 @@ async def _repair_persisted_energy_config(cfg: Dict[str, Any]) -> bool:
             if validation.valid:
                 continue
             logger.warning(
-                "[ENERGY_VALIDATE] room=%s entity=%s reason=%s action=clear_saved_field",
+                "[CONFIG] preserved_entity despite unavailable state room=%s field=%s entity=%s reason=%s",
                 room_id,
+                key,
                 entity_id,
                 validation.reason,
             )
-            room[key] = ""
-            changed = True
-            if key == "energy_power_entity":
-                missing_power = True
-            else:
-                missing_kwh = True
-
-        if device_id and (missing_power or missing_kwh):
-            discovered = await discover_energy_entities_for_device(device_id, room_id=room_id)
-            power_entity = str(discovered.get("power_entity") or "").strip()
-            kwh_entity = str(discovered.get("kwh_entity") or "").strip()
-            if missing_power and power_entity:
-                room["energy_power_entity"] = power_entity
-                changed = True
-            if missing_kwh and kwh_entity:
-                room["energy_kwh_entity"] = kwh_entity
-                changed = True
-
-    if not changed:
-        return False
-    if config_manager.save_config({"rooms": rooms}):
-        logger.info("[ENERGY_CONFIG] startup_repair persisted cleaned room energy config")
-        return True
-    logger.error("[ENERGY_CONFIG] startup_repair failed to persist cleaned room energy config")
-    return False
 
 
 async def _enqueue_climate_command(
@@ -328,7 +322,9 @@ async def lifespan(app: FastAPI):
     database.backup_db("startup")
     await database.init_db()
     cfg = config_manager.load_config()
-    await _repair_persisted_energy_config(cfg)
+    logger.info("[CONFIG] schema_version=%s", cfg.get("schema_version", config_manager.CONFIG_SCHEMA_VERSION))
+    await _wait_for_ha_hydration()
+    await _audit_persisted_energy_config(cfg)
     cfg = config_manager.load_config()
     room_log_store.set_max_lines_per_room(int(cfg.get("log_buffer_size", 300)))
     ac_ent = (cfg.get("ac_entity") or cfg.get("climate_entity") or "").strip() or "(not set)"
@@ -359,7 +355,7 @@ async def lifespan(app: FastAPI):
     logger.info("[HawaAI] Add-on stopped")
 
 
-app = FastAPI(title="HawaAI API", version="1.4.76", lifespan=lifespan)
+app = FastAPI(title="HawaAI API", version="1.4.77", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -1419,6 +1415,23 @@ async def api_room_ai_status(room_id: str):
 
 # ── SESSIONS ──────────────────────────────────────────────────────────────────
 
+def _analytics_tariff_for_room(room_id: str) -> float:
+    """Read-only tariff lookup for analytics display and aggregation."""
+    try:
+        base = config_manager.load_config()
+        room_def = room_registry.get_room(base, room_id)
+        eff = room_registry.merge_room_config(base, room_def) if room_def else base
+        raw = (
+            eff.get("power_tariff_per_kwh")
+            if eff.get("power_tariff_per_kwh") is not None
+            else eff.get("energy_tariff_per_kwh", 8.0)
+        )
+        tariff = float(raw)
+        return tariff if tariff >= 0 else 8.0
+    except Exception:
+        return 8.0
+
+
 @app.get("/api/sessions")
 async def get_sessions(
     room_id: str = Query(..., min_length=1),
@@ -1428,24 +1441,33 @@ async def get_sessions(
     date_to: Optional[str] = None,
 ):
     rid = _require_room_query(room_id)
+    tariff = _analytics_tariff_for_room(rid)
     sessions = await database.get_sessions(rid, limit, offset, date_from, date_to)
     total = await database.get_session_count(rid, date_from, date_to)
-    return {"sessions": sessions, "total": total, "limit": limit, "offset": offset}
+    return {
+        "sessions": sessions,
+        "total": total,
+        "limit": limit,
+        "offset": offset,
+        "tariff_per_kwh": tariff,
+    }
 
 
 @app.get("/api/sessions/stats")
 async def get_stats(room_id: str = Query(..., min_length=1)):
     """Today + ML quality stats (used by Dashboard and Analytics pages)."""
     rid = _require_room_query(room_id)
-    today = await database.get_today_stats(rid)
+    tariff = _analytics_tariff_for_room(rid)
+    today = await database.get_today_stats(rid, tariff)
     ml = await database.get_ml_stats(rid)
-    return {"today": today, "ml": ml}
+    return {"today": today, "ml": ml, "tariff_per_kwh": tariff}
 
 
 @app.get("/api/sessions/today")
 async def get_today_stats_route(room_id: str = Query(..., min_length=1)):
     """Today stats only."""
-    return await database.get_today_stats(_require_room_query(room_id))
+    rid = _require_room_query(room_id)
+    return await database.get_today_stats(rid, _analytics_tariff_for_room(rid))
 
 
 # ── INSIGHTS ──────────────────────────────────────────────────────────────────
@@ -1493,7 +1515,8 @@ async def get_daily(
     days: int = Query(7, ge=1, le=90),
     room_id: str = Query(..., min_length=1),
 ):
-    return await database.get_daily_stats(days, _require_room_query(room_id))
+    rid = _require_room_query(room_id)
+    return await database.get_daily_stats(days, rid, _analytics_tariff_for_room(rid))
 
 
 # ── CLIMATE ENTITY ────────────────────────────────────────────────────────────

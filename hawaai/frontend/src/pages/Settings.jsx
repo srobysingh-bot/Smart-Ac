@@ -126,6 +126,7 @@ function Toggle({ label, description, checked, onChange, danger }) {
 // Each field uses its own search string so they don't interfere.
 function EntityDropdown({ label, value, onChange, entities, search, onSearchChange }) {
   const q = search.toLowerCase()
+  const savedValue = String(value || '').trim()
   const filtered = q
     ? entities.filter(
         e =>
@@ -154,6 +155,9 @@ function EntityDropdown({ label, value, onChange, entities, search, onSearchChan
         }}
       >
         <option value="">— Not configured —</option>
+        {savedValue && !filtered.some(e => e.entity_id === savedValue) && (
+          <option value={savedValue}>{savedValue} (saved)</option>
+        )}
         {filtered.map(e => (
           <option key={e.entity_id} value={e.entity_id}>
             {e.friendly_name} ({e.entity_id})
@@ -346,6 +350,8 @@ export default function Settings() {
       setCfg({})
       setRoomTitle('')
       setRoomDisabled(false)
+      setSelectedDevice(null)
+      setDeviceEntities([])
       setLoading(false)
       return
     }
@@ -355,7 +361,10 @@ export default function Settings() {
     setLoadError(null)
     Promise.all([
       getRoom(roomId),
-      getEntities(),
+      getEntities().catch(err => {
+        console.warn('[HawaAI] Settings entity list unavailable; preserving saved room config', err)
+        return []
+      }),
       getDevices().catch(err => {
         setDevicesError(String(err))
         return []
@@ -437,8 +446,8 @@ export default function Settings() {
         presence_entity: cfg.presence_entity?.trim() || null,
         indoor_temp_entity: cfg.indoor_temp_entity?.trim() || null,
         indoor_humidity_entity: cfg.indoor_humidity_entity?.trim() || null,
-        energy_device_id: (cfg.energy_device_id || selectedDevice?.device_id || '').trim() || null,
-        energy_device_name: (cfg.energy_device_name || selectedDevice?.name || '').trim() || null,
+        energy_device_id: (cfg.energy_device_id || '').trim() || null,
+        energy_device_name: (cfg.energy_device_name || '').trim() || null,
         energy_power_entity: cfg.energy_power_entity?.trim() || null,
         energy_kwh_entity: cfg.energy_kwh_entity?.trim() || null,
         settings,
@@ -628,8 +637,15 @@ export default function Settings() {
       const powerEnt = sortedPower[0]
       const kwhEnt = sortedKwh[0]
 
-      if (powerEnt) patch('energy_power_entity', powerEnt.entity_id)
-      if (kwhEnt)   patch('energy_kwh_entity',   kwhEnt.entity_id)
+      setCfg(prev => ({
+        ...prev,
+        energy_power_entity: String(prev.energy_power_entity || '').trim()
+          ? prev.energy_power_entity
+          : (powerEnt?.entity_id || prev.energy_power_entity || ''),
+        energy_kwh_entity: String(prev.energy_kwh_entity || '').trim()
+          ? prev.energy_kwh_entity
+          : (kwhEnt?.entity_id || prev.energy_kwh_entity || ''),
+      }))
     } catch (err) {
       setEntitiesError(`Failed to load device entities: ${err.message || err}`)
     }

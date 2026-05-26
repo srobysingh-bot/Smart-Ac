@@ -64,8 +64,8 @@ export default function Analytics() {
   const ml    = stats?.ml    || {}
   const today = stats?.today || {}
 
-  const totalKwh  = daily.reduce((s, d) => s + (d.kwh  || 0), 0)
-  const totalCost = daily.reduce((s, d) => s + (d.cost || 0), 0)
+  const totalKwh  = daily.reduce((s, d) => s + (Number(d.kwh) || 0), 0)
+  const totalCost = daily.reduce((s, d) => s + (Number(d.cost) || 0), 0)
 
   const activeRoom = rooms.find(r => r.id === roomId)
 

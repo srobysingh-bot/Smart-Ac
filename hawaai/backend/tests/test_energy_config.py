@@ -530,7 +530,7 @@ class EnergyConfigResolverTests(unittest.TestCase):
         self.assertFalse(study["energy_live_available"])
         self.assertEqual(study["energy_status"], "unavailable")
 
-    def test_load_time_sanitizer_clears_only_poisoned_energy_fields(self):
+    def test_load_time_sanitizer_preserves_saved_energy_fields(self):
         from backend import config_manager
 
         cfg = {
@@ -555,7 +555,7 @@ class EnergyConfigResolverTests(unittest.TestCase):
         cleaned = config_manager.sanitize_energy_entities(cfg)
         study = cleaned["rooms"][0]
         dining = cleaned["rooms"][1]
-        self.assertEqual(study["energy_power_entity"], "")
+        self.assertEqual(study["energy_power_entity"], "select.study_power_on_behaviour")
         self.assertEqual(study["energy_kwh_entity"], "sensor.study_total_energy")
         self.assertEqual(study["settings"]["target_temp"], 25)
         self.assertEqual(dining["energy_power_entity"], "sensor.dining_power")

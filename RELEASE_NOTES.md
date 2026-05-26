@@ -1,5 +1,11 @@
 # HawaAI add-on — release notes
 
+## 1.4.77
+
+- **Config persistence:** Added schema-versioned, idempotent config migrations that preserve user-selected room entities and scrub transient runtime state from saved config.
+- **Startup hydration:** Startup now waits briefly for HA entity/device hydration and audits saved entities without clearing or rewriting config during temporary unavailable states.
+- **Analytics/UI:** Session history and analytics now compute durations only from finalized persisted session timestamps and calculate cost from numeric kWh x tariff.
+
 ## 1.4.76
 
 - **OFF reliability:** Vacancy shutdown now enters OFF confirmation, verifies physical OFF by power/climate state, retries missed IR sends with a cap, and only finalizes runtime/session after confirmation.
