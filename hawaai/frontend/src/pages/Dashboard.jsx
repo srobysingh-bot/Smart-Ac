@@ -32,6 +32,7 @@ import {
   Gauge,
   WifiOff,
   TimerReset,
+  ChevronDown,
 } from 'lucide-react'
 
 function formatAiTime(iso) {
@@ -744,25 +745,6 @@ function premiumTempLabel(value) {
   return Number.isInteger(n) ? String(n) : n.toFixed(1)
 }
 
-function PremiumClimateChip({ active, disabled, onClick, children, title }) {
-  return (
-    <button
-      type="button"
-      title={title}
-      aria-pressed={active}
-      disabled={disabled}
-      onClick={onClick}
-      className={`tap-highlight-none min-h-[40px] rounded-lg border px-3 py-2 text-xs font-semibold transition-all duration-200 ease-out active:scale-[0.98] disabled:cursor-not-allowed disabled:opacity-40 ${
-        active
-          ? 'border-sky-400/60 bg-sky-500/15 text-white shadow-[0_0_18px_rgba(56,189,248,0.14)]'
-          : 'border-gray-700/80 bg-gray-900/70 text-gray-300 hover:border-gray-500 hover:bg-gray-800'
-      }`}
-    >
-      {children}
-    </button>
-  )
-}
-
 function PremiumClimateStatePills({ status, climate, busy }) {
   const phase = String(status?.ac_state || '').toLowerCase()
   const telemetry = String(status?.telemetry_status || 'unconfigured').toLowerCase()
@@ -806,13 +788,105 @@ function PremiumClimateStatePills({ status, climate, busy }) {
   )
 }
 
+function PremiumControlButton({
+  active,
+  disabled,
+  Icon,
+  label,
+  value,
+  onClick,
+}) {
+  return (
+    <button
+      type="button"
+      disabled={disabled}
+      aria-expanded={active}
+      onClick={onClick}
+      className={`tap-highlight-none flex min-h-[58px] min-w-0 items-center justify-between gap-3 rounded-lg border px-3 py-2 text-left transition-all duration-200 active:scale-[0.99] disabled:cursor-not-allowed disabled:opacity-45 ${
+        active
+          ? 'border-sky-400/60 bg-sky-500/15 shadow-[0_0_18px_rgba(56,189,248,0.12)]'
+          : 'border-gray-800 bg-gray-950/45 hover:border-gray-600 hover:bg-gray-900/75'
+      }`}
+    >
+      <span className="flex min-w-0 items-center gap-2.5">
+        <span className="grid h-8 w-8 shrink-0 place-items-center rounded-lg bg-white/10 text-sky-200">
+          <Icon size={15} aria-hidden />
+        </span>
+        <span className="min-w-0">
+          <span className="block text-[10px] font-semibold uppercase tracking-[0.16em] text-gray-500">{label}</span>
+          <span className="block truncate text-sm font-semibold text-gray-100">{value || 'Unsupported'}</span>
+        </span>
+      </span>
+      <ChevronDown
+        size={15}
+        className={`shrink-0 text-gray-500 transition-transform duration-200 ${active ? 'rotate-180 text-sky-300' : ''}`}
+        aria-hidden
+      />
+    </button>
+  )
+}
+
+function PremiumSelectorPanel({
+  title,
+  options,
+  currentValue,
+  disabled,
+  emptyLabel = 'Unsupported',
+  onSelect,
+  optionMeta,
+}) {
+  if (!options || options.length === 0) {
+    return (
+      <div className="rounded-lg border border-gray-800 bg-gray-950/50 p-3 text-sm font-semibold text-gray-500">
+        {emptyLabel}
+      </div>
+    )
+  }
+
+  return (
+    <div className="rounded-lg border border-sky-500/20 bg-gray-950/70 p-3 shadow-xl shadow-black/20">
+      <p className="mb-3 text-[11px] font-semibold uppercase tracking-[0.16em] text-gray-500">{title}</p>
+      <div className="grid grid-cols-2 gap-2 sm:grid-cols-3">
+        {options.map(option => {
+          const meta = optionMeta?.(option)
+          const Icon = meta?.Icon || Gauge
+          const label = meta?.label || premiumModeLabel(option)
+          const active = option === currentValue
+          return (
+            <button
+              key={option}
+              type="button"
+              disabled={disabled || active}
+              aria-pressed={active}
+              onClick={() => onSelect(option)}
+              className={`tap-highlight-none min-h-[46px] rounded-lg border px-3 py-2 text-xs font-semibold transition-all duration-200 active:scale-[0.98] disabled:cursor-not-allowed ${
+                active
+                  ? meta?.active || 'border-sky-400/60 bg-sky-500/15 text-white'
+                  : 'border-gray-700/75 bg-gray-900/70 text-gray-300 hover:border-gray-500 hover:bg-gray-800/85'
+              }`}
+            >
+              <span className="flex items-center justify-center gap-2">
+                <Icon size={15} aria-hidden />
+                {label}
+              </span>
+            </button>
+          )
+        })}
+      </div>
+    </div>
+  )
+}
+
 function PremiumClimateCard({ entityId, status }) {
   const [climate, setClimate] = useState(null)
   const [error, setError] = useState(null)
   const [busy, setBusy] = useState(false)
   const [pendingTemperature, setPendingTemperature] = useState(null)
   const [isDraggingTemp, setIsDraggingTemp] = useState(false)
+  const [activeSelector, setActiveSelector] = useState(null)
   const tempDebounceRef = useRef(null)
+  const commandInFlightRef = useRef(false)
+  const temperatureInFlightRef = useRef(null)
 
   const fetchClimate = useCallback(() => {
     getClimateState(entityId)
@@ -833,12 +907,20 @@ function PremiumClimateCard({ entityId, status }) {
   useEffect(() => {
     setPendingTemperature(null)
     setIsDraggingTemp(false)
+    setActiveSelector(null)
+    commandInFlightRef.current = false
+    temperatureInFlightRef.current = null
     return () => {
       if (tempDebounceRef.current) clearTimeout(tempDebounceRef.current)
     }
   }, [entityId])
 
-  const sendCommand = async (fn) => {
+  const sendCommand = async (fn, optimisticPatch = null) => {
+    if (commandInFlightRef.current) return
+    commandInFlightRef.current = true
+    if (optimisticPatch) {
+      setClimate(prev => prev ? { ...prev, ...optimisticPatch } : prev)
+    }
     setBusy(true)
     try {
       await fn()
@@ -846,6 +928,7 @@ function PremiumClimateCard({ entityId, status }) {
     } catch (e) {
       setError(e.message || String(e))
     } finally {
+      commandInFlightRef.current = false
       setBusy(false)
     }
   }
@@ -865,15 +948,56 @@ function PremiumClimateCard({ entityId, status }) {
         tempDebounceRef.current = null
         return
       }
-      sendCommand(() => setClimateTemperature(entityId, clamped))
+      if (temperatureInFlightRef.current === clamped) {
+        tempDebounceRef.current = null
+        return
+      }
+      temperatureInFlightRef.current = clamped
+      setPendingTemperature(null)
+      sendCommand(
+        () => setClimateTemperature(entityId, clamped),
+        { temperature: clamped },
+      ).finally(() => {
+        if (temperatureInFlightRef.current === clamped) {
+          temperatureInFlightRef.current = null
+        }
+      })
       tempDebounceRef.current = null
-    }, 650)
+    }, 400)
   }
 
   const adjustTemp = (delta) => {
     if (!climate) return
     const current = pendingTemperature ?? climate.temperature ?? 24
     queueTemperature(Number(current) + Number(delta))
+  }
+
+  const toggleSelector = (name) => {
+    setActiveSelector(current => current === name ? null : name)
+  }
+
+  const selectHvacMode = (mode) => {
+    setActiveSelector(null)
+    sendCommand(
+      () => setHvacMode(entityId, mode),
+      { hvac_mode: mode },
+    )
+  }
+
+  const selectFanMode = (mode) => {
+    setActiveSelector(null)
+    sendCommand(
+      () => setFanMode(entityId, mode),
+      { fan_mode: mode },
+    )
+  }
+
+  const selectSwingMode = (mode) => {
+    setActiveSelector(null)
+    sendCommand(
+      () => setSwingMode(entityId, mode),
+      { swing_mode: mode },
+    )
   }
 
   if (error) {
@@ -911,7 +1035,12 @@ function PremiumClimateCard({ entityId, status }) {
     active: 'border-gray-500/70 bg-gray-800 text-gray-100',
   }
   const ActiveIcon = activeMode.Icon
+  const FanIcon = Fan
+  const SwingIcon = RotateCw
   const controlsDisabled = busy || hvac_mode === 'off'
+  const modeOptions = Array.isArray(hvac_modes) ? hvac_modes : []
+  const fanOptions = Array.isArray(fan_modes) ? fan_modes : []
+  const swingOptions = Array.isArray(swing_modes) ? swing_modes : []
 
   return (
     <div className="card relative overflow-hidden border-gray-700/80 bg-[radial-gradient(circle_at_50%_0%,rgba(14,165,233,0.14),transparent_34%),linear-gradient(180deg,rgba(17,24,39,0.96),rgba(3,7,18,0.94))] p-0 shadow-2xl shadow-black/25">
@@ -1012,101 +1141,76 @@ function PremiumClimateCard({ entityId, status }) {
             </span>
           </div>
 
-          {hvac_modes && hvac_modes.length > 0 && (
-            <div className="rounded-lg border border-gray-800/85 bg-gray-950/40 p-3">
-              <p className="mb-3 text-[11px] font-semibold uppercase tracking-[0.16em] text-gray-500">Mode</p>
-              <div className="grid grid-cols-2 gap-2 sm:grid-cols-3 xl:grid-cols-6">
-                {hvac_modes.map(mode => {
-                  const meta = PREMIUM_HVAC_MODE_META[mode] || { label: premiumModeLabel(mode), Icon: Gauge, active: 'border-sky-400/60 bg-sky-500/15 text-white' }
-                  const Icon = meta.Icon
-                  const active = mode === hvac_mode
-                  return (
-                    <button
-                      key={mode}
-                      type="button"
-                      disabled={busy || active}
-                      aria-pressed={active}
-                      onClick={() => sendCommand(() => setHvacMode(entityId, mode))}
-                      className={`tap-highlight-none min-h-[54px] rounded-lg border px-3 py-2 text-xs font-semibold transition-all duration-200 active:scale-[0.98] disabled:cursor-not-allowed ${
-                        active
-                          ? meta.active
-                          : 'border-gray-700/75 bg-gray-900/70 text-gray-300 hover:border-gray-500 hover:bg-gray-800/85'
-                      }`}
-                    >
-                      <span className="flex items-center justify-center gap-2">
-                        <Icon size={15} aria-hidden />
-                        {meta.label}
-                      </span>
-                    </button>
-                  )
-                })}
-              </div>
-            </div>
+          <div className="grid gap-2 sm:grid-cols-3">
+            <PremiumControlButton
+              active={activeSelector === 'mode'}
+              disabled={modeOptions.length === 0}
+              Icon={ActiveIcon}
+              label="Mode"
+              value={activeMode.label}
+              onClick={() => toggleSelector('mode')}
+            />
+            <PremiumControlButton
+              active={activeSelector === 'fan'}
+              disabled={fanOptions.length === 0 || hvac_mode === 'off'}
+              Icon={FanIcon}
+              label="Fan"
+              value={fan_mode ? premiumModeLabel(fan_mode) : 'Unsupported'}
+              onClick={() => toggleSelector('fan')}
+            />
+            <PremiumControlButton
+              active={activeSelector === 'swing'}
+              disabled={swingOptions.length <= 1 || hvac_mode === 'off'}
+              Icon={SwingIcon}
+              label="Swing"
+              value={swing_mode ? premiumModeLabel(swing_mode) : 'Unsupported'}
+              onClick={() => toggleSelector('swing')}
+            />
+          </div>
+
+          {activeSelector === 'mode' && (
+            <PremiumSelectorPanel
+              title="Select mode"
+              options={modeOptions}
+              currentValue={hvac_mode}
+              disabled={busy}
+              onSelect={selectHvacMode}
+              optionMeta={(mode) => PREMIUM_HVAC_MODE_META[mode] || {
+                label: premiumModeLabel(mode),
+                Icon: Gauge,
+                active: 'border-sky-400/60 bg-sky-500/15 text-white',
+              }}
+            />
           )}
 
-          <div className="grid gap-4 lg:grid-cols-2">
-            <div className="rounded-lg border border-gray-800/85 bg-gray-950/40 p-3">
-              <div className="mb-3 flex items-center justify-between gap-2">
-                <p className="text-[11px] font-semibold uppercase tracking-[0.16em] text-gray-500">Fan</p>
-                <span className="inline-flex items-center gap-1 rounded-full bg-gray-900 px-2 py-1 text-[11px] text-gray-400">
-                  <Fan size={11} aria-hidden />
-                  {fan_mode ?? '-'}
-                </span>
-              </div>
-              {fan_modes && fan_modes.length > 0 ? (
-                <div className="flex flex-wrap gap-2">
-                  {fan_modes.map(mode => (
-                    <PremiumClimateChip
-                      key={mode}
-                      active={mode === fan_mode}
-                      disabled={controlsDisabled || mode === fan_mode}
-                      onClick={() => sendCommand(() => setFanMode(entityId, mode))}
-                    >
-                      {premiumModeLabel(mode)}
-                    </PremiumClimateChip>
-                  ))}
-                </div>
-              ) : (
-                <div className="rounded-lg border border-gray-800 bg-gray-900/55 px-3 py-3 text-sm font-semibold text-gray-300">
-                  {fan_mode ?? 'Unsupported'}
-                </div>
-              )}
-            </div>
+          {activeSelector === 'fan' && (
+            <PremiumSelectorPanel
+              title="Select fan"
+              options={fanOptions}
+              currentValue={fan_mode}
+              disabled={controlsDisabled}
+              onSelect={selectFanMode}
+              optionMeta={(mode) => ({
+                label: premiumModeLabel(mode),
+                Icon: FanIcon,
+              })}
+            />
+          )}
 
-            <div className="rounded-lg border border-gray-800/85 bg-gray-950/40 p-3">
-              <div className="mb-3 flex items-center justify-between gap-2">
-                <p className="text-[11px] font-semibold uppercase tracking-[0.16em] text-gray-500">Swing</p>
-                <span className="inline-flex items-center gap-1 rounded-full bg-gray-900 px-2 py-1 text-[11px] text-gray-400">
-                  <RotateCw size={11} aria-hidden />
-                  {swing_mode ?? '-'}
-                </span>
-              </div>
-              {swing_modes && swing_modes.length > 1 ? (
-                <div className="space-y-3">
-                  <div className="flex flex-wrap gap-2">
-                    {swing_modes.map(mode => (
-                      <PremiumClimateChip
-                        key={mode}
-                        active={mode === swing_mode}
-                        disabled={controlsDisabled || mode === swing_mode}
-                        onClick={() => sendCommand(() => setSwingMode(entityId, mode))}
-                        title="Vertical swing"
-                      >
-                        {premiumModeLabel(mode)}
-                      </PremiumClimateChip>
-                    ))}
-                  </div>
-                  <div className="inline-flex rounded-lg border border-gray-800 bg-gray-900/45 px-2.5 py-2 text-[11px] font-semibold text-gray-500">
-                    Horizontal swing not reported
-                  </div>
-                </div>
-              ) : (
-                <div className="rounded-lg border border-gray-800 bg-gray-900/55 px-3 py-3 text-sm font-semibold text-gray-300">
-                  {swing_mode ?? 'Unsupported'}
-                </div>
-              )}
-            </div>
-          </div>
+          {activeSelector === 'swing' && (
+            <PremiumSelectorPanel
+              title="Select vertical swing"
+              options={swingOptions}
+              currentValue={swing_mode}
+              disabled={controlsDisabled}
+              onSelect={selectSwingMode}
+              optionMeta={(mode) => ({
+                label: premiumModeLabel(mode),
+                Icon: SwingIcon,
+              })}
+            />
+          )}
+
         </section>
       </div>
     </div>

@@ -1,5 +1,9 @@
 # HawaAI add-on — release notes
 
+## 1.4.80
+
+- **Climate controls UI:** Compact mode, fan, and swing controls into single-tap selectors while preserving optimistic updates, debounce, and existing climate API commands.
+
 ## 1.4.79
 
 - **Climate controls UI:** Redesigned the dashboard AC controls into a premium thermostat-style card with debounced setpoint control, dynamic mode/fan/swing chips, and visual-only runtime status badges.
