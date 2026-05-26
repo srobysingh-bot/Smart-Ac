@@ -1,5 +1,9 @@
 # HawaAI add-on — release notes
 
+## 1.4.79
+
+- **Climate controls UI:** Redesigned the dashboard AC controls into a premium thermostat-style card with debounced setpoint control, dynamic mode/fan/swing chips, and visual-only runtime status badges.
+
 ## 1.4.78
 
 - **Config migration:** Persisted upgraded schema versions after the first successful migration so future restarts report only the current schema.

@@ -13,7 +13,26 @@ import InsightsCard    from '../components/InsightsCard.jsx'
 import LiveSessionCard from '../components/LiveSessionCard.jsx'
 import SmartAdjustmentCard from '../components/SmartAdjustmentCard.jsx'
 import TemperaturePlanCard from '../components/TemperaturePlanCard.jsx'
-import { Thermometer, Wind, Zap, Cloud, AlertTriangle, Minus, Plus, Loader, Brain } from 'lucide-react'
+import {
+  Thermometer,
+  Wind,
+  Zap,
+  Cloud,
+  AlertTriangle,
+  Minus,
+  Plus,
+  Loader,
+  Brain,
+  Snowflake,
+  Flame,
+  Fan,
+  Droplets,
+  Power,
+  RotateCw,
+  Gauge,
+  WifiOff,
+  TimerReset,
+} from 'lucide-react'
 
 function formatAiTime(iso) {
   if (!iso) return '—'
@@ -696,6 +715,404 @@ function ClimateCard({ entityId }) {
 }
 
 // ── Dashboard: missing room ───────────────────────────────────────────────────
+const PREMIUM_HVAC_MODE_META = {
+  cool: { label: 'Cool', Icon: Snowflake, active: 'border-sky-400/70 bg-sky-500/20 text-sky-100 shadow-[0_0_24px_rgba(56,189,248,0.18)]' },
+  heat: { label: 'Heat', Icon: Flame, active: 'border-orange-400/70 bg-orange-500/20 text-orange-100 shadow-[0_0_24px_rgba(251,146,60,0.16)]' },
+  auto: { label: 'Auto', Icon: Gauge, active: 'border-violet-400/70 bg-violet-500/20 text-violet-100 shadow-[0_0_24px_rgba(167,139,250,0.16)]' },
+  dry: { label: 'Dry', Icon: Droplets, active: 'border-amber-300/70 bg-amber-400/15 text-amber-100 shadow-[0_0_24px_rgba(251,191,36,0.13)]' },
+  fan_only: { label: 'Fan', Icon: Fan, active: 'border-teal-300/70 bg-teal-400/15 text-teal-100 shadow-[0_0_24px_rgba(45,212,191,0.14)]' },
+  off: { label: 'Off', Icon: Power, active: 'border-slate-500/80 bg-slate-700/35 text-slate-200' },
+}
+
+function clampClimateNumber(value, min, max) {
+  return Math.max(min, Math.min(max, value))
+}
+
+function roundClimateToStep(value, step, min) {
+  const safeStep = Number(step) > 0 ? Number(step) : 1
+  return Math.round((Number(value) - min) / safeStep) * safeStep + min
+}
+
+function premiumModeLabel(value) {
+  const key = String(value || '').trim()
+  return HVAC_MODE_LABELS[key] || key.replace(/_/g, ' ').replace(/\b\w/g, c => c.toUpperCase()) || '-'
+}
+
+function premiumTempLabel(value) {
+  if (value == null || Number.isNaN(Number(value))) return '-'
+  const n = Number(value)
+  return Number.isInteger(n) ? String(n) : n.toFixed(1)
+}
+
+function PremiumClimateChip({ active, disabled, onClick, children, title }) {
+  return (
+    <button
+      type="button"
+      title={title}
+      aria-pressed={active}
+      disabled={disabled}
+      onClick={onClick}
+      className={`tap-highlight-none min-h-[40px] rounded-lg border px-3 py-2 text-xs font-semibold transition-all duration-200 ease-out active:scale-[0.98] disabled:cursor-not-allowed disabled:opacity-40 ${
+        active
+          ? 'border-sky-400/60 bg-sky-500/15 text-white shadow-[0_0_18px_rgba(56,189,248,0.14)]'
+          : 'border-gray-700/80 bg-gray-900/70 text-gray-300 hover:border-gray-500 hover:bg-gray-800'
+      }`}
+    >
+      {children}
+    </button>
+  )
+}
+
+function PremiumClimateStatePills({ status, climate, busy }) {
+  const phase = String(status?.ac_state || '').toLowerCase()
+  const telemetry = String(status?.telemetry_status || 'unconfigured').toLowerCase()
+  const climateUnavailable = status?.health?.climate?.available === false
+    || ['unavailable', 'unknown'].includes(String(climate?.hvac_mode || '').toLowerCase())
+  const pills = []
+
+  if (climateUnavailable) {
+    pills.push({ key: 'offline', label: 'Offline', Icon: WifiOff, cls: 'border-red-700/60 bg-red-950/35 text-red-200' })
+  } else if (phase === 'pending_on') {
+    pills.push({ key: 'pending-on', label: 'Waiting ON', Icon: TimerReset, cls: 'border-amber-700/60 bg-amber-950/30 text-amber-200' })
+  } else if (phase === 'pending_off') {
+    pills.push({ key: 'pending-off', label: 'Pending OFF', Icon: TimerReset, cls: 'border-amber-700/60 bg-amber-950/30 text-amber-200' })
+  } else if (phase === 'on' || status?.ac_on || status?.effective_ac_on) {
+    pills.push({ key: 'running', label: 'Running', Icon: Zap, cls: 'border-emerald-700/60 bg-emerald-950/30 text-emerald-200' })
+  }
+
+  if (status?.cooldown_active) {
+    pills.push({ key: 'cooldown', label: 'IR cooldown', Icon: Loader, spin: true, cls: 'border-yellow-700/60 bg-yellow-950/30 text-yellow-200' })
+  }
+  if (telemetry && !['healthy', 'unconfigured'].includes(telemetry)) {
+    pills.push({ key: 'telemetry', label: `Telemetry ${telemetryLabel(telemetry)}`, Icon: AlertTriangle, cls: 'border-orange-700/60 bg-orange-950/30 text-orange-200' })
+  }
+  if (busy) {
+    pills.push({ key: 'busy', label: 'Sending', Icon: Loader, spin: true, cls: 'border-sky-700/60 bg-sky-950/30 text-sky-200' })
+  }
+
+  if (pills.length === 0) return null
+  return (
+    <div className="flex flex-wrap gap-2">
+      {pills.map(({ key, label, Icon, cls, spin }) => (
+        <span
+          key={key}
+          className={`inline-flex min-h-[28px] items-center gap-1.5 rounded-full border px-2.5 py-1 text-[11px] font-semibold ${cls}`}
+        >
+          <Icon size={12} className={spin ? 'animate-spin' : ''} aria-hidden />
+          {label}
+        </span>
+      ))}
+    </div>
+  )
+}
+
+function PremiumClimateCard({ entityId, status }) {
+  const [climate, setClimate] = useState(null)
+  const [error, setError] = useState(null)
+  const [busy, setBusy] = useState(false)
+  const [pendingTemperature, setPendingTemperature] = useState(null)
+  const [isDraggingTemp, setIsDraggingTemp] = useState(false)
+  const tempDebounceRef = useRef(null)
+
+  const fetchClimate = useCallback(() => {
+    getClimateState(entityId)
+      .then(d => {
+        if (d?.error) throw new Error(d.error)
+        setClimate(d)
+        setError(null)
+      })
+      .catch(e => setError(e.message || String(e)))
+  }, [entityId])
+
+  useEffect(() => {
+    fetchClimate()
+    const id = setInterval(fetchClimate, 8_000)
+    return () => clearInterval(id)
+  }, [fetchClimate])
+
+  useEffect(() => {
+    setPendingTemperature(null)
+    setIsDraggingTemp(false)
+    return () => {
+      if (tempDebounceRef.current) clearTimeout(tempDebounceRef.current)
+    }
+  }, [entityId])
+
+  const sendCommand = async (fn) => {
+    setBusy(true)
+    try {
+      await fn()
+      setTimeout(fetchClimate, 800)
+    } catch (e) {
+      setError(e.message || String(e))
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  const queueTemperature = (value) => {
+    if (!climate) return
+    const min = Number(climate.min_temp ?? 16)
+    const max = Number(climate.max_temp ?? 30)
+    const step = Number(climate.target_temp_step || 1)
+    const rounded = roundClimateToStep(value, step, min)
+    const clamped = clampClimateNumber(rounded, min, max)
+    setPendingTemperature(clamped)
+    if (tempDebounceRef.current) clearTimeout(tempDebounceRef.current)
+    tempDebounceRef.current = setTimeout(() => {
+      const current = Number(climate.temperature)
+      if (Number.isFinite(current) && Math.abs(current - clamped) < 0.001) {
+        tempDebounceRef.current = null
+        return
+      }
+      sendCommand(() => setClimateTemperature(entityId, clamped))
+      tempDebounceRef.current = null
+    }, 650)
+  }
+
+  const adjustTemp = (delta) => {
+    if (!climate) return
+    const current = pendingTemperature ?? climate.temperature ?? 24
+    queueTemperature(Number(current) + Number(delta))
+  }
+
+  if (error) {
+    return (
+      <div className="card border-red-900/60 bg-red-950/10">
+        <p className="text-xs text-gray-500 uppercase tracking-wide mb-3">AC Climate</p>
+        <div className="flex items-center gap-2 text-sm text-red-300">
+          <AlertTriangle size={15} /> {error}
+        </div>
+        <p className="text-xs text-gray-600 mt-1">entity: {entityId}</p>
+      </div>
+    )
+  }
+
+  if (!climate) {
+    return (
+      <div className="card flex items-center gap-2 text-xs text-gray-500">
+        <Loader size={13} className="animate-spin" /> Loading climate data...
+      </div>
+    )
+  }
+
+  const { hvac_mode, current_temperature, temperature, fan_mode, swing_mode,
+          hvac_modes, fan_modes, swing_modes, friendly_name } = climate
+  const minTemp = Number(climate.min_temp ?? 16)
+  const maxTemp = Number(climate.max_temp ?? 30)
+  const tempStep = Number(climate.target_temp_step || 1)
+  const displayTemperature = clampClimateNumber(Number(pendingTemperature ?? temperature ?? 24), minTemp, maxTemp)
+  const tempPercent = clampClimateNumber(((displayTemperature - minTemp) / Math.max(1, maxTemp - minTemp)) * 100, 0, 100)
+  const ringRadius = 62
+  const ringCircumference = 2 * Math.PI * ringRadius
+  const activeMode = PREMIUM_HVAC_MODE_META[hvac_mode] || {
+    label: premiumModeLabel(hvac_mode),
+    Icon: Gauge,
+    active: 'border-gray-500/70 bg-gray-800 text-gray-100',
+  }
+  const ActiveIcon = activeMode.Icon
+  const controlsDisabled = busy || hvac_mode === 'off'
+
+  return (
+    <div className="card relative overflow-hidden border-gray-700/80 bg-[radial-gradient(circle_at_50%_0%,rgba(14,165,233,0.14),transparent_34%),linear-gradient(180deg,rgba(17,24,39,0.96),rgba(3,7,18,0.94))] p-0 shadow-2xl shadow-black/25">
+      <div className="absolute inset-x-0 top-0 h-px bg-gradient-to-r from-transparent via-sky-300/50 to-transparent" aria-hidden />
+      <div className="grid gap-5 p-4 sm:p-5 lg:grid-cols-[minmax(260px,0.9fr)_minmax(0,1.1fr)]">
+        <section className="flex min-w-0 flex-col items-center justify-between gap-4 rounded-lg border border-white/10 bg-black/20 p-4">
+          <div className="flex w-full items-start justify-between gap-3">
+            <div className="min-w-0">
+              <p className="text-[11px] font-semibold uppercase tracking-[0.18em] text-gray-500">AC Climate</p>
+              <p className="mt-1 truncate text-sm font-semibold text-gray-100" title={friendly_name || entityId}>
+                {friendly_name || entityId}
+              </p>
+            </div>
+            <span className={`inline-flex shrink-0 items-center gap-1.5 rounded-full border px-3 py-1.5 text-xs font-semibold ${activeMode.active}`}>
+              <ActiveIcon size={13} aria-hidden />
+              {activeMode.label}
+            </span>
+          </div>
+
+          <div className="relative grid aspect-square w-full max-w-[270px] place-items-center">
+            <svg className="absolute inset-0 h-full w-full -rotate-90 drop-shadow-[0_0_18px_rgba(56,189,248,0.16)]" viewBox="0 0 160 160" aria-hidden>
+              <circle cx="80" cy="80" r={ringRadius} fill="none" stroke="rgba(51,65,85,0.78)" strokeWidth="10" />
+              <circle
+                cx="80"
+                cy="80"
+                r={ringRadius}
+                fill="none"
+                stroke="url(#premium-climate-temp-ring)"
+                strokeLinecap="round"
+                strokeWidth="10"
+                strokeDasharray={`${(tempPercent / 100) * ringCircumference} ${ringCircumference}`}
+                className="transition-[stroke-dasharray] duration-300 ease-out"
+              />
+              <defs>
+                <linearGradient id="premium-climate-temp-ring" x1="20" x2="140" y1="20" y2="140">
+                  <stop offset="0%" stopColor="#38bdf8" />
+                  <stop offset="52%" stopColor="#22c55e" />
+                  <stop offset="100%" stopColor="#f59e0b" />
+                </linearGradient>
+              </defs>
+            </svg>
+            <div className="absolute inset-[17%] rounded-full border border-white/10 bg-gray-950/85 shadow-[inset_0_0_30px_rgba(15,23,42,0.9)]" aria-hidden />
+            <div className="relative z-10 flex flex-col items-center text-center">
+              <span className="text-[11px] font-semibold uppercase tracking-[0.18em] text-gray-500">Setpoint</span>
+              <span className={`mt-1 tabular-nums text-6xl font-black tracking-normal text-white transition-transform duration-200 ${isDraggingTemp ? 'scale-[1.04]' : ''}`}>
+                {premiumTempLabel(displayTemperature)}
+              </span>
+              <span className="-mt-1 text-sm font-semibold text-sky-200">deg C</span>
+              <span className="mt-3 text-xs text-gray-400">
+                Current {current_temperature != null ? `${premiumTempLabel(current_temperature)} deg` : 'unavailable'}
+              </span>
+            </div>
+          </div>
+
+          <div className="grid w-full grid-cols-[44px_minmax(0,1fr)_44px] items-center gap-3">
+            <button
+              disabled={controlsDisabled}
+              onClick={() => adjustTemp(-tempStep)}
+              className="touch-target rounded-lg border border-white/10 bg-white/10 text-gray-100 transition-all hover:bg-white/15 active:scale-95 disabled:opacity-35"
+              type="button"
+              aria-label="Decrease target temperature"
+            >
+              <Minus size={16} aria-hidden />
+            </button>
+            <input
+              type="range"
+              aria-label="Target temperature"
+              min={minTemp}
+              max={maxTemp}
+              step={tempStep}
+              value={displayTemperature}
+              disabled={controlsDisabled}
+              onPointerDown={() => setIsDraggingTemp(true)}
+              onPointerUp={() => setIsDraggingTemp(false)}
+              onPointerCancel={() => setIsDraggingTemp(false)}
+              onBlur={() => setIsDraggingTemp(false)}
+              onChange={e => queueTemperature(Number(e.target.value))}
+              className="climate-range h-8 w-full disabled:opacity-40"
+              style={{ '--climate-range': `${tempPercent}%` }}
+            />
+            <button
+              disabled={controlsDisabled}
+              onClick={() => adjustTemp(tempStep)}
+              className="touch-target rounded-lg border border-white/10 bg-white/10 text-gray-100 transition-all hover:bg-white/15 active:scale-95 disabled:opacity-35"
+              type="button"
+              aria-label="Increase target temperature"
+            >
+              <Plus size={16} aria-hidden />
+            </button>
+          </div>
+        </section>
+
+        <section className="min-w-0 space-y-4">
+          <div className="flex flex-wrap items-center justify-between gap-3">
+            <PremiumClimateStatePills status={status} climate={climate} busy={busy} />
+            <span className="max-w-full truncate rounded-full border border-gray-800 bg-black/25 px-2.5 py-1 text-[11px] font-mono text-gray-500" title={entityId}>
+              {entityId}
+            </span>
+          </div>
+
+          {hvac_modes && hvac_modes.length > 0 && (
+            <div className="rounded-lg border border-gray-800/85 bg-gray-950/40 p-3">
+              <p className="mb-3 text-[11px] font-semibold uppercase tracking-[0.16em] text-gray-500">Mode</p>
+              <div className="grid grid-cols-2 gap-2 sm:grid-cols-3 xl:grid-cols-6">
+                {hvac_modes.map(mode => {
+                  const meta = PREMIUM_HVAC_MODE_META[mode] || { label: premiumModeLabel(mode), Icon: Gauge, active: 'border-sky-400/60 bg-sky-500/15 text-white' }
+                  const Icon = meta.Icon
+                  const active = mode === hvac_mode
+                  return (
+                    <button
+                      key={mode}
+                      type="button"
+                      disabled={busy || active}
+                      aria-pressed={active}
+                      onClick={() => sendCommand(() => setHvacMode(entityId, mode))}
+                      className={`tap-highlight-none min-h-[54px] rounded-lg border px-3 py-2 text-xs font-semibold transition-all duration-200 active:scale-[0.98] disabled:cursor-not-allowed ${
+                        active
+                          ? meta.active
+                          : 'border-gray-700/75 bg-gray-900/70 text-gray-300 hover:border-gray-500 hover:bg-gray-800/85'
+                      }`}
+                    >
+                      <span className="flex items-center justify-center gap-2">
+                        <Icon size={15} aria-hidden />
+                        {meta.label}
+                      </span>
+                    </button>
+                  )
+                })}
+              </div>
+            </div>
+          )}
+
+          <div className="grid gap-4 lg:grid-cols-2">
+            <div className="rounded-lg border border-gray-800/85 bg-gray-950/40 p-3">
+              <div className="mb-3 flex items-center justify-between gap-2">
+                <p className="text-[11px] font-semibold uppercase tracking-[0.16em] text-gray-500">Fan</p>
+                <span className="inline-flex items-center gap-1 rounded-full bg-gray-900 px-2 py-1 text-[11px] text-gray-400">
+                  <Fan size={11} aria-hidden />
+                  {fan_mode ?? '-'}
+                </span>
+              </div>
+              {fan_modes && fan_modes.length > 0 ? (
+                <div className="flex flex-wrap gap-2">
+                  {fan_modes.map(mode => (
+                    <PremiumClimateChip
+                      key={mode}
+                      active={mode === fan_mode}
+                      disabled={controlsDisabled || mode === fan_mode}
+                      onClick={() => sendCommand(() => setFanMode(entityId, mode))}
+                    >
+                      {premiumModeLabel(mode)}
+                    </PremiumClimateChip>
+                  ))}
+                </div>
+              ) : (
+                <div className="rounded-lg border border-gray-800 bg-gray-900/55 px-3 py-3 text-sm font-semibold text-gray-300">
+                  {fan_mode ?? 'Unsupported'}
+                </div>
+              )}
+            </div>
+
+            <div className="rounded-lg border border-gray-800/85 bg-gray-950/40 p-3">
+              <div className="mb-3 flex items-center justify-between gap-2">
+                <p className="text-[11px] font-semibold uppercase tracking-[0.16em] text-gray-500">Swing</p>
+                <span className="inline-flex items-center gap-1 rounded-full bg-gray-900 px-2 py-1 text-[11px] text-gray-400">
+                  <RotateCw size={11} aria-hidden />
+                  {swing_mode ?? '-'}
+                </span>
+              </div>
+              {swing_modes && swing_modes.length > 1 ? (
+                <div className="space-y-3">
+                  <div className="flex flex-wrap gap-2">
+                    {swing_modes.map(mode => (
+                      <PremiumClimateChip
+                        key={mode}
+                        active={mode === swing_mode}
+                        disabled={controlsDisabled || mode === swing_mode}
+                        onClick={() => sendCommand(() => setSwingMode(entityId, mode))}
+                        title="Vertical swing"
+                      >
+                        {premiumModeLabel(mode)}
+                      </PremiumClimateChip>
+                    ))}
+                  </div>
+                  <div className="inline-flex rounded-lg border border-gray-800 bg-gray-900/45 px-2.5 py-2 text-[11px] font-semibold text-gray-500">
+                    Horizontal swing not reported
+                  </div>
+                </div>
+              ) : (
+                <div className="rounded-lg border border-gray-800 bg-gray-900/55 px-3 py-3 text-sm font-semibold text-gray-300">
+                  {swing_mode ?? 'Unsupported'}
+                </div>
+              )}
+            </div>
+          </div>
+        </section>
+      </div>
+    </div>
+  )
+}
+
 /** Shown when no room is selected (or none exist). Avoids ghost empty widgets. */
 function DashboardNeedsRoomGate({ rooms, onSelectRoom, onOpenSettings }) {
   const multi = rooms && rooms.length > 1
@@ -1085,7 +1502,10 @@ export default function Dashboard() {
 
         {/* Climate card — only shown when a climate entity is configured */}
         {(displayStatus?.climate_entity || displayStatus?.ac_entity) && (
-          <ClimateCard entityId={displayStatus.climate_entity || displayStatus.ac_entity} />
+          <PremiumClimateCard
+            entityId={displayStatus.climate_entity || displayStatus.ac_entity}
+            status={displayStatus}
+          />
         )}
 
         {/* Live session card — visible only when a session is active */}
