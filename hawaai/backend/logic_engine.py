@@ -633,6 +633,31 @@ _room_tick_serial_locks: Dict[str, asyncio.Lock] = {}
 
 _TICK_TRIGGER_DEBOUNCE_SEC = 2.0
 _tick_trigger_last_mono_by_room: Dict[str, float] = {}
+_startup_stabilization_until_mono: float = 0.0
+_startup_stabilization_logged_rooms: set[str] = set()
+
+
+def start_startup_stabilization(seconds: float) -> None:
+    """Temporarily route ticks through hydration-only startup work."""
+    global _startup_stabilization_until_mono
+    window = max(0.0, float(seconds or 0.0))
+    _startup_stabilization_until_mono = time.monotonic() + window
+    _startup_stabilization_logged_rooms.clear()
+
+
+def end_startup_stabilization() -> None:
+    """End startup stabilization and allow normal control ticks again."""
+    global _startup_stabilization_until_mono
+    _startup_stabilization_until_mono = 0.0
+    _startup_stabilization_logged_rooms.clear()
+
+
+def startup_stabilization_active() -> bool:
+    return time.monotonic() < _startup_stabilization_until_mono
+
+
+def startup_stabilization_remaining_seconds() -> float:
+    return max(0.0, _startup_stabilization_until_mono - time.monotonic())
 
 
 def _room_tick_serial_lock(room_id_key: str) -> asyncio.Lock:
@@ -2011,6 +2036,27 @@ async def _load_startup_state(room_id: str, cfg: dict) -> None:
         st.startup_state_loaded = True
         st.possible_on_since = None
         _clear_pending_command_state(st)
+
+
+async def startup_hydrate_room(room_id: str) -> None:
+    """
+    Restore startup runtime/telemetry only; never evaluates HVAC decisions or sends commands.
+    """
+    rid_raw = (room_id or "").strip()
+    if not rid_raw:
+        return
+    base_cfg = config_manager.load_config()
+    room_def = resolve_room_definition(base_cfg, rid_raw)
+    if not room_def or room_def.get("disabled"):
+        return
+    canon = normalize_room_id(rid_raw)
+    cfg = room_registry.merge_room_config(base_cfg, room_def)
+    st = _rt(canon)
+    await _load_startup_state(canon, cfg)
+    try:
+        await _read_runtime_energy(canon, cfg, st, now=datetime.now(timezone.utc))
+    except Exception:
+        logger.debug("[CONTROL][%s] startup hydrate telemetry refresh failed", canon, exc_info=True)
 
 
 async def _get_ai_target_adjustment(
@@ -3694,7 +3740,17 @@ async def tick(room_id: str) -> None:
     canon = normalize_room_id(rid_raw)
     async with _room_tick_serial_lock(canon):
         async with _room_ops_lock(canon):
-            await _tick_impl(rid_raw, canon)
+            if startup_stabilization_active():
+                if canon not in _startup_stabilization_logged_rooms:
+                    _startup_stabilization_logged_rooms.add(canon)
+                    logger.info(
+                        "[CONTROL][%s] startup_stabilization_active remaining=%.1fs active_decisions=suppressed",
+                        canon,
+                        startup_stabilization_remaining_seconds(),
+                    )
+                await startup_hydrate_room(rid_raw)
+            else:
+                await _tick_impl(rid_raw, canon)
     await live_broadcast.broadcast_room_update(canon)
 
 

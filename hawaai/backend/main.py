@@ -71,6 +71,7 @@ _climate_command_state: Dict[str, Dict[str, Any]] = {}
 _climate_command_lock = asyncio.Lock()
 _CLIMATE_COMMAND_DEBOUNCE_SECS = 1.2
 _CLIMATE_DUPLICATE_WINDOW_SECS = 2.0
+STARTUP_STABILIZATION_SECONDS = 60.0
 
 
 async def _wait_for_ha_hydration(timeout_seconds: float = 25.0) -> None:
@@ -144,6 +145,16 @@ async def _audit_persisted_energy_config(cfg: Dict[str, Any]) -> None:
                 entity_id,
                 validation.reason,
             )
+
+
+async def _finish_startup_stabilization_after(seconds: float) -> None:
+    try:
+        await asyncio.sleep(max(0.0, float(seconds or 0.0)))
+        logic_engine.end_startup_stabilization()
+        logger.info("[CONTROL] startup_stabilization_complete")
+    except asyncio.CancelledError:
+        logic_engine.end_startup_stabilization()
+        raise
 
 
 async def _enqueue_climate_command(
@@ -322,10 +333,14 @@ async def lifespan(app: FastAPI):
     database.backup_db("startup")
     await database.init_db()
     cfg = config_manager.load_config()
+    if config_manager.persist_migrated_config_if_needed():
+        cfg = config_manager.load_config()
     logger.info("[CONFIG] schema_version=%s", cfg.get("schema_version", config_manager.CONFIG_SCHEMA_VERSION))
     await _wait_for_ha_hydration()
     await _audit_persisted_energy_config(cfg)
     cfg = config_manager.load_config()
+    logic_engine.start_startup_stabilization(STARTUP_STABILIZATION_SECONDS)
+    logger.info("[CONTROL] startup_stabilization_started seconds=%.0f", STARTUP_STABILIZATION_SECONDS)
     room_log_store.set_max_lines_per_room(int(cfg.get("log_buffer_size", 300)))
     ac_ent = (cfg.get("ac_entity") or cfg.get("climate_entity") or "").strip() or "(not set)"
     smart_on = logic_engine.smart_temp_adjustment_enabled(cfg)
@@ -346,16 +361,18 @@ async def lifespan(app: FastAPI):
     except Exception:
         logger.exception("[AI] AI worker startup hook failed — continuing without AI bootstrap")
     live_broadcast.register_room_broadcast(_broadcast_to_room_subscribers)
+    asyncio.create_task(_finish_startup_stabilization_after(STARTUP_STABILIZATION_SECONDS))
     asyncio.create_task(scheduler.start())
     asyncio.create_task(ha_entity_events.run_forever())
     asyncio.create_task(_broadcast_loop())
     logger.info("[HawaAI] Add-on started")
     yield
+    logic_engine.end_startup_stabilization()
     database.backup_db("shutdown")
     logger.info("[HawaAI] Add-on stopped")
 
 
-app = FastAPI(title="HawaAI API", version="1.4.77", lifespan=lifespan)
+app = FastAPI(title="HawaAI API", version="1.4.78", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,

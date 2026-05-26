@@ -20,6 +20,7 @@ CONFIG_SCHEMA_VERSION = 3
 _last_known_good_config: Optional[Dict[str, Any]] = None
 _last_load_sanitized_energy_entities = False
 _last_logged_config_load_sig: Optional[tuple] = None
+_logged_migration_steps: set[tuple[int, int]] = set()
 
 # Default matches Ollama add-on pull (gemma:2b); override in Settings if needed.
 DEFAULT_OLLAMA_MODEL = "gemma:2b"
@@ -310,7 +311,15 @@ def migrate_v2_to_v3(cfg: Dict[str, Any]) -> Dict[str, Any]:
     return out
 
 
-def migrate_config(saved: Dict[str, Any]) -> Dict[str, Any]:
+def _log_migration_once(from_version: int, to_version: int) -> None:
+    key = (int(from_version), int(to_version))
+    if key in _logged_migration_steps:
+        return
+    _logged_migration_steps.add(key)
+    logger.info("[CONFIG] migration_applied from=%s to=%s", from_version, to_version)
+
+
+def migrate_config(saved: Dict[str, Any], *, log_migrations: bool = True) -> Dict[str, Any]:
     """Apply idempotent migrations without consulting Home Assistant."""
     cfg = copy.deepcopy(saved) if isinstance(saved, dict) else {}
     if not cfg:
@@ -321,11 +330,13 @@ def migrate_config(saved: Dict[str, Any]) -> Dict[str, Any]:
 
     if version < 2:
         cfg = migrate_v1_to_v2(cfg)
-        logger.info("[CONFIG] migration_applied from=%s to=2", version)
+        if log_migrations:
+            _log_migration_once(version, 2)
         version = 2
     if version < 3:
         cfg = migrate_v2_to_v3(cfg)
-        logger.info("[CONFIG] migration_applied from=%s to=3", version)
+        if log_migrations:
+            _log_migration_once(version, 3)
         version = 3
 
     _strip_transient_state_in_place(cfg)
@@ -447,12 +458,25 @@ def _read_config_dict_from_backup_path(path: str) -> Dict[str, Any]:
     return {}
 
 
-def _assemble_merged_config(saved: Dict[str, Any], options: Dict[str, Any]) -> Dict[str, Any]:
+def _write_json_dict(path: str, data: Dict[str, Any]) -> None:
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp_path = f"{path}.tmp"
+    with open(tmp_path, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2, ensure_ascii=False)
+    os.replace(tmp_path, path)
+
+
+def _assemble_merged_config(
+    saved: Dict[str, Any],
+    options: Dict[str, Any],
+    *,
+    log_migrations: bool = True,
+) -> Dict[str, Any]:
     """
     Deep-copy defaults, then layer supervisor options and saved UI config.
     Never mutate DEFAULT_CONFIG in place.
     """
-    saved_migrated = migrate_config(saved)
+    saved_migrated = migrate_config(saved, log_migrations=log_migrations)
 
     merged: Dict[str, Any] = copy.deepcopy(DEFAULT_CONFIG)
     merged.update(options or {})
@@ -501,6 +525,30 @@ def _assemble_merged_config(saved: Dict[str, Any], options: Dict[str, Any]) -> D
     room_registry.ensure_migrated(merged)
     merged["schema_version"] = CONFIG_SCHEMA_VERSION
     return merged
+
+
+def persist_migrated_config_if_needed() -> bool:
+    """
+    Persist an upgraded primary config exactly once after migration.
+    The write is schema-only/normalization-preserving and never consults HA state.
+    """
+    try:
+        saved = _read_json_dict(CONFIG_PATH)
+        if not saved:
+            return False
+        saved_version = _coerce_schema_version(saved.get("schema_version"))
+        if saved_version >= CONFIG_SCHEMA_VERSION:
+            return False
+
+        opts = _read_json_dict("/data/options.json")
+        upgraded = _assemble_merged_config(saved, opts, log_migrations=False)
+        upgraded["schema_version"] = CONFIG_SCHEMA_VERSION
+        _write_json_dict(CONFIG_PATH, upgraded)
+        logger.debug("[CONFIG] schema_version=%s persisted=true", CONFIG_SCHEMA_VERSION)
+        return True
+    except Exception:
+        logger.exception("[CONFIG] migration_persist_failed path=%s", CONFIG_PATH)
+        return False
 
 
 def load_config() -> Dict[str, Any]:
@@ -580,8 +628,7 @@ def save_config(data: Dict[str, Any]) -> bool:
         current["ac_entity"] = _ace
         current["climate_entity"] = _ace
         os.makedirs(os.path.dirname(CONFIG_PATH), exist_ok=True)
-        with open(CONFIG_PATH, "w", encoding="utf-8") as f:
-            json.dump(current, f, indent=2, ensure_ascii=False)
+        _write_json_dict(CONFIG_PATH, current)
         logger.info("[ENERGY_CONFIG] persisted %s", _energy_config_log_summary(current))
         logger.info("[HawaAI] Config saved to %s", CONFIG_PATH)
         return True

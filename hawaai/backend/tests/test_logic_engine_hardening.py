@@ -14,6 +14,24 @@ if _HAWAAI not in sys.path:
 from backend import logic_engine  # noqa: E402
 
 
+class TestStartupStabilization(unittest.IsolatedAsyncioTestCase):
+    async def asyncTearDown(self):
+        logic_engine.end_startup_stabilization()
+
+    async def test_tick_uses_hydrate_only_during_startup_stabilization(self):
+        logic_engine.start_startup_stabilization(60)
+        with (
+            mock.patch.object(logic_engine, "startup_hydrate_room", new=mock.AsyncMock()) as hydrate,
+            mock.patch.object(logic_engine.live_broadcast, "broadcast_room_update", new=mock.AsyncMock()) as broadcast,
+            mock.patch.object(logic_engine, "_tick_impl", new=mock.AsyncMock()) as tick_impl,
+        ):
+            await logic_engine.tick("Study")
+
+        hydrate.assert_awaited_once_with("Study")
+        tick_impl.assert_not_awaited()
+        broadcast.assert_awaited_once_with("study")
+
+
 class TestLogicEngineHardening(unittest.TestCase):
     def test_normalize_room_id_strip_lower(self):
         self.assertEqual(logic_engine.normalize_room_id("  BedROOM "), "bedroom")

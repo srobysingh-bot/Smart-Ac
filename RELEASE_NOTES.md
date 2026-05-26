@@ -1,5 +1,10 @@
 # HawaAI add-on — release notes
 
+## 1.4.78
+
+- **Config migration:** Persisted upgraded schema versions after the first successful migration so future restarts report only the current schema.
+- **Startup stabilization:** Added a startup hydrate-only window that restores runtime/entity/telemetry state while suppressing active HVAC ON/OFF decisions until stabilization completes.
+
 ## 1.4.77
 
 - **Config persistence:** Added schema-versioned, idempotent config migrations that preserve user-selected room entities and scrub transient runtime state from saved config.

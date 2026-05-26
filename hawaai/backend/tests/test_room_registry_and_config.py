@@ -241,6 +241,57 @@ class TestConfigLoad(unittest.TestCase):
         self.assertNotIn("pending_off_confirmation", room)
         self.assertNotIn("watt_draw", room.get("settings", {}))
 
+    def test_migrated_config_is_persisted_and_not_logged_again(self):
+        import backend.config_manager as cm
+
+        initial = {
+            "rooms": [
+                {
+                    "id": "persist12345",
+                    "name": "Study",
+                    "climate_entity": "climate.study",
+                    "energy_power_entity": "sensor.study_power",
+                    "effective_on_since_ts": 12345,
+                    "settings": {
+                        "energy_usage_sensor": "sensor.study_kwh",
+                        "watt_draw": 900,
+                    },
+                }
+            ]
+        }
+
+        with tempfile.TemporaryDirectory() as td:
+            primary = os.path.join(td, "hawaai_config.json")
+            with open(primary, "w", encoding="utf-8") as f:
+                json.dump(initial, f)
+
+            cm._last_known_good_config = None
+            cm._last_logged_config_load_sig = None
+            cm._logged_migration_steps.clear()
+            with mock.patch.object(cm, "CONFIG_PATH", primary):
+                first = cm.load_config()
+                self.assertEqual(first["schema_version"], cm.CONFIG_SCHEMA_VERSION)
+                self.assertTrue(cm.persist_migrated_config_if_needed())
+                with open(primary, "r", encoding="utf-8") as f:
+                    saved = json.load(f)
+
+                self.assertEqual(saved["schema_version"], cm.CONFIG_SCHEMA_VERSION)
+                room = saved["rooms"][0]
+                self.assertEqual(room["energy_power_entity"], "sensor.study_power")
+                self.assertEqual(room["energy_kwh_entity"], "sensor.study_kwh")
+                self.assertNotIn("effective_on_since_ts", room)
+                self.assertNotIn("watt_draw", room.get("settings", {}))
+
+                cm._logged_migration_steps.clear()
+                with mock.patch.object(cm.logger, "info") as info:
+                    cm.load_config()
+
+            migration_calls = [
+                call for call in info.call_args_list
+                if call.args and str(call.args[0]).startswith("[CONFIG] migration_applied")
+            ]
+            self.assertEqual(migration_calls, [])
+
 
 if __name__ == "__main__":
     unittest.main()
