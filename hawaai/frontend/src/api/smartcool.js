@@ -102,6 +102,11 @@ export const getRoomLogs = (roomId, limit = 200) =>
     request(`/rooms/${encodeURIComponent(rid)}/logs?limit=${Math.max(1, Math.min(500, Number(limit) || 200))}`),
   )
 
+export const getRoomHealth = (roomId) =>
+  roomParam(roomId).then((rid) =>
+    request(`/rooms/${encodeURIComponent(rid)}/health`),
+  )
+
 export const clearRoomLogs = (roomId) =>
   roomParam(roomId).then((rid) =>
     request(`/rooms/${encodeURIComponent(rid)}/logs`, { method: 'DELETE' }),

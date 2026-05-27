@@ -46,7 +46,7 @@ from fastapi import Body, FastAPI, HTTPException, Query, Request, WebSocket, Web
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, HTMLResponse, Response
 
-from . import config_manager, database, ha_entity_events, live_broadcast, logic_engine, room_registry, scheduler, session_logger, weather_api
+from . import ac_health, config_manager, database, ha_entity_events, live_broadcast, logic_engine, room_registry, scheduler, session_logger, weather_api
 from .room_log_store import LOG_SCOPE_RUNTIME, room_log_store
 from . import ha_client
 from .ac_controller import get_brands
@@ -372,7 +372,7 @@ async def lifespan(app: FastAPI):
     logger.info("[HawaAI] Add-on stopped")
 
 
-app = FastAPI(title="HawaAI API", version="1.4.80", lifespan=lifespan)
+app = FastAPI(title="HawaAI API", version="1.4.81", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -520,6 +520,12 @@ async def set_ai_flag(data: Dict[str, Any] = Body(...)):
 async def get_ai_runtime_status(room_id: str = Query(..., min_length=1)):
     """Last AI inference attempt for an explicit room_id."""
     return get_ai_status(_require_room_query(room_id))
+
+
+@app.get("/api/rooms/{room_id}/health")
+async def api_room_ac_health(room_id: str):
+    """Advisory-only AC health analytics scoped to one room."""
+    return await ac_health.get_room_health(_require_room_query(room_id))
 
 
 @app.get("/api/ai/decisions")

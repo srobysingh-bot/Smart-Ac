@@ -13,6 +13,7 @@ import InsightsCard    from '../components/InsightsCard.jsx'
 import LiveSessionCard from '../components/LiveSessionCard.jsx'
 import SmartAdjustmentCard from '../components/SmartAdjustmentCard.jsx'
 import TemperaturePlanCard from '../components/TemperaturePlanCard.jsx'
+import ACHealthCard from '../components/ACHealthCard.jsx'
 import {
   Thermometer,
   Wind,
@@ -1613,6 +1614,8 @@ export default function Dashboard() {
         )}
 
         {/* Live session card — visible only when a session is active */}
+        <ACHealthCard roomId={activeRoomId} />
+
         <LiveSessionCard status={displayStatus} />
 
         <AiDecisionsCard roomId={activeRoomId} />

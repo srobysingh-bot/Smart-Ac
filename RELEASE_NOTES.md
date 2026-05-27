@@ -1,5 +1,9 @@
 # HawaAI add-on — release notes
 
+## 1.4.81
+
+- **AC health:** Added advisory-only per-room AC health analytics with room-local baselines, learning mode, telemetry quality, filter runtime tracking, and a compact dashboard health card.
+
 ## 1.4.80
 
 - **Climate controls UI:** Compact mode, fan, and swing controls into single-tap selectors while preserving optimistic updates, debounce, and existing climate API commands.
