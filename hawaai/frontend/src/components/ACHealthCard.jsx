@@ -74,19 +74,19 @@ function friendlyTelemetry(value) {
 
 function ProgressRing({ value, color, label }) {
   const safe = pct(value)
-  const radius = 25
+  const radius = 21
   const circumference = 2 * Math.PI * radius
   const offset = circumference * (1 - safe / 100)
   return (
-    <div className="relative grid h-20 w-20 shrink-0 place-items-center">
-      <svg className="-rotate-90" width="80" height="80" viewBox="0 0 80 80" aria-hidden>
-        <circle cx="40" cy="40" r={radius} stroke="rgba(31,41,55,0.95)" strokeWidth="7" fill="none" />
+    <div className="relative grid h-16 w-16 shrink-0 place-items-center">
+      <svg className="-rotate-90" width="64" height="64" viewBox="0 0 64 64" aria-hidden>
+        <circle cx="32" cy="32" r={radius} stroke="rgba(31,41,55,0.95)" strokeWidth="6" fill="none" />
         <circle
-          cx="40"
-          cy="40"
+          cx="32"
+          cy="32"
           r={radius}
           stroke={color}
-          strokeWidth="7"
+          strokeWidth="6"
           fill="none"
           strokeLinecap="round"
           strokeDasharray={circumference}
@@ -96,9 +96,17 @@ function ProgressRing({ value, color, label }) {
         />
       </svg>
       <div className="absolute text-center">
-        <p className="text-lg font-bold leading-none text-white">{safe}%</p>
+        <p className="text-base font-bold leading-none text-white">{safe}%</p>
         <p className="mt-1 text-[9px] font-semibold uppercase tracking-[0.14em] text-gray-500">{label}</p>
       </div>
+    </div>
+  )
+}
+
+function LearningMark() {
+  return (
+    <div className="grid h-12 w-12 shrink-0 place-items-center rounded-2xl border border-cyan-400/20 bg-cyan-400/[0.08] shadow-[0_0_24px_rgba(34,211,238,0.10)]">
+      <Sparkles size={20} className="text-cyan-200" aria-hidden />
     </div>
   )
 }
@@ -186,15 +194,33 @@ export default function ACHealthCard({ roomId }) {
   const telemetryProgress = pct(telemetry.score)
   const confidenceLabel = friendlyConfidence(health?.confidence)
   const telemetryLabel = friendlyTelemetry(telemetry.label)
+  const isLearning = health?.phase === 'learning'
   const headline = health?.phase === 'learning'
-    ? 'Learning cooling behavior'
+    ? 'Building room cooling profile'
     : (health?.status_label || 'Healthy')
+  const minimumSessions = Number(learning.minimum_sessions || 0)
+  const stableSessions = Number(health?.stable_session_count || 0)
+  const sessionsText = minimumSessions > 0
+    ? `${stableSessions} / ${minimumSessions} sessions`
+    : `${stableSessions} sessions`
+  const responseValue = metrics.recent_runtime_per_degree != null
+    ? `${metrics.recent_runtime_per_degree} min/deg`
+    : 'Monitoring'
+  const consistencyValue = health?.confidence === 'high'
+    ? 'Stable'
+    : health?.confidence === 'medium'
+      ? 'Improving'
+      : 'Monitoring'
 
   return (
     <div className="card relative overflow-hidden border-white/10 bg-[radial-gradient(circle_at_12%_0%,rgba(34,211,238,0.13),transparent_30%),radial-gradient(circle_at_92%_12%,rgba(16,185,129,0.09),transparent_28%),linear-gradient(180deg,rgba(15,23,42,0.88),rgba(3,7,18,0.92))] shadow-[0_18px_55px_rgba(0,0,0,0.28)] backdrop-blur">
       <div className={`pointer-events-none absolute inset-x-0 top-0 h-px bg-gradient-to-r ${style.accent} via-white/30 to-transparent`} aria-hidden />
-      <div className="flex items-start gap-4">
-        <ProgressRing value={learning.progress} color={style.ring} label="Profile" />
+      <div className="flex items-start gap-3">
+        {isLearning ? (
+          <LearningMark />
+        ) : (
+          <ProgressRing value={telemetry.score} color={style.ring} label="Quality" />
+        )}
         <div className="min-w-0 flex-1">
           <div className="flex flex-wrap items-start justify-between gap-2">
             <div className="min-w-0">
@@ -211,14 +237,14 @@ export default function ACHealthCard({ roomId }) {
           </p>
           <div className="mt-3 flex flex-wrap gap-2">
             <MetricPill label="Confidence" value={confidenceLabel} tone={health?.confidence === 'high' ? 'green' : 'cyan'} />
-            <MetricPill label="Baseline" value={`${learningProgress}%`} tone="cyan" />
+            <MetricPill label={isLearning ? 'Progress' : 'Consistency'} value={isLearning ? sessionsText : consistencyValue} tone="cyan" />
           </div>
         </div>
       </div>
 
-      <div className="mt-4 grid grid-cols-3 gap-2">
-        <MetricPill label="Sessions" value={health?.stable_session_count ?? 0} tone="gray" />
-        <MetricPill label="Telemetry" value={telemetryLabel} tone={telemetryProgress >= 75 ? 'green' : 'amber'} />
+      <div className="mt-3 grid gap-2 sm:grid-cols-3">
+        <MetricPill label={isLearning ? 'Telemetry' : 'Response'} value={isLearning ? telemetryLabel : responseValue} tone={telemetryProgress >= 75 ? 'green' : 'amber'} />
+        <MetricPill label={isLearning ? 'Signal' : 'Telemetry'} value={isLearning ? 'Collecting data' : telemetryLabel} tone="gray" />
         <MetricPill label="Filter" value={`${Math.round(Number(filter.runtime_hours || 0))}h`} tone={filterProgress >= 90 ? 'amber' : 'gray'} />
       </div>
 
@@ -226,7 +252,7 @@ export default function ACHealthCard({ roomId }) {
         <div className="space-y-1.5">
           <div className="flex items-center justify-between gap-2 text-[11px] text-gray-500">
             <span className="inline-flex items-center gap-1"><ShieldCheck size={11} /> Room profile</span>
-            <span>{learningProgress}%</span>
+            <span>{isLearning ? sessionsText : `${learningProgress}%`}</span>
           </div>
           <div className="h-1.5 overflow-hidden rounded-full bg-gray-800">
             <div className="h-full rounded-full bg-cyan-300 shadow-[0_0_10px_rgba(103,232,249,0.55)] transition-all" style={{ width: `${learningProgress}%` }} />

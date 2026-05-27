@@ -1545,6 +1545,12 @@ export default function Dashboard() {
             comfortLevel={displayStatus?.comfort_level}
             humidityBand={displayStatus?.humidity_band}
             dryModeRecommended={displayStatus?.dry_mode_recommended}
+            thermalLoadLevel={displayStatus?.thermal_load_level}
+            thermalLoadConfidence={displayStatus?.thermal_load_confidence}
+            thermalLoadActive={displayStatus?.thermal_load_active}
+            thermalLoadSummary={displayStatus?.thermal_load_summary}
+            thermalLoadOffset={displayStatus?.thermal_load_offset}
+            coolingSaturated={displayStatus?.cooling_saturated}
           />
           <SmartAdjustmentCard
             smartAdjustment={displayStatus?.smart_adjustment ?? displayStatus?.smart_temp_adjustment}

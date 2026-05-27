@@ -621,6 +621,19 @@ class RoomRuntime:
     humidity_band: str = "unavailable"
     dry_mode_recommended: bool = False
     last_humidity_log_sig: Optional[tuple] = None
+    thermal_load_level: str = "low"
+    thermal_load_confidence: str = "low"
+    thermal_load_score: float = 0.0
+    thermal_load_temp_ema: Optional[float] = None
+    thermal_load_rise_rate_ema: float = 0.0
+    thermal_load_last_sample_at: Optional[datetime] = None
+    thermal_load_candidate_since: Optional[datetime] = None
+    thermal_load_last_high_at: Optional[datetime] = None
+    thermal_load_compensation_offset: float = 0.0
+    thermal_load_compensation_active: bool = False
+    cooling_saturated: bool = False
+    thermal_load_summary: str = "Monitoring room load"
+    last_thermal_load_log_sig: Optional[tuple] = None
 
 
 _runtime_by_room: Dict[str, RoomRuntime] = {}
@@ -967,6 +980,12 @@ DECISION_LOCK_SECONDS: float = 65.0
 MAX_PROVISIONAL_SECONDS: float = 180.0
 # Recent IR/compressor-command window: session may open after explicit ON before ac_is_on latches.
 _POST_ON_SESSION_INTENT_SECONDS: float = float(_COOLDOWN_SECS) + 120.0
+THERMAL_LOAD_PERSIST_SECONDS: float = 300.0
+THERMAL_LOAD_RELEASE_SECONDS: float = 480.0
+THERMAL_LOAD_MAX_COMPENSATION_DEG: float = 1.0
+THERMAL_LOAD_MEDIUM_COMPENSATION_DEG: float = 0.5
+THERMAL_LOAD_MIN_TARGET_C: float = 16.0
+THERMAL_LOAD_SATURATION_TARGET_C: float = 17.0
 
 
 def _cfg_float(
@@ -2151,7 +2170,19 @@ async def effective_target_for_temp_cross(
         ac_on=False,
         log_change=False,
     )
-    return humidity_result.adjusted_target
+    return _apply_thermal_load_comfort_layer(
+        room_canon,
+        merged_cfg,
+        now=datetime.now(timezone.utc),
+        indoor_temp=indoor_temp,
+        outdoor_temp=outdoor_temp,
+        humidity_percent=humidity_percent,
+        target_before_thermal=float(humidity_result.adjusted_target),
+        ac_on=False,
+        occupied=True,
+        climate_data={},
+        log_change=False,
+    )
 
 
 _EFF_DELTA_MIN = 1.0
@@ -3728,6 +3759,209 @@ def _apply_humidity_comfort_layer(
     return result
 
 
+def _fan_mode_is_high(fan_mode: object) -> bool:
+    mode = str(fan_mode or "").strip().lower()
+    return mode in {
+        "high",
+        "max",
+        "turbo",
+        "powerful",
+        "boost",
+        "f4",
+        "f5",
+        "5",
+    }
+
+
+def _thermal_load_reset(st: RoomRuntime) -> None:
+    st.thermal_load_level = "low"
+    st.thermal_load_confidence = "low"
+    st.thermal_load_score = 0.0
+    st.thermal_load_candidate_since = None
+    st.thermal_load_compensation_offset = 0.0
+    st.thermal_load_compensation_active = False
+    st.cooling_saturated = False
+    st.thermal_load_summary = "Monitoring room load"
+
+
+def _apply_thermal_load_comfort_layer(
+    room_id: str,
+    cfg: dict,
+    *,
+    now: datetime,
+    indoor_temp: float,
+    outdoor_temp: Optional[float],
+    humidity_percent: Optional[float],
+    target_before_thermal: float,
+    ac_on: bool,
+    occupied: bool,
+    climate_data: dict,
+    log_change: bool,
+) -> float:
+    """
+    Passive thermal-load modifier.
+
+    It only lowers the effective comfort target slightly when room-specific
+    thermal stress persists. It never turns HVAC on/off and never changes fan
+    mode. Cooling saturation disables further compensation so the automation
+    stays calm when the AC is already near its practical limit.
+    """
+    st = _rt(room_id)
+    if not bool(cfg.get("adaptive_thermal_load_enabled", True)):
+        _thermal_load_reset(st)
+        st.thermal_load_summary = "Adaptive room load disabled"
+        return float(target_before_thermal)
+
+    target = float(target_before_thermal)
+    if not occupied:
+        _thermal_load_reset(st)
+        return target
+
+    previous_temp = st.thermal_load_temp_ema
+    previous_sample = st.thermal_load_last_sample_at
+    if previous_temp is None:
+        st.thermal_load_temp_ema = float(indoor_temp)
+    else:
+        st.thermal_load_temp_ema = (previous_temp * 0.70) + (float(indoor_temp) * 0.30)
+
+    if previous_sample is not None and previous_temp is not None:
+        elapsed_min = max(0.0, (now - previous_sample).total_seconds() / 60.0)
+        if 0.25 <= elapsed_min <= 15.0:
+            instant_rate = (float(indoor_temp) - previous_temp) / elapsed_min
+            st.thermal_load_rise_rate_ema = (
+                st.thermal_load_rise_rate_ema * 0.75
+                + float(instant_rate) * 0.25
+            )
+    st.thermal_load_last_sample_at = now
+
+    gap = float(indoor_temp) - target
+    rise_rate = float(st.thermal_load_rise_rate_ema)
+    score = 0.0
+
+    if gap >= 1.0:
+        score += 1.0
+    if gap >= 2.0:
+        score += 1.0
+    if gap >= 3.0:
+        score += 1.0
+    if rise_rate >= 0.03:
+        score += 1.0
+    if rise_rate >= 0.08:
+        score += 1.0
+    if ac_on and gap >= 1.5 and rise_rate > -0.02:
+        score += 1.0
+    if outdoor_temp is not None and float(outdoor_temp) >= 38.0:
+        score += 1.0
+    if outdoor_temp is not None and float(outdoor_temp) >= 42.0:
+        score += 1.0
+    if humidity_percent is not None and float(humidity_percent) >= 65.0:
+        score += 0.5
+    if humidity_percent is not None and float(humidity_percent) >= 75.0:
+        score += 0.5
+    if st.zone_confirmed:
+        score += 0.5
+
+    st.thermal_load_score = round(score, 2)
+    if score >= 5.0:
+        level = "high"
+    elif score >= 3.0:
+        level = "medium"
+    else:
+        level = "low"
+
+    if score >= 3.0:
+        if st.thermal_load_candidate_since is None:
+            st.thermal_load_candidate_since = now
+        st.thermal_load_last_high_at = now
+    elif (
+        st.thermal_load_last_high_at is not None
+        and (now - st.thermal_load_last_high_at).total_seconds() >= THERMAL_LOAD_RELEASE_SECONDS
+    ):
+        st.thermal_load_candidate_since = None
+
+    persisted = (
+        (now - st.thermal_load_candidate_since).total_seconds()
+        if st.thermal_load_candidate_since is not None else 0.0
+    )
+    if score >= 5.0 and persisted >= THERMAL_LOAD_PERSIST_SECONDS:
+        confidence = "high"
+    elif score >= 3.0 and persisted >= (THERMAL_LOAD_PERSIST_SECONDS * 0.6):
+        confidence = "medium"
+    else:
+        confidence = "low"
+
+    current_target = climate_data.get("target_temp") if climate_data else None
+    try:
+        current_target_f = float(current_target)
+    except (TypeError, ValueError):
+        current_target_f = None
+    fan_high = _fan_mode_is_high(climate_data.get("fan_mode") if climate_data else None)
+    min_target = _cfg_float(
+        cfg,
+        "thermal_load_min_target",
+        THERMAL_LOAD_MIN_TARGET_C,
+        lo=float(AI_MIN_T),
+        hi=24.0,
+    )
+    saturated = bool(
+        target <= THERMAL_LOAD_SATURATION_TARGET_C
+        or (current_target_f is not None and current_target_f <= THERMAL_LOAD_SATURATION_TARGET_C)
+        or (ac_on and fan_high and target <= (THERMAL_LOAD_SATURATION_TARGET_C + 1.0))
+    )
+
+    offset = 0.0
+    if not saturated:
+        if level == "high" and confidence == "high":
+            offset = -THERMAL_LOAD_MAX_COMPENSATION_DEG
+        elif level in ("medium", "high") and confidence in ("medium", "high"):
+            offset = -THERMAL_LOAD_MEDIUM_COMPENSATION_DEG
+
+    requested_offset = offset
+    adjusted = max(min_target, target + requested_offset)
+    if adjusted >= target:
+        offset = 0.0
+        adjusted = target
+        if requested_offset < -0.01:
+            saturated = True
+
+    st.thermal_load_level = level
+    st.thermal_load_confidence = confidence
+    st.thermal_load_compensation_offset = round(float(offset), 2)
+    st.thermal_load_compensation_active = bool(offset < -0.01)
+    st.cooling_saturated = bool(saturated)
+    if saturated:
+        st.thermal_load_summary = "Max comfort cooling active"
+    elif st.thermal_load_compensation_active:
+        st.thermal_load_summary = "Comfort compensation active"
+    elif level in ("medium", "high"):
+        st.thermal_load_summary = "Monitoring elevated room load"
+    else:
+        st.thermal_load_summary = "Room load stable"
+
+    if log_change:
+        sig = (
+            st.thermal_load_level,
+            st.thermal_load_confidence,
+            round(st.thermal_load_compensation_offset, 1),
+            bool(st.cooling_saturated),
+        )
+        if sig != st.last_thermal_load_log_sig:
+            log_with_room(
+                "info",
+                room_id,
+                "[THERMAL_LOAD] level=%s confidence=%s score=%.1f rise=%.3fC/min offset=%+.1f saturated=%s",
+                st.thermal_load_level,
+                st.thermal_load_confidence,
+                st.thermal_load_score,
+                rise_rate,
+                st.thermal_load_compensation_offset,
+                bool(st.cooling_saturated),
+            )
+            st.last_thermal_load_log_sig = sig
+
+    return float(adjusted)
+
+
 async def tick(room_id: str) -> None:
     """
     Single decision-loop iteration for one room.
@@ -4346,7 +4580,19 @@ async def _tick_impl(rid_raw: str, room_id: str) -> None:
         ac_on=bool(ac_on),
         log_change=True,
     )
-    engine_target = float(humidity_result.adjusted_target)
+    engine_target = _apply_thermal_load_comfort_layer(
+        room_id,
+        cfg,
+        now=now,
+        indoor_temp=indoor_temp,
+        outdoor_temp=outdoor_temp,
+        humidity_percent=indoor_humidity,
+        target_before_thermal=float(humidity_result.adjusted_target),
+        ac_on=bool(ac_on),
+        occupied=bool(is_occupied_bool),
+        climate_data=climate_data or {},
+        log_change=True,
+    )
 
     manual_override_active, manual_target = _manual_override_resolve(
         room_id, cfg, climate_data or {}, indoor_temp, now, engine_target,
@@ -4715,8 +4961,9 @@ async def _tick_impl(rid_raw: str, room_id: str) -> None:
 
     sleep_target_changed = abs(float(getattr(sleep_result, "offset", 0.0))) >= 0.01
     humidity_target_changed = abs(float(getattr(humidity_result, "humidity_offset", 0.0))) >= 0.01
+    thermal_target_changed = abs(float(getattr(st, "thermal_load_compensation_offset", 0.0))) >= 0.01
     if (
-        (smart_curve or sleep_target_changed or humidity_target_changed)
+        (smart_curve or sleep_target_changed or humidity_target_changed or thermal_target_changed)
         and climate_entity and ac_on and occ_res and not in_cooldown
     ):
         interval = _cfg_int(cfg, "setpoint_command_min_interval_seconds", 180, lo=0)
@@ -5826,6 +6073,15 @@ def get_runtime_state(room_id: str) -> dict:
         "comfort_level":         st.comfort_level,
         "humidity_band":         st.humidity_band,
         "dry_mode_recommended":  st.dry_mode_recommended,
+        "thermal_load_level":    st.thermal_load_level,
+        "thermal_load_confidence": st.thermal_load_confidence,
+        "thermal_load_score":    st.thermal_load_score,
+        "thermal_load_rise_rate": round(float(st.thermal_load_rise_rate_ema), 4),
+        "thermal_load_offset":   st.thermal_load_compensation_offset,
+        "thermal_load_active":   st.thermal_load_compensation_active,
+        "thermal_load_summary":  st.thermal_load_summary,
+        "cooling_saturated":     st.cooling_saturated,
+        "max_comfort_cooling_active": st.cooling_saturated,
         "last_command_source":   st.last_command_source,
         "last_ac_on_at":         st.last_ac_on_at,
         "last_ac_off_at":        st.last_ac_off_at,

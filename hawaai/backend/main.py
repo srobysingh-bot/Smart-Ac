@@ -372,7 +372,7 @@ async def lifespan(app: FastAPI):
     logger.info("[HawaAI] Add-on stopped")
 
 
-app = FastAPI(title="HawaAI API", version="1.4.82", lifespan=lifespan)
+app = FastAPI(title="HawaAI API", version="1.4.83", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -899,6 +899,13 @@ async def _dashboard_status_payload(rid: str) -> Dict[str, Any]:
         "comfort_level": runtime.get("comfort_level", "unknown"),
         "humidity_band": runtime.get("humidity_band", "unavailable"),
         "dry_mode_recommended": runtime.get("dry_mode_recommended", False),
+        "thermal_load_level": runtime.get("thermal_load_level", "low"),
+        "thermal_load_confidence": runtime.get("thermal_load_confidence", "low"),
+        "thermal_load_offset": runtime.get("thermal_load_offset", 0.0),
+        "thermal_load_active": runtime.get("thermal_load_active", False),
+        "thermal_load_summary": runtime.get("thermal_load_summary", "Monitoring room load"),
+        "cooling_saturated": runtime.get("cooling_saturated", False),
+        "max_comfort_cooling_active": runtime.get("max_comfort_cooling_active", False),
         "temperature_mode": tm,
         "schedule_slot": schedule_slot,
         "ai_adjust_applied": ai_adjust_applied,

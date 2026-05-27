@@ -152,6 +152,12 @@ function ComfortRuntimePanel({
   humidityBand,
   humidityOffset,
   dryModeRecommended,
+  thermalLoadLevel,
+  thermalLoadConfidence,
+  thermalLoadActive,
+  thermalLoadSummary,
+  thermalLoadOffset,
+  coolingSaturated,
 }) {
   const hasSleep = sleepPhase || Math.abs(Number(sleepOffset) || 0) >= 0.05
   const hasHumidity =
@@ -161,17 +167,30 @@ function ComfortRuntimePanel({
     comfortLevel ||
     humidityBand ||
     dryModeRecommended
+  const hasThermalLoad =
+    thermalLoadLevel ||
+    thermalLoadActive ||
+    coolingSaturated ||
+    Math.abs(Number(thermalLoadOffset) || 0) >= 0.05
 
   const sleepOffsetLabel = fmtOffset(sleepOffset)
   const humidityOffsetLabel = fmtOffset(humidityOffset)
+  const thermalOffsetLabel = fmtOffset(thermalLoadOffset)
   const explanations = []
   if (sleepOffsetLabel) explanations.push(`${sleepOffsetLabel} sleep optimization`)
   if (humidityOffsetLabel) explanations.push(`${humidityOffsetLabel} humidity adjustment`)
+  if (thermalOffsetLabel) explanations.push(`${thermalOffsetLabel} room load compensation`)
 
-  if (!hasSleep && !hasHumidity && explanations.length === 0) return null
+  if (!hasSleep && !hasHumidity && !hasThermalLoad && explanations.length === 0) return null
 
   const comfortKey = String(comfortLevel || 'unknown').toLowerCase()
   const comfortCls = COMFORT_LEVEL_STYLE[comfortKey] || COMFORT_LEVEL_STYLE.unknown
+  const loadKey = String(thermalLoadLevel || 'low').toLowerCase()
+  const loadCls = {
+    low: 'border-emerald-800/50 bg-emerald-950/25 text-emerald-200',
+    medium: 'border-amber-800/55 bg-amber-950/30 text-amber-200',
+    high: 'border-orange-800/55 bg-orange-950/35 text-orange-200',
+  }[loadKey] || 'border-gray-800 bg-gray-900/60 text-gray-400'
 
   return (
     <div className="rounded-lg border border-gray-800/80 bg-gray-950/35 px-2.5 py-2 space-y-2">
@@ -233,6 +252,26 @@ function ComfortRuntimePanel({
                   Dry mode
                 </span>
               )}
+            </div>
+          </div>
+        )}
+
+        {hasThermalLoad && (
+          <div className="rounded-md border border-emerald-900/35 bg-emerald-950/10 px-2 py-1.5 min-w-0">
+            <div className="flex items-center justify-between gap-2">
+              <span className="inline-flex items-center gap-1 text-emerald-200">
+                <Gauge size={12} aria-hidden />
+                Room load
+              </span>
+              <span className={`rounded border px-1.5 py-0.5 text-[10px] ${loadCls}`}>
+                {labelize(thermalLoadLevel || 'low')}
+              </span>
+            </div>
+            <div className="mt-1 flex items-center justify-between gap-2 text-[11px]">
+              <span className="truncate text-gray-500">
+                {coolingSaturated ? 'Max comfort cooling active' : (thermalLoadSummary || 'Monitoring room load')}
+              </span>
+              <span className="shrink-0 text-gray-400">{labelize(thermalLoadConfidence || 'low')}</span>
             </div>
           </div>
         )}
@@ -332,6 +371,12 @@ export default function ACStatusCard({
   comfortLevel,
   humidityBand,
   dryModeRecommended,
+  thermalLoadLevel,
+  thermalLoadConfidence,
+  thermalLoadActive,
+  thermalLoadSummary,
+  thermalLoadOffset,
+  coolingSaturated,
   // Climate entity display data (read-only, never used for state)
   acCurrentTemp,
   acTargetTemp,
@@ -430,6 +475,12 @@ export default function ACStatusCard({
         comfortLevel={comfortLevel}
         humidityBand={humidityBand}
         dryModeRecommended={dryModeRecommended}
+        thermalLoadLevel={thermalLoadLevel}
+        thermalLoadConfidence={thermalLoadConfidence}
+        thermalLoadActive={thermalLoadActive}
+        thermalLoadSummary={thermalLoadSummary}
+        thermalLoadOffset={thermalLoadOffset}
+        coolingSaturated={coolingSaturated}
       />
 
       {(acOnLine || acOffLine) && (

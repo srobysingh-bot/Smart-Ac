@@ -1,5 +1,10 @@
 # HawaAI add-on — release notes
 
+## 1.4.83
+
+- **Comfort intelligence:** Added adaptive room thermal-load comfort compensation with saturation awareness, subtle target offsets, and a compact room-load status indicator.
+- **Health UI:** Refined learning-mode presentation so AC Health shows stable-session progress instead of a misleading percentage ring.
+
 ## 1.4.82
 
 - **Dashboard polish:** Refined AC Health and Recent Sessions with a more premium compact visual hierarchy, dense session rows, sticky grouped scrolling, and a stable fixed-height sessions panel.
