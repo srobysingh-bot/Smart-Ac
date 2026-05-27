@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { getSessions } from '../api/smartcool.js'
 import { ChevronDown, ChevronUp } from 'lucide-react'
 
@@ -145,23 +145,49 @@ export default function SessionTable({ limit = 10, roomId }) {
   const [loading, setLoading] = useState(true)
   const [showInvalid, setShowInvalid] = useState(false)
   const [tariffPerKwh, setTariffPerKwh] = useState(8.0)
+  const inFlightRef = useRef(false)
 
-  useEffect(() => {
+  const loadSessions = useCallback((showSpinner = false) => {
     if (!roomId) {
       setSessions([])
       setTariffPerKwh(8.0)
       setLoading(false)
       return
     }
-    setLoading(true)
+    if (inFlightRef.current) return
+    inFlightRef.current = true
+    if (showSpinner) setLoading(true)
     getSessions({ limit, room_id: roomId })
       .then(r => {
         setSessions(r.sessions || [])
         setTariffPerKwh(Number(r.tariff_per_kwh ?? 8.0))
       })
       .catch(console.error)
-      .finally(() => setLoading(false))
+      .finally(() => {
+        inFlightRef.current = false
+        setLoading(false)
+      })
   }, [limit, roomId])
+
+  useEffect(() => {
+    loadSessions(true)
+    if (!roomId) return undefined
+    const id = window.setInterval(() => {
+      if (typeof document !== 'undefined' && document.hidden) return
+      loadSessions(false)
+    }, 30_000)
+    const onVisible = () => {
+      if (typeof document !== 'undefined' && document.hidden) return
+      loadSessions(false)
+    }
+    window.addEventListener('focus', onVisible)
+    document.addEventListener('visibilitychange', onVisible)
+    return () => {
+      window.clearInterval(id)
+      window.removeEventListener('focus', onVisible)
+      document.removeEventListener('visibilitychange', onVisible)
+    }
+  }, [loadSessions, roomId])
 
   const enriched = useMemo(
     () => sessions.map(s => ({ ...s, _quality: sessionQuality(s) })),

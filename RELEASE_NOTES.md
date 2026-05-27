@@ -1,5 +1,9 @@
 # HawaAI add-on — release notes
 
+## 1.4.84
+
+- **Dashboard reliability:** Improved live refresh lifecycle with WebSocket stale detection, safe fallback polling, focus/visibility refreshes, and background session updates so the dashboard no longer needs manual browser refreshes.
+
 ## 1.4.83
 
 - **Comfort intelligence:** Added adaptive room thermal-load comfort compensation with saturation awareness, subtle target offsets, and a compact room-load status indicator.
