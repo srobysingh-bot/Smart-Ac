@@ -11,9 +11,6 @@ function formatDateTime(iso) {
   const d = new Date(iso)
   if (Number.isNaN(d.getTime())) return '--'
   return d.toLocaleString([], {
-    year: 'numeric',
-    month: '2-digit',
-    day: '2-digit',
     hour: '2-digit',
     minute: '2-digit',
   })
@@ -41,11 +38,20 @@ function finalizedDurationMinutes(s) {
 }
 
 const REASON_COLORS = {
-  cooled: 'text-green-400',
-  vacant: 'text-yellow-400',
-  manual: 'text-gray-400',
-  manual_off: 'text-gray-400',
-  schedule: 'text-blue-400',
+  cooled: 'border-emerald-400/20 bg-emerald-400/[0.07] text-emerald-200',
+  thermostat_reached: 'border-emerald-400/20 bg-emerald-400/[0.07] text-emerald-200',
+  vacant: 'border-amber-400/20 bg-amber-400/[0.07] text-amber-200',
+  manual: 'border-gray-500/20 bg-white/[0.04] text-gray-300',
+  manual_off: 'border-gray-500/20 bg-white/[0.04] text-gray-300',
+  power_off: 'border-gray-500/20 bg-white/[0.04] text-gray-300',
+  schedule: 'border-sky-400/20 bg-sky-400/[0.07] text-sky-200',
+}
+
+function reasonLabel(reason) {
+  if (!reason) return '--'
+  return String(reason)
+    .replace(/_/g, ' ')
+    .replace(/\b\w/g, c => c.toUpperCase())
 }
 
 function sessionQuality(s) {
@@ -64,17 +70,32 @@ function sessionQuality(s) {
 }
 
 const QUALITY_BADGE = {
-  good: { label: 'Good', dot: 'bg-green-400', text: 'text-green-400' },
-  weak: { label: 'Weak', dot: 'bg-yellow-400', text: 'text-yellow-400' },
-  invalid: { label: 'Invalid', dot: 'bg-red-500', text: 'text-red-400' },
+  good: {
+    label: 'Good',
+    dot: 'bg-emerald-300 shadow-[0_0_8px_rgba(110,231,183,0.55)]',
+    text: 'text-emerald-200',
+    bg: 'border-emerald-400/20 bg-emerald-400/[0.07]',
+  },
+  weak: {
+    label: 'Review',
+    dot: 'bg-amber-300 shadow-[0_0_8px_rgba(252,211,77,0.55)]',
+    text: 'text-amber-200',
+    bg: 'border-amber-400/20 bg-amber-400/[0.07]',
+  },
+  invalid: {
+    label: 'Low',
+    dot: 'bg-red-400 shadow-[0_0_8px_rgba(248,113,113,0.55)]',
+    text: 'text-red-200',
+    bg: 'border-red-400/20 bg-red-400/[0.07]',
+  },
 }
 
 function QualityBadge({ quality }) {
   const q = QUALITY_BADGE[quality] || QUALITY_BADGE.invalid
   return (
-    <span className="inline-flex items-center gap-1.5">
-      <span className={`w-1.5 h-1.5 rounded-full ${q.dot}`} />
-      <span className={`text-xs font-medium ${q.text}`}>{q.label}</span>
+    <span className={`inline-flex items-center gap-1.5 rounded-full border px-2 py-0.5 ${q.bg}`}>
+      <span className={`h-1.5 w-1.5 rounded-full ${q.dot}`} />
+      <span className={`text-[11px] font-semibold ${q.text}`}>{q.label}</span>
     </span>
   )
 }
@@ -82,8 +103,8 @@ function QualityBadge({ quality }) {
 function StorageBadge({ session }) {
   const stored = session.is_record_valid !== 0 && session.provisional !== 1
   return (
-    <span className={`inline-flex items-center rounded px-2 py-0.5 text-xs font-medium ${
-      stored ? 'bg-green-900/40 text-green-300' : 'bg-red-900/40 text-red-300'
+    <span className={`inline-flex items-center rounded-full border px-2 py-0.5 text-[11px] font-semibold ${
+      stored ? 'border-emerald-400/20 bg-emerald-400/[0.07] text-emerald-200' : 'border-red-400/20 bg-red-400/[0.07] text-red-200'
     }`}>
       {stored ? 'Stored' : 'Invalid'}
     </span>
@@ -152,47 +173,51 @@ export default function SessionTable({ limit = 10, roomId }) {
   const grouped = groupByDate(toRender)
 
   if (!roomId) {
-    return <p className="text-sm text-gray-500 py-4 text-center">Select a room to list sessions.</p>
+    return <p className="py-4 text-center text-sm text-gray-500">Select a room to list sessions.</p>
   }
 
   if (loading) {
-    return <p className="text-sm text-gray-500 py-4 text-center">Loading...</p>
+    return <p className="py-4 text-center text-sm text-gray-500">Loading...</p>
   }
   if (!sessions.length) {
-    return <p className="text-sm text-gray-600 py-4 text-center">No valid sessions recorded yet</p>
+    return <p className="py-4 text-center text-sm text-gray-600">No valid sessions recorded yet</p>
   }
 
   return (
-    <div className="overflow-x-auto">
-      {toRender.length === 0 ? (
-        <p className="text-sm text-gray-600 py-4 text-center">No valid sessions recorded yet</p>
-      ) : (
-        <table className="w-full text-sm">
-          <thead>
-            <tr className="text-left text-xs text-gray-500 uppercase tracking-wide border-b border-gray-800">
-              <th className="pb-2 pr-3">Start</th>
-              <th className="pb-2 pr-3">End</th>
-              <th className="pb-2 pr-3">Duration</th>
-              <th className="pb-2 pr-3">Delta Temp</th>
-              <th className="pb-2 pr-3">kWh</th>
-              <th className="pb-2 pr-3">Cost</th>
-              <th className="pb-2 pr-3">Stored</th>
-              <th className="pb-2 pr-3">Reason</th>
-              <th className="pb-2">Quality</th>
-            </tr>
-          </thead>
-          <tbody className="divide-y divide-gray-800/50">
-            {grouped.map(group => (
-              <FragmentRows key={group.key} group={group} tariffPerKwh={tariffPerKwh} />
-            ))}
-          </tbody>
-        </table>
-      )}
+    <div className="relative">
+      <div className="pointer-events-none absolute inset-x-0 top-0 z-20 h-6 rounded-t-xl bg-gradient-to-b from-gray-950/90 to-transparent" aria-hidden />
+      <div className="pointer-events-none absolute inset-x-0 bottom-0 z-20 h-8 rounded-b-xl bg-gradient-to-t from-gray-950/90 to-transparent" aria-hidden />
+      <div className="max-h-[360px] overflow-auto scroll-smooth rounded-xl border border-white/10 bg-black/10 [scrollbar-color:rgba(148,163,184,0.35)_transparent] [scrollbar-width:thin] sm:max-h-[420px]">
+        {toRender.length === 0 ? (
+          <p className="py-4 text-center text-sm text-gray-600">No valid sessions recorded yet</p>
+        ) : (
+          <table className="w-full min-w-[820px] text-sm">
+            <thead>
+              <tr className="sticky top-0 z-10 border-b border-white/10 bg-gray-950/95 text-left text-[10px] uppercase tracking-[0.16em] text-gray-500 backdrop-blur">
+                <th className="px-3 py-2 font-semibold">Start</th>
+                <th className="px-3 py-2 font-semibold">End</th>
+                <th className="px-3 py-2 font-semibold">Duration</th>
+                <th className="px-3 py-2 font-semibold">Delta</th>
+                <th className="px-3 py-2 font-semibold">kWh</th>
+                <th className="px-3 py-2 font-semibold">Cost</th>
+                <th className="px-3 py-2 font-semibold">Stored</th>
+                <th className="px-3 py-2 font-semibold">Reason</th>
+                <th className="px-3 py-2 font-semibold">Quality</th>
+              </tr>
+            </thead>
+            <tbody className="divide-y divide-white/[0.06]">
+              {grouped.map(group => (
+                <FragmentRows key={group.key} group={group} tariffPerKwh={tariffPerKwh} />
+              ))}
+            </tbody>
+          </table>
+        )}
+      </div>
 
       {invalidRows.length > 0 && (
         <button
           onClick={() => setShowInvalid(v => !v)}
-          className="flex items-center gap-1.5 mt-3 text-xs text-gray-500 hover:text-gray-300 transition-colors"
+          className="mt-3 flex items-center gap-1.5 text-xs text-gray-500 transition-colors hover:text-gray-300"
         >
           {showInvalid ? <ChevronUp size={13} /> : <ChevronDown size={13} />}
           {showInvalid
@@ -207,9 +232,11 @@ export default function SessionTable({ limit = 10, roomId }) {
 function FragmentRows({ group, tariffPerKwh }) {
   return (
     <>
-      <tr className="bg-gray-900/40">
-        <td colSpan={9} className="py-2 pr-3 text-xs font-semibold text-blue-300">
-          {group.key}
+      <tr className="sticky top-[33px] z-[9] bg-gradient-to-r from-sky-950/95 via-gray-950/95 to-gray-950/90 backdrop-blur">
+        <td colSpan={9} className="px-3 py-1.5 text-[11px] font-semibold uppercase tracking-[0.14em] text-sky-200/90">
+          <span className="inline-flex items-center rounded-full border border-sky-400/15 bg-sky-400/[0.06] px-2 py-0.5">
+            {group.key}
+          </span>
         </td>
       </tr>
       {group.rows.map(s => {
@@ -222,21 +249,27 @@ function FragmentRows({ group, tariffPerKwh }) {
         return (
           <tr
             key={s.session_id}
-            className={`hover:bg-gray-800/30 transition-colors ${isInvalid ? 'opacity-40' : ''}`}
+            className={`group transition-colors hover:bg-white/[0.035] ${isInvalid ? 'opacity-45' : ''}`}
           >
-            <td className="py-2 pr-3 text-gray-400 whitespace-nowrap">{formatDateTime(s.start_time)}</td>
-            <td className="py-2 pr-3 text-gray-400 whitespace-nowrap">{formatDateTime(s.end_time)}</td>
-            <td className="py-2 pr-3 text-gray-300">{duration ?? '--'}</td>
-            <td className="py-2 pr-3">
-              {delta != null ? <span className="text-blue-400">-{Number(delta).toFixed(1)}°C</span> : '--'}
+            <td className="whitespace-nowrap px-3 py-1.5 text-xs tabular-nums text-gray-500">{formatDateTime(s.start_time)}</td>
+            <td className="whitespace-nowrap px-3 py-1.5 text-xs tabular-nums text-gray-500">{formatDateTime(s.end_time)}</td>
+            <td className="px-3 py-1.5 text-sm font-semibold tabular-nums text-gray-100">{duration ?? '--'}</td>
+            <td className="px-3 py-1.5">
+              {delta != null ? (
+                <span className="text-sm font-semibold tabular-nums text-cyan-200">{`-${Number(delta).toFixed(1)}\u00b0C`}</span>
+              ) : (
+                <span className="text-gray-600">--</span>
+              )}
             </td>
-            <td className="py-2 pr-3">{fmt(s.energy_consumed_kwh, 3)}</td>
-            <td className="py-2 pr-3 text-yellow-400">{costDisplay(s, tariffPerKwh)}</td>
-            <td className="py-2 pr-3"><StorageBadge session={s} /></td>
-            <td className={`py-2 pr-3 text-xs font-medium ${REASON_COLORS[s.reason_stopped] || 'text-gray-500'}`}>
-              {s.reason_stopped || '--'}
+            <td className="px-3 py-1.5 text-xs tabular-nums text-gray-300">{fmt(s.energy_consumed_kwh, 3)}</td>
+            <td className="px-3 py-1.5 text-xs font-semibold tabular-nums text-amber-200">{costDisplay(s, tariffPerKwh)}</td>
+            <td className="px-3 py-1.5"><StorageBadge session={s} /></td>
+            <td className="px-3 py-1.5">
+              <span className={`inline-flex max-w-[150px] items-center truncate rounded-full border px-2 py-0.5 text-[11px] font-semibold ${REASON_COLORS[s.reason_stopped] || 'border-white/10 bg-white/[0.04] text-gray-400'}`}>
+                {reasonLabel(s.reason_stopped)}
+              </span>
             </td>
-            <td className="py-2"><QualityBadge quality={s._quality} /></td>
+            <td className="px-3 py-1.5"><QualityBadge quality={s._quality} /></td>
           </tr>
         )
       })}

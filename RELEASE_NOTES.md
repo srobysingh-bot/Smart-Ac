@@ -1,5 +1,9 @@
 # HawaAI add-on — release notes
 
+## 1.4.82
+
+- **Dashboard polish:** Refined AC Health and Recent Sessions with a more premium compact visual hierarchy, dense session rows, sticky grouped scrolling, and a stable fixed-height sessions panel.
+
 ## 1.4.81
 
 - **AC health:** Added advisory-only per-room AC health analytics with room-local baselines, learning mode, telemetry quality, filter runtime tracking, and a compact dashboard health card.
