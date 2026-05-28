@@ -34,6 +34,7 @@ import {
   WifiOff,
   TimerReset,
   ChevronDown,
+  PauseCircle,
 } from 'lucide-react'
 
 function formatAiTime(iso) {
@@ -372,7 +373,14 @@ function LiveStatusBar({ status }) {
     ac_state_source,
     ac_state: acPhase,
     physical_ac_on,
+    manual_override_active,
+    manual_override_enabled,
+    manual_override_persisted,
+    automation_paused_by_user,
   } = status || {}
+  const overrideActive = Boolean(
+    automation_paused_by_user || manual_override_active || manual_override_enabled || manual_override_persisted
+  )
 
   const physicalCore = Boolean(
     physical_ac_on != null ? physical_ac_on : (ac_on ?? effective_ac_on)
@@ -462,6 +470,18 @@ function LiveStatusBar({ status }) {
                 title={`${secs_since_cmd?.toFixed(0)}s since ${last_command} command`}>
             <Loader size={11} className="animate-spin" />
             Cooldown {secs_since_cmd != null ? `${Math.round(secs_since_cmd)}s` : ''}
+          </span>
+        </>
+      )}
+      {overrideActive && (
+        <>
+          <span className="hidden sm:inline text-gray-700" aria-hidden>|</span>
+          <span
+            className="inline-flex items-center gap-1.5 rounded-full border border-violet-700/60 bg-violet-950/35 px-2.5 py-1 text-xs font-semibold text-violet-200"
+            title="Manual Override is persisted. Automation stays paused until you turn it off."
+          >
+            <PauseCircle size={13} />
+            Override active · persisted
           </span>
         </>
       )}
@@ -749,13 +769,22 @@ function premiumTempLabel(value) {
 function PremiumClimateStatePills({ status, climate, busy }) {
   const phase = String(status?.ac_state || '').toLowerCase()
   const telemetry = String(status?.telemetry_status || 'unconfigured').toLowerCase()
+  const overrideActive = Boolean(
+    status?.automation_paused_by_user
+    || status?.manual_override_active
+    || status?.manual_override_enabled
+    || status?.manual_override_persisted
+  )
   const climateUnavailable = status?.health?.climate?.available === false
     || ['unavailable', 'unknown'].includes(String(climate?.hvac_mode || '').toLowerCase())
   const pills = []
 
   if (climateUnavailable) {
     pills.push({ key: 'offline', label: 'Offline', Icon: WifiOff, cls: 'border-red-700/60 bg-red-950/35 text-red-200' })
-  } else if (phase === 'pending_on') {
+  }
+  if (overrideActive) {
+    pills.push({ key: 'override', label: 'Automation paused by user', Icon: PauseCircle, cls: 'border-violet-700/60 bg-violet-950/35 text-violet-200' })
+  } else if (!climateUnavailable && phase === 'pending_on') {
     pills.push({ key: 'pending-on', label: 'Waiting ON', Icon: TimerReset, cls: 'border-amber-700/60 bg-amber-950/30 text-amber-200' })
   } else if (phase === 'pending_off') {
     pills.push({ key: 'pending-off', label: 'Pending OFF', Icon: TimerReset, cls: 'border-amber-700/60 bg-amber-950/30 text-amber-200' })

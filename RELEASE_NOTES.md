@@ -1,5 +1,9 @@
 # HawaAI add-on — release notes
 
+## 1.4.85
+
+- **Manual Override persistence:** Made Manual Override a durable per-room user-authority state that survives restarts, updates, reloads, and reconnects until the user explicitly disables it.
+
 ## 1.4.84
 
 - **Dashboard reliability:** Improved live refresh lifecycle with WebSocket stale detection, safe fallback polling, focus/visibility refreshes, and background session updates so the dashboard no longer needs manual browser refreshes.

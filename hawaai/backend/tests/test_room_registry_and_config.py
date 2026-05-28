@@ -225,6 +225,8 @@ class TestConfigLoad(unittest.TestCase):
                         "settings": {
                             "energy_usage_sensor": "sensor.study_kwh",
                             "watt_draw": 900,
+                            "manual_override": True,
+                            "target_temp": 23,
                         },
                     }
                 ],
@@ -240,6 +242,10 @@ class TestConfigLoad(unittest.TestCase):
         self.assertNotIn("effective_on_since_ts", room)
         self.assertNotIn("pending_off_confirmation", room)
         self.assertNotIn("watt_draw", room.get("settings", {}))
+        self.assertTrue(room["settings"]["manual_override_enabled"])
+        self.assertTrue(room["settings"]["manual_override"])
+        self.assertIsInstance(room["settings"]["override_started_at"], str)
+        self.assertIsInstance(room["settings"]["override_user_settings"], dict)
 
     def test_migrated_config_is_persisted_and_not_logged_again(self):
         import backend.config_manager as cm

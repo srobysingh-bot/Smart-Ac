@@ -197,7 +197,8 @@ const ROOM_SETTINGS_KEYS = [
   'target_temp', 'hysteresis', 'vacancy_timeout_minutes', 'logic_interval_seconds',
   'on_delay_seconds', 'off_delay_seconds',
   'energy_tariff_per_kwh', 'currency', 'use_presence', 'use_outdoor_temp',
-  'smart_temp_adjustment', 'smart_cooling_enabled', 'manual_override',
+  'smart_temp_adjustment', 'smart_cooling_enabled', 'manual_override', 'manual_override_enabled',
+  'override_started_at', 'override_user_settings',
   'ac_brand', 'ac_model', 'weather_provider', 'weather_api_key', 'weather_city',
   'temperature_mode', 'timezone', 'schedule',
   'effective_mode', 'manual_effective_temp', 'effective_max_delta_deg',
@@ -1619,9 +1620,25 @@ export default function Settings() {
           )}
           <Toggle
             label="Manual Override"
-            description="Disable all automation"
-            checked={cfg.manual_override ?? false}
-            onChange={v => patch('manual_override', v)}
+            description="Persistently pause automation until you turn this off"
+            checked={cfg.manual_override_enabled ?? cfg.manual_override ?? false}
+            onChange={v => {
+              setCfg(prev => ({
+                ...prev,
+                manual_override: v,
+                manual_override_enabled: v,
+                override_started_at: v ? (prev.override_started_at || new Date().toISOString()) : null,
+                override_user_settings: v
+                  ? {
+                      ...(prev.override_user_settings || {}),
+                      target_temp: prev.target_temp,
+                      temperature_mode: prev.temperature_mode || 'manual',
+                      effective_mode: prev.effective_mode || 'auto',
+                      manual_effective_temp: prev.manual_effective_temp ?? null,
+                    }
+                  : {},
+              }))
+            }}
             danger
           />
         </div>

@@ -673,6 +673,40 @@ def startup_stabilization_remaining_seconds() -> float:
     return max(0.0, _startup_stabilization_until_mono - time.monotonic())
 
 
+def manual_override_enabled(cfg: dict) -> bool:
+    """Durable room-level Manual Override flag; legacy key remains an alias."""
+    if not isinstance(cfg, dict):
+        return False
+    if "manual_override_enabled" in cfg and "manual_override" in cfg:
+        return bool(cfg.get("manual_override_enabled")) or bool(cfg.get("manual_override"))
+    if "manual_override_enabled" in cfg:
+        return bool(cfg.get("manual_override_enabled"))
+    return bool(cfg.get("manual_override", False))
+
+
+def _manual_override_user_settings(cfg: dict) -> dict:
+    raw = cfg.get("override_user_settings") if isinstance(cfg, dict) else None
+    return dict(raw) if isinstance(raw, dict) else {}
+
+
+def _restore_persisted_manual_override(room_id: str, cfg: dict, st: RoomRuntime) -> bool:
+    """Restore persistent user-authority before any automation decision can run."""
+    if not manual_override_enabled(cfg):
+        return False
+    if not st.manual_override_config_active:
+        log_with_room("info", room_id, "[OVERRIDE] restored persistent manual override")
+    st.manual_override_config_active = True
+    st.effective_control_source = "manual"
+    settings = _manual_override_user_settings(cfg)
+    raw_target = settings.get("target_temp", cfg.get("target_temp"))
+    try:
+        if raw_target is not None:
+            st.manual_override_temp = float(raw_target)
+    except (TypeError, ValueError):
+        pass
+    return True
+
+
 def _room_tick_serial_lock(room_id_key: str) -> asyncio.Lock:
     lk = _room_tick_serial_locks.get(room_id_key)
     if lk is None:
@@ -2016,6 +2050,7 @@ async def _load_startup_state(room_id: str, cfg: dict) -> None:
     st = _rt(room_id)
     if st.startup_state_loaded:
         return
+    _restore_persisted_manual_override(room_id, cfg, st)
 
     try:
         climate_entity = cfg.get("climate_entity") or cfg.get("ac_entity")
@@ -2134,7 +2169,7 @@ async def effective_target_for_temp_cross(
 
     Returns None when ``manual_override`` (global skip flag) matches tick early-return.
     """
-    if merged_cfg.get("manual_override", False):
+    if manual_override_enabled(merged_cfg):
         return None
     base_temp, _slot = resolve_base_target_temp(merged_cfg)
     weather = await weather_api.get_cached()
@@ -4271,6 +4306,91 @@ async def _tick_presence_only_mode(
         st.watts_samples.append(telemetry_power_watts)
 
 
+async def _tick_manual_override_observe_only(
+    *,
+    room_id: str,
+    cfg: dict,
+    climate_data: dict,
+    indoor_temp: float,
+    now: datetime,
+    st: RoomRuntime,
+) -> None:
+    """
+    Persistent Manual Override is user authority. Keep telemetry/session/runtime
+    observational paths alive, but do not run automation modifiers or dispatch
+    climate commands.
+    """
+    _restore_persisted_manual_override(room_id, cfg, st)
+    target_raw = (
+        climate_data.get("target_temp")
+        if climate_data and climate_data.get("target_temp") is not None
+        else _manual_override_user_settings(cfg).get("target_temp", cfg.get("target_temp", 24.0))
+    )
+    try:
+        target = float(target_raw)
+    except (TypeError, ValueError):
+        target = _cfg_float(cfg, "target_temp", 24.0)
+
+    st.effective_target_temp = target
+    st.last_control_effective_target_temp = target
+    st.effective_target_source = "manual_override"
+    st.effective_control_source = "manual"
+    st.sleep_offset = 0.0
+    st.sleep_phase = "manual_override"
+    st.sleep_optimization_active = False
+    st.sleep_suspended_reason = "manual_override"
+    st.thermal_load_compensation_offset = 0.0
+    st.thermal_load_compensation_active = False
+    st.thermal_load_summary = "Automation paused by user"
+
+    telemetry_power_reading, _telemetry_kwh = await _read_runtime_energy(
+        room_id, cfg, st, now=now
+    )
+    telemetry_power_watts = (
+        float(telemetry_power_reading) if telemetry_power_reading is not None else 0.0
+    )
+    in_cooldown = _is_in_cooldown(st, now)
+    _maybe_finalize_terminal_off(
+        room_id,
+        st,
+        now,
+        climate_data=climate_data or {},
+        in_cooldown=in_cooldown,
+    )
+    st.physical_ac_on = bool(st.ac_is_on)
+    st.effective_ac_on = bool(st.physical_ac_on)
+    if st.physical_ac_on:
+        if st.effective_on_since_ts is None:
+            st.effective_on_since_ts = now.timestamp()
+    else:
+        st.effective_on_since_ts = None
+    _clear_pending_when_physically_satisfied(
+        st,
+        manual_override_active=True,
+        confirmed_ac_on=bool(st.ac_is_on),
+        physical_ac_on=bool(st.physical_ac_on),
+    )
+    await _maintain_session_lifecycle(
+        room_id,
+        cfg,
+        indoor_temp,
+        now,
+        target,
+        in_cooldown=in_cooldown,
+        confirmed_ac_on=bool(st.ac_is_on),
+        inferred_only_physical=False,
+    )
+    _sync_ac_display_fields(st)
+    if (
+        session_logger.current_session_id(room_id)
+        and st.telemetry_power_live_valid
+        and not st.telemetry_gap
+        and telemetry_power_reading is not None
+    ):
+        st.watts_samples.append(telemetry_power_watts)
+    log_with_room("info", room_id, "[OVERRIDE] active persistent=true automation_paused=true")
+
+
 async def _tick_impl(rid_raw: str, room_id: str) -> None:
     """
     Core tick body. Caller must hold ``_room_ops_lock(room_id)`` so this never races ``stop_room``.
@@ -4393,13 +4513,20 @@ async def _tick_impl(rid_raw: str, room_id: str) -> None:
         presence_raw, is_occupied_bool,
     )
 
-    if cfg.get("manual_override", False):
+    if manual_override_enabled(cfg):
         if not st.manual_override_config_active:
-            log_with_room("info", room_id, "[OVERRIDE] enabled")
-        st.manual_override_config_active = True
-        st.effective_control_source = "manual"
-        logger.info("[HawaAI] Manual override active â€” skipping logic")
+            log_with_room("info", room_id, "[OVERRIDE] enabled persistent=true")
+        logger.info("[HawaAI] Manual override active - automation paused by user")
+        await _tick_manual_override_observe_only(
+            room_id=room_id,
+            cfg=cfg,
+            climate_data=climate_data or {},
+            indoor_temp=float(indoor_temp),
+            now=now,
+            st=st,
+        )
         return
+
     if st.manual_override_config_active:
         clear_manual_override(room_id, reason="manual_override_config_false")
 
@@ -4974,7 +5101,7 @@ async def _tick_impl(rid_raw: str, room_id: str) -> None:
             effective_target=et_eff,
             current_target=climate_data.get("target_temp"),
             ac_on=ac_on,
-            manual_override=cfg.get("manual_override", False) or manual_override_active,
+            manual_override=manual_override_enabled(cfg) or manual_override_active,
             min_interval_seconds=interval,
             meaningful_delta_deg=meaningful,
         )
@@ -5975,11 +6102,15 @@ def get_runtime_state(room_id: str) -> dict:
     min_iv = _cfg_float(merged, "min_command_interval_seconds", 150.0, lo=0.0)
 
     mo_until = st.manual_override_until.isoformat() if st.manual_override_until else None
-    mo_active = bool(
+    mo_persisted = manual_override_enabled(merged)
+    mo_started_at = merged.get("override_started_at") if mo_persisted else None
+    mo_user_settings = _manual_override_user_settings(merged) if mo_persisted else {}
+    mo_timed_active = bool(
         st.manual_override_until is not None
         and now < st.manual_override_until
         and st.manual_override_temp is not None
     )
+    mo_active = bool(mo_persisted or mo_timed_active or st.manual_override_config_active)
     in_cooldown = (
         secs_since_cmd is not None
         and secs_since_cmd < _COOLDOWN_SECS
@@ -6138,9 +6269,19 @@ def get_runtime_state(room_id: str) -> dict:
         "smart_fan_mode":        sc["smart_fan_mode"],
         "last_applied_target":   sc.get("last_applied_target"),
         "ir_backend":            normalize_ir_backend(merged),
-        "manual_override_active": mo_active,
-        "manual_override_expires_at": mo_until if mo_active else None,
-        "manual_override_target_temp": st.manual_override_temp if mo_active else None,
+        "manual_override": bool(mo_active),
+        "manual_override_enabled": bool(mo_persisted),
+        "manual_override_active": bool(mo_active),
+        "manual_override_persisted": bool(mo_persisted),
+        "automation_paused_by_user": bool(mo_active),
+        "override_started_at": mo_started_at,
+        "override_user_settings": mo_user_settings,
+        "manual_override_expires_at": None if mo_persisted else (mo_until if mo_active else None),
+        "manual_override_target_temp": (
+            st.manual_override_temp
+            if st.manual_override_temp is not None
+            else mo_user_settings.get("target_temp")
+        ) if mo_active else None,
         "min_command_interval_seconds": int(min_iv),
         "on_delay_seconds":           on_d,
         "off_delay_seconds":          off_d,

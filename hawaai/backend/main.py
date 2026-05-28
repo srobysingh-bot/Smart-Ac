@@ -372,7 +372,7 @@ async def lifespan(app: FastAPI):
     logger.info("[HawaAI] Add-on stopped")
 
 
-app = FastAPI(title="HawaAI API", version="1.4.84", lifespan=lifespan)
+app = FastAPI(title="HawaAI API", version="1.4.85", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -409,7 +409,10 @@ async def save_config(data: Dict[str, Any] = Body(...)):
     ok = config_manager.save_config(data)
     if ok:
         logger.info("[HawaAI] Config updated: %s", list(data.keys()))
-        if "manual_override" in data and data.get("manual_override") is False:
+        if (
+            ("manual_override" in data or "manual_override_enabled" in data)
+            and not logic_engine.manual_override_enabled(data)
+        ):
             new_cfg = config_manager.load_config()
             for room in room_registry.list_room_dicts(new_cfg):
                 rid = str(room.get("id") or "").strip()
@@ -418,9 +421,7 @@ async def save_config(data: Dict[str, Any] = Body(...)):
                 old_room = room_registry.get_room(previous_cfg, rid) or room
                 old_eff = room_registry.merge_room_config(previous_cfg, old_room)
                 new_eff = room_registry.merge_room_config(new_cfg, room)
-                if bool(old_eff.get("manual_override", False)) and not bool(
-                    new_eff.get("manual_override", False)
-                ):
+                if logic_engine.manual_override_enabled(old_eff) and not logic_engine.manual_override_enabled(new_eff):
                     await logic_engine.clear_manual_override_and_resume(
                         rid,
                         reason="manual_override_cleared",
@@ -870,7 +871,12 @@ async def _dashboard_status_payload(rid: str) -> Dict[str, Any]:
         "pending_since_ts":         runtime.get("pending_since_ts"),
         "pending_remaining_seconds": runtime.get("pending_remaining_seconds"),
         # ── Config ────────────────────────────────────────────────────────────
-        "manual_override":  cfg.get("manual_override", False),
+        "manual_override":  logic_engine.manual_override_enabled(cfg),
+        "manual_override_enabled": logic_engine.manual_override_enabled(cfg),
+        "manual_override_persisted": logic_engine.manual_override_enabled(cfg),
+        "automation_paused_by_user": logic_engine.manual_override_enabled(cfg),
+        "override_started_at": cfg.get("override_started_at"),
+        "override_user_settings": cfg.get("override_user_settings") if isinstance(cfg.get("override_user_settings"), dict) else {},
         "control_mode": logic_engine.normalize_control_mode(cfg),
         "ir_backend": logic_engine.normalize_ir_backend(cfg),
         "config_complete":  bool(
@@ -1115,6 +1121,7 @@ async def api_create_room(body: Dict[str, Any] = Body(...)):
         inc = dict(body["settings"])
         _sanitize_zone_room_settings(inc)
         _sanitize_control_mode_room_settings(inc)
+        _normalize_manual_override_room_settings(inc, room_registry.merge_room_config(base, row))
         _sanitize_effective_target_room_settings(base, row, inc)
         row["settings"] = {
             k: v for k, v in inc.items()
@@ -1173,6 +1180,50 @@ def _sanitize_control_mode_room_settings(incoming_settings: Dict[str, Any]) -> N
             incoming_settings[key] = max(lo, min(float(incoming_settings[key]), hi))
         except (TypeError, ValueError):
             incoming_settings[key] = default
+
+
+def _normalize_manual_override_room_settings(
+    incoming_settings: Dict[str, Any],
+    old_effective: Dict[str, Any],
+) -> None:
+    """Persist Manual Override as explicit durable room state with legacy alias."""
+    if not isinstance(incoming_settings, dict):
+        return
+    touched = (
+        "manual_override_enabled" in incoming_settings
+        or "manual_override" in incoming_settings
+    )
+    if not touched:
+        return
+    raw = (
+        incoming_settings.get("manual_override_enabled")
+        if "manual_override_enabled" in incoming_settings
+        else incoming_settings.get("manual_override")
+    )
+    enabled = bool(raw)
+    was_enabled = logic_engine.manual_override_enabled(old_effective)
+    incoming_settings["manual_override_enabled"] = enabled
+    incoming_settings["manual_override"] = enabled
+    if enabled:
+        if not was_enabled or not incoming_settings.get("override_started_at"):
+            incoming_settings["override_started_at"] = datetime.now(timezone.utc).isoformat()
+        user_settings = incoming_settings.get("override_user_settings")
+        if not isinstance(user_settings, dict):
+            user_settings = {}
+        for key in (
+            "target_temp",
+            "temperature_mode",
+            "effective_mode",
+            "manual_effective_temp",
+        ):
+            if key in incoming_settings and incoming_settings.get(key) is not None:
+                user_settings[key] = incoming_settings.get(key)
+            elif key in old_effective and key not in user_settings:
+                user_settings[key] = old_effective.get(key)
+        incoming_settings["override_user_settings"] = user_settings
+    else:
+        incoming_settings["override_started_at"] = None
+        incoming_settings["override_user_settings"] = {}
 
 
 def _sanitize_effective_target_room_settings(
@@ -1247,7 +1298,7 @@ async def api_update_room(room_id: str, body: Dict[str, Any] = Body(...)):
         raise HTTPException(status_code=404, detail="room not found")
     r = rooms[idx]
     old_effective = room_registry.merge_room_config(base, r)
-    old_manual_override = bool(old_effective.get("manual_override", False))
+    old_manual_override = logic_engine.manual_override_enabled(old_effective)
     if "name" in body and body["name"] is not None:
         r["name"] = str(body["name"]).strip() or r.get("name", "Room")
     if "climate_entity" in body and body["climate_entity"] is not None:
@@ -1273,6 +1324,7 @@ async def api_update_room(room_id: str, body: Dict[str, Any] = Body(...)):
             inc_applied = dict(inc)
             _sanitize_zone_room_settings(inc_applied)
             _sanitize_control_mode_room_settings(inc_applied)
+            _normalize_manual_override_room_settings(inc_applied, old_effective)
             _sanitize_effective_target_room_settings(base, r, inc_applied)
             cur_s = dict(r.get("settings") or {})
             for sk, sv in inc_applied.items():
@@ -1308,7 +1360,7 @@ async def api_update_room(room_id: str, body: Dict[str, Any] = Body(...)):
     new_base = dict(base)
     new_base["rooms"] = rooms
     new_effective = room_registry.merge_room_config(new_base, r)
-    new_manual_override = bool(new_effective.get("manual_override", False))
+    new_manual_override = logic_engine.manual_override_enabled(new_effective)
     if old_manual_override and not new_manual_override:
         await logic_engine.clear_manual_override_and_resume(
             rid,

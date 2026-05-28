@@ -5,6 +5,7 @@ import glob
 import json
 import logging
 import os
+from datetime import datetime, timezone
 from typing import Any, Dict, Optional
 
 from .energy_config import static_energy_entity_rejection_reason
@@ -14,7 +15,7 @@ from .temperature_schedule import validate_timezone_optional
 logger = logging.getLogger(__name__)
 
 CONFIG_PATH = "/data/hawaai_config.json"
-CONFIG_SCHEMA_VERSION = 3
+CONFIG_SCHEMA_VERSION = 4
 
 # Last successful merged config (survives single bad load so rooms are not silently wiped).
 _last_known_good_config: Optional[Dict[str, Any]] = None
@@ -83,6 +84,9 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "humidity_min_offset": -1.0,
     "humidity_max_offset": 0.5,
     "manual_override": False,
+    "manual_override_enabled": False,
+    "override_started_at": None,
+    "override_user_settings": {},
     "ai_enabled": False,
     "ai_provider": "ollama",
     "ai_ollama_url": "http://172.30.32.1:11434",
@@ -172,6 +176,10 @@ _ENERGY_FIELD_ALIASES = {
         "energy_monitor_device_name",
     ),
 }
+
+
+def _utc_now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
 
 
 def _energy_config_snapshot(cfg: Dict[str, Any]) -> Dict[str, Any]:
@@ -280,6 +288,65 @@ def _strip_transient_state_in_place(cfg: Dict[str, Any]) -> bool:
     return changed
 
 
+def _normalize_manual_override_fields_in_place(cfg: Dict[str, Any]) -> bool:
+    """
+    Keep persisted Manual Override as durable user-authority config.
+
+    `manual_override_enabled` is the canonical v4 field. The legacy
+    `manual_override` flag is kept in sync so older UI/config payloads remain
+    compatible and never silently unpause automation.
+    """
+    if not isinstance(cfg, dict):
+        return False
+    changed = False
+    has_new = "manual_override_enabled" in cfg
+    has_legacy = "manual_override" in cfg
+    if has_new and has_legacy:
+        enabled = bool(cfg.get("manual_override_enabled")) or bool(cfg.get("manual_override"))
+    elif has_new:
+        enabled = bool(cfg.get("manual_override_enabled"))
+    else:
+        enabled = bool(cfg.get("manual_override"))
+    if cfg.get("manual_override_enabled") is not enabled:
+        cfg["manual_override_enabled"] = enabled
+        changed = True
+    if cfg.get("manual_override") is not enabled:
+        cfg["manual_override"] = enabled
+        changed = True
+    if enabled:
+        started = cfg.get("override_started_at")
+        if started in (None, ""):
+            cfg["override_started_at"] = _utc_now_iso()
+            changed = True
+        if not isinstance(cfg.get("override_user_settings"), dict):
+            cfg["override_user_settings"] = {}
+            changed = True
+    else:
+        if cfg.get("override_started_at") not in (None, ""):
+            cfg["override_started_at"] = None
+            changed = True
+        if cfg.get("override_user_settings") not in ({}, None):
+            cfg["override_user_settings"] = {}
+            changed = True
+        elif cfg.get("override_user_settings") is None:
+            cfg["override_user_settings"] = {}
+            changed = True
+    return changed
+
+
+def _normalize_manual_override_tree_in_place(cfg: Dict[str, Any]) -> bool:
+    changed = _normalize_manual_override_fields_in_place(cfg)
+    rooms = cfg.get("rooms")
+    if isinstance(rooms, list):
+        for room in rooms:
+            if not isinstance(room, dict):
+                continue
+            settings = room.get("settings")
+            if isinstance(settings, dict):
+                changed = _normalize_manual_override_fields_in_place(settings) or changed
+    return changed
+
+
 def _coerce_schema_version(raw: Any) -> int:
     try:
         n = int(raw)
@@ -311,6 +378,17 @@ def migrate_v2_to_v3(cfg: Dict[str, Any]) -> Dict[str, Any]:
     return out
 
 
+def migrate_v3_to_v4(cfg: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    v4 promotes Manual Override into explicit durable user-authority fields.
+    Existing legacy `manual_override` values are preserved and mirrored.
+    """
+    out = copy.deepcopy(cfg) if isinstance(cfg, dict) else {}
+    _normalize_manual_override_tree_in_place(out)
+    out["schema_version"] = 4
+    return out
+
+
 def _log_migration_once(from_version: int, to_version: int) -> None:
     key = (int(from_version), int(to_version))
     if key in _logged_migration_steps:
@@ -338,8 +416,14 @@ def migrate_config(saved: Dict[str, Any], *, log_migrations: bool = True) -> Dic
         if log_migrations:
             _log_migration_once(version, 3)
         version = 3
+    if version < 4:
+        cfg = migrate_v3_to_v4(cfg)
+        if log_migrations:
+            _log_migration_once(version, 4)
+        version = 4
 
     _strip_transient_state_in_place(cfg)
+    _normalize_manual_override_tree_in_place(cfg)
     cfg["schema_version"] = CONFIG_SCHEMA_VERSION
     if original_version == CONFIG_SCHEMA_VERSION:
         logger.debug("[CONFIG] migration_check schema_version=%s", CONFIG_SCHEMA_VERSION)
@@ -491,6 +575,7 @@ def _assemble_merged_config(
     _normalize_energy_fields_in_place(merged)
     _normalize_room_energy_fields(merged.get("rooms"))
     _strip_transient_state_in_place(merged)
+    _normalize_manual_override_tree_in_place(merged)
 
     if merged.get("ai_enabled") is None:
         merged["ai_enabled"] = False
@@ -523,6 +608,7 @@ def _assemble_merged_config(
     merged["climate_entity"] = _ace
 
     room_registry.ensure_migrated(merged)
+    _normalize_manual_override_tree_in_place(merged)
     merged["schema_version"] = CONFIG_SCHEMA_VERSION
     return merged
 
@@ -622,6 +708,7 @@ def save_config(data: Dict[str, Any]) -> bool:
         _normalize_energy_fields_in_place(current)
         _normalize_room_energy_fields(current.get("rooms"))
         _strip_transient_state_in_place(current)
+        _normalize_manual_override_tree_in_place(current)
         current["schema_version"] = CONFIG_SCHEMA_VERSION
         current["timezone"] = validate_timezone_optional(current.get("timezone"))
         _ace = (current.get("ac_entity") or current.get("climate_entity") or "").strip()

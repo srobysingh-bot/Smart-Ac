@@ -740,6 +740,43 @@ class TestLogicEngineHardening(unittest.TestCase):
         self.assertAlmostEqual(target, 23.0)
         self.assertAlmostEqual(st.manual_override_temp, 23.0)
 
+    def test_persistent_manual_override_restores_without_expiry(self):
+        logic_engine._runtime_by_room.clear()
+        rid = "persistent-override"
+        st = logic_engine._rt(rid)
+        cfg = {
+            "manual_override_enabled": True,
+            "manual_override": True,
+            "override_started_at": "2026-01-01T00:00:00+00:00",
+            "override_user_settings": {"target_temp": 23.0},
+            "target_temp": 24.0,
+        }
+
+        restored = logic_engine._restore_persisted_manual_override(rid, cfg, st)
+        with mock.patch.object(
+            logic_engine.config_manager,
+            "load_config",
+            return_value={
+                "rooms": [
+                    {
+                        "id": rid,
+                        "name": "Persistent Override",
+                        "climate_entity": "climate.override",
+                        "settings": dict(cfg),
+                    }
+                ]
+            },
+        ):
+            runtime = logic_engine.get_runtime_state(rid)
+
+        self.assertTrue(restored)
+        self.assertTrue(st.manual_override_config_active)
+        self.assertTrue(runtime["manual_override_active"])
+        self.assertTrue(runtime["manual_override_persisted"])
+        self.assertTrue(runtime["automation_paused_by_user"])
+        self.assertIsNone(runtime["manual_override_expires_at"])
+        self.assertEqual(runtime["override_started_at"], "2026-01-01T00:00:00+00:00")
+
     def test_target_context_change_clears_stale_target_state(self):
         st = logic_engine.RoomRuntime()
         st.last_target_context_key = ("manual", "manual", 27.0, False, "auto", None, 3.0)
