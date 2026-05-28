@@ -7,6 +7,7 @@ import {
   getWeather,
   getStatus,
   updateRoom,
+  resetAutoComfortLearning,
   disableRoom,
   enableRoom,
   deleteRoom,
@@ -201,6 +202,9 @@ const ROOM_SETTINGS_KEYS = [
   'override_started_at', 'override_user_settings',
   'ac_brand', 'ac_model', 'weather_provider', 'weather_api_key', 'weather_city',
   'temperature_mode', 'timezone', 'schedule',
+  'auto_comfort_profile', 'auto_comfort_learning_enabled',
+  'auto_comfort_min_target', 'auto_comfort_max_target', 'auto_comfort_max_step_deg',
+  'auto_comfort_max_total_offset_deg', 'auto_comfort_min_change_seconds',
   'effective_mode', 'manual_effective_temp', 'effective_max_delta_deg',
   'zone_entity_id', 'zone_required_for_on', 'zone_dwell_seconds',
 ]
@@ -1395,7 +1399,50 @@ export default function Settings() {
               <option value="manual">Manual</option>
               <option value="schedule">Schedule</option>
               <option value="schedule_ai">Schedule + AI</option>
+              <option value="auto_comfort">Auto Comfort</option>
             </select>
+            {(cfg.temperature_mode || 'manual') === 'auto_comfort' && (
+              <div className="mt-3 rounded-xl border border-cyan-900/45 bg-cyan-950/15 p-3 space-y-3">
+                <p className="text-xs text-cyan-200/85 leading-relaxed">
+                  <strong className="text-cyan-100">Auto Comfort</strong> keeps the existing thermostat safety path, learns this room by time band, and adapts gently without requiring AI.
+                </p>
+                <div>
+                  <Label>Auto Comfort profile</Label>
+                  <select
+                    className="w-full bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm text-gray-100 focus:outline-none focus:border-blue-500"
+                    value={cfg.auto_comfort_profile || 'comfort'}
+                    onChange={e => patch('auto_comfort_profile', e.target.value)}
+                  >
+                    <option value="comfort">Comfort</option>
+                    <option value="balanced">Balanced</option>
+                    <option value="eco">Eco</option>
+                  </select>
+                </div>
+                <Toggle
+                  label="Learn room comfort pattern"
+                  description="Requires repeated similar user corrections before changing this room's learned band."
+                  checked={cfg.auto_comfort_learning_enabled ?? true}
+                  onChange={v => patch('auto_comfort_learning_enabled', v)}
+                />
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                  <Slider label="Min target" value={cfg.auto_comfort_min_target ?? 16} onChange={v => patch('auto_comfort_min_target', v)} min={16} max={24} step={0.5} unit="Â°C" />
+                  <Slider label="Max target" value={cfg.auto_comfort_max_target ?? 25} onChange={v => patch('auto_comfort_max_target', v)} min={20} max={30} step={0.5} unit="Â°C" />
+                  <Slider label="Max step" value={cfg.auto_comfort_max_step_deg ?? 0.5} onChange={v => patch('auto_comfort_max_step_deg', v)} min={0.25} max={2} step={0.25} unit="Â°C" />
+                  <Slider label="Adjustment interval" value={Math.round(Number(cfg.auto_comfort_min_change_seconds ?? 900) / 60)} onChange={v => patch('auto_comfort_min_change_seconds', Math.round(Number(v) * 60))} min={5} max={120} step={5} unit=" min" />
+                </div>
+                <button
+                  type="button"
+                  className="text-xs rounded-lg border border-cyan-800/50 bg-cyan-950/25 px-3 py-2 text-cyan-100 hover:bg-cyan-900/35 transition"
+                  onClick={async () => {
+                    if (!roomId) return
+                    await resetAutoComfortLearning(roomId)
+                    setSaveStatus({ type: 'success', text: 'Auto Comfort learning reset for this room.' })
+                  }}
+                >
+                  Reset learned pattern
+                </button>
+              </div>
+            )}
             <p className="text-xs text-gray-500 mt-1 leading-relaxed">
               <strong className="text-gray-400">Manual</strong> — one fixed °C target (above).&nbsp;
               <strong className="text-gray-400">Schedule</strong> — four time bands with your °C per band + outdoor smart curve.&nbsp;

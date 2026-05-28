@@ -135,6 +135,10 @@ export const enableRoom = roomId =>
   roomParam(roomId).then(rid =>
     request(`/rooms/${encodeURIComponent(rid)}/enable`, { method: 'POST' }),
   )
+export const resetAutoComfortLearning = roomId =>
+  roomParam(roomId).then(rid =>
+    request(`/rooms/${encodeURIComponent(rid)}/auto-comfort/reset`, { method: 'POST' }),
+  )
 export const getBrands = () => request('/brands')
 
 // ── HA Entities ──────────────────────────────────────────────────────────────

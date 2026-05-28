@@ -43,6 +43,7 @@ const REASON_COLORS = {
   vacant: 'border-amber-400/20 bg-amber-400/[0.07] text-amber-200',
   manual: 'border-gray-500/20 bg-white/[0.04] text-gray-300',
   manual_off: 'border-gray-500/20 bg-white/[0.04] text-gray-300',
+  auto_comfort: 'border-cyan-500/20 bg-cyan-500/10 text-cyan-200',
   power_off: 'border-gray-500/20 bg-white/[0.04] text-gray-300',
   schedule: 'border-sky-400/20 bg-sky-400/[0.07] text-sky-200',
 }

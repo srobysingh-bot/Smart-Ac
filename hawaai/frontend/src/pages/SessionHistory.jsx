@@ -71,6 +71,7 @@ function ReasonBadge({ reason }) {
     vacant: 'bg-yellow-900/50 text-yellow-300',
     manual: 'bg-gray-700 text-gray-300',
     manual_off: 'bg-gray-700 text-gray-300',
+    auto_comfort: 'bg-cyan-900/60 text-cyan-200',
     schedule: 'bg-blue-900/50 text-blue-300',
   }
   return (

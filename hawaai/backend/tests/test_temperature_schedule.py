@@ -61,6 +61,8 @@ class TestModesAndClamp(unittest.TestCase):
         self.assertEqual(normalize_temperature_mode("manual"), "manual")
         self.assertEqual(normalize_temperature_mode("Schedule"), "schedule")
         self.assertEqual(normalize_temperature_mode("schedule_ai"), "schedule_ai")
+        self.assertEqual(normalize_temperature_mode("auto_comfort"), "auto_comfort")
+        self.assertEqual(normalize_temperature_mode("HawaAI Pilot"), "auto_comfort")
         self.assertEqual(normalize_temperature_mode("bogus"), "manual")
 
     def test_manual_uses_slider_target(self):
@@ -87,6 +89,24 @@ class TestModesAndClamp(unittest.TestCase):
         t, lbl = resolve_base_target_temp(cfg, now_local=noon)
         self.assertEqual(lbl, "afternoon")
         self.assertAlmostEqual(t, 27.0)
+
+    def test_auto_comfort_uses_schedule_slot_as_base(self):
+        cfg = {
+            "target_temp": 24,
+            "temperature_mode": "auto_comfort",
+            "schedule": {
+                "morning_temp": 25.0,
+                "afternoon_temp": 26.0,
+                "evening_temp": 24.0,
+                "night_temp": 23.0,
+            },
+            "timezone": "UTC",
+        }
+        ensure_temperature_schedule_defaults(cfg)
+        evening = datetime(2026, 7, 1, 18, 0, tzinfo=timezone.utc)
+        t, lbl = resolve_base_target_temp(cfg, now_local=evening)
+        self.assertEqual(lbl, "evening")
+        self.assertAlmostEqual(t, 24.0)
 
     def test_ai_clamp_within_one_degree_of_effective_weather_curve(self):
         eff = 24.5

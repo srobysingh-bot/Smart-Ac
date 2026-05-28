@@ -7,6 +7,7 @@ const MODE_LABEL = {
   manual: 'Manual',
   schedule: 'Schedule',
   schedule_ai: 'Schedule + AI',
+  auto_comfort: 'Auto Comfort',
 }
 
 const COMFORT_MODE_LABEL = {
@@ -39,6 +40,11 @@ export default function TemperaturePlanCard({ status }) {
   const effective = status.effective_target
   const aiOn = !!(status.ai_enabled && mode === 'schedule_ai')
   const aiApplied = !!status.ai_adjust_applied && aiOn
+  const autoComfortOn = mode === 'auto_comfort'
+  const autoComfortStatus = status.auto_comfort_status || 'learning'
+  const autoComfortConfidence = status.auto_comfort_confidence || 'learning'
+  const autoComfortReason = status.auto_comfort_reason || 'learning_room_comfort_profile'
+  const autoComfortWarning = status.cooling_effectiveness_warning || (status.auto_comfort_warnings || [])[0]
   const comfortMode = status.effective_mode || 'auto'
   const maxComfortDelta = status.effective_max_delta_deg
 
@@ -68,6 +74,11 @@ export default function TemperaturePlanCard({ status }) {
             AI layer
           </span>
         )}
+        {autoComfortOn && (
+          <span className="px-2 py-0.5 rounded text-[10px] uppercase tracking-wide bg-cyan-900/40 text-cyan-200 border border-cyan-700/50">
+            {autoComfortStatus === 'learning' ? 'Learning' : 'Pilot active'}
+          </span>
+        )}
       </div>
 
       <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4 text-sm min-w-0">
@@ -81,11 +92,11 @@ export default function TemperaturePlanCard({ status }) {
           <span className="text-[10px] text-gray-600">Slider or slot</span>
         </div>
         <div className="min-w-0">
-          <span className="text-xs text-gray-500">After weather</span>
+          <span className="text-xs text-gray-500">{autoComfortOn ? 'Auto target' : 'After weather'}</span>
           <span className="font-mono font-semibold text-emerald-200/95 mt-0.5 block">
             {effWeather != null ? `${Number(effWeather).toFixed(1)}°C` : '—'}
           </span>
-          <span className="text-[10px] text-gray-600">Outdoor curve</span>
+          <span className="text-[10px] text-gray-600">{autoComfortOn ? 'Room pilot' : 'Outdoor curve'}</span>
         </div>
         <div className="min-w-0 sm:col-span-2 lg:col-span-2">
           <span className="text-xs text-gray-500 flex items-center gap-1 flex-wrap">
@@ -125,6 +136,40 @@ export default function TemperaturePlanCard({ status }) {
               Engine compares indoor temp to <strong className="text-gray-400">effective</strong> ± hysteresis; band is [base … base+max Δ] (auto caps weather+AI uplift).
             </span>
           </div>
+          {autoComfortOn && (
+            <div className="mt-2 rounded-lg border border-cyan-900/50 bg-cyan-950/15 px-3 py-2 grid grid-cols-2 gap-x-3 gap-y-1 text-[11px] text-gray-400">
+              <span>Auto Comfort</span>
+              <span className="font-mono text-cyan-100 text-right capitalize">
+                {String(autoComfortStatus).replace(/_/g, ' ')}
+              </span>
+              <span>Profile</span>
+              <span className="font-mono text-cyan-100 text-right capitalize">
+                {String(status.auto_comfort_profile || 'comfort').replace(/_/g, ' ')}
+              </span>
+              <span>Confidence</span>
+              <span className="font-mono text-cyan-100 text-right capitalize">
+                {String(autoComfortConfidence).replace(/_/g, ' ')}
+              </span>
+              <span>Learned band</span>
+              <span className="font-mono text-cyan-100 text-right capitalize">
+                {String(status.auto_comfort_learning_band || '—').replace(/_/g, ' ')}
+              </span>
+              <span>Learned offset</span>
+              <span className="font-mono text-cyan-100 text-right">
+                {Number(status.auto_comfort_learning_offset || 0).toFixed(1)}°C
+              </span>
+              <span className="col-span-2 text-[10px] text-cyan-200/70 pt-1 border-t border-cyan-900/40 mt-1">
+                {autoComfortStatus === 'degraded'
+                  ? 'Auto Comfort needs a room temperature sensor for reliable comfort.'
+                  : `Reason: ${String(autoComfortReason).replace(/_/g, ' ')}`}
+              </span>
+              {autoComfortWarning && (
+                <span className="col-span-2 text-[10px] text-amber-200/85">
+                  {String(autoComfortWarning).replace(/_/g, ' ')}
+                </span>
+              )}
+            </div>
+          )}
           <span className="text-[10px] text-gray-600 block mt-2">
             {aiApplied
               ? 'Schedule + weather + small bounded model nudge (max ±1°C).'

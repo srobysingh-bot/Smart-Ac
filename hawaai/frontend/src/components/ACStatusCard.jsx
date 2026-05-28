@@ -158,6 +158,7 @@ function ComfortRuntimePanel({
   thermalLoadSummary,
   thermalLoadOffset,
   coolingSaturated,
+  roomActive = false,
 }) {
   const hasSleep = sleepPhase || Math.abs(Number(sleepOffset) || 0) >= 0.05
   const hasHumidity =
@@ -167,6 +168,12 @@ function ComfortRuntimePanel({
     comfortLevel ||
     humidityBand ||
     dryModeRecommended
+  const shownThermalLevel = roomActive ? thermalLoadLevel : (thermalLoadSummary ? 'standby' : 'idle')
+  const shownThermalConfidence = roomActive ? thermalLoadConfidence : 'monitoring'
+  const shownThermalSummary = roomActive
+    ? (coolingSaturated ? 'Max comfort cooling active' : (thermalLoadSummary || 'Monitoring room load'))
+    : (thermalLoadSummary || 'Standby')
+
   const hasThermalLoad =
     thermalLoadLevel ||
     thermalLoadActive ||
@@ -185,11 +192,13 @@ function ComfortRuntimePanel({
 
   const comfortKey = String(comfortLevel || 'unknown').toLowerCase()
   const comfortCls = COMFORT_LEVEL_STYLE[comfortKey] || COMFORT_LEVEL_STYLE.unknown
-  const loadKey = String(thermalLoadLevel || 'low').toLowerCase()
+  const loadKey = String(shownThermalLevel || 'low').toLowerCase()
   const loadCls = {
     low: 'border-emerald-800/50 bg-emerald-950/25 text-emerald-200',
     medium: 'border-amber-800/55 bg-amber-950/30 text-amber-200',
     high: 'border-orange-800/55 bg-orange-950/35 text-orange-200',
+    standby: 'border-gray-800 bg-gray-900/60 text-gray-400',
+    idle: 'border-gray-800 bg-gray-900/60 text-gray-400',
   }[loadKey] || 'border-gray-800 bg-gray-900/60 text-gray-400'
 
   return (
@@ -264,14 +273,14 @@ function ComfortRuntimePanel({
                 Room load
               </span>
               <span className={`rounded border px-1.5 py-0.5 text-[10px] ${loadCls}`}>
-                {labelize(thermalLoadLevel || 'low')}
+                {labelize(shownThermalLevel || 'idle')}
               </span>
             </div>
             <div className="mt-1 flex items-center justify-between gap-2 text-[11px]">
               <span className="truncate text-gray-500">
-                {coolingSaturated ? 'Max comfort cooling active' : (thermalLoadSummary || 'Monitoring room load')}
+                {shownThermalSummary}
               </span>
-              <span className="shrink-0 text-gray-400">{labelize(thermalLoadConfidence || 'low')}</span>
+              <span className="shrink-0 text-gray-400">{labelize(shownThermalConfidence || 'monitoring')}</span>
             </div>
           </div>
         )}
@@ -481,6 +490,7 @@ export default function ACStatusCard({
         thermalLoadSummary={thermalLoadSummary}
         thermalLoadOffset={thermalLoadOffset}
         coolingSaturated={coolingSaturated}
+        roomActive={runningCompress || acIdle || !!sessionStart}
       />
 
       {(acOnLine || acOffLine) && (

@@ -46,7 +46,7 @@ from fastapi import Body, FastAPI, HTTPException, Query, Request, WebSocket, Web
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, HTMLResponse, Response
 
-from . import ac_health, config_manager, database, ha_entity_events, live_broadcast, logic_engine, room_registry, scheduler, session_logger, weather_api
+from . import ac_health, auto_comfort, config_manager, database, ha_entity_events, live_broadcast, logic_engine, room_registry, scheduler, session_logger, weather_api
 from .room_log_store import LOG_SCOPE_RUNTIME, room_log_store
 from . import ha_client
 from .ac_controller import get_brands
@@ -57,7 +57,7 @@ from .energy_config import (
     resolve_energy_config,
     validate_energy_entity,
 )
-from .temperature_schedule import resolve_base_target_temp
+from .temperature_schedule import normalize_temperature_mode, resolve_base_target_temp
 from .utils import parse_presence
 
 # Room-scoped WebSocket subscribers: broadcast never crosses room_id boundaries.
@@ -243,7 +243,10 @@ async def _drain_climate_command(
         try:
             ok = await ha_client.call_service("climate", service, payload)
             if ok and room_id:
-                logic_engine.record_user_api_command(room_id)
+                if service == "set_temperature" and payload.get("temperature") is not None:
+                    logic_engine.record_user_temperature_command(room_id, float(payload.get("temperature")))
+                else:
+                    logic_engine.record_user_api_command(room_id)
                 _api_last_command[room_id] = time.monotonic()
             result = {"success": ok, "queued": True}
         except Exception as exc:
@@ -734,12 +737,18 @@ async def _dashboard_status_payload(rid: str) -> Dict[str, Any]:
 
     # Effective target — same pipeline as logic_engine.tick (manual / schedule × weather ± optional AI clamp)
     base_target, schedule_slot = resolve_base_target_temp(cfg)
-    smart_curve = logic_engine.smart_temp_adjustment_enabled(cfg) and bool(cfg.get("use_outdoor_temp", True))
+    tm = normalize_temperature_mode(cfg.get("temperature_mode"))
+    smart_curve = (
+        logic_engine.smart_temp_adjustment_enabled(cfg)
+        and bool(cfg.get("use_outdoor_temp", True))
+        and tm != "auto_comfort"
+    )
     outdoor_temp_val = weather.get("temp") if weather else None
     effective_after_weather = logic_engine.compute_effective_target(
         base_target, outdoor_temp_val, smart_curve,
     )
-    tm = str(cfg.get("temperature_mode") or "manual")
+    if tm == "auto_comfort" and runtime.get("auto_comfort_target") is not None:
+        effective_after_weather = runtime.get("auto_comfort_target")
     try:
         effective_target = float(runtime.get("target_temp"))
     except (TypeError, ValueError):
@@ -912,6 +921,25 @@ async def _dashboard_status_payload(rid: str) -> Dict[str, Any]:
         "thermal_load_summary": runtime.get("thermal_load_summary", "Monitoring room load"),
         "cooling_saturated": runtime.get("cooling_saturated", False),
         "max_comfort_cooling_active": runtime.get("max_comfort_cooling_active", False),
+        "auto_comfort_active": runtime.get("auto_comfort_active", False),
+        "auto_comfort_target": runtime.get("auto_comfort_target"),
+        "auto_comfort_base_target": runtime.get("auto_comfort_base_target"),
+        "auto_comfort_final_target": runtime.get("auto_comfort_final_target"),
+        "auto_comfort_profile": runtime.get("auto_comfort_profile", cfg.get("auto_comfort_profile", "comfort")),
+        "auto_comfort_confidence": runtime.get("auto_comfort_confidence", "inactive"),
+        "auto_comfort_status": runtime.get("auto_comfort_status", "inactive"),
+        "auto_comfort_reason": runtime.get("auto_comfort_reason"),
+        "auto_comfort_warnings": runtime.get("auto_comfort_warnings", []),
+        "auto_comfort_offsets": runtime.get("auto_comfort_offsets", {}),
+        "auto_comfort_learning_band": runtime.get("auto_comfort_learning_band"),
+        "auto_comfort_learning_offset": runtime.get("auto_comfort_learning_offset", 0.0),
+        "auto_comfort_learning_sample_count": runtime.get("auto_comfort_learning_sample_count", 0),
+        "auto_comfort_last_learned_reason": runtime.get("auto_comfort_last_learned_reason"),
+        "auto_comfort_sample_count": runtime.get("auto_comfort_sample_count", 0),
+        "cooling_effectiveness": runtime.get("cooling_effectiveness", "unknown"),
+        "cooling_effectiveness_reason": runtime.get("cooling_effectiveness_reason"),
+        "cooling_effectiveness_warning": runtime.get("cooling_effectiveness_warning"),
+        "cooling_effectiveness_drop_rate": runtime.get("cooling_effectiveness_drop_rate"),
         "temperature_mode": tm,
         "schedule_slot": schedule_slot,
         "ai_adjust_applied": ai_adjust_applied,
@@ -1284,6 +1312,41 @@ def _sanitize_effective_target_room_settings(
             incoming_settings.pop("manual_effective_temp", None)
 
 
+def _sanitize_temperature_mode_room_settings(incoming_settings: Dict[str, Any]) -> None:
+    """Normalize persisted temperature authority mode while preserving valid rooms."""
+    if not isinstance(incoming_settings, dict):
+        return
+    if "temperature_mode" in incoming_settings:
+        incoming_settings["temperature_mode"] = normalize_temperature_mode(
+            incoming_settings.get("temperature_mode")
+        )
+    if "auto_comfort_profile" in incoming_settings:
+        incoming_settings["auto_comfort_profile"] = auto_comfort.normalize_profile(
+            incoming_settings.get("auto_comfort_profile")
+        )
+    for key, default, lo, hi in (
+        ("auto_comfort_min_target", auto_comfort.DEFAULT_MIN_TARGET_C, 16.0, 30.0),
+        ("auto_comfort_max_target", auto_comfort.DEFAULT_MAX_TARGET_C, 16.0, 30.0),
+        ("auto_comfort_max_step_deg", auto_comfort.DEFAULT_MAX_STEP_C, 0.25, 2.0),
+        ("auto_comfort_max_total_offset_deg", auto_comfort.DEFAULT_MAX_TOTAL_OFFSET_C, 0.0, 3.0),
+        ("auto_comfort_min_change_seconds", auto_comfort.DEFAULT_MIN_CHANGE_SECONDS, 0.0, 7200.0),
+    ):
+        if key not in incoming_settings or incoming_settings[key] is None:
+            continue
+        try:
+            incoming_settings[key] = max(lo, min(float(incoming_settings[key]), hi))
+        except (TypeError, ValueError):
+            incoming_settings[key] = default
+    if (
+        incoming_settings.get("auto_comfort_min_target") is not None
+        and incoming_settings.get("auto_comfort_max_target") is not None
+        and float(incoming_settings["auto_comfort_max_target"]) < float(incoming_settings["auto_comfort_min_target"])
+    ):
+        incoming_settings["auto_comfort_max_target"] = incoming_settings["auto_comfort_min_target"]
+    if "auto_comfort_learning_enabled" in incoming_settings:
+        incoming_settings["auto_comfort_learning_enabled"] = bool(incoming_settings.get("auto_comfort_learning_enabled"))
+
+
 @app.put("/api/rooms/{room_id}")
 async def api_update_room(room_id: str, body: Dict[str, Any] = Body(...)):
     rid = _require_room_query(room_id)
@@ -1324,6 +1387,7 @@ async def api_update_room(room_id: str, body: Dict[str, Any] = Body(...)):
             inc_applied = dict(inc)
             _sanitize_zone_room_settings(inc_applied)
             _sanitize_control_mode_room_settings(inc_applied)
+            _sanitize_temperature_mode_room_settings(inc_applied)
             _normalize_manual_override_room_settings(inc_applied, old_effective)
             _sanitize_effective_target_room_settings(base, r, inc_applied)
             cur_s = dict(r.get("settings") or {})
@@ -1425,6 +1489,19 @@ async def api_enable_room(room_id: str):
         raise HTTPException(status_code=500, detail="failed to save rooms")
     rid_canon = logic_engine.normalize_room_id(stored)
     return {"status": "enabled", "room_id": stored, "room_id_canonical": rid_canon}
+
+
+@app.post("/api/rooms/{room_id}/auto-comfort/reset")
+async def api_reset_auto_comfort(room_id: str):
+    """Reset persisted Auto Comfort learning for one room only."""
+    rid = _require_room_query(room_id)
+    base = config_manager.load_config()
+    stored = _resolve_stored_room_id(base, rid)
+    if not stored:
+        raise HTTPException(status_code=404, detail="room not found")
+    await logic_engine.reset_auto_comfort_learning(stored)
+    logic_engine.trigger_tick(stored, reason="auto_comfort_reset", skip_debounce=True)
+    return {"ok": True, "room_id": stored}
 
 
 @app.delete("/api/rooms/{room_id}")

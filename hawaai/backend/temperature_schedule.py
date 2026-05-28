@@ -54,7 +54,7 @@ def validate_timezone_optional(raw: Any) -> str:
         )
         return "Asia/Kolkata"
 
-TemperatureMode = Literal["manual", "schedule", "schedule_ai"]
+TemperatureMode = Literal["manual", "schedule", "schedule_ai", "auto_comfort"]
 
 SCHEDULE_SLOTS = ("morning", "afternoon", "evening", "night")  # informational
 
@@ -119,13 +119,15 @@ def _coerce_schedule_temps(schedule: Any, fallback: float) -> Dict[str, float]:
 
 
 def normalize_temperature_mode(raw: Any) -> str:
-    m = str(raw or "manual").strip().lower().replace("+", "_")
+    m = str(raw or "manual").strip().lower().replace("+", "_").replace(" ", "_")
     if m == "manual":
         return "manual"
     if m == "schedule":
         return "schedule"
     if m in ("schedule_ai", "schedule+ai"):
         return "schedule_ai"
+    if m in ("auto_comfort", "auto-comfort", "hawaai_pilot", "hawaai-pilot", "pilot"):
+        return "auto_comfort"
     return "manual"
 
 

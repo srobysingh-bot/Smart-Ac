@@ -30,6 +30,7 @@ from typing import Dict, List, Optional, Tuple
 from . import (
     ac_aerostate_adapter,
     ac_tuya_adapter,
+    auto_comfort,
     config_manager,
     database,
     ha_client,
@@ -634,6 +635,34 @@ class RoomRuntime:
     cooling_saturated: bool = False
     thermal_load_summary: str = "Monitoring room load"
     last_thermal_load_log_sig: Optional[tuple] = None
+    auto_comfort_sample_count: int = 0
+    auto_comfort_target: Optional[float] = None
+    auto_comfort_base_target: Optional[float] = None
+    auto_comfort_final_target: Optional[float] = None
+    auto_comfort_profile: str = "comfort"
+    auto_comfort_confidence: str = "inactive"
+    auto_comfort_status: str = "inactive"
+    auto_comfort_reason: str = ""
+    auto_comfort_warnings: List[str] = field(default_factory=list)
+    auto_comfort_offsets: Dict[str, float] = field(default_factory=dict)
+    auto_comfort_learning_band: str = "unknown"
+    auto_comfort_learning_offset: float = 0.0
+    auto_comfort_learning_sample_count: int = 0
+    auto_comfort_last_learned_reason: str = ""
+    auto_comfort_profile_loaded: bool = False
+    auto_comfort_learning_profile: Dict[str, object] = field(default_factory=dict)
+    auto_comfort_last_target_at: Optional[datetime] = None
+    last_auto_comfort_log_sig: Optional[tuple] = None
+    last_user_setpoint_temp: Optional[float] = None
+    last_user_setpoint_at: Optional[datetime] = None
+    last_user_setpoint_consumed_at: Optional[datetime] = None
+    cooling_effectiveness: str = "unknown"
+    cooling_effectiveness_reason: str = "not_running"
+    cooling_effectiveness_warning: str = ""
+    cooling_effectiveness_drop_rate: Optional[float] = None
+    cooling_effectiveness_on_started_at: Optional[datetime] = None
+    cooling_effectiveness_start_temp: Optional[float] = None
+    last_cooling_effectiveness_sig: Optional[tuple] = None
 
 
 _runtime_by_room: Dict[str, RoomRuntime] = {}
@@ -2172,12 +2201,78 @@ async def effective_target_for_temp_cross(
     if manual_override_enabled(merged_cfg):
         return None
     base_temp, _slot = resolve_base_target_temp(merged_cfg)
+    temperature_mode_str = str(merged_cfg.get("temperature_mode") or "manual").strip().lower()
+    auto_comfort_active = temperature_mode_str == auto_comfort.AUTO_COMFORT_MODE
     weather = await weather_api.get_cached()
     outdoor_temp = weather.get("temp") if weather else None
     smart_curve = smart_temp_adjustment_enabled(merged_cfg) and bool(
         merged_cfg.get("use_outdoor_temp", True)
-    )
+    ) and not auto_comfort_active
     eff_aw = compute_effective_target(base_temp, outdoor_temp, smart_curve)
+    humidity_percent = await _read_indoor_humidity(merged_cfg)
+
+    if auto_comfort_active:
+        st = _rt(room_canon)
+        await _ensure_auto_comfort_profile_loaded(room_canon, st)
+        band = _slot if _slot in AUTO_COMFORT_BANDS else "night"
+        learned_offset, learned_count, _reason = _profile_learned_offset(st, band)
+        seed, source = auto_comfort.resolve_base_target(
+            merged_cfg,
+            learned_target=None,
+            auto_default_target=merged_cfg.get("auto_comfort_base_target"),
+            room_target_temp=merged_cfg.get("target_temp"),
+            schedule_hint_target=base_temp,
+        )
+        if learned_count >= 3:
+            source = "learned"
+        decision = _resolve_auto_comfort_decision(
+            room_canon,
+            merged_cfg,
+            st,
+            now=datetime.now(timezone.utc),
+            base_target=seed,
+            base_source=source,
+            learned_band=band,
+            learned_offset=learned_offset,
+            learned_sample_count=learned_count,
+            indoor_temp=indoor_temp,
+            outdoor_temp=outdoor_temp,
+            humidity_percent=humidity_percent,
+            occupied=True,
+            ac_on=False,
+            learn=False,
+        )
+        sleep_result = _apply_sleep_optimizer_layer(
+            room_canon,
+            merged_cfg,
+            now=datetime.now(timezone.utc),
+            indoor_temp=indoor_temp,
+            target_before_sleep=float(decision.target),
+            log_change=False,
+        )
+        humidity_result = _apply_humidity_comfort_layer(
+            room_canon,
+            merged_cfg,
+            indoor_temp=indoor_temp,
+            humidity_percent=humidity_percent,
+            target_before_humidity=sleep_result.adjusted_target,
+            ac_on=False,
+            log_change=False,
+        )
+        return _apply_thermal_load_comfort_layer(
+            room_canon,
+            merged_cfg,
+            now=datetime.now(timezone.utc),
+            indoor_temp=indoor_temp,
+            outdoor_temp=outdoor_temp,
+            humidity_percent=humidity_percent,
+            target_before_thermal=float(humidity_result.adjusted_target),
+            ac_on=False,
+            occupied=True,
+            climate_data={},
+            log_change=False,
+        )
+
     ai_delta = await _get_ai_target_adjustment(room_canon, indoor_temp, eff_aw, merged_cfg)
     planned_raw = float(eff_aw + ai_delta)
     target_before_sleep = apply_effective_mode_engine_target(
@@ -2195,7 +2290,6 @@ async def effective_target_for_temp_cross(
         target_before_sleep=target_before_sleep,
         log_change=False,
     )
-    humidity_percent = await _read_indoor_humidity(merged_cfg)
     humidity_result = _apply_humidity_comfort_layer(
         room_canon,
         merged_cfg,
@@ -2330,7 +2424,7 @@ def sync_effective_mode_transition(st: RoomRuntime, room_id: str, cfg: dict) -> 
 
 def _target_context_key(cfg: dict, slot_label: str, base_temp: float) -> tuple:
     mode = str(cfg.get("temperature_mode") or "manual").strip().lower()
-    if mode not in ("manual", "schedule", "schedule_ai"):
+    if mode not in ("manual", "schedule", "schedule_ai", auto_comfort.AUTO_COMFORT_MODE):
         mode = "manual"
     eff_mode = str(cfg.get("effective_mode") or "auto").strip().lower()
     if eff_mode not in ("auto", "manual"):
@@ -3012,6 +3106,18 @@ def record_user_api_command(room_id: str) -> None:
     _clear_pending_command_state(st)
 
 
+def record_user_temperature_command(room_id: str, temperature: float) -> None:
+    """Record an explicit user setpoint for Auto Comfort learning only."""
+    record_user_api_command(room_id)
+    st = _rt(room_id)
+    try:
+        temp = float(temperature)
+    except (TypeError, ValueError):
+        return
+    st.last_user_setpoint_temp = temp
+    st.last_user_setpoint_at = datetime.now(timezone.utc)
+
+
 def _session_creation_eligible(st: RoomRuntime, now: datetime) -> bool:
     """
     Opening a cooling session requires real AC intent/on state â€” NOT inferred-only effective_ac_on.
@@ -3178,7 +3284,7 @@ def _manual_override_resolve(
             ct = None
 
     temperature_mode = str(cfg.get("temperature_mode") or "manual").strip().lower()
-    if temperature_mode not in ("manual", "schedule", "schedule_ai"):
+    if temperature_mode not in ("manual", "schedule", "schedule_ai", auto_comfort.AUTO_COMFORT_MODE):
         temperature_mode = "manual"
     if temperature_mode != "manual":
         if st.manual_override_until is not None or st.manual_override_temp is not None:
@@ -3997,6 +4103,335 @@ def _apply_thermal_load_comfort_layer(
     return float(adjusted)
 
 
+AUTO_COMFORT_BANDS = ("morning", "afternoon", "evening", "night")
+
+
+def _empty_auto_comfort_profile(room_id: str) -> Dict[str, object]:
+    return {
+        "room_id": room_id,
+        "version": 1,
+        "bands": {
+            band: {
+                "offset": 0.0,
+                "sample_count": 0,
+                "pending_count": 0,
+                "pending_sum": 0.0,
+                "pending_direction": 0,
+                "last_reason": "",
+                "updated_at": None,
+            }
+            for band in AUTO_COMFORT_BANDS
+        },
+    }
+
+
+def _coerce_auto_comfort_profile(room_id: str, raw: object) -> Dict[str, object]:
+    profile = _empty_auto_comfort_profile(room_id)
+    if isinstance(raw, dict):
+        bands = raw.get("bands") if isinstance(raw.get("bands"), dict) else {}
+        for band in AUTO_COMFORT_BANDS:
+            src = bands.get(band) if isinstance(bands.get(band), dict) else {}
+            dst = profile["bands"][band]  # type: ignore[index]
+            try:
+                dst["offset"] = max(-2.0, min(2.0, float(src.get("offset", 0.0))))  # type: ignore[index]
+            except (TypeError, ValueError):
+                pass
+            for key in ("sample_count", "pending_count", "pending_direction"):
+                try:
+                    dst[key] = int(src.get(key, 0))  # type: ignore[index]
+                except (TypeError, ValueError):
+                    pass
+            try:
+                dst["pending_sum"] = float(src.get("pending_sum", 0.0))  # type: ignore[index]
+            except (TypeError, ValueError):
+                pass
+            dst["last_reason"] = str(src.get("last_reason") or "")  # type: ignore[index]
+            dst["updated_at"] = src.get("updated_at")  # type: ignore[index]
+    return profile
+
+
+async def _ensure_auto_comfort_profile_loaded(room_id: str, st: RoomRuntime) -> None:
+    if st.auto_comfort_profile_loaded:
+        return
+    try:
+        persisted = await database.get_auto_comfort_profile(room_id)
+    except Exception as exc:
+        logger.warning("[AUTO_COMFORT][%s] profile_load_failed: %s", room_id, exc)
+        persisted = None
+    st.auto_comfort_learning_profile = _coerce_auto_comfort_profile(room_id, persisted)
+    st.auto_comfort_profile_loaded = True
+
+
+async def reset_auto_comfort_learning(room_id: str) -> None:
+    """Reset one room's persisted Auto Comfort learning profile."""
+    rid = normalize_room_id(room_id)
+    st = _rt(rid)
+    st.auto_comfort_learning_profile = _empty_auto_comfort_profile(rid)
+    st.auto_comfort_profile_loaded = True
+    st.auto_comfort_learning_offset = 0.0
+    st.auto_comfort_learning_sample_count = 0
+    st.auto_comfort_last_learned_reason = "reset_by_user"
+    await database.reset_auto_comfort_profile(rid)
+    log_with_room("info", rid, "[AUTO_COMFORT] learning_reset")
+
+
+def _auto_comfort_band_data(st: RoomRuntime, band: str) -> Dict[str, object]:
+    profile = st.auto_comfort_learning_profile
+    if not isinstance(profile, dict):
+        profile = _empty_auto_comfort_profile("")
+        st.auto_comfort_learning_profile = profile
+    bands = profile.get("bands")
+    if not isinstance(bands, dict):
+        bands = _empty_auto_comfort_profile("").get("bands")
+        profile["bands"] = bands
+    if band not in bands or not isinstance(bands.get(band), dict):
+        bands[band] = _empty_auto_comfort_profile("").get("bands", {}).get(band, {})
+    return bands[band]  # type: ignore[index]
+
+
+def _profile_learned_offset(st: RoomRuntime, band: str) -> tuple[float, int, str]:
+    data = _auto_comfort_band_data(st, band if band in AUTO_COMFORT_BANDS else "night")
+    try:
+        offset = float(data.get("offset", 0.0))
+    except (TypeError, ValueError):
+        offset = 0.0
+    try:
+        count = int(data.get("sample_count", 0))
+    except (TypeError, ValueError):
+        count = 0
+    return max(-2.0, min(2.0, offset)), max(0, count), str(data.get("last_reason") or "")
+
+
+async def _maybe_learn_auto_comfort_user_correction(
+    room_id: str,
+    cfg: dict,
+    st: RoomRuntime,
+    *,
+    now: datetime,
+    band: str,
+    indoor_temp: Optional[float],
+    in_cooldown: bool,
+) -> None:
+    if not bool(cfg.get("auto_comfort_learning_enabled", True)):
+        return
+    if manual_override_enabled(cfg) or startup_stabilization_active() or in_cooldown:
+        return
+    if indoor_temp is None or st.auto_comfort_target is None or st.last_user_setpoint_temp is None:
+        return
+    if st.last_user_setpoint_at is None:
+        return
+    if st.last_user_setpoint_consumed_at == st.last_user_setpoint_at:
+        return
+    if (now - st.last_user_setpoint_at).total_seconds() > 3600.0:
+        return
+
+    correction = float(st.last_user_setpoint_temp) - float(st.auto_comfort_target)
+    if abs(correction) < 0.5:
+        st.last_user_setpoint_consumed_at = st.last_user_setpoint_at
+        return
+
+    data = _auto_comfort_band_data(st, band if band in AUTO_COMFORT_BANDS else "night")
+    direction = -1 if correction < 0 else 1
+    prior_direction = int(data.get("pending_direction") or 0)
+    if prior_direction and prior_direction != direction:
+        data["pending_count"] = 0
+        data["pending_sum"] = 0.0
+
+    data["pending_direction"] = direction
+    data["pending_count"] = int(data.get("pending_count") or 0) + 1
+    data["pending_sum"] = float(data.get("pending_sum") or 0.0) + correction
+    st.last_user_setpoint_consumed_at = st.last_user_setpoint_at
+
+    if int(data["pending_count"]) < 3:
+        st.auto_comfort_last_learned_reason = "collecting_similar_user_corrections"
+        return
+
+    avg = float(data["pending_sum"]) / max(1, int(data["pending_count"]))
+    old_offset = max(-2.0, min(2.0, float(data.get("offset") or 0.0)))
+    learned = max(-2.0, min(2.0, (old_offset * 0.70) + (avg * 0.30)))
+    data["offset"] = round(learned, 2)
+    data["sample_count"] = int(data.get("sample_count") or 0) + int(data["pending_count"])
+    data["pending_count"] = 0
+    data["pending_sum"] = 0.0
+    data["pending_direction"] = 0
+    data["last_reason"] = "user_correction"
+    data["updated_at"] = now.isoformat()
+    st.auto_comfort_learning_offset = float(data["offset"])
+    st.auto_comfort_learning_sample_count = int(data["sample_count"])
+    st.auto_comfort_last_learned_reason = "user_correction"
+    await database.upsert_auto_comfort_profile(room_id, st.auto_comfort_learning_profile)
+    log_with_room(
+        "info",
+        room_id,
+        "[AUTO_COMFORT] learned band=%s offset=%+.2f samples=%s",
+        band,
+        st.auto_comfort_learning_offset,
+        st.auto_comfort_learning_sample_count,
+    )
+
+
+def _update_cooling_effectiveness_runtime(
+    room_id: str,
+    st: RoomRuntime,
+    *,
+    now: datetime,
+    ac_on: bool,
+    indoor_temp: Optional[float],
+    target_gap: Optional[float],
+    outdoor_temp: Optional[float],
+    humidity_percent: Optional[float],
+) -> None:
+    if not ac_on or indoor_temp is None:
+        st.cooling_effectiveness_on_started_at = None
+        st.cooling_effectiveness_start_temp = None
+        st.cooling_effectiveness = "unknown"
+        st.cooling_effectiveness_reason = "not_running" if not ac_on else "room_temp_sensor_required"
+        st.cooling_effectiveness_warning = ""
+        st.cooling_effectiveness_drop_rate = None
+        return
+    if st.cooling_effectiveness_on_started_at is None:
+        st.cooling_effectiveness_on_started_at = now
+        st.cooling_effectiveness_start_temp = float(indoor_temp)
+    elapsed = (now - st.cooling_effectiveness_on_started_at).total_seconds()
+    result = auto_comfort.evaluate_cooling_effectiveness(
+        ac_on=bool(ac_on),
+        elapsed_seconds=elapsed,
+        start_temp=st.cooling_effectiveness_start_temp,
+        current_temp=float(indoor_temp),
+        target_gap=target_gap,
+        outdoor_temp=outdoor_temp,
+        humidity_percent=humidity_percent,
+        cooling_saturated=bool(st.cooling_saturated),
+    )
+    st.cooling_effectiveness = result.status
+    st.cooling_effectiveness_reason = result.reason
+    st.cooling_effectiveness_warning = result.warning
+    st.cooling_effectiveness_drop_rate = result.drop_rate_c_per_hour
+    sig = (result.status, result.reason, result.warning, result.drop_rate_c_per_hour)
+    if sig != st.last_cooling_effectiveness_sig:
+        log_with_room(
+            "info",
+            room_id,
+            "[AUTO_COMFORT] cooling_effectiveness=%s reason=%s warning=%s rate=%s",
+            result.status,
+            result.reason,
+            result.warning or "none",
+            result.drop_rate_c_per_hour if result.drop_rate_c_per_hour is not None else "n/a",
+        )
+        st.last_cooling_effectiveness_sig = sig
+
+
+def _clear_auto_comfort_runtime(st: RoomRuntime) -> None:
+    st.auto_comfort_target = None
+    st.auto_comfort_base_target = None
+    st.auto_comfort_final_target = None
+    st.auto_comfort_profile = "comfort"
+    st.auto_comfort_confidence = "inactive"
+    st.auto_comfort_status = "inactive"
+    st.auto_comfort_reason = ""
+    st.auto_comfort_warnings = []
+    st.auto_comfort_offsets = {}
+    st.auto_comfort_learning_band = "unknown"
+    st.auto_comfort_learning_offset = 0.0
+    st.auto_comfort_learning_sample_count = 0
+
+
+def _resolve_auto_comfort_decision(
+    room_id: str,
+    cfg: dict,
+    st: RoomRuntime,
+    *,
+    now: datetime,
+    base_target: float,
+    base_source: str,
+    learned_band: str,
+    learned_offset: float,
+    learned_sample_count: int,
+    indoor_temp: float,
+    outdoor_temp: Optional[float],
+    humidity_percent: Optional[float],
+    occupied: bool,
+    ac_on: bool,
+    learn: bool = True,
+) -> auto_comfort.AutoComfortDecision:
+    if learn and bool(occupied) and indoor_temp is not None:
+        st.auto_comfort_sample_count = min(int(st.auto_comfort_sample_count) + 1, 100_000)
+
+    decision = auto_comfort.resolve_auto_comfort_target(
+        cfg,
+        now=now,
+        base_target=float(base_target),
+        base_source=base_source,
+        indoor_temp=float(indoor_temp),
+        outdoor_temp=outdoor_temp,
+        humidity_percent=humidity_percent,
+        occupied=bool(occupied),
+        ac_on=bool(ac_on),
+        thermal_load_level=st.thermal_load_level,
+        thermal_load_confidence=st.thermal_load_confidence,
+        cooling_saturated=bool(st.cooling_saturated),
+        cooling_effectiveness=st.cooling_effectiveness,
+        learned_band=learned_band,
+        learned_offset=learned_offset,
+        learned_sample_count=learned_sample_count,
+        runtime_sample_count=st.auto_comfort_sample_count,
+        previous_target=st.auto_comfort_target,
+        previous_target_at=st.auto_comfort_last_target_at,
+        include_humidity_offset=False,
+        include_thermal_load_offset=False,
+    )
+
+    if st.auto_comfort_target is None or abs(float(decision.target) - float(st.auto_comfort_target)) >= 0.01:
+        st.auto_comfort_last_target_at = now
+    st.auto_comfort_target = float(decision.target)
+    st.auto_comfort_base_target = float(decision.base_target)
+    st.auto_comfort_final_target = float(decision.final_target)
+    st.auto_comfort_profile = decision.profile
+    st.auto_comfort_confidence = decision.confidence
+    st.auto_comfort_status = decision.status
+    st.auto_comfort_reason = decision.reason
+    st.auto_comfort_warnings = list(decision.warnings)
+    st.auto_comfort_learning_band = decision.learned_band
+    st.auto_comfort_learning_offset = float(decision.learned_offset)
+    st.auto_comfort_learning_sample_count = int(learned_sample_count)
+    st.auto_comfort_offsets = {
+        "learned": float(decision.learned_offset),
+        "profile": float(decision.profile_offset),
+        "weather": float(decision.weather_offset),
+        "humidity": float(decision.humidity_offset),
+        "thermal_load": float(decision.thermal_load_offset),
+        "cooling_effectiveness": float(decision.cooling_effectiveness_offset),
+        "sleep": float(decision.sleep_offset),
+    }
+
+    sig = (
+        round(float(decision.target), 1),
+        decision.confidence,
+        decision.status,
+        decision.reason,
+        tuple(decision.warnings),
+    )
+    if sig != st.last_auto_comfort_log_sig:
+        log_with_room(
+            "info",
+            room_id,
+            "[AUTO_COMFORT][%s] status=%s profile=%s base=%.1f learned=%+.1f weather=%+.1f humidity=%+.1f load=%+.1f final=%.1f confidence=%s reason=%s",
+            room_id,
+            decision.status,
+            decision.profile,
+            float(decision.base_target),
+            float(decision.learned_offset),
+            float(decision.weather_offset),
+            float(decision.humidity_offset),
+            float(decision.thermal_load_offset),
+            float(decision.target),
+            decision.confidence,
+            decision.reason,
+        )
+        st.last_auto_comfort_log_sig = sig
+    return decision
+
+
 async def tick(room_id: str) -> None:
     """
     Single decision-loop iteration for one room.
@@ -4468,6 +4903,12 @@ async def _tick_impl(rid_raw: str, room_id: str) -> None:
                 pass
 
     if indoor_temp is None and not presence_only:
+        if str(cfg.get("temperature_mode") or "manual").strip().lower() == auto_comfort.AUTO_COMFORT_MODE:
+            st.auto_comfort_status = "degraded"
+            st.auto_comfort_confidence = "degraded"
+            st.auto_comfort_reason = "room_temp_sensor_required"
+            st.auto_comfort_warnings = ["room_temp_sensor_required"]
+            st.effective_target_source = "auto_comfort_degraded"
         logger.warning(
             "[HawaAI] tick skipped for room=%s â€” indoor_temp is None (HA unavailable?)",
             room_id,
@@ -4514,6 +4955,7 @@ async def _tick_impl(rid_raw: str, room_id: str) -> None:
     )
 
     if manual_override_enabled(cfg):
+        _clear_auto_comfort_runtime(st)
         if not st.manual_override_config_active:
             log_with_room("info", room_id, "[OVERRIDE] enabled persistent=true")
         logger.info("[HawaAI] Manual override active - automation paused by user")
@@ -4546,14 +4988,40 @@ async def _tick_impl(rid_raw: str, room_id: str) -> None:
 
     base_temp, slot_label = resolve_base_target_temp(cfg)
     log_target_resolve(room_id, cfg, base_temp, slot_label)
-    temperature_mode_str = (cfg.get("temperature_mode") or "manual")
+    temperature_mode_str = str(cfg.get("temperature_mode") or "manual").strip().lower()
+    auto_comfort_active = temperature_mode_str == auto_comfort.AUTO_COMFORT_MODE
+    auto_comfort_base_source = "schedule_hint"
+    auto_comfort_learned_offset = 0.0
+    auto_comfort_learned_count = 0
+    if auto_comfort_active:
+        await _ensure_auto_comfort_profile_loaded(room_id, st)
+        band = slot_label if slot_label in AUTO_COMFORT_BANDS else "night"
+        auto_comfort_learned_offset, auto_comfort_learned_count, last_reason = _profile_learned_offset(st, band)
+        st.auto_comfort_learning_band = band
+        st.auto_comfort_last_learned_reason = last_reason
+        st.auto_comfort_learning_sample_count = auto_comfort_learned_count
+        auto_default = cfg.get("auto_comfort_base_target")
+        seed_base, auto_comfort_base_source = auto_comfort.resolve_base_target(
+            cfg,
+            learned_target=None,
+            auto_default_target=auto_default,
+            room_target_temp=cfg.get("target_temp"),
+            schedule_hint_target=base_temp,
+        )
+        if auto_comfort_learned_count >= 3:
+            auto_comfort_base_source = "learned"
+        base_temp = seed_base
     sync_target_context_transition(st, room_id, cfg, slot_label, base_temp)
 
     vacancy_timeout = max(
         _cfg_int(cfg, "vacancy_timeout_minutes", 5, lo=0) * 60,
         float(VACANCY_CONFIRM_SECS),
     )
-    smart_curve = smart_temp_adjustment_enabled(cfg) and bool(cfg.get("use_outdoor_temp", True))
+    smart_curve = (
+        smart_temp_adjustment_enabled(cfg)
+        and bool(cfg.get("use_outdoor_temp", True))
+        and not auto_comfort_active
+    )
 
     weather = await weather_api.get_cached()
     outdoor_temp = weather.get("temp") if weather else None
@@ -4657,6 +5125,38 @@ async def _tick_impl(rid_raw: str, room_id: str) -> None:
             )
         rst.last_schedule_slot = slot_label
 
+    if auto_comfort_active:
+        await _maybe_learn_auto_comfort_user_correction(
+            room_id,
+            cfg,
+            st,
+            now=now,
+            band=st.auto_comfort_learning_band if st.auto_comfort_learning_band in AUTO_COMFORT_BANDS else "night",
+            indoor_temp=float(indoor_temp),
+            in_cooldown=in_cooldown,
+        )
+        auto_comfort_learned_offset, auto_comfort_learned_count, last_reason = _profile_learned_offset(
+            st,
+            st.auto_comfort_learning_band if st.auto_comfort_learning_band in AUTO_COMFORT_BANDS else "night",
+        )
+        st.auto_comfort_learning_sample_count = auto_comfort_learned_count
+        st.auto_comfort_last_learned_reason = last_reason or st.auto_comfort_last_learned_reason
+
+    _update_cooling_effectiveness_runtime(
+        room_id,
+        st,
+        now=now,
+        ac_on=bool(ac_on),
+        indoor_temp=float(indoor_temp),
+        target_gap=(
+            float(indoor_temp) - float(st.auto_comfort_target)
+            if st.auto_comfort_target is not None
+            else float(indoor_temp) - float(base_temp)
+        ),
+        outdoor_temp=outdoor_temp,
+        humidity_percent=indoor_humidity,
+    )
+
     use_ai_layer = (
         bool(cfg.get("ai_enabled", False))
         and bool(is_occupied_bool)
@@ -4681,15 +5181,38 @@ async def _tick_impl(rid_raw: str, room_id: str) -> None:
         if rec and throttle_cache_use_log(room_id):
             logger.debug("[AI][%s] Cached used", room_id)
 
-    ai_delta = await _get_ai_target_adjustment(room_id, indoor_temp, eff_aw, cfg)
-    planned_with_ai = eff_aw + ai_delta
-    target_before_sleep = apply_effective_mode_engine_target(
-        room_id=room_id,
-        base_temp=float(base_temp),
-        planned_with_ai=float(planned_with_ai),
-        cfg=cfg,
-        control_log=True,
-    )
+    if auto_comfort_active:
+        auto_decision = _resolve_auto_comfort_decision(
+            room_id,
+            cfg,
+            st,
+            now=now,
+            base_target=float(base_temp),
+            base_source=auto_comfort_base_source,
+            learned_band=st.auto_comfort_learning_band,
+            learned_offset=auto_comfort_learned_offset,
+            learned_sample_count=auto_comfort_learned_count,
+            indoor_temp=float(indoor_temp),
+            outdoor_temp=outdoor_temp,
+            humidity_percent=indoor_humidity,
+            occupied=bool(is_occupied_bool),
+            ac_on=bool(ac_on),
+        )
+        ai_delta = 0.0
+        planned_with_ai = float(auto_decision.target)
+        target_before_sleep = float(auto_decision.target)
+        eff_aw = float(auto_decision.target)
+    else:
+        _clear_auto_comfort_runtime(st)
+        ai_delta = await _get_ai_target_adjustment(room_id, indoor_temp, eff_aw, cfg)
+        planned_with_ai = eff_aw + ai_delta
+        target_before_sleep = apply_effective_mode_engine_target(
+            room_id=room_id,
+            base_temp=float(base_temp),
+            planned_with_ai=float(planned_with_ai),
+            cfg=cfg,
+            control_log=True,
+        )
     sleep_result = _apply_sleep_optimizer_layer(
         room_id,
         cfg,
@@ -4720,6 +5243,11 @@ async def _tick_impl(rid_raw: str, room_id: str) -> None:
         climate_data=climate_data or {},
         log_change=True,
     )
+    if auto_comfort_active:
+        st.auto_comfort_final_target = float(engine_target)
+        st.auto_comfort_offsets["sleep"] = float(getattr(sleep_result, "offset", 0.0))
+        st.auto_comfort_offsets["humidity"] = float(getattr(humidity_result, "humidity_offset", 0.0))
+        st.auto_comfort_offsets["thermal_load"] = float(getattr(st, "thermal_load_compensation_offset", 0.0))
 
     manual_override_active, manual_target = _manual_override_resolve(
         room_id, cfg, climate_data or {}, indoor_temp, now, engine_target,
@@ -4743,7 +5271,7 @@ async def _tick_impl(rid_raw: str, room_id: str) -> None:
         target_source = "manual_setpoint"
     else:
         et_eff = float(engine_target)
-        target_source = "control_effective"
+        target_source = "auto_comfort" if auto_comfort_active else "control_effective"
     st.last_control_effective_target_temp = float(engine_target)
     st.effective_target_temp = et_eff
     st.effective_target_source = target_source
@@ -5089,8 +5617,15 @@ async def _tick_impl(rid_raw: str, room_id: str) -> None:
     sleep_target_changed = abs(float(getattr(sleep_result, "offset", 0.0))) >= 0.01
     humidity_target_changed = abs(float(getattr(humidity_result, "humidity_offset", 0.0))) >= 0.01
     thermal_target_changed = abs(float(getattr(st, "thermal_load_compensation_offset", 0.0))) >= 0.01
+    auto_comfort_target_changed = bool(auto_comfort_active)
     if (
-        (smart_curve or sleep_target_changed or humidity_target_changed or thermal_target_changed)
+        (
+            smart_curve
+            or auto_comfort_target_changed
+            or sleep_target_changed
+            or humidity_target_changed
+            or thermal_target_changed
+        )
         and climate_entity and ac_on and occ_res and not in_cooldown
     ):
         interval = _cfg_int(cfg, "setpoint_command_min_interval_seconds", 180, lo=0)
@@ -6213,6 +6748,25 @@ def get_runtime_state(room_id: str) -> dict:
         "thermal_load_summary":  st.thermal_load_summary,
         "cooling_saturated":     st.cooling_saturated,
         "max_comfort_cooling_active": st.cooling_saturated,
+        "auto_comfort_active": st.auto_comfort_status not in ("inactive", ""),
+        "auto_comfort_target": st.auto_comfort_target,
+        "auto_comfort_base_target": st.auto_comfort_base_target,
+        "auto_comfort_final_target": st.auto_comfort_final_target,
+        "auto_comfort_profile": st.auto_comfort_profile,
+        "auto_comfort_confidence": st.auto_comfort_confidence,
+        "auto_comfort_status": st.auto_comfort_status,
+        "auto_comfort_reason": st.auto_comfort_reason,
+        "auto_comfort_warnings": list(st.auto_comfort_warnings),
+        "auto_comfort_offsets": dict(st.auto_comfort_offsets),
+        "auto_comfort_learning_band": st.auto_comfort_learning_band,
+        "auto_comfort_learning_offset": st.auto_comfort_learning_offset,
+        "auto_comfort_learning_sample_count": st.auto_comfort_learning_sample_count,
+        "auto_comfort_last_learned_reason": st.auto_comfort_last_learned_reason,
+        "auto_comfort_sample_count": int(st.auto_comfort_sample_count),
+        "cooling_effectiveness": st.cooling_effectiveness,
+        "cooling_effectiveness_reason": st.cooling_effectiveness_reason,
+        "cooling_effectiveness_warning": st.cooling_effectiveness_warning,
+        "cooling_effectiveness_drop_rate": st.cooling_effectiveness_drop_rate,
         "last_command_source":   st.last_command_source,
         "last_ac_on_at":         st.last_ac_on_at,
         "last_ac_off_at":        st.last_ac_off_at,

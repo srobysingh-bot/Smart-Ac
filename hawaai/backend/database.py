@@ -1,6 +1,7 @@
 """SQLite database schema and query helpers for HawaAI."""
 
 import aiosqlite
+import json
 import logging
 import shutil
 from collections import defaultdict
@@ -116,6 +117,14 @@ async def init_db() -> None:
             )
         """)
 
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS auto_comfort_profiles (
+                room_id      TEXT PRIMARY KEY,
+                updated_at   DATETIME DEFAULT CURRENT_TIMESTAMP,
+                profile_json TEXT NOT NULL
+            )
+        """)
+
         # Performance indexes
         await db.execute(
             "CREATE INDEX IF NOT EXISTS idx_sessions_start    ON sessions(start_time)"
@@ -186,6 +195,59 @@ async def init_db() -> None:
 
         await db.commit()
     logger.info("Database ready at %s", DB_PATH)
+
+
+async def get_auto_comfort_profile(room_id: str) -> Optional[Dict[str, Any]]:
+    """Return persisted Auto Comfort learning profile for one room, if present."""
+    rid = (room_id or "").strip()
+    if not rid:
+        return None
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT profile_json FROM auto_comfort_profiles WHERE room_id = ?",
+            (rid,),
+        ) as cursor:
+            row = await cursor.fetchone()
+    if not row:
+        return None
+    try:
+        data = json.loads(row[0] or "{}")
+    except (TypeError, json.JSONDecodeError):
+        logger.warning("[AUTO_COMFORT] invalid persisted profile for room=%s", rid)
+        return None
+    return data if isinstance(data, dict) else None
+
+
+async def upsert_auto_comfort_profile(room_id: str, profile: Dict[str, Any]) -> None:
+    """Persist one room's Auto Comfort profile non-destructively."""
+    rid = (room_id or "").strip()
+    if not rid:
+        return
+    payload = dict(profile or {})
+    payload["room_id"] = rid
+    payload["updated_at"] = datetime.utcnow().isoformat()
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            """
+            INSERT INTO auto_comfort_profiles(room_id, updated_at, profile_json)
+            VALUES (?, CURRENT_TIMESTAMP, ?)
+            ON CONFLICT(room_id) DO UPDATE SET
+                updated_at = excluded.updated_at,
+                profile_json = excluded.profile_json
+            """,
+            (rid, json.dumps(payload, ensure_ascii=False, sort_keys=True)),
+        )
+        await db.commit()
+
+
+async def reset_auto_comfort_profile(room_id: str) -> None:
+    """Delete persisted Auto Comfort learning for one room only."""
+    rid = (room_id or "").strip()
+    if not rid:
+        return
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("DELETE FROM auto_comfort_profiles WHERE room_id = ?", (rid,))
+        await db.commit()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
