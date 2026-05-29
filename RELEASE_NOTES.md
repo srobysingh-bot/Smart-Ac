@@ -1,5 +1,9 @@
 # HawaAI add-on — release notes
 
+## 1.4.87
+
+- **Auto Comfort:** Fixed repeated manual-override clearing/log spam by only clearing on real temperature-mode transitions, refreshed Auto Comfort reasoning logs, and corrected misleading power telemetry labels.
+
 ## 1.4.85
 
 - **Manual Override persistence:** Made Manual Override a durable per-room user-authority state that survives restarts, updates, reloads, and reconnects until the user explicitly disables it.

@@ -209,6 +209,90 @@ class TestConfigLoad(unittest.TestCase):
         self.assertNotIn("live_power_sensor", room.get("settings", {}))
         self.assertNotIn("energy_usage_sensor", room.get("settings", {}))
 
+    def test_temperature_mode_transition_clears_override_once(self):
+        import backend.config_manager as cm
+        import backend.main as main
+
+        initial = {
+            "rooms": [
+                {
+                    "id": "roommode1234",
+                    "name": "Dining",
+                    "climate_entity": "climate.dining",
+                    "settings": {
+                        "temperature_mode": "manual",
+                        "manual_override_enabled": True,
+                        "manual_override": True,
+                    },
+                }
+            ]
+        }
+
+        with tempfile.TemporaryDirectory() as td:
+            primary = os.path.join(td, "hawaai_config.json")
+            with open(primary, "w", encoding="utf-8") as f:
+                json.dump(initial, f)
+
+            cm._last_known_good_config = None
+            with (
+                mock.patch.object(cm, "CONFIG_PATH", primary),
+                mock.patch.object(main.logic_engine, "clear_manual_override_and_resume", new=mock.AsyncMock()) as clear_resume,
+                mock.patch.object(main.logic_engine, "trigger_tick") as trigger_tick,
+            ):
+                asyncio.run(
+                    main.api_update_room(
+                        "roommode1234",
+                        {"settings": {"temperature_mode": "auto_comfort"}},
+                    )
+                )
+
+        clear_resume.assert_awaited_once_with("roommode1234", reason="temperature_mode_changed")
+        trigger_tick.assert_not_called()
+
+    def test_same_temperature_mode_payload_does_not_clear_override(self):
+        import backend.config_manager as cm
+        import backend.main as main
+
+        initial = {
+            "rooms": [
+                {
+                    "id": "roommode5678",
+                    "name": "Dining",
+                    "climate_entity": "climate.dining",
+                    "settings": {
+                        "temperature_mode": "auto_comfort",
+                        "manual_override_enabled": False,
+                        "manual_override": False,
+                    },
+                }
+            ]
+        }
+
+        with tempfile.TemporaryDirectory() as td:
+            primary = os.path.join(td, "hawaai_config.json")
+            with open(primary, "w", encoding="utf-8") as f:
+                json.dump(initial, f)
+
+            cm._last_known_good_config = None
+            with (
+                mock.patch.object(cm, "CONFIG_PATH", primary),
+                mock.patch.object(main.logic_engine, "clear_manual_override_and_resume", new=mock.AsyncMock()) as clear_resume,
+                mock.patch.object(main.logic_engine, "trigger_tick") as trigger_tick,
+            ):
+                asyncio.run(
+                    main.api_update_room(
+                        "roommode5678",
+                        {"settings": {"temperature_mode": "auto_comfort"}},
+                    )
+                )
+
+        clear_resume.assert_not_awaited()
+        trigger_tick.assert_called_once_with(
+            "roommode5678",
+            reason="config_updated",
+            skip_debounce=True,
+        )
+
     def test_config_migration_preserves_entities_and_drops_runtime_state(self):
         import backend.config_manager as cm
 

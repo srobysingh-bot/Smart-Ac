@@ -64,6 +64,7 @@ from .utils import parse_presence
 from .temperature_schedule import (
     apply_ai_bounded_adjustment,
     log_target_resolve,
+    normalize_temperature_mode,
     resolve_base_target_temp,
 )
 
@@ -256,10 +257,11 @@ def _log_energy_runtime_diagnostic(
     power_suspicious: bool = False,
 ) -> None:
     now = datetime.now(timezone.utc)
+    display_mode = "telemetry_manual" if mode == EnergyConfigMode.MANUAL_OVERRIDE.value else mode
     power_status = _energy_runtime_status(power_entity, raw_power_state, parsed_power)
     kwh_status = _energy_runtime_status(kwh_entity, raw_kwh_state, parsed_kwh)
     sig = (
-        mode,
+        display_mode,
         configured,
         device_lookup_skipped,
         power_entity,
@@ -280,7 +282,7 @@ def _log_energy_runtime_diagnostic(
         room_id,
         "[POWER] room=%s mode=%s power_entity=%s kwh_entity=%s device_lookup_skipped=%s",
         room_id,
-        mode,
+        display_mode,
         power_entity or "none",
         kwh_entity or "none",
         device_lookup_skipped,
@@ -2201,7 +2203,7 @@ async def effective_target_for_temp_cross(
     if manual_override_enabled(merged_cfg):
         return None
     base_temp, _slot = resolve_base_target_temp(merged_cfg)
-    temperature_mode_str = str(merged_cfg.get("temperature_mode") or "manual").strip().lower()
+    temperature_mode_str = normalize_temperature_mode(merged_cfg.get("temperature_mode"))
     auto_comfort_active = temperature_mode_str == auto_comfort.AUTO_COMFORT_MODE
     weather = await weather_api.get_cached()
     outdoor_temp = weather.get("temp") if weather else None
@@ -2423,9 +2425,7 @@ def sync_effective_mode_transition(st: RoomRuntime, room_id: str, cfg: dict) -> 
 
 
 def _target_context_key(cfg: dict, slot_label: str, base_temp: float) -> tuple:
-    mode = str(cfg.get("temperature_mode") or "manual").strip().lower()
-    if mode not in ("manual", "schedule", "schedule_ai", auto_comfort.AUTO_COMFORT_MODE):
-        mode = "manual"
+    mode = normalize_temperature_mode(cfg.get("temperature_mode"))
     eff_mode = str(cfg.get("effective_mode") or "auto").strip().lower()
     if eff_mode not in ("auto", "manual"):
         eff_mode = "auto"
@@ -3283,17 +3283,8 @@ def _manual_override_resolve(
         except (TypeError, ValueError):
             ct = None
 
-    temperature_mode = str(cfg.get("temperature_mode") or "manual").strip().lower()
-    if temperature_mode not in ("manual", "schedule", "schedule_ai", auto_comfort.AUTO_COMFORT_MODE):
-        temperature_mode = "manual"
+    temperature_mode = normalize_temperature_mode(cfg.get("temperature_mode"))
     if temperature_mode != "manual":
-        if st.manual_override_until is not None or st.manual_override_temp is not None:
-            logger.info(
-                "[HawaAI][%s] Clearing manual setpoint lock because temperature_mode=%s",
-                room_id,
-                temperature_mode,
-            )
-        clear_manual_override(room_id, reason="temperature_mode_changed")
         if ct is not None:
             st.prev_ha_setpoint_seen = ct
         return False, engine_planned_target
@@ -4412,20 +4403,22 @@ def _resolve_auto_comfort_decision(
         tuple(decision.warnings),
     )
     if sig != st.last_auto_comfort_log_sig:
+        log_status = "active" if decision.status == "stable" else decision.status
         log_with_room(
             "info",
             room_id,
-            "[AUTO_COMFORT][%s] status=%s profile=%s base=%.1f learned=%+.1f weather=%+.1f humidity=%+.1f load=%+.1f final=%.1f confidence=%s reason=%s",
+            "[AUTO_COMFORT] room=%s status=%s profile=%s base=%.1f learned=%+.1f weather=%+.1f humidity=%+.1f load=%+.1f cooling=%+.1f sleep=%+.1f final=%.1f reason=%s",
             room_id,
-            decision.status,
+            log_status,
             decision.profile,
             float(decision.base_target),
             float(decision.learned_offset),
             float(decision.weather_offset),
             float(decision.humidity_offset),
             float(decision.thermal_load_offset),
+            float(decision.cooling_effectiveness_offset),
+            float(decision.sleep_offset),
             float(decision.target),
-            decision.confidence,
             decision.reason,
         )
         st.last_auto_comfort_log_sig = sig
@@ -4903,7 +4896,7 @@ async def _tick_impl(rid_raw: str, room_id: str) -> None:
                 pass
 
     if indoor_temp is None and not presence_only:
-        if str(cfg.get("temperature_mode") or "manual").strip().lower() == auto_comfort.AUTO_COMFORT_MODE:
+        if normalize_temperature_mode(cfg.get("temperature_mode")) == auto_comfort.AUTO_COMFORT_MODE:
             st.auto_comfort_status = "degraded"
             st.auto_comfort_confidence = "degraded"
             st.auto_comfort_reason = "room_temp_sensor_required"
@@ -4988,7 +4981,7 @@ async def _tick_impl(rid_raw: str, room_id: str) -> None:
 
     base_temp, slot_label = resolve_base_target_temp(cfg)
     log_target_resolve(room_id, cfg, base_temp, slot_label)
-    temperature_mode_str = str(cfg.get("temperature_mode") or "manual").strip().lower()
+    temperature_mode_str = normalize_temperature_mode(cfg.get("temperature_mode"))
     auto_comfort_active = temperature_mode_str == auto_comfort.AUTO_COMFORT_MODE
     auto_comfort_base_source = "schedule_hint"
     auto_comfort_learned_offset = 0.0

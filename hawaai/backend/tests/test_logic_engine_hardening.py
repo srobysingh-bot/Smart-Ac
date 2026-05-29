@@ -740,6 +740,170 @@ class TestLogicEngineHardening(unittest.TestCase):
         self.assertAlmostEqual(target, 23.0)
         self.assertAlmostEqual(st.manual_override_temp, 23.0)
 
+    def test_non_manual_mode_does_not_clear_override_on_each_tick(self):
+        logic_engine._runtime_by_room.clear()
+        rid = "auto-comfort-no-clear"
+        st = logic_engine._rt(rid)
+        st.manual_override_temp = 23.0
+        st.manual_override_until = datetime.now(timezone.utc) + timedelta(minutes=5)
+
+        with mock.patch.object(logic_engine, "clear_manual_override") as clear_override:
+            for _ in range(2):
+                active, target = logic_engine._manual_override_resolve(
+                    rid,
+                    {"temperature_mode": "auto_comfort"},
+                    {"target_temp": 23.0},
+                    indoor_temp=25.0,
+                    now=datetime.now(timezone.utc),
+                    engine_planned_target=19.0,
+                )
+
+        self.assertFalse(active)
+        self.assertAlmostEqual(target, 19.0)
+        clear_override.assert_not_called()
+        self.assertAlmostEqual(st.manual_override_temp, 23.0)
+
+    def test_auto_comfort_does_not_call_ai(self):
+        logic_engine._runtime_by_room.clear()
+        rid = "auto-comfort-no-ai"
+        cfg = {
+            "rooms": [
+                {
+                    "id": rid,
+                    "name": "Auto Comfort",
+                    "climate_entity": "climate.auto_comfort",
+                    "presence_entity": "binary_sensor.auto_comfort_presence",
+                    "indoor_temp_entity": "sensor.auto_comfort_temp",
+                    "settings": {
+                        "target_temp": 20.0,
+                        "temperature_mode": "auto_comfort",
+                        "ai_enabled": True,
+                        "use_presence": True,
+                        "thermostat_on_delta_deg": 0.7,
+                        "thermostat_off_delta_deg": 0.3,
+                    },
+                }
+            ]
+        }
+
+        async def fake_get_state(entity_id):
+            vals = {
+                "sensor.auto_comfort_temp": "20.0",
+                "binary_sensor.auto_comfort_presence": "on",
+            }
+            return vals.get(entity_id)
+
+        async def run_case():
+            with (
+                mock.patch.object(logic_engine.config_manager, "load_config", return_value=cfg),
+                mock.patch.object(logic_engine, "_load_startup_state", new=mock.AsyncMock()),
+                mock.patch.object(logic_engine.ha_client, "get_state", side_effect=fake_get_state),
+                mock.patch.object(
+                    logic_engine.ha_client,
+                    "get_climate_state",
+                    new=mock.AsyncMock(return_value={"mode": "cool", "current_temp": 20.0, "target_temp": 20.0}),
+                ),
+                mock.patch.object(logic_engine, "resolve_base_target_temp", return_value=(20.0, "night")),
+                mock.patch.object(logic_engine, "log_target_resolve"),
+                mock.patch.object(logic_engine, "_fp2_zone_sensor_tick", new=mock.AsyncMock()),
+                mock.patch.object(logic_engine.weather_api, "get_cached", new=mock.AsyncMock(return_value={})),
+                mock.patch.object(logic_engine, "_read_indoor_humidity", new=mock.AsyncMock(return_value=None)),
+                mock.patch.object(logic_engine, "_read_runtime_energy", new=mock.AsyncMock(return_value=(None, None))),
+                mock.patch.object(logic_engine, "_stabilize_presence", return_value=True),
+                mock.patch.object(logic_engine.database, "get_auto_comfort_profile", new=mock.AsyncMock(return_value=None)),
+                mock.patch.object(logic_engine, "_maintain_session_lifecycle", new=mock.AsyncMock()),
+                mock.patch.object(logic_engine.smart_cooling, "apply_effective_target", new=mock.AsyncMock()),
+                mock.patch.object(logic_engine.smart_cooling, "apply_smart_cooling", new=mock.AsyncMock()),
+                mock.patch.object(logic_engine, "_turn_ac_on", new=mock.AsyncMock()),
+                mock.patch.object(logic_engine, "_turn_ac_off", new=mock.AsyncMock()),
+                mock.patch.object(logic_engine, "should_run_ai") as should_run_ai,
+                mock.patch.object(logic_engine, "fetch_ai_in_background") as fetch_ai,
+            ):
+                await logic_engine._tick_impl(rid, rid)
+            return should_run_ai, fetch_ai
+
+        should_run_ai, fetch_ai = asyncio.run(run_case())
+
+        should_run_ai.assert_not_called()
+        fetch_ai.assert_not_called()
+
+    def test_persistent_manual_override_blocks_auto_comfort(self):
+        logic_engine._runtime_by_room.clear()
+        rid = "auto-comfort-blocked"
+        cfg = {
+            "rooms": [
+                {
+                    "id": rid,
+                    "name": "Auto Comfort Blocked",
+                    "climate_entity": "climate.auto_comfort_blocked",
+                    "presence_entity": "binary_sensor.auto_comfort_blocked_presence",
+                    "indoor_temp_entity": "sensor.auto_comfort_blocked_temp",
+                    "settings": {
+                        "target_temp": 22.0,
+                        "temperature_mode": "auto_comfort",
+                        "manual_override_enabled": True,
+                        "manual_override": True,
+                        "use_presence": True,
+                    },
+                }
+            ]
+        }
+
+        async def fake_get_state(entity_id):
+            vals = {
+                "sensor.auto_comfort_blocked_temp": "24.0",
+                "binary_sensor.auto_comfort_blocked_presence": "on",
+            }
+            return vals.get(entity_id)
+
+        async def run_case():
+            with (
+                mock.patch.object(logic_engine.config_manager, "load_config", return_value=cfg),
+                mock.patch.object(logic_engine, "_load_startup_state", new=mock.AsyncMock()),
+                mock.patch.object(logic_engine.ha_client, "get_state", side_effect=fake_get_state),
+                mock.patch.object(
+                    logic_engine.ha_client,
+                    "get_climate_state",
+                    new=mock.AsyncMock(return_value={"mode": "cool", "current_temp": 24.0, "target_temp": 22.0}),
+                ),
+                mock.patch.object(logic_engine, "_fp2_zone_sensor_tick", new=mock.AsyncMock()),
+                mock.patch.object(logic_engine, "_tick_manual_override_observe_only", new=mock.AsyncMock()) as observe_only,
+                mock.patch.object(logic_engine, "_resolve_auto_comfort_decision") as resolve_auto,
+            ):
+                await logic_engine._tick_impl(rid, rid)
+            return observe_only, resolve_auto
+
+        observe_only, resolve_auto = asyncio.run(run_case())
+
+        observe_only.assert_awaited_once()
+        resolve_auto.assert_not_called()
+
+    def test_resolve_control_decision_thermostat_baseline_unchanged(self):
+        logic_engine._runtime_by_room.clear()
+        now = datetime.now(timezone.utc)
+
+        on_decision = logic_engine._resolve_control_decision(
+            "control-baseline",
+            {"thermostat_on_delta_deg": 0.7, "thermostat_off_delta_deg": 0.3},
+            indoor_temp=24.8,
+            effective_target=24.0,
+            is_occupied=True,
+            ac_on=False,
+            now=now,
+        )
+        hold_decision = logic_engine._resolve_control_decision(
+            "control-baseline",
+            {"thermostat_on_delta_deg": 0.7, "thermostat_off_delta_deg": 0.3},
+            indoor_temp=24.2,
+            effective_target=24.0,
+            is_occupied=True,
+            ac_on=False,
+            now=now,
+        )
+
+        self.assertEqual(on_decision, ("on", "thermostat", 24.0))
+        self.assertEqual(hold_decision, ("hold", "thermostat", 24.0))
+
     def test_persistent_manual_override_restores_without_expiry(self):
         logic_engine._runtime_by_room.clear()
         rid = "persistent-override"

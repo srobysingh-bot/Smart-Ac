@@ -1362,6 +1362,7 @@ async def api_update_room(room_id: str, body: Dict[str, Any] = Body(...)):
     r = rooms[idx]
     old_effective = room_registry.merge_room_config(base, r)
     old_manual_override = logic_engine.manual_override_enabled(old_effective)
+    old_temperature_mode = normalize_temperature_mode(old_effective.get("temperature_mode"))
     if "name" in body and body["name"] is not None:
         r["name"] = str(body["name"]).strip() or r.get("name", "Room")
     if "climate_entity" in body and body["climate_entity"] is not None:
@@ -1425,7 +1426,13 @@ async def api_update_room(room_id: str, body: Dict[str, Any] = Body(...)):
     new_base["rooms"] = rooms
     new_effective = room_registry.merge_room_config(new_base, r)
     new_manual_override = logic_engine.manual_override_enabled(new_effective)
-    if old_manual_override and not new_manual_override:
+    new_temperature_mode = normalize_temperature_mode(new_effective.get("temperature_mode"))
+    if old_temperature_mode != new_temperature_mode:
+        await logic_engine.clear_manual_override_and_resume(
+            rid,
+            reason="temperature_mode_changed",
+        )
+    elif old_manual_override and not new_manual_override:
         await logic_engine.clear_manual_override_and_resume(
             rid,
             reason="manual_override_cleared",
