@@ -69,7 +69,11 @@ _dashboard_energy_trace_sig_by_room: Dict[str, tuple] = {}
 _api_last_command: Dict[str, float] = defaultdict(float)
 _climate_command_state: Dict[str, Dict[str, Any]] = {}
 _climate_command_lock = asyncio.Lock()
-_CLIMATE_COMMAND_DEBOUNCE_SECS = 1.2
+_climate_command_seq = 0
+_CLIMATE_COMMAND_AEROSTATE_TRAILING_LOCK_SECS = 0.45
+_CLIMATE_COMMAND_TUYA_TRAILING_LOCK_SECS = 1.0
+_CLIMATE_COMMAND_AEROSTATE_TIMEOUT_MS = 5_000
+_CLIMATE_COMMAND_TUYA_TIMEOUT_MS = 12_000
 _CLIMATE_DUPLICATE_WINDOW_SECS = 2.0
 STARTUP_STABILIZATION_SECONDS = 60.0
 
@@ -163,27 +167,30 @@ async def _enqueue_climate_command(
     entity_id: str,
     service: str,
     payload: Dict[str, Any],
+    api_received_mono: Optional[float] = None,
 ) -> Dict[str, Any]:
     """
-    Coalesce rapid UI climate commands so HA/Tuya receives only the latest payload.
+    Fast UI climate command lane.
 
-    Calls are grouped by room/entity/service. Multiple requests that arrive during the
-    debounce window all wait for one HA service call using the newest payload.
+    The first command dispatches immediately. If more commands arrive while a
+    dispatch is in flight, only the latest trailing command is kept.
     """
+    global _climate_command_seq
     key_room = room_id or "_unscoped"
     key = f"{key_room}:{entity_id}:{service}"
     loop = asyncio.get_running_loop()
     fut = loop.create_future()
     fingerprint = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+    received_mono = api_received_mono if api_received_mono is not None else time.monotonic()
 
     async with _climate_command_lock:
+        _climate_command_seq += 1
+        command_seq = _climate_command_seq
         st = _climate_command_state.setdefault(
             key,
             {
-                "latest_payload": None,
-                "latest_fingerprint": None,
-                "updated_at": 0.0,
-                "waiters": [],
+                "active_command": None,
+                "pending_command": None,
                 "task": None,
                 "last_sent_at": 0.0,
                 "last_sent_fingerprint": None,
@@ -191,20 +198,169 @@ async def _enqueue_climate_command(
         )
         now_mono = time.monotonic()
         if (
-            st.get("last_sent_fingerprint") == fingerprint
+            st.get("task") is None
+            and st.get("last_sent_fingerprint") == fingerprint
             and now_mono - float(st.get("last_sent_at") or 0.0) < _CLIMATE_DUPLICATE_WINDOW_SECS
         ):
-            fut.set_result({"success": True, "deduped": True})
+            fut.set_result({
+                "success": True,
+                "deduped": True,
+                "command_seq": command_seq,
+                "pending_timeout_ms": _climate_pending_timeout_ms(room_id),
+            })
             return await fut
 
-        st["latest_payload"] = dict(payload)
-        st["latest_fingerprint"] = fingerprint
-        st["updated_at"] = now_mono
-        st["waiters"].append(fut)
-        if st.get("task") is None or st["task"].done():
+        logger.info(
+            "[CLIMATE_CMD] room=%s cmd=%s%s api_received seq=%s",
+            key_room,
+            service,
+            _climate_payload_log_suffix(service, payload),
+            command_seq,
+        )
+
+        command = {
+            "payload": dict(payload),
+            "fingerprint": fingerprint,
+            "seq": command_seq,
+            "api_received_mono": received_mono,
+            "waiters": [fut],
+        }
+
+        active = st.get("active_command")
+        pending = st.get("pending_command")
+        if active and active.get("fingerprint") == fingerprint:
+            active.setdefault("waiters", []).append(fut)
+        elif pending and pending.get("fingerprint") == fingerprint:
+            pending.setdefault("waiters", []).append(fut)
+        elif st.get("task") is not None and not st["task"].done():
+            _resolve_climate_waiters(
+                pending,
+                {
+                    "success": True,
+                    "dropped": True,
+                    "superseded_by": command_seq,
+                    "pending_timeout_ms": _climate_pending_timeout_ms(room_id),
+                },
+            )
+            st["pending_command"] = command
+        else:
+            st["active_command"] = command
             st["task"] = asyncio.create_task(_drain_climate_command(key, room_id, entity_id, service))
 
     return await fut
+
+
+def _climate_payload_log_suffix(service: str, payload: Dict[str, Any]) -> str:
+    if service == "set_temperature" and payload.get("temperature") is not None:
+        return f" temp={payload.get('temperature')}"
+    for key in ("hvac_mode", "fan_mode", "swing_mode"):
+        if key in payload:
+            return f" {key}={payload.get(key)}"
+    return ""
+
+
+def _climate_backend_for_room(room_id: Optional[str]) -> str:
+    if not room_id:
+        return "aerostate"
+    try:
+        base = config_manager.load_config()
+        room_def = logic_engine.resolve_room_definition(base, room_id)
+        merged = room_registry.merge_room_config(base, room_def) if room_def else base
+        return logic_engine.normalize_ir_backend(merged)
+    except Exception:
+        logger.debug("[CLIMATE_CMD] backend resolve failed room=%s", room_id, exc_info=True)
+        return "aerostate"
+
+
+def _climate_trailing_lock_seconds(room_id: Optional[str]) -> float:
+    if _climate_backend_for_room(room_id) == "tuya":
+        return float(_CLIMATE_COMMAND_TUYA_TRAILING_LOCK_SECS)
+    return float(_CLIMATE_COMMAND_AEROSTATE_TRAILING_LOCK_SECS)
+
+
+def _climate_pending_timeout_ms(room_id: Optional[str]) -> int:
+    if _climate_backend_for_room(room_id) == "tuya":
+        return int(_CLIMATE_COMMAND_TUYA_TIMEOUT_MS)
+    return int(_CLIMATE_COMMAND_AEROSTATE_TIMEOUT_MS)
+
+
+def _resolve_climate_waiters(command: Optional[Dict[str, Any]], result: Dict[str, Any]) -> None:
+    if not command:
+        return
+    for waiter in list(command.get("waiters") or []):
+        if not waiter.done():
+            waiter.set_result(result)
+
+
+async def _send_climate_command(
+    *,
+    room_id: Optional[str],
+    entity_id: str,
+    service: str,
+    command: Dict[str, Any],
+) -> Dict[str, Any]:
+    payload = dict(command.get("payload") or {})
+    seq = int(command.get("seq") or 0)
+    received_mono = float(command.get("api_received_mono") or time.monotonic())
+    room_label = room_id or "_unscoped"
+    started_ms = int((time.monotonic() - received_mono) * 1000)
+    logger.info(
+        "[CLIMATE_CMD] room=%s cmd=%s service_call_start elapsed_ms=%s seq=%s",
+        room_label,
+        service,
+        started_ms,
+        seq,
+    )
+
+    try:
+        ok = await ha_client.call_service("climate", service, payload)
+    except Exception as exc:
+        done_ms = int((time.monotonic() - received_mono) * 1000)
+        logger.exception(
+            "[CLIMATE_CMD] room=%s cmd=%s service_call_done elapsed_ms=%s success=false seq=%s",
+            room_label,
+            service,
+            done_ms,
+            seq,
+        )
+        return {
+            "success": False,
+            "error": str(exc),
+            "command_seq": seq,
+            "pending_timeout_ms": _climate_pending_timeout_ms(room_id),
+        }
+
+    done_ms = int((time.monotonic() - received_mono) * 1000)
+    logger.info(
+        "[CLIMATE_CMD] room=%s cmd=%s service_call_done elapsed_ms=%s success=%s seq=%s",
+        room_label,
+        service,
+        done_ms,
+        bool(ok),
+        seq,
+    )
+
+    if ok and room_id:
+        if service == "set_temperature" and payload.get("temperature") is not None:
+            logic_engine.record_user_temperature_command(room_id, float(payload.get("temperature")))
+        else:
+            logic_engine.record_user_api_command(room_id)
+        _api_last_command[room_id] = time.monotonic()
+        logic_engine.trigger_tick(room_id, reason="climate_command", skip_debounce=True)
+        refresh_ms = int((time.monotonic() - received_mono) * 1000)
+        logger.info(
+            "[CLIMATE_CMD] room=%s status_refresh_scheduled elapsed_ms=%s seq=%s",
+            room_label,
+            refresh_ms,
+            seq,
+        )
+
+    return {
+        "success": bool(ok),
+        "queued": False,
+        "command_seq": seq,
+        "pending_timeout_ms": _climate_pending_timeout_ms(room_id),
+    }
 
 
 async def _drain_climate_command(
@@ -214,54 +370,48 @@ async def _drain_climate_command(
     service: str,
 ) -> None:
     while True:
-        await asyncio.sleep(_CLIMATE_COMMAND_DEBOUNCE_SECS)
         async with _climate_command_lock:
             st = _climate_command_state.get(key)
-            if not st:
-                return
-            elapsed = time.monotonic() - float(st.get("updated_at") or 0.0)
-            if elapsed < _CLIMATE_COMMAND_DEBOUNCE_SECS:
-                continue
-            payload = dict(st.get("latest_payload") or {})
-            fingerprint = st.get("latest_fingerprint")
-            waiters = list(st.get("waiters") or [])
-            st["waiters"] = []
-            st["latest_payload"] = None
-            st["latest_fingerprint"] = None
-            st["task"] = None
-            duplicate = (
-                st.get("last_sent_fingerprint") == fingerprint
-                and time.monotonic() - float(st.get("last_sent_at") or 0.0) < _CLIMATE_DUPLICATE_WINDOW_SECS
-            )
-            if duplicate:
-                result = {"success": True, "deduped": True}
-                for waiter in waiters:
-                    if not waiter.done():
-                        waiter.set_result(result)
-                return
+            command = dict(st.get("active_command") or {}) if st else {}
+        if not command:
+            return
 
-        try:
-            ok = await ha_client.call_service("climate", service, payload)
-            if ok and room_id:
-                if service == "set_temperature" and payload.get("temperature") is not None:
-                    logic_engine.record_user_temperature_command(room_id, float(payload.get("temperature")))
-                else:
-                    logic_engine.record_user_api_command(room_id)
-                _api_last_command[room_id] = time.monotonic()
-            result = {"success": ok, "queued": True}
-        except Exception as exc:
-            result = {"success": False, "error": str(exc)}
+        result = await _send_climate_command(
+            room_id=room_id,
+            entity_id=entity_id,
+            service=service,
+            command=command,
+        )
 
         async with _climate_command_lock:
             st = _climate_command_state.get(key)
             if st is not None:
                 st["last_sent_at"] = time.monotonic()
-                st["last_sent_fingerprint"] = fingerprint
+                st["last_sent_fingerprint"] = command.get("fingerprint")
+        _resolve_climate_waiters(command, result)
 
-        for waiter in waiters:
-            if not waiter.done():
-                waiter.set_result(result)
-        return
+        async with _climate_command_lock:
+            st = _climate_command_state.get(key)
+            has_pending = bool(st and st.get("pending_command"))
+            if not has_pending:
+                if st is not None:
+                    st["active_command"] = None
+                    st["task"] = None
+                return
+
+        await asyncio.sleep(_climate_trailing_lock_seconds(room_id))
+
+        async with _climate_command_lock:
+            st = _climate_command_state.get(key)
+            if not st:
+                return
+            pending = st.get("pending_command")
+            if not pending:
+                st["active_command"] = None
+                st["task"] = None
+                return
+            st["active_command"] = pending
+            st["pending_command"] = None
 
 
 def _room_id_for_climate_entity(entity_id: str) -> Optional[str]:
@@ -375,7 +525,7 @@ async def lifespan(app: FastAPI):
     logger.info("[HawaAI] Add-on stopped")
 
 
-app = FastAPI(title="HawaAI API", version="1.4.85", lifespan=lifespan)
+app = FastAPI(title="HawaAI API", version="1.4.88", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -1726,6 +1876,7 @@ async def get_climate_state(entity_id: str):
 @app.post("/api/climate/{entity_id:path}/set_temperature")
 async def climate_set_temperature(entity_id: str, data: Dict[str, Any] = Body(...)):
     """Set climate setpoint. Body: {"temperature": 24}"""
+    api_received_mono = time.monotonic()
     rid_room = _room_id_for_climate_entity(entity_id)
     temperature = data.get("temperature")
     if temperature is None:
@@ -1738,12 +1889,14 @@ async def climate_set_temperature(entity_id: str, data: Dict[str, Any] = Body(..
         "entity_id":   entity_id,
         "temperature": float(temperature),
         },
+        api_received_mono=api_received_mono,
     )
 
 
 @app.post("/api/climate/{entity_id:path}/set_hvac_mode")
 async def climate_set_hvac_mode(entity_id: str, data: Dict[str, Any] = Body(...)):
     """Set HVAC mode. Body: {"hvac_mode": "cool"}"""
+    api_received_mono = time.monotonic()
     rid_room = _room_id_for_climate_entity(entity_id)
     hvac_mode = data.get("hvac_mode")
     if not hvac_mode:
@@ -1756,12 +1909,14 @@ async def climate_set_hvac_mode(entity_id: str, data: Dict[str, Any] = Body(...)
             "entity_id": entity_id,
             "hvac_mode": hvac_mode,
         },
+        api_received_mono=api_received_mono,
     )
 
 
 @app.post("/api/climate/{entity_id:path}/set_fan_mode")
 async def climate_set_fan_mode(entity_id: str, data: Dict[str, Any] = Body(...)):
     """Set fan mode. Body: {"fan_mode": "auto"}"""
+    api_received_mono = time.monotonic()
     rid_room = _room_id_for_climate_entity(entity_id)
     fan_mode = data.get("fan_mode")
     if not fan_mode:
@@ -1774,12 +1929,14 @@ async def climate_set_fan_mode(entity_id: str, data: Dict[str, Any] = Body(...))
             "entity_id": entity_id,
             "fan_mode":  fan_mode,
         },
+        api_received_mono=api_received_mono,
     )
 
 
 @app.post("/api/climate/{entity_id:path}/set_swing_mode")
 async def climate_set_swing_mode(entity_id: str, data: Dict[str, Any] = Body(...)):
     """Set swing mode. Body: {"swing_mode": "auto"}"""
+    api_received_mono = time.monotonic()
     rid_room = _room_id_for_climate_entity(entity_id)
     swing_mode = data.get("swing_mode")
     if not swing_mode:
@@ -1792,6 +1949,7 @@ async def climate_set_swing_mode(entity_id: str, data: Dict[str, Any] = Body(...
             "entity_id":  entity_id,
             "swing_mode": swing_mode,
         },
+        api_received_mono=api_received_mono,
     )
 
 

@@ -552,11 +552,25 @@ function ClimateCard({ entityId }) {
   const [error,    setError]    = useState(null)
   const [busy,     setBusy]     = useState(false)   // pending control command
   const [pendingTemperature, setPendingTemperature] = useState(null)
-  const tempDebounceRef = useRef(null)
+  const pendingTemperatureRef = useRef(null)
+  const pendingTemperatureStartedRef = useRef(0)
 
   const fetchClimate = useCallback(() => {
     getClimateState(entityId)
-      .then(d => { setClimate(d); setError(null) })
+      .then(d => {
+        const pending = pendingTemperatureRef.current
+        if (
+          pending != null
+          && (
+            sameClimateTemperature(d.temperature, pending)
+            || Date.now() - pendingTemperatureStartedRef.current >= DEFAULT_CLIMATE_COMMAND_TIMEOUT_MS
+          )
+        ) {
+          setPendingTemperature(null)
+        }
+        setClimate(d)
+        setError(null)
+      })
       .catch(e => setError(e.message || String(e)))
   }, [entityId])
 
@@ -569,19 +583,36 @@ function ClimateCard({ entityId }) {
 
   useEffect(() => {
     setPendingTemperature(null)
-    return () => {
-      if (tempDebounceRef.current) clearTimeout(tempDebounceRef.current)
-    }
   }, [entityId])
+
+  useEffect(() => {
+    pendingTemperatureRef.current = pendingTemperature
+    if (pendingTemperature != null) {
+      const remaining = Math.max(
+        0,
+        pendingTemperatureStartedRef.current + DEFAULT_CLIMATE_COMMAND_TIMEOUT_MS - Date.now(),
+      )
+      const id = window.setTimeout(() => {
+        setPendingTemperature(current => (current === pendingTemperature ? null : current))
+      }, remaining)
+      return () => window.clearTimeout(id)
+    }
+    return undefined
+  }, [pendingTemperature])
 
   const sendCommand = async (fn) => {
     setBusy(true)
     try {
-      await fn()
+      const result = await fn()
+      if (result && result.success === false) {
+        throw new Error(result.error || 'Climate command failed')
+      }
       // Short delay then re-fetch so UI reflects confirmed state
-      setTimeout(fetchClimate, 800)
+      setTimeout(fetchClimate, 150)
+      return result
     } catch (e) {
       setError(e.message || String(e))
+      throw e
     } finally {
       setBusy(false)
     }
@@ -593,12 +624,11 @@ function ClimateCard({ entityId }) {
     const current = pendingTemperature ?? climate.temperature ?? 24
     const next = Math.round((current + delta) / step) * step
     const clamped = Math.max(climate.min_temp ?? 16, Math.min(climate.max_temp ?? 30, next))
+    pendingTemperatureStartedRef.current = Date.now()
     setPendingTemperature(clamped)
-    if (tempDebounceRef.current) clearTimeout(tempDebounceRef.current)
-    tempDebounceRef.current = setTimeout(() => {
-      sendCommand(() => setClimateTemperature(entityId, clamped))
-      tempDebounceRef.current = null
-    }, 800)
+    sendCommand(() => setClimateTemperature(entityId, clamped)).catch(() => {
+      setPendingTemperature(current => (current === clamped ? null : current))
+    })
   }
 
   if (error) {
@@ -766,6 +796,14 @@ function premiumTempLabel(value) {
   return Number.isInteger(n) ? String(n) : n.toFixed(1)
 }
 
+const DEFAULT_CLIMATE_COMMAND_TIMEOUT_MS = 5_000
+
+function sameClimateTemperature(a, b) {
+  const na = Number(a)
+  const nb = Number(b)
+  return Number.isFinite(na) && Number.isFinite(nb) && Math.abs(na - nb) < 0.01
+}
+
 function PremiumClimateStatePills({ status, climate, busy }) {
   const phase = String(status?.ac_state || '').toLowerCase()
   const telemetry = String(status?.telemetry_status || 'unconfigured').toLowerCase()
@@ -911,17 +949,28 @@ function PremiumClimateCard({ entityId, status }) {
   const [climate, setClimate] = useState(null)
   const [error, setError] = useState(null)
   const [busy, setBusy] = useState(false)
-  const [pendingTemperature, setPendingTemperature] = useState(null)
+  const [pendingDesiredTarget, setPendingDesiredTarget] = useState(null)
+  const [localDraftTarget, setLocalDraftTarget] = useState(null)
   const [isDraggingTemp, setIsDraggingTemp] = useState(false)
   const [activeSelector, setActiveSelector] = useState(null)
-  const tempDebounceRef = useRef(null)
-  const commandInFlightRef = useRef(false)
-  const temperatureInFlightRef = useRef(null)
+  const commandSeqRef = useRef(0)
+  const pendingDesiredRef = useRef(null)
+  const busyCountRef = useRef(0)
+  const tempDragRef = useRef(false)
 
   const fetchClimate = useCallback(() => {
+    const requestSeq = commandSeqRef.current
     getClimateState(entityId)
       .then(d => {
         if (d?.error) throw new Error(d.error)
+        const pending = pendingDesiredRef.current
+        if (pending && requestSeq >= pending.seq) {
+          const confirmed = sameClimateTemperature(d.temperature, pending.target)
+          const expired = Date.now() - pending.startedAt >= pending.timeoutMs
+          if (confirmed || expired) {
+            setPendingDesiredTarget(prev => (prev?.seq === pending.seq ? null : prev))
+          }
+        }
         setClimate(d)
         setError(null)
       })
@@ -935,71 +984,117 @@ function PremiumClimateCard({ entityId, status }) {
   }, [fetchClimate])
 
   useEffect(() => {
-    setPendingTemperature(null)
+    setPendingDesiredTarget(null)
+    setLocalDraftTarget(null)
     setIsDraggingTemp(false)
     setActiveSelector(null)
-    commandInFlightRef.current = false
-    temperatureInFlightRef.current = null
-    return () => {
-      if (tempDebounceRef.current) clearTimeout(tempDebounceRef.current)
-    }
+    commandSeqRef.current = 0
+    pendingDesiredRef.current = null
+    busyCountRef.current = 0
+    tempDragRef.current = false
+    setBusy(false)
   }, [entityId])
 
+  useEffect(() => {
+    pendingDesiredRef.current = pendingDesiredTarget
+  }, [pendingDesiredTarget])
+
+  useEffect(() => {
+    if (!pendingDesiredTarget) return undefined
+    const remaining = Math.max(0, pendingDesiredTarget.startedAt + pendingDesiredTarget.timeoutMs - Date.now())
+    const id = window.setTimeout(() => {
+      setPendingDesiredTarget(prev => (prev?.seq === pendingDesiredTarget.seq ? null : prev))
+    }, remaining)
+    return () => window.clearTimeout(id)
+  }, [pendingDesiredTarget])
+
+  const setCommandBusy = (active) => {
+    busyCountRef.current = Math.max(0, busyCountRef.current + (active ? 1 : -1))
+    setBusy(busyCountRef.current > 0)
+  }
+
   const sendCommand = async (fn, optimisticPatch = null) => {
-    if (commandInFlightRef.current) return
-    commandInFlightRef.current = true
     if (optimisticPatch) {
       setClimate(prev => prev ? { ...prev, ...optimisticPatch } : prev)
     }
-    setBusy(true)
+    setCommandBusy(true)
     try {
-      await fn()
-      setTimeout(fetchClimate, 800)
+      const result = await fn()
+      if (result && result.success === false) {
+        throw new Error(result.error || 'Climate command failed')
+      }
+      setTimeout(fetchClimate, 150)
+      return result
     } catch (e) {
       setError(e.message || String(e))
+      throw e
     } finally {
-      commandInFlightRef.current = false
-      setBusy(false)
+      setCommandBusy(false)
     }
   }
 
-  const queueTemperature = (value) => {
+  const normalizeTarget = (value) => {
     if (!climate) return
     const min = Number(climate.min_temp ?? 16)
     const max = Number(climate.max_temp ?? 30)
     const step = Number(climate.target_temp_step || 1)
     const rounded = roundClimateToStep(value, step, min)
-    const clamped = clampClimateNumber(rounded, min, max)
-    setPendingTemperature(clamped)
-    if (tempDebounceRef.current) clearTimeout(tempDebounceRef.current)
-    tempDebounceRef.current = setTimeout(() => {
-      const current = Number(climate.temperature)
-      if (Number.isFinite(current) && Math.abs(current - clamped) < 0.001) {
-        tempDebounceRef.current = null
-        return
+    return clampClimateNumber(rounded, min, max)
+  }
+
+  const commitTemperature = (value) => {
+    const target = normalizeTarget(value)
+    if (target == null) return
+    const seq = commandSeqRef.current + 1
+    commandSeqRef.current = seq
+    setLocalDraftTarget(null)
+    setPendingDesiredTarget({
+      target,
+      seq,
+      startedAt: Date.now(),
+      timeoutMs: DEFAULT_CLIMATE_COMMAND_TIMEOUT_MS,
+    })
+    sendCommand(
+      () => setClimateTemperature(entityId, target),
+      { temperature: target },
+    ).then(result => {
+      const timeoutMs = Number(result?.pending_timeout_ms)
+      if (Number.isFinite(timeoutMs) && timeoutMs > 0) {
+        setPendingDesiredTarget(prev => (prev?.seq === seq ? { ...prev, timeoutMs } : prev))
       }
-      if (temperatureInFlightRef.current === clamped) {
-        tempDebounceRef.current = null
-        return
-      }
-      temperatureInFlightRef.current = clamped
-      setPendingTemperature(null)
-      sendCommand(
-        () => setClimateTemperature(entityId, clamped),
-        { temperature: clamped },
-      ).finally(() => {
-        if (temperatureInFlightRef.current === clamped) {
-          temperatureInFlightRef.current = null
-        }
-      })
-      tempDebounceRef.current = null
-    }, 400)
+    }).catch(() => {
+      setPendingDesiredTarget(prev => (prev?.seq === seq ? null : prev))
+    })
   }
 
   const adjustTemp = (delta) => {
     if (!climate) return
-    const current = pendingTemperature ?? climate.temperature ?? 24
-    queueTemperature(Number(current) + Number(delta))
+    const current = localDraftTarget ?? pendingDesiredTarget?.target ?? climate.temperature ?? 24
+    commitTemperature(Number(current) + Number(delta))
+  }
+
+  const beginTempDrag = (value) => {
+    tempDragRef.current = true
+    setIsDraggingTemp(true)
+    const target = normalizeTarget(value)
+    if (target != null) setLocalDraftTarget(target)
+  }
+
+  const updateTempInput = (value) => {
+    const target = normalizeTarget(value)
+    if (target == null) return
+    if (tempDragRef.current) {
+      setLocalDraftTarget(target)
+      return
+    }
+    commitTemperature(target)
+  }
+
+  const commitTempDrag = (value) => {
+    if (!tempDragRef.current) return
+    tempDragRef.current = false
+    setIsDraggingTemp(false)
+    commitTemperature(value)
   }
 
   const toggleSelector = (name) => {
@@ -1055,7 +1150,11 @@ function PremiumClimateCard({ entityId, status }) {
   const minTemp = Number(climate.min_temp ?? 16)
   const maxTemp = Number(climate.max_temp ?? 30)
   const tempStep = Number(climate.target_temp_step || 1)
-  const displayTemperature = clampClimateNumber(Number(pendingTemperature ?? temperature ?? 24), minTemp, maxTemp)
+  const displayTemperature = clampClimateNumber(
+    Number(localDraftTarget ?? pendingDesiredTarget?.target ?? temperature ?? 24),
+    minTemp,
+    maxTemp,
+  )
   const tempPercent = clampClimateNumber(((displayTemperature - minTemp) / Math.max(1, maxTemp - minTemp)) * 100, 0, 100)
   const ringRadius = 62
   const ringCircumference = 2 * Math.PI * ringRadius
@@ -1067,7 +1166,7 @@ function PremiumClimateCard({ entityId, status }) {
   const ActiveIcon = activeMode.Icon
   const FanIcon = Fan
   const SwingIcon = RotateCw
-  const controlsDisabled = busy || hvac_mode === 'off'
+  const controlsDisabled = hvac_mode === 'off'
   const modeOptions = Array.isArray(hvac_modes) ? hvac_modes : []
   const fanOptions = Array.isArray(fan_modes) ? fan_modes : []
   const swingOptions = Array.isArray(swing_modes) ? swing_modes : []
@@ -1143,11 +1242,11 @@ function PremiumClimateCard({ entityId, status }) {
               step={tempStep}
               value={displayTemperature}
               disabled={controlsDisabled}
-              onPointerDown={() => setIsDraggingTemp(true)}
-              onPointerUp={() => setIsDraggingTemp(false)}
-              onPointerCancel={() => setIsDraggingTemp(false)}
-              onBlur={() => setIsDraggingTemp(false)}
-              onChange={e => queueTemperature(Number(e.target.value))}
+              onPointerDown={e => beginTempDrag(Number(e.currentTarget.value))}
+              onPointerUp={e => commitTempDrag(Number(e.currentTarget.value))}
+              onPointerCancel={e => commitTempDrag(Number(e.currentTarget.value))}
+              onBlur={e => commitTempDrag(Number(e.currentTarget.value))}
+              onChange={e => updateTempInput(Number(e.target.value))}
               className="climate-range h-8 w-full disabled:opacity-40"
               style={{ '--climate-range': `${tempPercent}%` }}
             />

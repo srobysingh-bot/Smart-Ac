@@ -77,7 +77,7 @@ export default function App() {
               ))}
             </nav>
             <div className="hidden lg:block text-xs text-gray-600 shrink-0 whitespace-nowrap">
-              v1.4.75 · All data local
+              v1.4.88 · All data local
             </div>
           </header>
 

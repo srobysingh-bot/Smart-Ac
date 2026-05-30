@@ -1,5 +1,9 @@
 # HawaAI add-on — release notes
 
+## 1.4.88
+
+- **Climate controls:** Removed pre-dispatch debounce from climate-card commands, added latest-state-wins command coalescing, and protected pending user setpoints from stale status rollback.
+
 ## 1.4.87
 
 - **Auto Comfort:** Fixed repeated manual-override clearing/log spam by only clearing on real temperature-mode transitions, refreshed Auto Comfort reasoning logs, and corrected misleading power telemetry labels.
