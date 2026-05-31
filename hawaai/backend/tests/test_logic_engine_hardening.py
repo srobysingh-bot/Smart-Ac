@@ -33,9 +33,303 @@ class TestStartupStabilization(unittest.IsolatedAsyncioTestCase):
 
 
 class TestLogicEngineHardening(unittest.TestCase):
+    def _pre_cool_config(self, rid="precoolroom"):
+        return {
+            "pre_cool_enabled": True,
+            "pre_cool_duration_minutes": 25,
+            "pre_cool_min_temp_gap_deg": 1.0,
+            "pre_cool_target_offset_deg": 1.0,
+            "pre_cool_arrival_grace_seconds": 120,
+            "pre_cool_no_show_action": "off",
+            "target_temp": 24,
+            "temperature_mode": "manual",
+            "use_presence": True,
+            "vacancy_timeout_minutes": 1,
+            "thermostat_on_delta_deg": 0.7,
+            "rooms": [
+                {
+                    "id": rid,
+                    "name": "Dining",
+                    "climate_entity": "climate.dining",
+                    "presence_entity": "binary_sensor.dining_presence",
+                    "indoor_temp_entity": "sensor.dining_temp",
+                },
+            ],
+        }
+
     def test_normalize_room_id_strip_lower(self):
         self.assertEqual(logic_engine.normalize_room_id("  BedROOM "), "bedroom")
         self.assertEqual(logic_engine.normalize_room_id(""), "")
+
+    def test_pre_cool_does_not_start_when_room_already_cool(self):
+        logic_engine._runtime_by_room.clear()
+        rid = "precoolcool"
+        cfg = self._pre_cool_config(rid)
+
+        async def run_case():
+            with (
+                mock.patch.object(logic_engine.config_manager, "load_config", return_value=cfg),
+                mock.patch.object(logic_engine.weather_api, "get_cached", new=mock.AsyncMock(return_value={})),
+                mock.patch.object(logic_engine.ha_client, "get_state", new=mock.AsyncMock(return_value="25.5")),
+                mock.patch.object(logic_engine, "tick", new=mock.AsyncMock()) as tick_mock,
+            ):
+                result = await logic_engine.start_pre_cool(rid, 25)
+            self.assertEqual(result["pre_cool_result"], "skipped_already_cool")
+            self.assertFalse(result["pre_cool_active"])
+            tick_mock.assert_not_awaited()
+
+        asyncio.run(run_case())
+
+    def test_pre_cool_starts_when_hot_and_vacant(self):
+        logic_engine._runtime_by_room.clear()
+        rid = "precoolhot"
+        cfg = self._pre_cool_config(rid)
+
+        async def run_case():
+            with (
+                mock.patch.object(logic_engine.config_manager, "load_config", return_value=cfg),
+                mock.patch.object(logic_engine.weather_api, "get_cached", new=mock.AsyncMock(return_value={})),
+                mock.patch.object(logic_engine.ha_client, "get_state", new=mock.AsyncMock(return_value="29")),
+                mock.patch.object(logic_engine, "tick", new=mock.AsyncMock()) as tick_mock,
+            ):
+                result = await logic_engine.start_pre_cool(rid, 25)
+            st = logic_engine._rt(rid)
+            self.assertTrue(result["pre_cool_active"])
+            self.assertTrue(st.pre_cool_active)
+            self.assertEqual(st.pre_cool_result, "started")
+            self.assertAlmostEqual(st.pre_cool_target, 25.0)
+            tick_mock.assert_awaited_once_with(rid, reason="pre_cool_started", skip_debounce=True)
+
+        asyncio.run(run_case())
+
+    def test_pre_cool_vacancy_off_is_blocked_while_active(self):
+        logic_engine._runtime_by_room.clear()
+        rid = "precoolblock"
+        cfg = self._pre_cool_config(rid)
+        st = logic_engine._rt(rid)
+        now = datetime.now(timezone.utc)
+        st.pre_cool_active = True
+        st.pre_cool_until = now + timedelta(minutes=10)
+        st.pre_cool_target = 25.0
+        st.occupied = False
+        st.stable_occupied = False
+        st.vacant_since = now - timedelta(minutes=10)
+        st.ac_is_on = True
+        action, source, target = logic_engine._resolve_pre_cool_decision(
+            rid,
+            cfg,
+            indoor_temp=29.0,
+            pre_cool_target=25.0,
+            ac_on=True,
+            now=now,
+        )
+        self.assertEqual((action, source, target), ("hold", "pre_cool", 25.0))
+        self.assertEqual(st.vacancy_off_blocked_reason, "pre_cool")
+        self.assertFalse(st.occupied)
+
+    def test_pre_cool_turns_off_when_target_reached_but_keeps_hold_active(self):
+        logic_engine._runtime_by_room.clear()
+        rid = "precoolreached"
+        cfg = self._pre_cool_config(rid)
+        st = logic_engine._rt(rid)
+        now = datetime.now(timezone.utc)
+        st.pre_cool_active = True
+        st.pre_cool_until = now + timedelta(minutes=10)
+        st.pre_cool_target = 25.0
+        st.occupied = False
+        st.stable_occupied = False
+        st.vacant_since = now - timedelta(minutes=10)
+        st.ac_is_on = True
+
+        action, source, target = logic_engine._resolve_pre_cool_decision(
+            rid,
+            cfg,
+            indoor_temp=24.6,
+            pre_cool_target=25.0,
+            ac_on=True,
+            now=now,
+        )
+
+        self.assertTrue(st.pre_cool_active)
+        self.assertEqual(st.vacancy_off_blocked_reason, "pre_cool")
+        self.assertEqual((action, source, target), ("off", "pre_cool_target_reached", 25.0))
+
+    def test_pre_cool_timeout_no_presence_resumes_normal_vacancy_off(self):
+        logic_engine._runtime_by_room.clear()
+        rid = "precoolnoshow"
+        cfg = self._pre_cool_config(rid)
+        st = logic_engine._rt(rid)
+        now = datetime.now(timezone.utc)
+        st.pre_cool_active = True
+        st.pre_cool_until = now - timedelta(seconds=1)
+        st.pre_cool_target = 25.0
+        st.occupied = False
+        st.stable_occupied = False
+        st.last_known_presence = False
+        st.vacant_since = now - timedelta(minutes=5)
+        st.ac_is_on = True
+        st.physical_ac_on = False
+
+        occupied = logic_engine._reconcile_pre_cool_state(rid, cfg, st, now, False)
+        action, source, _target = logic_engine._resolve_control_decision(
+            rid,
+            cfg,
+            indoor_temp=29.0,
+            effective_target=25.0,
+            is_occupied=occupied,
+            ac_on=True,
+            now=now,
+        )
+
+        self.assertFalse(st.pre_cool_active)
+        self.assertEqual(st.pre_cool_result, "expired_no_show")
+        self.assertEqual((action, source), ("off", "safety_vacant"))
+
+    def test_zero_vacancy_timeout_stable_vacant_returns_safety_off(self):
+        logic_engine._runtime_by_room.clear()
+        rid = "zerovacancy"
+        cfg = self._pre_cool_config(rid)
+        cfg["vacancy_timeout_minutes"] = 0
+        st = logic_engine._rt(rid)
+        now = datetime.now(timezone.utc)
+        st.occupied = False
+        st.stable_occupied = False
+        st.last_known_presence = False
+        st.vacant_since = now - timedelta(seconds=logic_engine.VACANCY_CONFIRM_SECS + 5)
+        st.ac_is_on = True
+        st.physical_ac_on = False
+
+        action, source, target = logic_engine._resolve_control_decision(
+            rid,
+            cfg,
+            indoor_temp=29.0,
+            effective_target=24.0,
+            is_occupied=False,
+            ac_on=True,
+            now=now,
+        )
+
+        self.assertEqual((action, source, target), ("off", "safety_vacant", 24.0))
+
+    def test_pre_cool_blocks_zero_vacancy_timeout(self):
+        logic_engine._runtime_by_room.clear()
+        rid = "precoolzero"
+        cfg = self._pre_cool_config(rid)
+        cfg["vacancy_timeout_minutes"] = 0
+        st = logic_engine._rt(rid)
+        now = datetime.now(timezone.utc)
+        st.pre_cool_active = True
+        st.pre_cool_until = now + timedelta(minutes=10)
+        st.pre_cool_target = 25.0
+        st.occupied = False
+        st.stable_occupied = False
+        st.vacant_since = now - timedelta(seconds=logic_engine.VACANCY_CONFIRM_SECS + 5)
+        st.ac_is_on = True
+
+        action, source, target = logic_engine._resolve_pre_cool_decision(
+            rid,
+            cfg,
+            indoor_temp=29.0,
+            pre_cool_target=25.0,
+            ac_on=True,
+            now=now,
+        )
+
+        self.assertTrue(st.pre_cool_active)
+        self.assertEqual(st.vacancy_off_blocked_reason, "pre_cool")
+        self.assertEqual((action, source, target), ("hold", "pre_cool", 25.0))
+
+    def test_pre_cool_timeout_presence_hands_off_to_occupied_logic(self):
+        logic_engine._runtime_by_room.clear()
+        rid = "precoolpresent"
+        cfg = self._pre_cool_config(rid)
+        st = logic_engine._rt(rid)
+        now = datetime.now(timezone.utc)
+        st.pre_cool_active = True
+        st.pre_cool_until = now - timedelta(seconds=1)
+        st.pre_cool_target = 25.0
+        st.occupied = True
+        st.stable_occupied = True
+        st.last_known_presence = True
+        st.ac_is_on = True
+
+        occupied = logic_engine._reconcile_pre_cool_state(rid, cfg, st, now, True)
+        action, source, _target = logic_engine._resolve_control_decision(
+            rid,
+            cfg,
+            indoor_temp=29.0,
+            effective_target=24.0,
+            is_occupied=occupied,
+            ac_on=True,
+            now=now,
+        )
+
+        self.assertFalse(st.pre_cool_active)
+        self.assertEqual(st.pre_cool_result, "handoff_presence_detected")
+        self.assertEqual((action, source), ("hold", "thermostat"))
+
+    def test_manual_override_blocks_pre_cool(self):
+        logic_engine._runtime_by_room.clear()
+        rid = "precoolmanual"
+        cfg = self._pre_cool_config(rid)
+        cfg["manual_override_enabled"] = True
+
+        async def run_case():
+            with (
+                mock.patch.object(logic_engine.config_manager, "load_config", return_value=cfg),
+                mock.patch.object(logic_engine.ha_client, "get_state", new=mock.AsyncMock()) as get_state,
+                mock.patch.object(logic_engine, "tick", new=mock.AsyncMock()) as tick_mock,
+            ):
+                result = await logic_engine.start_pre_cool(rid, 25)
+            self.assertEqual(result["pre_cool_result"], "blocked_by_manual_override")
+            get_state.assert_not_awaited()
+            tick_mock.assert_not_awaited()
+
+        asyncio.run(run_case())
+
+    def test_missing_room_temp_sensor_blocks_pre_cool(self):
+        logic_engine._runtime_by_room.clear()
+        rid = "precoolnotemp"
+        cfg = self._pre_cool_config(rid)
+        cfg["rooms"][0]["indoor_temp_entity"] = ""
+
+        async def run_case():
+            with (
+                mock.patch.object(logic_engine.config_manager, "load_config", return_value=cfg),
+                mock.patch.object(logic_engine.ha_client, "get_state", new=mock.AsyncMock()) as get_state,
+                mock.patch.object(logic_engine, "tick", new=mock.AsyncMock()) as tick_mock,
+            ):
+                result = await logic_engine.start_pre_cool(rid, 25)
+            self.assertEqual(result["pre_cool_result"], "blocked_room_temp_required")
+            get_state.assert_not_awaited()
+            tick_mock.assert_not_awaited()
+
+        asyncio.run(run_case())
+
+    def test_normal_automation_unchanged_without_pre_cool(self):
+        logic_engine._runtime_by_room.clear()
+        rid = "normalauto"
+        cfg = self._pre_cool_config(rid)
+        st = logic_engine._rt(rid)
+        now = datetime.now(timezone.utc)
+        st.occupied = False
+        st.stable_occupied = False
+        st.last_known_presence = False
+        st.vacant_since = now - timedelta(minutes=5)
+        st.ac_is_on = True
+
+        action, source, target = logic_engine._resolve_control_decision(
+            rid,
+            cfg,
+            indoor_temp=29.0,
+            effective_target=24.0,
+            is_occupied=False,
+            ac_on=True,
+            now=now,
+        )
+
+        self.assertEqual((action, source, target), ("off", "safety_vacant", 24.0))
+        self.assertIsNone(st.vacancy_off_blocked_reason)
 
     def test_resolve_room_definition_case_insensitive(self):
         cfg = {

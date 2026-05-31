@@ -1,5 +1,5 @@
 name: HawaAI AC Optimizer
-version: 1.4.88
+version: 1.4.89
 slug: hawaai
 description: AI-powered AC optimization using presence, temperature, and energy data
 url: https://github.com/srobysingh-bot/Smart-Ac
@@ -24,6 +24,12 @@ options:
   target_temp: 24
   hysteresis: 1.5
   vacancy_timeout_minutes: 5
+  pre_cool_enabled: false
+  pre_cool_duration_minutes: 25
+  pre_cool_min_temp_gap_deg: 1.0
+  pre_cool_target_offset_deg: 1.0
+  pre_cool_arrival_grace_seconds: 120
+  pre_cool_no_show_action: "off"
   energy_tariff_per_kwh: 8.0
   logic_interval_seconds: 60
   currency: "INR"
@@ -72,6 +78,12 @@ schema:
   target_temp: int
   hysteresis: float
   vacancy_timeout_minutes: int
+  pre_cool_enabled: bool?
+  pre_cool_duration_minutes: int?
+  pre_cool_min_temp_gap_deg: float?
+  pre_cool_target_offset_deg: float?
+  pre_cool_arrival_grace_seconds: int?
+  pre_cool_no_show_action: str?
   energy_tariff_per_kwh: float
   logic_interval_seconds: int
   currency: str

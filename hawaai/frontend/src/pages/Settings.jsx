@@ -196,6 +196,8 @@ const CURRENCY_OPTIONS = [
 const ROOM_SETTINGS_KEYS = [
   'control_mode', 'ir_backend', 'presence_only_on_dwell_seconds', 'presence_only_max_runtime_minutes',
   'target_temp', 'hysteresis', 'vacancy_timeout_minutes', 'logic_interval_seconds',
+  'pre_cool_enabled', 'pre_cool_duration_minutes', 'pre_cool_min_temp_gap_deg',
+  'pre_cool_target_offset_deg', 'pre_cool_arrival_grace_seconds', 'pre_cool_no_show_action',
   'on_delay_seconds', 'off_delay_seconds',
   'energy_tariff_per_kwh', 'currency', 'use_presence', 'use_outdoor_temp',
   'smart_temp_adjustment', 'smart_cooling_enabled', 'manual_override', 'manual_override_enabled',
@@ -1546,10 +1548,10 @@ export default function Settings() {
           label="Vacancy Timeout"
           value={cfg.vacancy_timeout_minutes ?? 5}
           onChange={v => patch('vacancy_timeout_minutes', v)}
-          min={1} max={60} step={1} unit=" min"
+          min={0} max={60} step={1} unit=" min"
         />
         <p className="text-xs text-gray-500 -mt-3">
-          Minutes room must be empty before AC turns off automatically.
+          Minutes room must be empty before AC turns off automatically. 0 min = turn OFF as soon as vacancy is confirmed.
         </p>
 
         {/* ── Automation toggles ─────────────────────────────────────────── */}
@@ -1582,6 +1584,52 @@ export default function Settings() {
             checked={cfg.smart_cooling_enabled ?? false}
             onChange={v => patch('smart_cooling_enabled', v)}
           />
+          <Toggle
+            label="Pre-cool"
+            description="Allow a user-started arrival cooling hold while the room is vacant"
+            checked={cfg.pre_cool_enabled ?? false}
+            onChange={v => patch('pre_cool_enabled', v)}
+          />
+          {cfg.pre_cool_enabled && (
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 rounded-lg border border-gray-800 bg-gray-950/35 p-3">
+              <Slider
+                label="Default pre-cool"
+                value={cfg.pre_cool_duration_minutes ?? 25}
+                onChange={v => patch('pre_cool_duration_minutes', v)}
+                min={10}
+                max={45}
+                step={5}
+                unit=" min"
+              />
+              <Slider
+                label="Start gap"
+                value={cfg.pre_cool_min_temp_gap_deg ?? 1}
+                onChange={v => patch('pre_cool_min_temp_gap_deg', v)}
+                min={0}
+                max={3}
+                step={0.5}
+                unit="°C"
+              />
+              <Slider
+                label="Target offset"
+                value={cfg.pre_cool_target_offset_deg ?? 1}
+                onChange={v => patch('pre_cool_target_offset_deg', v)}
+                min={0}
+                max={3}
+                step={0.5}
+                unit="°C"
+              />
+              <Slider
+                label="Arrival grace"
+                value={Math.round(Number(cfg.pre_cool_arrival_grace_seconds ?? 120) / 60)}
+                onChange={v => patch('pre_cool_arrival_grace_seconds', Math.round(Number(v) * 60))}
+                min={0}
+                max={10}
+                step={1}
+                unit=" min"
+              />
+            </div>
+          )}
           <Toggle
             label="Enable AI Optimization"
             description="Soft setpoint and fan hints from an AI model. Choose Ollama (local) or an OpenAI-compatible cloud API below — no credentials are hardcoded."

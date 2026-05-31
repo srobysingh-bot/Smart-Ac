@@ -78,6 +78,148 @@ function formatDelayCountdown(totalSec) {
   return `${m}:${String(r).padStart(2, '0')}`
 }
 
+const PRE_COOL_DURATIONS = [10, 15, 20, 25, 30, 45]
+
+function preCoolMessage(result) {
+  const key = String(result || '')
+  if (key === 'skipped_already_cool') return 'Room already cool'
+  if (key === 'expired_no_show') return 'Pre-cool ended - no presence detected'
+  if (key === 'blocked_by_manual_override') return 'Manual Override active'
+  if (key === 'blocked_room_temp_required') return 'Room temp required'
+  if (key === 'blocked_pre_cool_disabled') return 'Pre-cool disabled'
+  return null
+}
+
+function PreCoolControl({
+  enabled,
+  active,
+  defaultDuration,
+  remainingSeconds,
+  result,
+  target,
+  blockedReason,
+  onStart,
+  onCancel,
+}) {
+  const [duration, setDuration] = useState(defaultDuration || 25)
+  const [busy, setBusy] = useState(false)
+  const [localResult, setLocalResult] = useState(null)
+  const [countdown, setCountdown] = useState(null)
+
+  useEffect(() => {
+    const safeDefault = PRE_COOL_DURATIONS.includes(Number(defaultDuration))
+      ? Number(defaultDuration)
+      : 25
+    setDuration(safeDefault)
+  }, [defaultDuration])
+
+  useEffect(() => {
+    if (!active || remainingSeconds == null || !Number.isFinite(Number(remainingSeconds))) {
+      setCountdown(null)
+      return undefined
+    }
+    setCountdown(Math.max(0, Number(remainingSeconds)))
+    const id = window.setInterval(() => {
+      setCountdown((value) => (value != null ? Math.max(0, value - 1) : value))
+    }, 1000)
+    return () => window.clearInterval(id)
+  }, [active, remainingSeconds])
+
+  const shownResult = localResult || result
+  const message = preCoolMessage(shownResult)
+  const shownTarget = Number(target)
+
+  const runStart = async () => {
+    if (!onStart) return
+    setBusy(true)
+    setLocalResult(null)
+    try {
+      const res = await onStart(duration)
+      setLocalResult(res?.pre_cool_result || null)
+    } catch (err) {
+      setLocalResult('error')
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  const runCancel = async () => {
+    if (!onCancel) return
+    setBusy(true)
+    try {
+      const res = await onCancel()
+      setLocalResult(res?.pre_cool_result || 'cancelled')
+    } catch (err) {
+      setLocalResult('error')
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  return (
+    <div className="rounded-lg border border-sky-900/45 bg-sky-950/15 px-2.5 py-2">
+      <div className="flex flex-wrap items-center justify-between gap-2">
+        <div className="flex min-w-0 items-center gap-2">
+          <span className="grid h-7 w-7 shrink-0 place-items-center rounded-lg border border-sky-500/25 bg-sky-400/10 text-sky-200">
+            <Wind size={14} aria-hidden />
+          </span>
+          <div className="min-w-0">
+            <p className="text-xs font-semibold text-gray-100">Pre-cool</p>
+            {active ? (
+              <p className="text-[11px] font-mono text-sky-200">
+                {formatDelayCountdown(countdown ?? remainingSeconds)} remaining
+              </p>
+            ) : message ? (
+              <p className="text-[11px] text-gray-400">{message}</p>
+            ) : (
+              <p className="text-[11px] text-gray-500">
+                {Number.isFinite(shownTarget) ? `Target ${shownTarget.toFixed(1)}Â°C` : 'Arrival cooling'}
+              </p>
+            )}
+          </div>
+        </div>
+        {active ? (
+          <button
+            type="button"
+            disabled={busy}
+            onClick={runCancel}
+            className="rounded-md border border-gray-700 bg-gray-900 px-2.5 py-1.5 text-xs font-semibold text-gray-200 transition hover:border-gray-500 disabled:cursor-not-allowed disabled:opacity-50"
+          >
+            Cancel
+          </button>
+        ) : (
+          <div className="flex items-center gap-1.5">
+            <select
+              value={duration}
+              disabled={!enabled || busy}
+              onChange={e => setDuration(Number(e.target.value))}
+              className="h-8 rounded-md border border-gray-700 bg-gray-900 px-2 text-xs font-semibold text-gray-100 disabled:cursor-not-allowed disabled:opacity-50"
+            >
+              {PRE_COOL_DURATIONS.map(min => (
+                <option key={min} value={min}>{min}m</option>
+              ))}
+            </select>
+            <button
+              type="button"
+              disabled={!enabled || busy}
+              onClick={runStart}
+              className="h-8 rounded-md border border-sky-500/45 bg-sky-500/15 px-2.5 text-xs font-semibold text-sky-100 transition hover:border-sky-300/70 disabled:cursor-not-allowed disabled:opacity-45"
+            >
+              Pre-cool
+            </button>
+          </div>
+        )}
+      </div>
+      {active && blockedReason === 'pre_cool' && (
+        <p className="mt-1.5 text-[11px] text-sky-300/80">Vacancy OFF blocked</p>
+      )}
+      {shownResult === 'error' && (
+        <p className="mt-1.5 text-[11px] text-red-300">Pre-cool command failed</p>
+      )}
+    </div>
+  )
+}
+
 function fmtTemp(v, digits = 1) {
   const n = Number(v)
   return Number.isFinite(n) ? `${n.toFixed(digits)}°C` : '—'
@@ -364,6 +506,15 @@ export default function ACStatusCard({
   lastAcOffAt,
   pendingAction,
   pendingRemainSec,
+  preCoolEnabled,
+  preCoolActive,
+  preCoolDurationMinutes,
+  preCoolRemainingSeconds,
+  preCoolTarget,
+  preCoolResult,
+  vacancyOffBlockedReason,
+  onPreCoolStart,
+  onPreCoolCancel,
   // Smart cooling (read-only display)
   smartCoolingEnabled = false,
   smartMode,
@@ -472,6 +623,18 @@ export default function ACStatusCard({
           delta={smartDelta}
         />
       )}
+
+      <PreCoolControl
+        enabled={preCoolEnabled}
+        active={preCoolActive}
+        defaultDuration={preCoolDurationMinutes}
+        remainingSeconds={preCoolRemainingSeconds}
+        result={preCoolResult}
+        target={preCoolTarget}
+        blockedReason={vacancyOffBlockedReason}
+        onStart={onPreCoolStart}
+        onCancel={onPreCoolCancel}
+      />
 
       <ComfortRuntimePanel
         sleepActive={sleepOptimizationActive}

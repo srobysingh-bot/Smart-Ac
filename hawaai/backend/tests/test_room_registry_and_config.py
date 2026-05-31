@@ -33,6 +33,17 @@ class TestRoomIds(unittest.TestCase):
 
 
 class TestConfigLoad(unittest.TestCase):
+    def test_settings_ui_allows_zero_vacancy_timeout(self):
+        settings_path = os.path.normpath(
+            os.path.join(os.path.dirname(__file__), "..", "..", "frontend", "src", "pages", "Settings.jsx")
+        )
+        with open(settings_path, "r", encoding="utf-8") as f:
+            src = f.read()
+
+        self.assertIn('label="Vacancy Timeout"', src)
+        self.assertIn('min={0} max={60} step={1} unit=" min"', src)
+        self.assertIn("0 min = turn OFF as soon as vacancy is confirmed.", src)
+
     def test_load_uses_backup_when_primary_read_fails(self):
         import backend.config_manager as cm
 
@@ -158,6 +169,44 @@ class TestConfigLoad(unittest.TestCase):
             effective = room_registry.merge_room_config(reloaded, room)
             self.assertEqual(effective["energy_power_entity"], "sensor.study_power")
             self.assertEqual(effective["energy_kwh_entity"], "sensor.study_energy")
+
+    def test_backend_accepts_zero_vacancy_timeout(self):
+        import backend.config_manager as cm
+        import backend.main as main
+
+        initial = {
+            "rooms": [
+                {
+                    "id": "roomzero12345",
+                    "name": "Study",
+                    "climate_entity": "climate.study",
+                    "settings": {"vacancy_timeout_minutes": 5},
+                }
+            ]
+        }
+
+        with tempfile.TemporaryDirectory() as td:
+            primary = os.path.join(td, "hawaai_config.json")
+            with open(primary, "w", encoding="utf-8") as f:
+                json.dump(initial, f)
+
+            cm._last_known_good_config = None
+            with (
+                mock.patch.object(cm, "CONFIG_PATH", primary),
+                mock.patch.object(main.logic_engine, "trigger_tick"),
+            ):
+                asyncio.run(
+                    main.api_update_room(
+                        "roomzero12345",
+                        {"settings": {"vacancy_timeout_minutes": 0}},
+                    )
+                )
+                reloaded = cm.load_config()
+
+        room = reloaded["rooms"][0]
+        self.assertEqual(room["settings"]["vacancy_timeout_minutes"], 0)
+        effective = room_registry.merge_room_config(reloaded, room)
+        self.assertEqual(effective["vacancy_timeout_minutes"], 0)
 
     def test_room_energy_aliases_are_migrated_without_silent_loss(self):
         import backend.config_manager as cm

@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState, useCallback } from 'react'
 import { useNavigate } from 'react-router-dom'
-import { getClimateState, setClimateTemperature, setHvacMode, setFanMode, setSwingMode, createRoom, getRoomLogs, clearRoomLogs } from '../api/smartcool.js'
+import { getClimateState, setClimateTemperature, setHvacMode, setFanMode, setSwingMode, createRoom, getRoomLogs, clearRoomLogs, startPreCool, cancelPreCool } from '../api/smartcool.js'
 import { useRoom } from '../context/RoomContext.jsx'
 import { useRoomData } from '../context/RoomDataContext.jsx'
 import ACStatusCard    from '../components/ACStatusCard.jsx'
@@ -1571,6 +1571,14 @@ export default function Dashboard() {
   )
   const hasRoom = Boolean(activeRoomId)
   const showDashboardBody = !loadError && (!roomLoading || showSoftLoading)
+  const handlePreCoolStart = useCallback(
+    (durationMinutes) => startPreCool(activeRoomId, durationMinutes),
+    [activeRoomId],
+  )
+  const handlePreCoolCancel = useCallback(
+    () => cancelPreCool(activeRoomId),
+    [activeRoomId],
+  )
 
   return (
     <div className="flex flex-col min-w-0">
@@ -1653,6 +1661,15 @@ export default function Dashboard() {
             lastAcOffAt={displayStatus?.last_ac_off_at}
             pendingAction={displayStatus?.pending_action}
             pendingRemainSec={displayStatus?.pending_remaining_seconds}
+            preCoolEnabled={displayStatus?.pre_cool_enabled}
+            preCoolActive={displayStatus?.pre_cool_active}
+            preCoolDurationMinutes={displayStatus?.pre_cool_duration_minutes}
+            preCoolRemainingSeconds={displayStatus?.pre_cool_remaining_seconds}
+            preCoolTarget={displayStatus?.pre_cool_target}
+            preCoolResult={displayStatus?.pre_cool_result}
+            vacancyOffBlockedReason={displayStatus?.vacancy_off_blocked_reason}
+            onPreCoolStart={handlePreCoolStart}
+            onPreCoolCancel={handlePreCoolCancel}
             hasClimateEntity={!!(displayStatus?.climate_entity || displayStatus?.ac_entity)}
             acCurrentTemp={displayStatus?.ac_current_temp}
             acTargetTemp={displayStatus?.ac_target_temp}

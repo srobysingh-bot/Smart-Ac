@@ -1,5 +1,10 @@
 # HawaAI add-on — release notes
 
+## 1.4.89
+
+- **Pre-cool:** Added user-triggered arrival cooling holds that block vacancy OFF while active, hand off to normal occupied logic on arrival, and expire back to normal vacancy behavior on no-show.
+- **Vacancy timeout:** Settings now allows `0 min`, which turns AC off as soon as vacancy is confirmed while preserving debounce and pre-cool protection.
+
 ## 1.4.88
 
 - **Climate controls:** Removed pre-dispatch debounce from climate-card commands, added latest-state-wins command coalescing, and protected pending user setpoints from stale status rollback.

@@ -139,6 +139,17 @@ export const resetAutoComfortLearning = roomId =>
   roomParam(roomId).then(rid =>
     request(`/rooms/${encodeURIComponent(rid)}/auto-comfort/reset`, { method: 'POST' }),
   )
+export const startPreCool = (roomId, durationMinutes = 25) =>
+  roomParam(roomId).then(rid =>
+    request(`/rooms/${encodeURIComponent(rid)}/pre_cool/start`, {
+      method: 'POST',
+      body: JSON.stringify({ duration_minutes: durationMinutes }),
+    }),
+  )
+export const cancelPreCool = roomId =>
+  roomParam(roomId).then(rid =>
+    request(`/rooms/${encodeURIComponent(rid)}/pre_cool/cancel`, { method: 'POST' }),
+  )
 export const getBrands = () => request('/brands')
 
 // ── HA Entities ──────────────────────────────────────────────────────────────

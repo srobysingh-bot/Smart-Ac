@@ -525,7 +525,7 @@ async def lifespan(app: FastAPI):
     logger.info("[HawaAI] Add-on stopped")
 
 
-app = FastAPI(title="HawaAI API", version="1.4.88", lifespan=lifespan)
+app = FastAPI(title="HawaAI API", version="1.4.89", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -1029,6 +1029,20 @@ async def _dashboard_status_payload(rid: str) -> Dict[str, Any]:
         "pending_action":           runtime.get("pending_action"),
         "pending_since_ts":         runtime.get("pending_since_ts"),
         "pending_remaining_seconds": runtime.get("pending_remaining_seconds"),
+        "pre_cool_enabled": runtime.get("pre_cool_enabled", cfg.get("pre_cool_enabled", False)),
+        "pre_cool_duration_minutes": runtime.get("pre_cool_duration_minutes", cfg.get("pre_cool_duration_minutes", 25)),
+        "pre_cool_min_temp_gap_deg": runtime.get("pre_cool_min_temp_gap_deg", cfg.get("pre_cool_min_temp_gap_deg", 1.0)),
+        "pre_cool_target_offset_deg": runtime.get("pre_cool_target_offset_deg", cfg.get("pre_cool_target_offset_deg", 1.0)),
+        "pre_cool_arrival_grace_seconds": runtime.get("pre_cool_arrival_grace_seconds", cfg.get("pre_cool_arrival_grace_seconds", 120)),
+        "pre_cool_no_show_action": runtime.get("pre_cool_no_show_action", cfg.get("pre_cool_no_show_action", "off")),
+        "pre_cool_active": runtime.get("pre_cool_active", False),
+        "pre_cool_requested_at": runtime.get("pre_cool_requested_at"),
+        "pre_cool_until": runtime.get("pre_cool_until"),
+        "pre_cool_target": runtime.get("pre_cool_target"),
+        "pre_cool_reason": runtime.get("pre_cool_reason"),
+        "pre_cool_result": runtime.get("pre_cool_result"),
+        "pre_cool_remaining_seconds": runtime.get("pre_cool_remaining_seconds", 0),
+        "vacancy_off_blocked_reason": runtime.get("vacancy_off_blocked_reason"),
         # ── Config ────────────────────────────────────────────────────────────
         "manual_override":  logic_engine.manual_override_enabled(cfg),
         "manual_override_enabled": logic_engine.manual_override_enabled(cfg),
@@ -1659,6 +1673,27 @@ async def api_reset_auto_comfort(room_id: str):
     await logic_engine.reset_auto_comfort_learning(stored)
     logic_engine.trigger_tick(stored, reason="auto_comfort_reset", skip_debounce=True)
     return {"ok": True, "room_id": stored}
+
+
+@app.post("/api/rooms/{room_id}/pre_cool/start")
+async def api_start_pre_cool(room_id: str, body: Optional[Dict[str, Any]] = Body(default=None)):
+    rid = _require_room_query(room_id)
+    base = config_manager.load_config()
+    stored = _resolve_stored_room_id(base, rid)
+    if not stored:
+        raise HTTPException(status_code=404, detail="room not found")
+    duration = (body or {}).get("duration_minutes")
+    return await logic_engine.start_pre_cool(stored, duration)
+
+
+@app.post("/api/rooms/{room_id}/pre_cool/cancel")
+async def api_cancel_pre_cool(room_id: str):
+    rid = _require_room_query(room_id)
+    base = config_manager.load_config()
+    stored = _resolve_stored_room_id(base, rid)
+    if not stored:
+        raise HTTPException(status_code=404, detail="room not found")
+    return await logic_engine.cancel_pre_cool(stored)
 
 
 @app.delete("/api/rooms/{room_id}")

@@ -512,6 +512,7 @@ class RoomRuntime:
     pending_vacancy_deadline: Optional[float] = None
     vacancy_generation: int = 0
     vacancy_reason: str = ""
+    vacancy_off_blocked_reason: Optional[str] = None
     thermostat_blocked: bool = False
     off_reason: Optional[str] = None
     stale_idle: bool = False
@@ -524,6 +525,15 @@ class RoomRuntime:
     presence_only_last_invalid_log_at: Optional[datetime] = None
     presence_only_idle: bool = False
     presence_control_disabled_logged: bool = False
+
+    # User-triggered arrival cooling hold. This never mutates occupancy.
+    pre_cool_active: bool = False
+    pre_cool_requested_at: Optional[datetime] = None
+    pre_cool_until: Optional[datetime] = None
+    pre_cool_target: Optional[float] = None
+    pre_cool_reason: str = ""
+    pre_cool_result: Optional[str] = None
+    pre_cool_expiry_task: Optional[asyncio.Task] = None
 
     # â”€â”€ Startup recovery flag â”€â”€
     startup_state_loaded: bool = False
@@ -842,8 +852,12 @@ def _cancel_pending_vacancy_shutdown(
     st.pending_vacancy_task = None
     st.pending_vacancy_deadline = None
     st.vacancy_reason = ""
-    if st.pending_action == "off" and _is_vacancy_off_reason(st.off_reason):
+    if (
+        (st.pending_action == "off" or st.pending_off_confirmation)
+        and _is_vacancy_off_reason(st.off_reason)
+    ):
         _clear_pending_command_state(st)
+        _clear_pending_off_confirmation(st)
         st.off_reason = None
     st.pending_vacancy = False
     if had_pending:
@@ -1095,6 +1109,329 @@ def _cfg_int(
     if hi is not None:
         val = min(int(hi), val)
     return val
+
+
+PRE_COOL_ALLOWED_DURATIONS_MINUTES = (10, 15, 20, 25, 30, 45)
+
+
+def _pre_cool_remaining_seconds(st: RoomRuntime, now: datetime) -> int:
+    if not st.pre_cool_active or st.pre_cool_until is None:
+        return 0
+    return max(0, int(math.ceil((st.pre_cool_until - now).total_seconds())))
+
+
+def _pre_cool_runtime_manual_active(st: RoomRuntime, now: datetime) -> bool:
+    return bool(
+        st.manual_override_config_active
+        or (
+            st.manual_override_until is not None
+            and now < st.manual_override_until
+            and st.manual_override_temp is not None
+        )
+    )
+
+
+def _clear_pre_cool_state(
+    room_id: str,
+    st: RoomRuntime,
+    *,
+    result: str,
+    reason: str,
+    cancel_task: bool = True,
+) -> None:
+    was_active = bool(st.pre_cool_active)
+    if cancel_task:
+        task = st.pre_cool_expiry_task
+        if task is not None and not task.done():
+            task.cancel()
+    st.pre_cool_expiry_task = None
+    st.pre_cool_active = False
+    st.pre_cool_until = None
+    st.pre_cool_target = None
+    st.pre_cool_reason = reason
+    st.pre_cool_result = result
+    st.vacancy_off_blocked_reason = None
+    if was_active and result == "handoff_presence_detected":
+        log_with_room("info", room_id, "[PRECOOL] room=%s handoff reason=presence_detected", room_id)
+    elif was_active and result == "handoff_recent_presence":
+        log_with_room("info", room_id, "[PRECOOL] room=%s handoff reason=recent_presence", room_id)
+    elif was_active and result == "expired_no_show":
+        log_with_room(
+            "info",
+            room_id,
+            "[PRECOOL] room=%s expired reason=no_show normal_vacancy_logic_resumed",
+            room_id,
+        )
+
+
+async def _pre_cool_expiry_runner(room_id: str, until: datetime) -> None:
+    try:
+        delay = max(0.0, (until - datetime.now(timezone.utc)).total_seconds())
+        await asyncio.sleep(delay)
+        trigger_tick(room_id, reason="pre_cool_expired", skip_debounce=True)
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        logger.debug("[PRECOOL] expiry runner failed room=%s", room_id, exc_info=True)
+
+
+def _schedule_pre_cool_expiry(room_id: str, st: RoomRuntime, until: datetime) -> None:
+    task = st.pre_cool_expiry_task
+    if task is not None and not task.done():
+        task.cancel()
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        st.pre_cool_expiry_task = None
+        return
+    st.pre_cool_expiry_task = loop.create_task(_pre_cool_expiry_runner(room_id, until))
+
+
+def _pre_cool_duration_minutes(cfg: dict, requested: object) -> int:
+    default = _cfg_int(cfg, "pre_cool_duration_minutes", 25, lo=10, hi=45)
+    try:
+        minutes = int(requested if requested is not None else default)
+    except (TypeError, ValueError):
+        minutes = default
+    if minutes in PRE_COOL_ALLOWED_DURATIONS_MINUTES:
+        return minutes
+    return min(PRE_COOL_ALLOWED_DURATIONS_MINUTES, key=lambda item: abs(item - minutes))
+
+
+def _parse_room_temp_sensor(raw: object) -> Optional[float]:
+    if raw in (None, "unavailable", "unknown"):
+        return None
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return None
+    return value if math.isfinite(value) else None
+
+
+async def _resolve_current_effective_target_for_pre_cool(cfg: dict, st: RoomRuntime) -> float:
+    if st.last_control_effective_target_temp is not None:
+        try:
+            return float(st.last_control_effective_target_temp)
+        except (TypeError, ValueError):
+            pass
+    if st.effective_target_source != "init":
+        try:
+            return float(st.effective_target_temp)
+        except (TypeError, ValueError):
+            pass
+    base_target, _slot_label = resolve_base_target_temp(cfg)
+    temperature_mode_str = normalize_temperature_mode(cfg.get("temperature_mode"))
+    if temperature_mode_str == auto_comfort.AUTO_COMFORT_MODE:
+        for candidate in (st.auto_comfort_final_target, st.auto_comfort_target):
+            if candidate is not None:
+                try:
+                    return float(candidate)
+                except (TypeError, ValueError):
+                    pass
+    weather = await weather_api.get_cached()
+    outdoor_temp = weather.get("temp") if weather else None
+    smart_curve = (
+        smart_temp_adjustment_enabled(cfg)
+        and bool(cfg.get("use_outdoor_temp", True))
+        and temperature_mode_str != auto_comfort.AUTO_COMFORT_MODE
+    )
+    return float(compute_effective_target(base_target, outdoor_temp, smart_curve))
+
+
+def _pre_cool_response(room_id: str, st: RoomRuntime, *, result: str, success: bool) -> Dict[str, object]:
+    now = datetime.now(timezone.utc)
+    return {
+        "success": bool(success),
+        "room_id": normalize_room_id(room_id),
+        "pre_cool_active": bool(st.pre_cool_active),
+        "pre_cool_result": result,
+        "pre_cool_requested_at": st.pre_cool_requested_at.isoformat() if st.pre_cool_requested_at else None,
+        "pre_cool_until": st.pre_cool_until.isoformat() if st.pre_cool_until else None,
+        "pre_cool_target": st.pre_cool_target,
+        "pre_cool_remaining_seconds": _pre_cool_remaining_seconds(st, now),
+        "vacancy_off_blocked_reason": st.vacancy_off_blocked_reason,
+    }
+
+
+async def start_pre_cool(room_id: str, duration_minutes: object = None) -> Dict[str, object]:
+    rid_raw = (room_id or "").strip()
+    canon = normalize_room_id(rid_raw)
+    st = _rt(canon)
+    base_cfg = config_manager.load_config()
+    room_def = resolve_room_definition(base_cfg, rid_raw)
+    if not room_def:
+        st.pre_cool_result = "blocked_unknown_room"
+        return _pre_cool_response(canon, st, result=st.pre_cool_result, success=False)
+    if room_def.get("disabled"):
+        st.pre_cool_result = "blocked_room_disabled"
+        return _pre_cool_response(canon, st, result=st.pre_cool_result, success=False)
+    cfg = room_registry.merge_room_config(base_cfg, room_def)
+    if not bool(cfg.get("pre_cool_enabled", False)):
+        st.pre_cool_result = "blocked_pre_cool_disabled"
+        return _pre_cool_response(canon, st, result=st.pre_cool_result, success=False)
+
+    now = datetime.now(timezone.utc)
+    if manual_override_enabled(cfg) or _pre_cool_runtime_manual_active(st, now):
+        st.pre_cool_result = "blocked_by_manual_override"
+        return _pre_cool_response(canon, st, result=st.pre_cool_result, success=False)
+
+    temp_entity = str(cfg.get("indoor_temp_entity") or "").strip()
+    if not temp_entity:
+        st.pre_cool_result = "blocked_room_temp_required"
+        return _pre_cool_response(canon, st, result=st.pre_cool_result, success=False)
+    indoor_temp = _parse_room_temp_sensor(await ha_client.get_state(temp_entity))
+    if indoor_temp is None:
+        st.pre_cool_result = "blocked_room_temp_required"
+        return _pre_cool_response(canon, st, result=st.pre_cool_result, success=False)
+
+    effective_target = await _resolve_current_effective_target_for_pre_cool(cfg, st)
+    target = effective_target + _cfg_float(cfg, "pre_cool_target_offset_deg", 1.0)
+    min_gap = _cfg_float(cfg, "pre_cool_min_temp_gap_deg", 1.0, lo=0.0)
+    if float(indoor_temp) <= float(target) + min_gap:
+        _clear_pre_cool_state(canon, st, result="skipped_already_cool", reason="already_cool")
+        log_with_room(
+            "info",
+            canon,
+            "[PRECOOL] room=%s skipped reason=already_cool indoor=%.1f target=%.1f",
+            canon,
+            float(indoor_temp),
+            float(target),
+        )
+        return _pre_cool_response(canon, st, result="skipped_already_cool", success=True)
+
+    minutes = _pre_cool_duration_minutes(cfg, duration_minutes)
+    until = now + timedelta(minutes=minutes)
+    st.pre_cool_active = True
+    st.pre_cool_requested_at = now
+    st.pre_cool_until = until
+    st.pre_cool_target = float(target)
+    st.pre_cool_reason = "user_requested"
+    st.pre_cool_result = "started"
+    st.vacancy_off_blocked_reason = None
+    _schedule_pre_cool_expiry(canon, st, until)
+    log_with_room(
+        "info",
+        canon,
+        "[PRECOOL] room=%s start duration=%s target=%.1f indoor=%.1f until=%s",
+        canon,
+        minutes,
+        float(target),
+        float(indoor_temp),
+        until.isoformat(),
+    )
+    await tick(canon, reason="pre_cool_started", skip_debounce=True)
+    return _pre_cool_response(canon, st, result="started", success=True)
+
+
+async def cancel_pre_cool(room_id: str) -> Dict[str, object]:
+    canon = normalize_room_id(room_id)
+    st = _rt(canon)
+    _clear_pre_cool_state(canon, st, result="cancelled", reason="user_cancelled")
+    await tick(canon, reason="pre_cool_cancelled", skip_debounce=True)
+    return _pre_cool_response(canon, st, result="cancelled", success=True)
+
+
+def _reconcile_pre_cool_state(
+    room_id: str,
+    cfg: dict,
+    st: RoomRuntime,
+    now: datetime,
+    resolved_occupied: bool,
+) -> bool:
+    if not st.pre_cool_active:
+        st.vacancy_off_blocked_reason = None
+        return resolved_occupied
+    if resolved_occupied:
+        _clear_pre_cool_state(
+            room_id,
+            st,
+            result="handoff_presence_detected",
+            reason="presence_detected",
+        )
+        return True
+    if st.pre_cool_until is None or now < st.pre_cool_until:
+        return resolved_occupied
+
+    grace = _cfg_int(cfg, "pre_cool_arrival_grace_seconds", 120, lo=0, hi=3600)
+    recent_presence = bool(
+        st.presence_last_true_at is not None
+        and (now - st.presence_last_true_at).total_seconds() <= float(grace)
+    )
+    if recent_presence:
+        _clear_vacancy_state(room_id, st, now, reason="pre_cool_arrival_grace")
+        _clear_pre_cool_state(
+            room_id,
+            st,
+            result="handoff_recent_presence",
+            reason="recent_presence",
+        )
+        return True
+
+    _clear_pre_cool_state(
+        room_id,
+        st,
+        result="expired_no_show",
+        reason="no_show",
+        cancel_task=False,
+    )
+    return False
+
+
+def _resolve_pre_cool_decision(
+    room_id: str,
+    cfg: dict,
+    indoor_temp: float,
+    pre_cool_target: float,
+    ac_on: bool,
+    now: datetime,
+) -> Tuple[str, str, float]:
+    st = _rt(room_id)
+    vacancy_timeout = max(
+        _cfg_int(cfg, "vacancy_timeout_minutes", 5, lo=0) * 60,
+        float(VACANCY_CONFIRM_SECS),
+    )
+    if st.vacant_since is None:
+        _start_vacancy_cycle(
+            room_id,
+            st,
+            now,
+            reason="pre_cool",
+            timeout_seconds=vacancy_timeout,
+        )
+    if st.pending_action == "off" and _is_vacancy_off_reason(st.off_reason):
+        _clear_pending_command_state(st)
+        st.off_reason = None
+    st.vacancy_active = True
+    st.vacancy_hold = True
+    st.safety_vacant = False
+    st.pending_vacancy = False
+    st.thermostat_blocked = False
+    st.vacancy_off_blocked_reason = "pre_cool"
+    remaining = _pre_cool_remaining_seconds(st, now)
+    log_with_room(
+        "info",
+        room_id,
+        "[PRECOOL] room=%s vacancy_off_blocked remaining=%s",
+        room_id,
+        remaining,
+    )
+
+    if _is_user_authority_active(st, cfg, now):
+        return ("hold", "manual", pre_cool_target)
+    if (
+        _is_in_cooldown(st, now)
+        and st.pending_action != "on"
+        and st.ac_state != "on_failed"
+    ):
+        return ("hold_cooldown", "pre_cool", pre_cool_target)
+
+    on_delta = _cfg_float(cfg, "thermostat_on_delta_deg", 0.7, lo=0.0)
+    off_delta = _cfg_float(cfg, "thermostat_off_delta_deg", 0.3, lo=0.0)
+    if not ac_on and float(indoor_temp) > float(pre_cool_target) + on_delta:
+        return ("on", "pre_cool", pre_cool_target)
+    if ac_on and float(indoor_temp) <= float(pre_cool_target) - off_delta:
+        return ("off", "pre_cool_target_reached", pre_cool_target)
+    return ("hold", "pre_cool", pre_cool_target)
 
 
 def _seconds_since_last_command(st: RoomRuntime, now: datetime) -> float:
@@ -4425,7 +4762,7 @@ def _resolve_auto_comfort_decision(
     return decision
 
 
-async def tick(room_id: str) -> None:
+async def tick(room_id: str, *, reason: str = "scheduled", skip_debounce: bool = False) -> None:
     """
     Single decision-loop iteration for one room.
     """
@@ -4435,6 +4772,8 @@ async def tick(room_id: str) -> None:
         return
 
     canon = normalize_room_id(rid_raw)
+    if reason != "scheduled":
+        logger.info("[TICK][%s] reason=%s skip_debounce=%s", canon, reason, skip_debounce)
     async with _room_tick_serial_lock(canon):
         async with _room_ops_lock(canon):
             if startup_stabilization_active():
@@ -4941,6 +5280,13 @@ async def _tick_impl(rid_raw: str, room_id: str) -> None:
         cfg=cfg,
         source=occupancy_source,
     )
+    is_occupied_bool = _reconcile_pre_cool_state(
+        room_id,
+        cfg,
+        st,
+        now,
+        bool(is_occupied_bool),
+    )
 
     logger.info(
         "[HawaAI] Presence: %r â†’ occupied=%s",
@@ -4948,6 +5294,13 @@ async def _tick_impl(rid_raw: str, room_id: str) -> None:
     )
 
     if manual_override_enabled(cfg):
+        if st.pre_cool_active:
+            _clear_pre_cool_state(
+                room_id,
+                st,
+                result="blocked_by_manual_override",
+                reason="manual_override",
+            )
         _clear_auto_comfort_runtime(st)
         if not st.manual_override_config_active:
             log_with_room("info", room_id, "[OVERRIDE] enabled persistent=true")
@@ -5265,6 +5618,17 @@ async def _tick_impl(rid_raw: str, room_id: str) -> None:
     else:
         et_eff = float(engine_target)
         target_source = "auto_comfort" if auto_comfort_active else "control_effective"
+    pre_cool_hold_active = bool(
+        st.pre_cool_active
+        and st.pre_cool_until is not None
+        and now < st.pre_cool_until
+        and not bool(is_occupied_bool)
+        and st.pre_cool_target is not None
+        and not manual_override_active
+    )
+    if pre_cool_hold_active:
+        et_eff = float(st.pre_cool_target)
+        target_source = "pre_cool"
     st.last_control_effective_target_temp = float(engine_target)
     st.effective_target_temp = et_eff
     st.effective_target_source = target_source
@@ -5401,10 +5765,20 @@ async def _tick_impl(rid_raw: str, room_id: str) -> None:
 
     occ_res = bool(is_occupied_bool)
 
-    action, source, tgt = _resolve_control_decision(
-        room_id, cfg, indoor_temp, et_eff,
-        occ_res, ac_on, now,
-    )
+    if pre_cool_hold_active:
+        action, source, tgt = _resolve_pre_cool_decision(
+            room_id,
+            cfg,
+            indoor_temp,
+            et_eff,
+            ac_on,
+            now,
+        )
+    else:
+        action, source, tgt = _resolve_control_decision(
+            room_id, cfg, indoor_temp, et_eff,
+            occ_res, ac_on, now,
+        )
     action, source, zone_gate_blocked = _fp2_zone_apply_on_gate(room_id, cfg, action, source)
     action, source = _apply_pending_on_decision_lock(room_id, st, action, source)
     action, source = _apply_pending_on_off_block(room_id, st, action, source, now)
@@ -5619,7 +5993,7 @@ async def _tick_impl(rid_raw: str, room_id: str) -> None:
             or humidity_target_changed
             or thermal_target_changed
         )
-        and climate_entity and ac_on and occ_res and not in_cooldown
+        and climate_entity and ac_on and (occ_res or pre_cool_hold_active) and not in_cooldown
     ):
         interval = _cfg_int(cfg, "setpoint_command_min_interval_seconds", 180, lo=0)
         meaningful = _cfg_float(cfg, "setpoint_min_delta_deg", 0.7, lo=0.0)
@@ -6712,6 +7086,7 @@ def get_runtime_state(room_id: str) -> dict:
         "safety_vacant":         st.safety_vacant,
         "pending_vacancy":       st.pending_vacancy,
         "thermostat_blocked":    st.thermostat_blocked,
+        "vacancy_off_blocked_reason": st.vacancy_off_blocked_reason,
         "vacant_since":          st.vacant_since.isoformat() if st.vacant_since else None,
         "off_reason":            st.off_reason,
         "stale_idle":            st.stale_idle,
@@ -6829,6 +7204,27 @@ def get_runtime_state(room_id: str) -> dict:
             if st.manual_override_temp is not None
             else mo_user_settings.get("target_temp")
         ) if mo_active else None,
+        "pre_cool_enabled": bool(merged.get("pre_cool_enabled", False)),
+        "pre_cool_duration_minutes": _cfg_int(merged, "pre_cool_duration_minutes", 25, lo=10, hi=45),
+        "pre_cool_min_temp_gap_deg": _cfg_float(merged, "pre_cool_min_temp_gap_deg", 1.0, lo=0.0),
+        "pre_cool_target_offset_deg": _cfg_float(merged, "pre_cool_target_offset_deg", 1.0),
+        "pre_cool_arrival_grace_seconds": _cfg_int(
+            merged,
+            "pre_cool_arrival_grace_seconds",
+            120,
+            lo=0,
+            hi=3600,
+        ),
+        "pre_cool_no_show_action": str(merged.get("pre_cool_no_show_action") or "off"),
+        "pre_cool_active": bool(st.pre_cool_active),
+        "pre_cool_requested_at": (
+            st.pre_cool_requested_at.isoformat() if st.pre_cool_requested_at else None
+        ),
+        "pre_cool_until": st.pre_cool_until.isoformat() if st.pre_cool_until else None,
+        "pre_cool_target": st.pre_cool_target,
+        "pre_cool_reason": st.pre_cool_reason,
+        "pre_cool_result": st.pre_cool_result,
+        "pre_cool_remaining_seconds": _pre_cool_remaining_seconds(st, now),
         "min_command_interval_seconds": int(min_iv),
         "on_delay_seconds":           on_d,
         "off_delay_seconds":          off_d,
