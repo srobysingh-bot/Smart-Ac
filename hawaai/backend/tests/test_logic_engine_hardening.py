@@ -46,6 +46,10 @@ class TestLogicEngineHardening(unittest.TestCase):
             "use_presence": True,
             "vacancy_timeout_minutes": 1,
             "thermostat_on_delta_deg": 0.7,
+            "physical_state_from_power": True,
+            "physical_on_watts": 100,
+            "physical_off_watts": 30,
+            "physical_state_confirm_seconds": 5,
             "rooms": [
                 {
                     "id": rid,
@@ -56,6 +60,12 @@ class TestLogicEngineHardening(unittest.TestCase):
                 },
             ],
         }
+
+    def _mark_power_telemetry_valid(self, st):
+        st.energy_configured = True
+        st.energy_power_entity = "sensor.test_power"
+        st.telemetry_power_live_valid = True
+        st.energy_power_suspicious = False
 
     def test_normalize_room_id_strip_lower(self):
         self.assertEqual(logic_engine.normalize_room_id("  BedROOM "), "bedroom")
@@ -330,6 +340,157 @@ class TestLogicEngineHardening(unittest.TestCase):
 
         self.assertEqual((action, source, target), ("off", "safety_vacant", 24.0))
         self.assertIsNone(st.vacancy_off_blocked_reason)
+
+    def test_physical_remote_on_detected_from_power_telemetry(self):
+        logic_engine._runtime_by_room.clear()
+        rid = "physicalon"
+        cfg = self._pre_cool_config(rid)
+        st = logic_engine._rt(rid)
+        self._mark_power_telemetry_valid(st)
+        now = datetime.now(timezone.utc)
+        st.physical_power_last_sample_at = now - timedelta(seconds=10)
+        st.pending_action = "on"
+        st.pending_since = now.timestamp()
+
+        applied = logic_engine._reconcile_physical_ac_from_power(rid, cfg, st, now, 843)
+
+        self.assertTrue(applied)
+        self.assertTrue(st.physical_ac_on)
+        self.assertTrue(st.ac_is_on)
+        self.assertEqual(st.ac_state_source, "power_telemetry")
+        self.assertIsNone(st.pending_action)
+
+    def test_physical_remote_off_detected_from_power_telemetry(self):
+        logic_engine._runtime_by_room.clear()
+        rid = "physicaloff"
+        cfg = self._pre_cool_config(rid)
+        st = logic_engine._rt(rid)
+        self._mark_power_telemetry_valid(st)
+        now = datetime.now(timezone.utc)
+        st.physical_ac_on = True
+        st.ac_is_on = True
+        st.physical_power_last_sample_at = now - timedelta(seconds=10)
+        st.pending_action = "off"
+        st.pending_off_confirmation = True
+
+        applied = logic_engine._reconcile_physical_ac_from_power(rid, cfg, st, now, 5)
+
+        self.assertTrue(applied)
+        self.assertFalse(st.physical_ac_on)
+        self.assertFalse(st.ac_is_on)
+        self.assertEqual(st.ac_state_source, "power_telemetry")
+        self.assertIsNone(st.pending_action)
+        self.assertFalse(st.pending_off_confirmation)
+
+    def test_invalid_power_telemetry_does_not_change_physical_state(self):
+        logic_engine._runtime_by_room.clear()
+        rid = "physicalinvalid"
+        cfg = self._pre_cool_config(rid)
+        st = logic_engine._rt(rid)
+        now = datetime.now(timezone.utc)
+        st.physical_ac_on = False
+        st.ac_is_on = False
+        st.energy_configured = True
+        st.energy_power_entity = "sensor.test_power"
+        st.telemetry_power_live_valid = False
+
+        applied = logic_engine._reconcile_physical_ac_from_power(rid, cfg, st, now, 843)
+
+        self.assertFalse(applied)
+        self.assertFalse(st.physical_ac_on)
+        self.assertEqual(st.ac_state_source, "system")
+
+    def test_power_hysteresis_prevents_physical_state_flicker(self):
+        logic_engine._runtime_by_room.clear()
+        rid = "physicalhysteresis"
+        cfg = self._pre_cool_config(rid)
+        st = logic_engine._rt(rid)
+        self._mark_power_telemetry_valid(st)
+        now = datetime.now(timezone.utc)
+        st.physical_power_last_sample_at = now - timedelta(seconds=10)
+
+        applied_mid_off = logic_engine._reconcile_physical_ac_from_power(rid, cfg, st, now, 80)
+        self.assertFalse(applied_mid_off)
+        self.assertFalse(st.physical_ac_on)
+
+        applied_on = logic_engine._reconcile_physical_ac_from_power(
+            rid,
+            cfg,
+            st,
+            now + timedelta(seconds=10),
+            843,
+        )
+        self.assertTrue(applied_on)
+        self.assertTrue(st.physical_ac_on)
+
+        applied_mid_on = logic_engine._reconcile_physical_ac_from_power(
+            rid,
+            cfg,
+            st,
+            now + timedelta(seconds=20),
+            80,
+        )
+        self.assertFalse(applied_mid_on)
+        self.assertTrue(st.physical_ac_on)
+
+    def test_vacant_room_physical_remote_on_can_still_resolve_vacancy_off_later(self):
+        logic_engine._runtime_by_room.clear()
+        rid = "physicalvacant"
+        cfg = self._pre_cool_config(rid)
+        cfg["vacancy_timeout_minutes"] = 0
+        st = logic_engine._rt(rid)
+        self._mark_power_telemetry_valid(st)
+        now = datetime.now(timezone.utc)
+        st.occupied = False
+        st.stable_occupied = False
+        st.last_known_presence = False
+        st.vacant_since = now - timedelta(seconds=logic_engine.VACANCY_CONFIRM_SECS + 5)
+        st.physical_power_last_sample_at = now - timedelta(seconds=10)
+
+        logic_engine._reconcile_physical_ac_from_power(rid, cfg, st, now, 843)
+        later = now + timedelta(seconds=logic_engine.RUNNING_OFF_BLOCK_SECS + 1)
+        action, source, target = logic_engine._resolve_control_decision(
+            rid,
+            cfg,
+            indoor_temp=29.0,
+            effective_target=24.0,
+            is_occupied=False,
+            ac_on=st.physical_ac_on,
+            now=later,
+        )
+
+        self.assertTrue(st.physical_ac_on)
+        self.assertEqual((action, source, target), ("off", "safety_vacant", 24.0))
+
+    def test_pre_cool_active_blocks_vacancy_off_after_physical_remote_on_detection(self):
+        logic_engine._runtime_by_room.clear()
+        rid = "physicalprecool"
+        cfg = self._pre_cool_config(rid)
+        cfg["vacancy_timeout_minutes"] = 0
+        st = logic_engine._rt(rid)
+        self._mark_power_telemetry_valid(st)
+        now = datetime.now(timezone.utc)
+        st.pre_cool_active = True
+        st.pre_cool_until = now + timedelta(minutes=10)
+        st.pre_cool_target = 25.0
+        st.occupied = False
+        st.stable_occupied = False
+        st.vacant_since = now - timedelta(seconds=logic_engine.VACANCY_CONFIRM_SECS + 5)
+        st.physical_power_last_sample_at = now - timedelta(seconds=10)
+
+        logic_engine._reconcile_physical_ac_from_power(rid, cfg, st, now, 843)
+        action, source, target = logic_engine._resolve_pre_cool_decision(
+            rid,
+            cfg,
+            indoor_temp=29.0,
+            pre_cool_target=25.0,
+            ac_on=st.physical_ac_on,
+            now=now,
+        )
+
+        self.assertTrue(st.physical_ac_on)
+        self.assertEqual(st.vacancy_off_blocked_reason, "pre_cool")
+        self.assertEqual((action, source, target), ("hold", "pre_cool", 25.0))
 
     def test_resolve_room_definition_case_insensitive(self):
         cfg = {

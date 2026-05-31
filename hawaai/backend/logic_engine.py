@@ -482,6 +482,9 @@ class RoomRuntime:
     # â”€â”€ Single source of truth â€” set once per tick, read everywhere â”€â”€
     # Physical compressor / HA / inferred truth (never masked by pending ON).
     physical_ac_on: bool = False
+    physical_power_candidate: Optional[str] = None
+    physical_power_candidate_since: Optional[datetime] = None
+    physical_power_last_sample_at: Optional[datetime] = None
     # UI / masked: False while pending_action == "on" even if physical is True.
     effective_ac_on: bool = False
     # Display phase: off | pending_on | on | pending_off | on_failed
@@ -1206,6 +1209,111 @@ def _parse_room_temp_sensor(raw: object) -> Optional[float]:
     except (TypeError, ValueError):
         return None
     return value if math.isfinite(value) else None
+
+
+def _power_physical_state_enabled(cfg: dict, st: RoomRuntime, power_watts: object) -> bool:
+    if not bool(cfg.get("physical_state_from_power", True)):
+        return False
+    if power_watts is None:
+        return False
+    try:
+        watts = float(power_watts)
+    except (TypeError, ValueError):
+        return False
+    if not math.isfinite(watts):
+        return False
+    return bool(
+        st.energy_configured
+        and str(st.energy_power_entity or "").strip()
+        and st.telemetry_power_live_valid
+        and not st.energy_power_suspicious
+    )
+
+
+def _power_candidate_confirmed(
+    st: RoomRuntime,
+    desired: str,
+    now: datetime,
+    confirm_seconds: float,
+) -> bool:
+    confirm = max(0.0, float(confirm_seconds))
+    if st.physical_power_candidate != desired:
+        since = now
+        if (
+            st.physical_power_last_sample_at is not None
+            and (now - st.physical_power_last_sample_at).total_seconds() >= confirm
+        ):
+            since = now - timedelta(seconds=confirm)
+        st.physical_power_candidate = desired
+        st.physical_power_candidate_since = since
+    since = st.physical_power_candidate_since or now
+    return (now - since).total_seconds() >= confirm
+
+
+def _reconcile_physical_ac_from_power(
+    room_id: str,
+    cfg: dict,
+    st: RoomRuntime,
+    now: datetime,
+    power_watts: object,
+) -> bool:
+    """
+    Trust live, validated power telemetry only for physical ON/OFF reconciliation.
+    This does not alter occupancy, manual override, schedules, or thermostat rules.
+    """
+    if not _power_physical_state_enabled(cfg, st, power_watts):
+        return False
+
+    watts = float(power_watts)
+    on_watts = _cfg_float(cfg, "physical_on_watts", 100.0, lo=0.0)
+    off_watts = _cfg_float(cfg, "physical_off_watts", 30.0, lo=0.0)
+    if off_watts >= on_watts:
+        off_watts = max(0.0, on_watts - 1.0)
+    confirm = _cfg_float(cfg, "physical_state_confirm_seconds", 5.0, lo=0.0, hi=300.0)
+    applied = False
+
+    if watts >= on_watts:
+        if _power_candidate_confirmed(st, "on", now, confirm):
+            if not st.physical_ac_on:
+                st.last_ac_on_at = now.timestamp()
+                log_with_room(
+                    "info",
+                    room_id,
+                    "[PHYSICAL_AC] room=%s source=power_telemetry detected=on watts=%.0f",
+                    room_id,
+                    watts,
+                )
+            st.physical_ac_on = True
+            st.ac_is_on = True
+            st.ac_state_source = "power_telemetry"
+            if st.pending_action == "on":
+                _clear_pending_command_state(st)
+            applied = True
+    elif watts <= off_watts:
+        if _power_candidate_confirmed(st, "off", now, confirm):
+            if st.physical_ac_on:
+                st.last_ac_off_at = now.timestamp()
+                log_with_room(
+                    "info",
+                    room_id,
+                    "[PHYSICAL_AC] room=%s source=power_telemetry detected=off watts=%.0f",
+                    room_id,
+                    watts,
+                )
+            st.physical_ac_on = False
+            st.ac_is_on = False
+            st.ac_state_source = "power_telemetry"
+            if st.pending_action == "off":
+                _clear_pending_command_state(st)
+            if st.pending_off_confirmation:
+                _clear_pending_off_confirmation(st)
+            applied = True
+    else:
+        st.physical_power_candidate = None
+        st.physical_power_candidate_since = None
+
+    st.physical_power_last_sample_at = now
+    return applied
 
 
 async def _resolve_current_effective_target_for_pre_cool(cfg: dict, st: RoomRuntime) -> float:
@@ -4828,6 +4936,9 @@ async def _tick_presence_only_mode(
 
     st.physical_ac_on = bool(ac_on)
     confirmed_ac_on = bool(ac_on)
+    if _reconcile_physical_ac_from_power(room_id, cfg, st, now, telemetry_power_reading):
+        ac_on = bool(st.physical_ac_on)
+        confirmed_ac_on = bool(st.ac_is_on)
     if await _handle_pending_off_confirmation(
         room_id,
         cfg,
@@ -5125,6 +5236,8 @@ async def _tick_manual_override_observe_only(
         in_cooldown=in_cooldown,
     )
     st.physical_ac_on = bool(st.ac_is_on)
+    if _reconcile_physical_ac_from_power(room_id, cfg, st, now, telemetry_power_reading):
+        pass
     st.effective_ac_on = bool(st.physical_ac_on)
     if st.physical_ac_on:
         if st.effective_on_since_ts is None:
@@ -5680,6 +5793,17 @@ async def _tick_impl(rid_raw: str, room_id: str) -> None:
             st.ac_state_source = "system"
     else:
         st.ac_state_source = "system"
+
+    power_physical_applied = _reconcile_physical_ac_from_power(
+        room_id,
+        cfg,
+        st,
+        now,
+        telemetry_power_reading,
+    )
+    if power_physical_applied:
+        ac_on = bool(st.physical_ac_on)
+        confirmed_ac_on = bool(st.ac_is_on)
 
     if st.physical_ac_on:
         if st.effective_on_since_ts is None:

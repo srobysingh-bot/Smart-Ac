@@ -196,6 +196,7 @@ const CURRENCY_OPTIONS = [
 const ROOM_SETTINGS_KEYS = [
   'control_mode', 'ir_backend', 'presence_only_on_dwell_seconds', 'presence_only_max_runtime_minutes',
   'target_temp', 'hysteresis', 'vacancy_timeout_minutes', 'logic_interval_seconds',
+  'physical_state_from_power', 'physical_on_watts', 'physical_off_watts', 'physical_state_confirm_seconds',
   'pre_cool_enabled', 'pre_cool_duration_minutes', 'pre_cool_min_temp_gap_deg',
   'pre_cool_target_offset_deg', 'pre_cool_arrival_grace_seconds', 'pre_cool_no_show_action',
   'on_delay_seconds', 'off_delay_seconds',

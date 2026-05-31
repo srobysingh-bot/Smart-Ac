@@ -1,5 +1,9 @@
 # HawaAI add-on — release notes
 
+## 1.4.90
+
+- **Physical remote state:** Reconciles trusted live power telemetry into physical AC ON/OFF state so remote-driven AC starts show as ON without faking occupancy or bypassing safety logic.
+
 ## 1.4.89
 
 - **Pre-cool:** Added user-triggered arrival cooling holds that block vacancy OFF while active, hand off to normal occupied logic on arrival, and expire back to normal vacancy behavior on no-show.

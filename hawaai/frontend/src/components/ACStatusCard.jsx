@@ -245,6 +245,16 @@ function StateSourceHint({ source, show }) {
       label: 'Power confirmed',
       cls: 'text-yellow-400/90',
     },
+    power_telemetry: {
+      Icon: Zap,
+      label: 'Physical remote',
+      cls: 'text-yellow-400/90',
+    },
+    physical_remote: {
+      Icon: Zap,
+      label: 'Physical remote',
+      cls: 'text-yellow-400/90',
+    },
     inferred: {
       Icon: Brain,
       label: 'Estimated',

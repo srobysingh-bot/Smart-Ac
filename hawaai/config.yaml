@@ -1,5 +1,5 @@
 name: HawaAI AC Optimizer
-version: 1.4.89
+version: 1.4.90
 slug: hawaai
 description: AI-powered AC optimization using presence, temperature, and energy data
 url: https://github.com/srobysingh-bot/Smart-Ac
@@ -23,6 +23,10 @@ options:
   weather_provider: "openweathermap"
   target_temp: 24
   hysteresis: 1.5
+  physical_state_from_power: true
+  physical_on_watts: 100
+  physical_off_watts: 30
+  physical_state_confirm_seconds: 5
   vacancy_timeout_minutes: 5
   pre_cool_enabled: false
   pre_cool_duration_minutes: 25
@@ -77,6 +81,10 @@ schema:
   weather_provider: str
   target_temp: int
   hysteresis: float
+  physical_state_from_power: bool?
+  physical_on_watts: float?
+  physical_off_watts: float?
+  physical_state_confirm_seconds: int?
   vacancy_timeout_minutes: int
   pre_cool_enabled: bool?
   pre_cool_duration_minutes: int?
