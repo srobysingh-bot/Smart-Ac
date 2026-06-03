@@ -1,5 +1,9 @@
 # HawaAI add-on — release notes
 
+## 1.4.91
+
+- **LG fan guard:** Added a room-scoped guard for LG F1-F5/Turbo fan modes so automation never sends Turbo, while explicit user Turbo remains allowed and can time out back to the last safe fan.
+
 ## 1.4.90
 
 - **Physical remote state:** Reconciles trusted live power telemetry into physical AC ON/OFF state so remote-driven AC starts show as ON without faking occupancy or bypassing safety logic.

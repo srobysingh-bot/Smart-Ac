@@ -202,6 +202,8 @@ const ROOM_SETTINGS_KEYS = [
   'on_delay_seconds', 'off_delay_seconds',
   'energy_tariff_per_kwh', 'currency', 'use_presence', 'use_outdoor_temp',
   'smart_temp_adjustment', 'smart_cooling_enabled', 'manual_override', 'manual_override_enabled',
+  'lg_fan_guard_enabled', 'fan_guard_profile', 'auto_turbo_allowed', 'allow_manual_turbo',
+  'default_safe_fan_mode', 'preserve_last_non_turbo_fan', 'turbo_auto_timeout_minutes',
   'override_started_at', 'override_user_settings',
   'ac_brand', 'ac_model', 'weather_provider', 'weather_api_key', 'weather_city',
   'temperature_mode', 'timezone', 'schedule',

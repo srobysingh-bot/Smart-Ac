@@ -28,7 +28,7 @@ Modes:
 import logging
 from collections import defaultdict
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from . import ha_client
 
@@ -152,6 +152,7 @@ async def apply_smart_cooling(
     manual_override: bool,
     climate_entity: str,
     enabled:        bool,
+    fan_mode_guard: Optional[Callable[[str], Optional[str]]] = None,
 ) -> Dict[str, Any]:
     """
     Evaluate the current temperature gap and issue a fan-mode adjustment if needed.
@@ -265,6 +266,26 @@ async def apply_smart_cooling(
             target_fan_mode, _log_frag, supported,
         )
         return result
+
+    if fan_mode_guard is not None:
+        guarded = fan_mode_guard(str(resolved))
+        if guarded is None:
+            st["current_mode"] = target_mode
+            result["action"] = "fan_mode_guarded"
+            logger.info("[HawaAI] smart_cooling fan: guarded automation fan=%r", resolved)
+            return result
+        supported_replacement = _mode_in_supported(guarded, supported)
+        if supported_replacement is None:
+            st["current_mode"] = target_mode
+            result["action"] = "fan_mode_guard_replacement_unsupported"
+            logger.warning(
+                "[HawaAI] smart_cooling fan: guard replacement %r unsupported by %s",
+                guarded,
+                supported,
+            )
+            return result
+        resolved = supported_replacement
+        result["fan_mode_ha"] = resolved
 
     cur_fan = cstate.get("fan_mode")
     cur_norm = str(cur_fan).lower() if cur_fan is not None else ""

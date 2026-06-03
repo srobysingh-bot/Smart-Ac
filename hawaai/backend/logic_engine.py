@@ -502,6 +502,9 @@ class RoomRuntime:
     last_user_command_time: Optional[datetime] = None
     last_command_source: str = "system"                  # "user" | "system"
     manual_override_config_active: bool = False
+    last_non_turbo_fan_mode: Optional[str] = None
+    turbo_user_active: bool = False
+    turbo_started_at: Optional[datetime] = None
 
     # Last trusted occupancy reading when presence sensor is flaky (None/unavailable).
     last_known_presence: Optional[bool] = None
@@ -749,6 +752,130 @@ def _restore_persisted_manual_override(room_id: str, cfg: dict, st: RoomRuntime)
     except (TypeError, ValueError):
         pass
     return True
+
+
+LG_FAN_GUARD_PROFILE = "lg_f1_f5_turbo"
+LG_NORMAL_FAN_MODES = frozenset({"f1", "f2", "f3", "f4", "f5"})
+LG_TURBO_FAN_MODE = "turbo"
+
+
+def _fan_mode_norm(fan_mode: object) -> str:
+    return str(fan_mode or "").strip().lower()
+
+
+def _lg_fan_guard_enabled(cfg: dict) -> bool:
+    if not isinstance(cfg, dict) or not bool(cfg.get("lg_fan_guard_enabled", False)):
+        return False
+    return _fan_mode_norm(cfg.get("fan_guard_profile")) == LG_FAN_GUARD_PROFILE
+
+
+def _is_lg_normal_fan(fan_mode: object) -> bool:
+    return _fan_mode_norm(fan_mode) in LG_NORMAL_FAN_MODES
+
+
+def _is_lg_turbo_fan(fan_mode: object) -> bool:
+    return _fan_mode_norm(fan_mode) == LG_TURBO_FAN_MODE
+
+
+def _lg_safe_fan_mode(cfg: dict, st: RoomRuntime) -> str:
+    if bool(cfg.get("preserve_last_non_turbo_fan", True)) and _is_lg_normal_fan(st.last_non_turbo_fan_mode):
+        return str(st.last_non_turbo_fan_mode)
+    default_mode = _fan_mode_norm(cfg.get("default_safe_fan_mode") or "f3")
+    return default_mode if default_mode in LG_NORMAL_FAN_MODES else "f3"
+
+
+def _lg_turbo_timeout_expired(cfg: dict, st: RoomRuntime, now: Optional[datetime] = None) -> bool:
+    if not st.turbo_user_active or st.turbo_started_at is None:
+        return False
+    minutes = _cfg_float(cfg, "turbo_auto_timeout_minutes", 10.0, lo=0.0)
+    if minutes <= 0:
+        return False
+    tnow = now if now is not None else datetime.now(timezone.utc)
+    return tnow >= st.turbo_started_at + timedelta(minutes=minutes)
+
+
+def observe_fan_mode(room_id: str, cfg: dict, fan_mode: object, source: str = "climate_state") -> None:
+    """Track room-local LG fan state without changing any target or power decisions."""
+    st = _rt(room_id)
+    if not _lg_fan_guard_enabled(cfg):
+        return
+    if _is_lg_normal_fan(fan_mode):
+        st.last_non_turbo_fan_mode = str(fan_mode).strip()
+        st.turbo_user_active = False
+        st.turbo_started_at = None
+    elif _is_lg_turbo_fan(fan_mode) and bool(cfg.get("allow_manual_turbo", True)):
+        if not st.turbo_user_active:
+            logger.info("[COMFORT_GUARD] room=%s turbo_user_active", room_id)
+        st.turbo_user_active = True
+        if st.turbo_started_at is None:
+            st.turbo_started_at = datetime.now(timezone.utc)
+
+
+def record_user_fan_command(room_id: str, cfg: dict, fan_mode: object) -> None:
+    """Record explicit UI/HA fan commands; Turbo is user authority for this guard."""
+    if not _lg_fan_guard_enabled(cfg):
+        return
+    observe_fan_mode(room_id, cfg, fan_mode, source="user")
+
+
+def guard_automation_fan_mode(
+    room_id: str,
+    cfg: dict,
+    fan_mode: object,
+    source: str,
+    *,
+    now: Optional[datetime] = None,
+) -> Optional[str]:
+    """Return an automation-safe fan mode, or None when user Turbo should be preserved."""
+    st = _rt(room_id)
+    if not _lg_fan_guard_enabled(cfg) or fan_mode is None:
+        return None if fan_mode is None else str(fan_mode)
+    if st.turbo_user_active and not _lg_turbo_timeout_expired(cfg, st, now):
+        if _is_lg_turbo_fan(fan_mode):
+            replacement = _lg_safe_fan_mode(cfg, st)
+            logger.info(
+                "[COMFORT_GUARD] room=%s turbo_blocked replacement=%s source=%s",
+                room_id,
+                replacement,
+                source,
+            )
+        return None
+    if _is_lg_turbo_fan(fan_mode) and not bool(cfg.get("auto_turbo_allowed", False)):
+        replacement = _lg_safe_fan_mode(cfg, st)
+        logger.info(
+            "[COMFORT_GUARD] room=%s turbo_blocked replacement=%s source=%s",
+            room_id,
+            replacement,
+            source,
+        )
+        return replacement
+    if _is_lg_normal_fan(fan_mode):
+        st.last_non_turbo_fan_mode = str(fan_mode).strip()
+    return str(fan_mode)
+
+
+async def maybe_restore_lg_turbo_timeout(
+    room_id: str,
+    cfg: dict,
+    climate_entity: str,
+    now: Optional[datetime] = None,
+) -> Optional[str]:
+    st = _rt(room_id)
+    if not (_lg_fan_guard_enabled(cfg) and climate_entity and _lg_turbo_timeout_expired(cfg, st, now)):
+        return None
+    fan = _lg_safe_fan_mode(cfg, st)
+    ok = await ha_client.call_service(
+        "climate",
+        "set_fan_mode",
+        {"entity_id": climate_entity, "fan_mode": fan},
+    )
+    if ok:
+        logger.info("[COMFORT_GUARD] room=%s turbo_timeout_restore fan=%s", room_id, fan)
+        st.turbo_user_active = False
+        st.turbo_started_at = None
+        if _is_lg_normal_fan(fan):
+            st.last_non_turbo_fan_mode = fan
+    return fan if ok else None
 
 
 def _room_tick_serial_lock(room_id_key: str) -> asyncio.Lock:
@@ -1228,6 +1355,12 @@ def _power_physical_state_enabled(cfg: dict, st: RoomRuntime, power_watts: objec
         and st.telemetry_power_live_valid
         and not st.energy_power_suspicious
     )
+
+
+def _power_says_physical_on(cfg: dict, st: RoomRuntime, power_watts: object) -> bool:
+    if not _power_physical_state_enabled(cfg, st, power_watts):
+        return False
+    return float(power_watts) >= _cfg_float(cfg, "physical_on_watts", 100.0, lo=0.0)
 
 
 def _power_candidate_confirmed(
@@ -2536,6 +2669,7 @@ async def _load_startup_state(room_id: str, cfg: dict) -> None:
         climate_data = await ha_client.get_climate_state(str(climate_entity).strip())
         if not climate_data:
             return
+        observe_fan_mode(room_id, cfg, climate_data.get("fan_mode"), source="startup_climate")
 
         ha_state = (climate_data.get("state") or "off").lower()
         if ha_state == "cool":
@@ -3466,6 +3600,54 @@ async def _handle_pending_off_confirmation(
     return False
 
 
+def _ha_mode_label(climate_data: dict) -> str:
+    return str(
+        (climate_data or {}).get("mode")
+        or (climate_data or {}).get("hvac_mode")
+        or (climate_data or {}).get("state")
+        or "unknown"
+    ).strip().lower() or "unknown"
+
+
+async def _send_forced_physical_off_if_needed(
+    room_id: str,
+    cfg: dict,
+    indoor_temp: float,
+    st: RoomRuntime,
+    now: datetime,
+    *,
+    control_source: str,
+    telemetry_power_reading: Optional[float],
+    climate_data: dict,
+) -> Optional[bool]:
+    if control_source != "safety_vacant":
+        return None
+    if st.pending_off_confirmation:
+        return None
+    if not st.physical_ac_on:
+        return None
+    if not _power_says_physical_on(cfg, st, telemetry_power_reading):
+        return None
+
+    ha_mode = _ha_mode_label(climate_data or {})
+    log_with_room(
+        "warning",
+        room_id,
+        "[CONTROL] force_physical_off reason=power_says_on ha_mode=%s source=%s",
+        ha_mode,
+        control_source,
+    )
+    return await _turn_ac_off(
+        room_id,
+        cfg,
+        indoor_temp,
+        "vacant",
+        now=now,
+        force=True,
+        force_physical=True,
+    )
+
+
 def _off_dispatch_elapsed(st: RoomRuntime, now: datetime) -> float:
     if st.off_dispatched_at is None:
         return float("inf")
@@ -3478,6 +3660,7 @@ def _should_suppress_duplicate_off(
     now: datetime,
     *,
     climate_data: dict,
+    power_says_on: bool = False,
 ) -> bool:
     if st.last_command != "off":
         return False
@@ -3493,12 +3676,13 @@ def _should_suppress_duplicate_off(
 
     suppress = False
     reason = ""
-    if st.off_finalized and ha_off:
+    if st.off_finalized and ha_off and not power_says_on:
         suppress = True
         reason = "settled_off"
     elif (
         st.off_dispatch_pending
         and ha_off
+        and not power_says_on
         and _off_dispatch_elapsed(st, now) >= float(OFF_TERMINAL_RECONCILE_SECONDS)
     ):
         _finalize_runtime_off_state(
@@ -3512,7 +3696,7 @@ def _should_suppress_duplicate_off(
     elif st.off_dispatch_pending and _off_dispatch_elapsed(st, now) < float(OFF_TERMINAL_RECONCILE_SECONDS):
         suppress = True
         reason = "reconciliation_active"
-    elif _is_in_cooldown(st, now) and ha_off:
+    elif _is_in_cooldown(st, now) and ha_off and not power_says_on:
         suppress = True
         reason = "cooldown_off"
 
@@ -5333,6 +5517,9 @@ async def _tick_impl(rid_raw: str, room_id: str) -> None:
 
     if climate_entity:
         climate_data = await ha_client.get_climate_state(climate_entity)
+        if climate_data:
+            observe_fan_mode(room_id, cfg, climate_data.get("fan_mode"), source="tick_climate")
+            await maybe_restore_lg_turbo_timeout(room_id, cfg, climate_entity, now)
 
     if indoor_temp is None and climate_data:
         fallback = climate_data.get("current_temp")
@@ -6041,11 +6228,28 @@ async def _tick_impl(rid_raw: str, room_id: str) -> None:
 
         reason_off = "vacant" if "vacant" in control_source else "target_reached"
         force_off = control_source.startswith("safety") or control_source == "thermostat_reached"
-        if _should_suppress_duplicate_off(
+        power_says_on = bool(
+            st.physical_ac_on
+            and _power_says_physical_on(cfg, st, telemetry_power_reading)
+        )
+        forced_physical_off = await _send_forced_physical_off_if_needed(
+            room_id,
+            cfg,
+            indoor_temp,
+            st,
+            now,
+            control_source=control_source,
+            telemetry_power_reading=telemetry_power_reading,
+            climate_data=climate_data or {},
+        )
+        if forced_physical_off is not None:
+            pass
+        elif _should_suppress_duplicate_off(
             room_id,
             st,
             now,
             climate_data=climate_data or {},
+            power_says_on=power_says_on,
         ):
             if st.off_finalized:
                 _clear_pending_command_state(st)
@@ -6084,13 +6288,21 @@ async def _tick_impl(rid_raw: str, room_id: str) -> None:
             and _rec.get("fan_mode")
             and _rec.get("action") not in (None, "none")
         ):
-            await apply_ai_fan(
+            guarded_fan = guard_automation_fan_mode(
                 room_id,
-                climate_entity,
+                cfg,
                 str(_rec.get("fan_mode", "auto")),
-                str(_rec.get("action", "none")),
+                "schedule_ai",
+                now=now,
             )
-            ai_fan_applied = True
+            if guarded_fan:
+                await apply_ai_fan(
+                    room_id,
+                    climate_entity,
+                    guarded_fan,
+                    str(_rec.get("action", "none")),
+                )
+                ai_fan_applied = True
 
         if not ai_fan_applied and cfg.get("smart_cooling_enabled", False):
             await smart_cooling.apply_smart_cooling(
@@ -6103,6 +6315,13 @@ async def _tick_impl(rid_raw: str, room_id: str) -> None:
                 manual_override=False,
                 climate_entity=climate_entity,
                 enabled=True,
+                fan_mode_guard=lambda fan: guard_automation_fan_mode(
+                    room_id,
+                    cfg,
+                    fan,
+                    "smart_fan",
+                    now=now,
+                ),
             )
 
     sleep_target_changed = abs(float(getattr(sleep_result, "offset", 0.0))) >= 0.01
@@ -7014,6 +7233,7 @@ async def _turn_ac_off(
     now: Optional[datetime] = None,
     *,
     force: bool = False,
+    force_physical: bool = False,
     close_session_on_send: bool = True,
 ) -> bool:
     st = _rt(room_id)
@@ -7023,7 +7243,7 @@ async def _turn_ac_off(
     vacancy_off = _is_vacancy_off_reason(reason)
 
     if st.last_command == "off":
-        if st.off_finalized:
+        if st.off_finalized and not force_physical:
             log_with_room("info", room_id, "[RUNTIME] duplicate_off_suppressed reason=settled_off")
             return False
         if st.pending_off_confirmation:
@@ -7260,6 +7480,9 @@ def get_runtime_state(room_id: str) -> dict:
         "cooling_effectiveness_warning": st.cooling_effectiveness_warning,
         "cooling_effectiveness_drop_rate": st.cooling_effectiveness_drop_rate,
         "last_command_source":   st.last_command_source,
+        "last_non_turbo_fan_mode": st.last_non_turbo_fan_mode,
+        "turbo_user_active":     bool(st.turbo_user_active),
+        "turbo_started_at":      st.turbo_started_at.isoformat() if st.turbo_started_at else None,
         "last_ac_on_at":         st.last_ac_on_at,
         "last_ac_off_at":        st.last_ac_off_at,
         "ir_last_sent_at":       st.ir_last_sent_ts.isoformat() if st.ir_last_sent_ts else None,

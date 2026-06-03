@@ -462,6 +462,168 @@ class TestLogicEngineHardening(unittest.TestCase):
         self.assertTrue(st.physical_ac_on)
         self.assertEqual((action, source, target), ("off", "safety_vacant", 24.0))
 
+    def test_physical_remote_off_forces_ir_when_ha_mode_off_and_power_high(self):
+        logic_engine._runtime_by_room.clear()
+        rid = "physicalforceoff"
+        cfg = self._pre_cool_config(rid)
+        cfg["climate_entity"] = "climate.dining"
+        st = logic_engine._rt(rid)
+        self._mark_power_telemetry_valid(st)
+        now = datetime.now(timezone.utc)
+        st.physical_ac_on = True
+        st.ac_is_on = False
+        st.ac_state = "off"
+        st.ac_state_source = "power_telemetry"
+        st.last_ac_on_at = (now - timedelta(minutes=10)).timestamp()
+        st.last_command = "off"
+        st.last_command_time = now - timedelta(minutes=10)
+        st.off_finalized = True
+
+        async def run_case():
+            with (
+                mock.patch.object(logic_engine, "_dispatch_off_ir", new=mock.AsyncMock(return_value=True)) as dispatch,
+                mock.patch.object(logic_engine, "log_with_room") as log_room,
+            ):
+                sent = await logic_engine._send_forced_physical_off_if_needed(
+                    rid,
+                    cfg,
+                    29.0,
+                    st,
+                    now,
+                    control_source="safety_vacant",
+                    telemetry_power_reading=843,
+                    climate_data={"mode": "off"},
+                )
+
+            self.assertTrue(sent)
+            dispatch.assert_awaited_once_with(rid, cfg, "climate.dining")
+            self.assertEqual(st.last_command, "off")
+            self.assertEqual(st.off_reason, "vacant")
+            self.assertTrue(st.pending_off_confirmation)
+            self.assertEqual(st.ac_state, "pending_off")
+            self.assertTrue(
+                any(
+                    call.args[2]
+                    == "[CONTROL] force_physical_off reason=power_says_on ha_mode=%s source=%s"
+                    for call in log_room.call_args_list
+                )
+            )
+
+        asyncio.run(run_case())
+
+    def test_forced_physical_off_power_drop_confirms_and_clears(self):
+        logic_engine._runtime_by_room.clear()
+        rid = "physicalforceconfirm"
+        cfg = self._pre_cool_config(rid)
+        cfg["climate_entity"] = "climate.dining"
+        st = logic_engine._rt(rid)
+        self._mark_power_telemetry_valid(st)
+        now = datetime.now(timezone.utc)
+        st.physical_ac_on = True
+        st.ac_is_on = True
+        st.pending_action = "off"
+        st.pending_off_confirmation = True
+        st.pending_off_sent_at = now - timedelta(seconds=5)
+        st.off_reason = "vacant"
+        st.last_command = "off"
+        st.occupied = False
+        st.stable_occupied = False
+
+        async def run_case():
+            confirmed = await logic_engine._handle_pending_off_confirmation(
+                rid,
+                cfg,
+                29.0,
+                st,
+                now,
+                telemetry_power_reading=5,
+                climate_data={"mode": "off"},
+                room_is_occupied=False,
+            )
+            self.assertTrue(confirmed)
+            self.assertFalse(st.pending_off_confirmation)
+            self.assertFalse(st.physical_ac_on)
+            self.assertFalse(st.ac_is_on)
+            self.assertEqual(st.ac_state, "off")
+
+        asyncio.run(run_case())
+
+    def test_forced_physical_off_power_high_allows_retry_after_backoff(self):
+        logic_engine._runtime_by_room.clear()
+        rid = "physicalforceretry"
+        cfg = self._pre_cool_config(rid)
+        cfg["climate_entity"] = "climate.dining"
+        st = logic_engine._rt(rid)
+        self._mark_power_telemetry_valid(st)
+        now = datetime.now(timezone.utc)
+        st.physical_ac_on = True
+        st.ac_is_on = True
+        st.pending_action = "off"
+        st.pending_off_confirmation = True
+        st.pending_off_sent_at = now - timedelta(seconds=logic_engine.OFF_CONFIRM_RETRY_SECONDS + 1)
+        st.pending_off_retry_count = 0
+        st.off_reason = "vacant"
+        st.last_command = "off"
+        st.occupied = False
+        st.stable_occupied = False
+
+        async def run_case():
+            with mock.patch.object(
+                logic_engine,
+                "_dispatch_off_ir",
+                new=mock.AsyncMock(return_value=True),
+            ) as dispatch:
+                handled = await logic_engine._handle_pending_off_confirmation(
+                    rid,
+                    cfg,
+                    29.0,
+                    st,
+                    now,
+                    telemetry_power_reading=843,
+                    climate_data={"mode": "off"},
+                    room_is_occupied=False,
+                )
+            self.assertFalse(handled)
+            dispatch.assert_awaited_once_with(rid, cfg, "climate.dining")
+            self.assertEqual(st.pending_off_retry_count, 1)
+            self.assertTrue(st.pending_off_confirmation)
+
+        asyncio.run(run_case())
+
+    def test_normal_hawaai_off_path_still_sends_command(self):
+        logic_engine._runtime_by_room.clear()
+        rid = "normaloffpath"
+        cfg = self._pre_cool_config(rid)
+        cfg["climate_entity"] = "climate.dining"
+        st = logic_engine._rt(rid)
+        now = datetime.now(timezone.utc)
+        st.ac_is_on = True
+        st.physical_ac_on = True
+        st.ac_state = "on"
+        st.last_ac_on_at = (now - timedelta(minutes=10)).timestamp()
+        st.compressor_on_since = now - timedelta(minutes=10)
+
+        async def run_case():
+            with mock.patch.object(
+                logic_engine,
+                "_dispatch_off_ir",
+                new=mock.AsyncMock(return_value=True),
+            ) as dispatch:
+                sent = await logic_engine._turn_ac_off(
+                    rid,
+                    cfg,
+                    24.0,
+                    "target_reached",
+                    now=now,
+                    force=False,
+                )
+            self.assertTrue(sent)
+            dispatch.assert_awaited_once_with(rid, cfg, "climate.dining")
+            self.assertFalse(st.pending_off_confirmation)
+            self.assertFalse(st.ac_is_on)
+
+        asyncio.run(run_case())
+
     def test_pre_cool_active_blocks_vacancy_off_after_physical_remote_on_detection(self):
         logic_engine._runtime_by_room.clear()
         rid = "physicalprecool"

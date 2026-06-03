@@ -259,13 +259,19 @@ def _climate_payload_log_suffix(service: str, payload: Dict[str, Any]) -> str:
     return ""
 
 
+def _climate_config_for_room(room_id: Optional[str]) -> Dict[str, Any]:
+    base = config_manager.load_config()
+    if not room_id:
+        return base
+    room_def = logic_engine.resolve_room_definition(base, room_id)
+    return room_registry.merge_room_config(base, room_def) if room_def else base
+
+
 def _climate_backend_for_room(room_id: Optional[str]) -> str:
     if not room_id:
         return "aerostate"
     try:
-        base = config_manager.load_config()
-        room_def = logic_engine.resolve_room_definition(base, room_id)
-        merged = room_registry.merge_room_config(base, room_def) if room_def else base
+        merged = _climate_config_for_room(room_id)
         return logic_engine.normalize_ir_backend(merged)
     except Exception:
         logger.debug("[CLIMATE_CMD] backend resolve failed room=%s", room_id, exc_info=True)
@@ -343,6 +349,16 @@ async def _send_climate_command(
     if ok and room_id:
         if service == "set_temperature" and payload.get("temperature") is not None:
             logic_engine.record_user_temperature_command(room_id, float(payload.get("temperature")))
+        elif service == "set_fan_mode" and payload.get("fan_mode") is not None:
+            try:
+                logic_engine.record_user_fan_command(
+                    room_id,
+                    _climate_config_for_room(room_id),
+                    payload.get("fan_mode"),
+                )
+            except Exception:
+                logger.debug("[CLIMATE_CMD] fan guard record failed room=%s", room_id, exc_info=True)
+            logic_engine.record_user_api_command(room_id)
         else:
             logic_engine.record_user_api_command(room_id)
         _api_last_command[room_id] = time.monotonic()
@@ -525,7 +541,7 @@ async def lifespan(app: FastAPI):
     logger.info("[HawaAI] Add-on stopped")
 
 
-app = FastAPI(title="HawaAI API", version="1.4.90", lifespan=lifespan)
+app = FastAPI(title="HawaAI API", version="1.4.91", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -1313,6 +1329,7 @@ async def api_create_room(body: Dict[str, Any] = Body(...)):
         inc = dict(body["settings"])
         _sanitize_zone_room_settings(inc)
         _sanitize_control_mode_room_settings(inc)
+        _sanitize_lg_fan_guard_room_settings(inc)
         _normalize_manual_override_room_settings(inc, room_registry.merge_room_config(base, row))
         _sanitize_effective_target_room_settings(base, row, inc)
         row["settings"] = {
@@ -1372,6 +1389,34 @@ def _sanitize_control_mode_room_settings(incoming_settings: Dict[str, Any]) -> N
             incoming_settings[key] = max(lo, min(float(incoming_settings[key]), hi))
         except (TypeError, ValueError):
             incoming_settings[key] = default
+
+
+def _sanitize_lg_fan_guard_room_settings(incoming_settings: Dict[str, Any]) -> None:
+    if not isinstance(incoming_settings, dict):
+        return
+    if "lg_fan_guard_enabled" in incoming_settings:
+        incoming_settings["lg_fan_guard_enabled"] = bool(incoming_settings.get("lg_fan_guard_enabled"))
+    if "fan_guard_profile" in incoming_settings:
+        profile = str(incoming_settings.get("fan_guard_profile") or "").strip().lower()
+        incoming_settings["fan_guard_profile"] = (
+            profile if profile == logic_engine.LG_FAN_GUARD_PROFILE else ""
+        )
+    for key in ("auto_turbo_allowed", "allow_manual_turbo", "preserve_last_non_turbo_fan"):
+        if key in incoming_settings:
+            incoming_settings[key] = bool(incoming_settings.get(key))
+    if "default_safe_fan_mode" in incoming_settings:
+        fan = str(incoming_settings.get("default_safe_fan_mode") or "f3").strip().lower()
+        incoming_settings["default_safe_fan_mode"] = (
+            fan if fan in logic_engine.LG_NORMAL_FAN_MODES else "f3"
+        )
+    if "turbo_auto_timeout_minutes" in incoming_settings:
+        try:
+            incoming_settings["turbo_auto_timeout_minutes"] = max(
+                0,
+                min(int(round(float(incoming_settings["turbo_auto_timeout_minutes"]))), 1440),
+            )
+        except (TypeError, ValueError):
+            incoming_settings["turbo_auto_timeout_minutes"] = 10
 
 
 def _normalize_manual_override_room_settings(
@@ -1552,6 +1597,7 @@ async def api_update_room(room_id: str, body: Dict[str, Any] = Body(...)):
             inc_applied = dict(inc)
             _sanitize_zone_room_settings(inc_applied)
             _sanitize_control_mode_room_settings(inc_applied)
+            _sanitize_lg_fan_guard_room_settings(inc_applied)
             _sanitize_temperature_mode_room_settings(inc_applied)
             _normalize_manual_override_room_settings(inc_applied, old_effective)
             _sanitize_effective_target_room_settings(base, r, inc_applied)
