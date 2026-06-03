@@ -180,6 +180,9 @@ export const getEntities = (domain) => {
 }
 
 // ── Climate entity ────────────────────────────────────────────────────────────
+export const getHaPersons = () => request('/ha/persons')
+export const getHaHomeLocation = () => request('/ha/home-location')
+
 export const getClimateState = (entityId) =>
   request(`/climate/${encodeURIComponent(entityId)}`)
 

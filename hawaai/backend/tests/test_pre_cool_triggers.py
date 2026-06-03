@@ -217,6 +217,54 @@ class PreCoolTriggerTests(TestCase):
 
         asyncio.run(run_case())
 
+    def test_geofence_auto_start_blocked_without_home_coordinates(self):
+        async def run_case():
+            cfg = _cfg(
+                pre_cool_geofence_enabled=True,
+                pre_cool_geofence_mode="auto_start",
+                pre_cool_allowed_people=["person.amit"],
+                pre_cool_home_latitude=None,
+                pre_cool_home_longitude=None,
+            )
+            result, tick_mock = await self._start(cfg, source="geofence", person="person.amit")
+            self.assertFalse(result["success"])
+            self.assertEqual(result["pre_cool_result"], "blocked_geofence_home_location_required")
+            tick_mock.assert_not_awaited()
+
+        asyncio.run(run_case())
+
+    def test_api_ha_persons_returns_only_person_entities(self):
+        async def run_case():
+            states = [
+                {"entity_id": "person.amit", "attributes": {"friendly_name": "Amit"}},
+                {"entity_id": "sensor.temp", "attributes": {"friendly_name": "Temp"}},
+                {"entity_id": "person.mother", "attributes": {"friendly_name": "Mother"}},
+                {"entity_id": "device_tracker.phone", "attributes": {"friendly_name": "Phone"}},
+            ]
+            with mock.patch.object(main.ha_client, "get_all_entities", new=mock.AsyncMock(return_value=states)):
+                result = await main.list_ha_persons()
+            self.assertEqual(
+                result,
+                [
+                    {"entity_id": "person.amit", "name": "Amit"},
+                    {"entity_id": "person.mother", "name": "Mother"},
+                ],
+            )
+
+        asyncio.run(run_case())
+
+    def test_api_ha_home_location_reads_ha_config(self):
+        async def run_case():
+            with mock.patch.object(
+                main.ha_client,
+                "get_ha_config",
+                new=mock.AsyncMock(return_value={"latitude": 28.6139, "longitude": 77.2090}),
+            ):
+                result = await main.get_ha_home_location()
+            self.assertEqual(result, {"latitude": 28.6139, "longitude": 77.209})
+
+        asyncio.run(run_case())
+
     def test_ha_person_location_outside_addon_radius_does_not_trigger_pre_cool(self):
         async def run_case():
             cfg = _cfg(
@@ -384,6 +432,36 @@ class PreCoolTriggerTests(TestCase):
             self.assertFalse(result["pre_cool_geofence_enabled"])
             save_mock.assert_called_once()
             self.assertFalse(saved["rooms"][0]["settings"]["pre_cool_geofence_enabled"])
+
+        asyncio.run(run_case())
+
+    def test_room_update_saves_multiple_allowed_people_from_multiselect(self):
+        async def run_case():
+            cfg = _cfg()
+            saved = {}
+
+            def save_config(payload):
+                saved.update(payload)
+                return True
+
+            with (
+                mock.patch.object(main.config_manager, "load_config", return_value=cfg),
+                mock.patch.object(main.config_manager, "save_config", side_effect=save_config),
+                mock.patch.object(main.logic_engine, "trigger_tick"),
+            ):
+                await main.api_update_room(
+                    "precool-room",
+                    {
+                        "settings": {
+                            "pre_cool_allowed_people": ["person.amit", "person.mother"],
+                        },
+                    },
+                )
+
+            self.assertEqual(
+                saved["rooms"][0]["settings"]["pre_cool_allowed_people"],
+                ["person.amit", "person.mother"],
+            )
 
         asyncio.run(run_case())
 

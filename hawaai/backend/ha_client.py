@@ -158,6 +158,24 @@ async def get_all_entities() -> List[Dict[str, Any]]:
         return []
 
 
+async def get_ha_config() -> Dict[str, Any]:
+    """Return Home Assistant Core config, including home latitude/longitude."""
+    url = f"{HA_BASE_URL}/api/config"
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(
+                url, headers=_headers(), timeout=aiohttp.ClientTimeout(total=5)
+            ) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    return data if isinstance(data, dict) else {}
+                logger.error("[HawaAI] get_ha_config HTTP %s", resp.status)
+                return {}
+    except Exception as e:
+        logger.error("[HawaAI] get_ha_config exception: %s", e)
+        return {}
+
+
 async def call_service(
     domain: str,
     service: str,

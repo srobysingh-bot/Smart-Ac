@@ -4,6 +4,8 @@ import {
   getEntities,
   getDevices,
   getDeviceEntities,
+  getHaHomeLocation,
+  getHaPersons,
   getWeather,
   getStatus,
   updateRoom,
@@ -173,6 +175,56 @@ function EntityDropdown({ label, value, onChange, entities, search, onSearchChan
 }
 
 // ── Hardcoded brand list ──────────────────────────────────────────────────────
+function PersonMultiSelect({ people, value, onChange, loading }) {
+  const selected = Array.isArray(value) ? value : []
+  const knownIds = new Set(people.map(p => p.entity_id))
+  const savedOnly = selected
+    .filter(id => id && !knownIds.has(id))
+    .map(id => ({ entity_id: id, name: `${id} (saved)` }))
+  const options = [...people, ...savedOnly]
+
+  const toggle = (entityId) => {
+    const id = String(entityId || '').trim()
+    if (!id) return
+    const next = selected.includes(id)
+      ? selected.filter(item => item !== id)
+      : [...selected, id]
+    onChange(next)
+  }
+
+  return (
+    <div className="sm:col-span-2">
+      <Label>Allowed people</Label>
+      <p className="text-xs text-gray-500 mb-2">Select who can trigger geofence pre-cool for this room.</p>
+      <div className="rounded-lg border border-gray-700 bg-gray-900/45 p-2 max-h-48 overflow-y-auto">
+        {loading ? (
+          <p className="px-2 py-1.5 text-xs text-gray-500">Loading people...</p>
+        ) : options.length === 0 ? (
+          <p className="px-2 py-1.5 text-xs text-amber-300">No Home Assistant person entities found.</p>
+        ) : (
+          options.map(person => (
+            <label
+              key={person.entity_id}
+              className="flex items-center gap-2 rounded-md px-2 py-1.5 text-sm text-gray-200 hover:bg-gray-800"
+            >
+              <input
+                type="checkbox"
+                checked={selected.includes(person.entity_id)}
+                onChange={() => toggle(person.entity_id)}
+                className="h-4 w-4 rounded border-gray-600 bg-gray-900 accent-blue-500"
+              />
+              <span className="min-w-0">
+                <span className="block font-medium">{person.name || person.entity_id}</span>
+                <span className="block truncate text-xs text-gray-500">{person.entity_id}</span>
+              </span>
+            </label>
+          ))
+        )}
+      </div>
+    </div>
+  )
+}
+
 const AC_BRANDS = [
   'Daikin', 'LG', 'Samsung', 'Voltas', 'Carrier', 'Hitachi',
   'Mitsubishi Electric', 'Panasonic', 'Haier', 'Blue Star', 'Other',
@@ -287,6 +339,10 @@ export default function Settings() {
 
   const [cfg,        setCfg]        = useState({})
   const [entities,   setEntities]   = useState([])
+  const [haPersons,  setHaPersons]  = useState([])
+  const [haPersonsLoading, setHaPersonsLoading] = useState(false)
+  const [homeLocationBusy, setHomeLocationBusy] = useState(false)
+  const [homeLocationWarning, setHomeLocationWarning] = useState('')
   const [roomTitle,  setRoomTitle]  = useState('')
   const [loadError,  setLoadError]  = useState(null)
   const [saving,     setSaving]     = useState(false)
@@ -368,11 +424,14 @@ export default function Settings() {
       setRoomDisabled(false)
       setSelectedDevice(null)
       setDeviceEntities([])
+      setHaPersons([])
+      setHaPersonsLoading(false)
       setLoading(false)
       return
     }
     let alive = true
     setLoading(true)
+    setHaPersonsLoading(true)
     setDevicesError(null)
     setLoadError(null)
     Promise.all([
@@ -381,12 +440,16 @@ export default function Settings() {
         console.warn('[HawaAI] Settings entity list unavailable; preserving saved room config', err)
         return []
       }),
+      getHaPersons().catch(err => {
+        console.warn('[HawaAI] HA person list unavailable', err)
+        return []
+      }),
       getDevices().catch(err => {
         setDevicesError(String(err))
         return []
       }),
     ])
-      .then(([detail, e, devs]) => {
+      .then(([detail, e, people, devs]) => {
         if (!alive) return
         const c = { ...detail.effective }
         if (c.weather_api_key === '***') c.weather_api_key = ''
@@ -395,6 +458,7 @@ export default function Settings() {
         setRoomTitle(detail.room?.name || roomId)
         setRoomDisabled(Boolean(detail.room?.disabled))
         setEntities(e)
+        setHaPersons(Array.isArray(people) ? people : [])
         setAllDevices(devs)
         setSelectedDevice(
           devs.find(d => d.device_id === String(c.energy_device_id || '').trim()) || null,
@@ -408,13 +472,47 @@ export default function Settings() {
         }
       })
       .finally(() => {
-        if (alive) setLoading(false)
+        if (alive) {
+          setLoading(false)
+          setHaPersonsLoading(false)
+        }
       })
     return () => { alive = false }
   }, [roomId])
 
   const patch = useCallback((key, val) => {
     setCfg(prev => ({ ...prev, [key]: val }))
+  }, [])
+
+  const hasHomeCoordinates = useCallback((source = cfg) => {
+    const lat = Number(source.pre_cool_home_latitude)
+    const lon = Number(source.pre_cool_home_longitude)
+    return Number.isFinite(lat) && Number.isFinite(lon)
+      && lat >= -90 && lat <= 90
+      && lon >= -180 && lon <= 180
+  }, [cfg])
+
+  const useHomeAssistantLocation = useCallback(async () => {
+    setHomeLocationBusy(true)
+    setHomeLocationWarning('')
+    try {
+      const loc = await getHaHomeLocation()
+      const lat = Number(loc?.latitude)
+      const lon = Number(loc?.longitude)
+      if (!Number.isFinite(lat) || !Number.isFinite(lon)) {
+        setHomeLocationWarning('Set your Home Assistant home location first.')
+        return
+      }
+      setCfg(prev => ({
+        ...prev,
+        pre_cool_home_latitude: lat,
+        pre_cool_home_longitude: lon,
+      }))
+    } catch (err) {
+      setHomeLocationWarning('Set your Home Assistant home location first.')
+    } finally {
+      setHomeLocationBusy(false)
+    }
   }, [])
 
   const patchScheduleTemp = useCallback((key, val) => {
@@ -448,6 +546,21 @@ export default function Settings() {
       if (!String(settings.zone_entity_id || '').trim()) {
         delete settings.zone_entity_id
         settings.zone_required_for_on = false
+      }
+      if (
+        settings.pre_cool_geofence_enabled &&
+        settings.pre_cool_geofence_mode === 'auto_start'
+      ) {
+        if (!Array.isArray(settings.pre_cool_allowed_people) || settings.pre_cool_allowed_people.length === 0) {
+          setSaveStatus('error')
+          setSaveMsg('Select who can trigger geofence pre-cool before enabling auto-start.')
+          return
+        }
+        if (!hasHomeCoordinates(settings)) {
+          setSaveStatus('error')
+          setSaveMsg('Set home latitude and longitude before enabling geofence auto-start.')
+          return
+        }
       }
 
       const ai_config = {}
@@ -1679,29 +1792,52 @@ export default function Settings() {
               <p className="sm:col-span-2 text-[11px] text-gray-500">
                 Uses phone latitude/longitude from Home Assistant and this add-on radius. Small radius starts closer to home. Recommended: 2 km.
               </p>
-              <Input
-                label="Home latitude"
-                type="number"
-                value={cfg.pre_cool_home_latitude ?? ''}
-                onChange={v => patch('pre_cool_home_latitude', v === '' ? null : v)}
-                min={-90}
-                max={90}
-                step={0.000001}
-              />
-              <Input
-                label="Home longitude"
-                type="number"
-                value={cfg.pre_cool_home_longitude ?? ''}
-                onChange={v => patch('pre_cool_home_longitude', v === '' ? null : v)}
-                min={-180}
-                max={180}
-                step={0.000001}
-              />
-              <Input
-                label="Allowed people"
-                value={Array.isArray(cfg.pre_cool_allowed_people) ? cfg.pre_cool_allowed_people.join(', ') : ''}
-                onChange={v => patch('pre_cool_allowed_people', String(v || '').split(',').map(x => x.trim()).filter(Boolean))}
-                placeholder="person.amit, person.family"
+              <div>
+                <Label>Home latitude</Label>
+                <input
+                  type="number"
+                  min={-90}
+                  max={90}
+                  step={0.000001}
+                  className="w-full bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm text-gray-100 focus:outline-none focus:border-blue-500"
+                  value={cfg.pre_cool_home_latitude ?? ''}
+                  onChange={e => patch('pre_cool_home_latitude', e.target.value === '' ? null : Number(e.target.value))}
+                />
+              </div>
+              <div>
+                <Label>Home longitude</Label>
+                <input
+                  type="number"
+                  min={-180}
+                  max={180}
+                  step={0.000001}
+                  className="w-full bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm text-gray-100 focus:outline-none focus:border-blue-500"
+                  value={cfg.pre_cool_home_longitude ?? ''}
+                  onChange={e => patch('pre_cool_home_longitude', e.target.value === '' ? null : Number(e.target.value))}
+                />
+              </div>
+              <div className="sm:col-span-2 rounded-lg border border-gray-800 bg-gray-900/35 p-3">
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <p className="text-xs text-gray-500">Used as center point for add-on radius calculation.</p>
+                  <button
+                    type="button"
+                    onClick={useHomeAssistantLocation}
+                    disabled={homeLocationBusy}
+                    className="inline-flex items-center gap-2 rounded-md border border-blue-500/45 bg-blue-500/15 px-3 py-1.5 text-xs font-semibold text-blue-100 transition hover:border-blue-300/70 disabled:cursor-not-allowed disabled:opacity-50"
+                  >
+                    <RefreshCw size={13} className={homeLocationBusy ? 'animate-spin' : ''} />
+                    Use Home Assistant home location
+                  </button>
+                </div>
+                {homeLocationWarning && (
+                  <p className="mt-2 text-xs text-amber-300">{homeLocationWarning}</p>
+                )}
+              </div>
+              <PersonMultiSelect
+                people={haPersons}
+                value={cfg.pre_cool_allowed_people}
+                onChange={v => patch('pre_cool_allowed_people', v)}
+                loading={haPersonsLoading}
               />
               <Slider
                 label="Geofence cooldown"

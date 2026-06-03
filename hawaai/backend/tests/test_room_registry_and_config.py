@@ -61,6 +61,36 @@ class TestConfigLoad(unittest.TestCase):
         self.assertEqual(src.count("\n              Cancel\n"), 1)
         self.assertEqual(src.count("\n              Snooze today\n"), 1)
 
+    def test_geofence_precool_settings_use_person_multiselect_and_home_location_button(self):
+        frontend_root = os.path.normpath(
+            os.path.join(os.path.dirname(__file__), "..", "..", "frontend")
+        )
+        with open(
+            os.path.join(frontend_root, "src", "pages", "Settings.jsx"),
+            "r",
+            encoding="utf-8",
+        ) as f:
+            src = f.read()
+        with open(
+            os.path.join(frontend_root, "src", "api", "smartcool.js"),
+            "r",
+            encoding="utf-8",
+        ) as f:
+            api_src = f.read()
+
+        self.assertIn("function PersonMultiSelect", src)
+        self.assertIn('type="checkbox"', src)
+        self.assertIn("Select who can trigger geofence pre-cool for this room.", src)
+        self.assertIn("Use Home Assistant home location", src)
+        self.assertIn("Used as center point for add-on radius calculation.", src)
+        self.assertIn("getHaPersons", src)
+        self.assertIn("getHaHomeLocation", src)
+        self.assertIn("patch('pre_cool_allowed_people', v)", src)
+        self.assertNotIn("join(', ')", src)
+        self.assertNotIn("split(',')", src)
+        self.assertIn("request('/ha/persons')", api_src)
+        self.assertIn("request('/ha/home-location')", api_src)
+
     def test_load_uses_backup_when_primary_read_fails(self):
         import backend.config_manager as cm
 

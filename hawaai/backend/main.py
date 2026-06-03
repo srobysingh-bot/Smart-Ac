@@ -541,7 +541,7 @@ async def lifespan(app: FastAPI):
     logger.info("[HawaAI] Add-on stopped")
 
 
-app = FastAPI(title="HawaAI API", version="1.4.91", lifespan=lifespan)
+app = FastAPI(title="HawaAI API", version="1.4.93", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -2205,6 +2205,40 @@ async def list_entities(filter: Optional[str] = None, domain: Optional[str] = No
 
 
 # ── HA DEVICE REGISTRY ────────────────────────────────────────────────────────
+
+@app.get("/api/ha/persons")
+async def list_ha_persons():
+    """Return Home Assistant person entities for geofence pre-cool selection."""
+    all_entities = await ha_client.get_all_entities()
+    result = []
+    for e in all_entities:
+        entity_id = str(e.get("entity_id") or "").strip()
+        if not entity_id.startswith("person."):
+            continue
+        attrs = e.get("attributes") or {}
+        fallback = entity_id.split(".", 1)[1].replace("_", " ").title()
+        name = str(attrs.get("friendly_name") or fallback)
+        result.append({"entity_id": entity_id, "name": name})
+    result.sort(key=lambda item: item["name"].lower())
+    return result
+
+
+@app.get("/api/ha/home-location")
+async def get_ha_home_location():
+    """Return Home Assistant's configured home latitude/longitude."""
+    cfg = await ha_client.get_ha_config()
+    try:
+        latitude = float(cfg.get("latitude"))
+        longitude = float(cfg.get("longitude"))
+    except (TypeError, ValueError):
+        latitude = None
+        longitude = None
+    if latitude is None or longitude is None:
+        return {"latitude": None, "longitude": None}
+    if latitude < -90.0 or latitude > 90.0 or longitude < -180.0 or longitude > 180.0:
+        return {"latitude": None, "longitude": None}
+    return {"latitude": latitude, "longitude": longitude}
+
 
 @app.get("/api/devices")
 async def get_devices():

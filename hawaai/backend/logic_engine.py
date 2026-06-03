@@ -1361,6 +1361,20 @@ def _person_allowed_for_pre_cool(cfg: dict, person: Optional[str]) -> bool:
     return bool(p and p in allowed)
 
 
+def _pre_cool_home_location_configured(cfg: dict) -> bool:
+    try:
+        lat = float(cfg.get("pre_cool_home_latitude"))
+        lon = float(cfg.get("pre_cool_home_longitude"))
+    except (TypeError, ValueError):
+        return False
+    return bool(
+        math.isfinite(lat)
+        and math.isfinite(lon)
+        and -90.0 <= lat <= 90.0
+        and -180.0 <= lon <= 180.0
+    )
+
+
 def _pre_cool_visit_id(person: Optional[str], explicit_visit_id: Optional[str] = None) -> str:
     visit = str(explicit_visit_id or "").strip()
     if visit:
@@ -1651,6 +1665,9 @@ async def start_pre_cool(
             return _pre_cool_response(canon, st, result=st.pre_cool_result, success=False)
         if not _person_allowed_for_pre_cool(cfg, person):
             st.pre_cool_result = "blocked_person_not_allowed"
+            return _pre_cool_response(canon, st, result=st.pre_cool_result, success=False)
+        if _pre_cool_geofence_mode(cfg) == "auto_start" and not _pre_cool_home_location_configured(cfg):
+            st.pre_cool_result = "blocked_geofence_home_location_required"
             return _pre_cool_response(canon, st, result=st.pre_cool_result, success=False)
         if _pre_cool_blocked_by_snooze(st, now):
             st.pre_cool_result = "blocked_snoozed"
