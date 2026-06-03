@@ -44,6 +44,23 @@ class TestConfigLoad(unittest.TestCase):
         self.assertIn('min={0} max={60} step={1} unit=" min"', src)
         self.assertIn("0 min = turn OFF as soon as vacancy is confirmed.", src)
 
+    def test_frontend_build_script_and_precool_card_cancel_regression(self):
+        frontend_root = os.path.normpath(
+            os.path.join(os.path.dirname(__file__), "..", "..", "frontend")
+        )
+        with open(os.path.join(frontend_root, "package.json"), "r", encoding="utf-8") as f:
+            pkg = json.load(f)
+        with open(
+            os.path.join(frontend_root, "src", "components", "ACStatusCard.jsx"),
+            "r",
+            encoding="utf-8",
+        ) as f:
+            src = f.read()
+
+        self.assertEqual(pkg.get("scripts", {}).get("build"), "vite build")
+        self.assertEqual(src.count("\n              Cancel\n"), 1)
+        self.assertEqual(src.count("\n              Snooze today\n"), 1)
+
     def test_load_uses_backup_when_primary_read_fails(self):
         import backend.config_manager as cm
 

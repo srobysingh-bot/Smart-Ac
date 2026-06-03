@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState, useCallback } from 'react'
 import { useNavigate } from 'react-router-dom'
-import { getClimateState, setClimateTemperature, setHvacMode, setFanMode, setSwingMode, createRoom, getRoomLogs, clearRoomLogs, startPreCool, cancelPreCool } from '../api/smartcool.js'
+import { getClimateState, setClimateTemperature, setHvacMode, setFanMode, setSwingMode, createRoom, getRoomLogs, clearRoomLogs, startPreCool, cancelPreCool, snoozePreCool, disableGeofencePreCool } from '../api/smartcool.js'
 import { useRoom } from '../context/RoomContext.jsx'
 import { useRoomData } from '../context/RoomDataContext.jsx'
 import ACStatusCard    from '../components/ACStatusCard.jsx'
@@ -1579,6 +1579,14 @@ export default function Dashboard() {
     () => cancelPreCool(activeRoomId),
     [activeRoomId],
   )
+  const handlePreCoolSnooze = useCallback(
+    () => snoozePreCool(activeRoomId, 1440),
+    [activeRoomId],
+  )
+  const handlePreCoolDisableGeofence = useCallback(
+    () => disableGeofencePreCool(activeRoomId),
+    [activeRoomId],
+  )
 
   return (
     <div className="flex flex-col min-w-0">
@@ -1667,9 +1675,15 @@ export default function Dashboard() {
             preCoolRemainingSeconds={displayStatus?.pre_cool_remaining_seconds}
             preCoolTarget={displayStatus?.pre_cool_target}
             preCoolResult={displayStatus?.pre_cool_result}
+            preCoolTriggerSource={displayStatus?.pre_cool_trigger_source}
+            preCoolPerson={displayStatus?.pre_cool_geofence_trigger_person}
+            preCoolSnoozedUntil={displayStatus?.pre_cool_snoozed_until}
+            preCoolExtensionCount={displayStatus?.pre_cool_extension_count}
             vacancyOffBlockedReason={displayStatus?.vacancy_off_blocked_reason}
             onPreCoolStart={handlePreCoolStart}
             onPreCoolCancel={handlePreCoolCancel}
+            onPreCoolSnooze={handlePreCoolSnooze}
+            onPreCoolDisableGeofence={handlePreCoolDisableGeofence}
             hasClimateEntity={!!(displayStatus?.climate_entity || displayStatus?.ac_entity)}
             acCurrentTemp={displayStatus?.ac_current_temp}
             acTargetTemp={displayStatus?.ac_target_temp}

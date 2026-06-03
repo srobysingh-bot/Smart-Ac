@@ -97,9 +97,15 @@ function PreCoolControl({
   remainingSeconds,
   result,
   target,
+  triggerSource,
+  person,
+  snoozedUntil,
+  extensionCount,
   blockedReason,
   onStart,
   onCancel,
+  onSnooze,
+  onDisableGeofence,
 }) {
   const [duration, setDuration] = useState(defaultDuration || 25)
   const [busy, setBusy] = useState(false)
@@ -128,6 +134,10 @@ function PreCoolControl({
   const shownResult = localResult || result
   const message = preCoolMessage(shownResult)
   const shownTarget = Number(target)
+  const sourceLabel = triggerSource === 'geofence'
+    ? (person ? `Geofence · ${person}` : 'Geofence')
+    : null
+  const snoozed = snoozedUntil ? new Date(snoozedUntil) : null
 
   const runStart = async () => {
     if (!onStart) return
@@ -156,6 +166,32 @@ function PreCoolControl({
     }
   }
 
+  const runSnooze = async () => {
+    if (!onSnooze) return
+    setBusy(true)
+    try {
+      const res = await onSnooze()
+      setLocalResult(res?.pre_cool_result || 'snoozed')
+    } catch (err) {
+      setLocalResult('error')
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  const runDisableGeofence = async () => {
+    if (!onDisableGeofence) return
+    setBusy(true)
+    try {
+      await onDisableGeofence()
+      setLocalResult('geofence_disabled')
+    } catch (err) {
+      setLocalResult('error')
+    } finally {
+      setBusy(false)
+    }
+  }
+
   return (
     <div className="rounded-lg border border-sky-900/45 bg-sky-950/15 px-2.5 py-2">
       <div className="flex flex-wrap items-center justify-between gap-2">
@@ -169,6 +205,8 @@ function PreCoolControl({
               <p className="text-[11px] font-mono text-sky-200">
                 {formatDelayCountdown(countdown ?? remainingSeconds)} remaining
               </p>
+            ) : snoozed && snoozed > new Date() ? (
+              <p className="text-[11px] text-gray-400">Snoozed today</p>
             ) : message ? (
               <p className="text-[11px] text-gray-400">{message}</p>
             ) : (
@@ -179,14 +217,24 @@ function PreCoolControl({
           </div>
         </div>
         {active ? (
-          <button
-            type="button"
-            disabled={busy}
-            onClick={runCancel}
-            className="rounded-md border border-gray-700 bg-gray-900 px-2.5 py-1.5 text-xs font-semibold text-gray-200 transition hover:border-gray-500 disabled:cursor-not-allowed disabled:opacity-50"
-          >
-            Cancel
-          </button>
+          <div className="flex items-center gap-1.5" data-testid="pre-cool-active-actions">
+            <button
+              type="button"
+              disabled={busy || !onSnooze}
+              onClick={runSnooze}
+              className="rounded-md border border-gray-700 bg-gray-900 px-2.5 py-1.5 text-xs font-semibold text-gray-200 transition hover:border-gray-500 disabled:cursor-not-allowed disabled:opacity-50"
+            >
+              Snooze today
+            </button>
+            <button
+              type="button"
+              disabled={busy || !onCancel}
+              onClick={runCancel}
+              className="rounded-md border border-gray-700 bg-gray-900 px-2.5 py-1.5 text-xs font-semibold text-gray-200 transition hover:border-gray-500 disabled:cursor-not-allowed disabled:opacity-50"
+            >
+              Cancel
+            </button>
+          </div>
         ) : (
           <div className="flex items-center gap-1.5">
             <select
@@ -212,6 +260,21 @@ function PreCoolControl({
       </div>
       {active && blockedReason === 'pre_cool' && (
         <p className="mt-1.5 text-[11px] text-sky-300/80">Vacancy OFF blocked</p>
+      )}
+      {(sourceLabel || Number(extensionCount) > 0) && (
+        <p className="mt-1.5 text-[11px] text-sky-300/80">
+          {[sourceLabel, Number(extensionCount) > 0 ? `${Number(extensionCount)} extension${Number(extensionCount) === 1 ? '' : 's'}` : null].filter(Boolean).join(' · ')}
+        </p>
+      )}
+      {triggerSource === 'geofence' && (
+        <button
+          type="button"
+          disabled={busy}
+          onClick={runDisableGeofence}
+          className="mt-1.5 text-[11px] font-semibold text-gray-400 underline-offset-2 hover:text-gray-200 hover:underline disabled:cursor-not-allowed disabled:opacity-50"
+        >
+          Disable geofence pre-cool
+        </button>
       )}
       {shownResult === 'error' && (
         <p className="mt-1.5 text-[11px] text-red-300">Pre-cool command failed</p>
@@ -522,9 +585,15 @@ export default function ACStatusCard({
   preCoolRemainingSeconds,
   preCoolTarget,
   preCoolResult,
+  preCoolTriggerSource,
+  preCoolPerson,
+  preCoolSnoozedUntil,
+  preCoolExtensionCount,
   vacancyOffBlockedReason,
   onPreCoolStart,
   onPreCoolCancel,
+  onPreCoolSnooze,
+  onPreCoolDisableGeofence,
   // Smart cooling (read-only display)
   smartCoolingEnabled = false,
   smartMode,
@@ -641,9 +710,15 @@ export default function ACStatusCard({
         remainingSeconds={preCoolRemainingSeconds}
         result={preCoolResult}
         target={preCoolTarget}
+        triggerSource={preCoolTriggerSource}
+        person={preCoolPerson}
+        snoozedUntil={preCoolSnoozedUntil}
+        extensionCount={preCoolExtensionCount}
         blockedReason={vacancyOffBlockedReason}
         onStart={onPreCoolStart}
         onCancel={onPreCoolCancel}
+        onSnooze={onPreCoolSnooze}
+        onDisableGeofence={onPreCoolDisableGeofence}
       />
 
       <ComfortRuntimePanel

@@ -71,6 +71,19 @@ Then in HA: **Settings → Add-ons → Add-on Store → ⋮ → Check for update
 
 ---
 
+## Pre-Cool Geofence
+
+Room-level geofence pre-cool listens to configured Home Assistant `person.*` entities.
+HawaAI reads the person's latitude/longitude attributes and calculates distance from
+`pre_cool_home_latitude` / `pre_cool_home_longitude`. The room
+`pre_cool_geofence_radius_km` value is the actual trigger radius.
+
+For suggestion mode, HawaAI creates a Home Assistant persistent notification instead of
+starting the AC. For auto-start mode, only people listed in `pre_cool_allowed_people`
+can trigger pre-cool for that specific room.
+
+---
+
 ## Entities Published to HA
 
 | Entity | Type | Description |

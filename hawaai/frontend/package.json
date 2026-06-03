@@ -1,7 +1,7 @@
 {
   "name": "smartcool-frontend",
   "private": true,
-  "version": "1.4.91",
+  "version": "1.4.92",
   "type": "module",
   "scripts": {
     "dev": "vite",

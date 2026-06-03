@@ -1051,6 +1051,18 @@ async def _dashboard_status_payload(rid: str) -> Dict[str, Any]:
         "pre_cool_target_offset_deg": runtime.get("pre_cool_target_offset_deg", cfg.get("pre_cool_target_offset_deg", 1.0)),
         "pre_cool_arrival_grace_seconds": runtime.get("pre_cool_arrival_grace_seconds", cfg.get("pre_cool_arrival_grace_seconds", 120)),
         "pre_cool_no_show_action": runtime.get("pre_cool_no_show_action", cfg.get("pre_cool_no_show_action", "off")),
+        "pre_cool_geofence_enabled": runtime.get("pre_cool_geofence_enabled", cfg.get("pre_cool_geofence_enabled", False)),
+        "pre_cool_geofence_mode": runtime.get("pre_cool_geofence_mode", cfg.get("pre_cool_geofence_mode", "suggest_only")),
+        "pre_cool_geofence_radius_km": runtime.get("pre_cool_geofence_radius_km", cfg.get("pre_cool_geofence_radius_km", 2)),
+        "pre_cool_home_latitude": cfg.get("pre_cool_home_latitude"),
+        "pre_cool_home_longitude": cfg.get("pre_cool_home_longitude"),
+        "pre_cool_allowed_people": runtime.get("pre_cool_allowed_people", cfg.get("pre_cool_allowed_people", [])),
+        "pre_cool_geofence_cooldown_minutes": runtime.get("pre_cool_geofence_cooldown_minutes", cfg.get("pre_cool_geofence_cooldown_minutes", 30)),
+        "pre_cool_one_shot_per_window": runtime.get("pre_cool_one_shot_per_window", cfg.get("pre_cool_one_shot_per_window", True)),
+        "pre_cool_allow_extension": runtime.get("pre_cool_allow_extension", cfg.get("pre_cool_allow_extension", True)),
+        "pre_cool_extension_minutes": runtime.get("pre_cool_extension_minutes", cfg.get("pre_cool_extension_minutes", 10)),
+        "pre_cool_max_total_minutes": runtime.get("pre_cool_max_total_minutes", cfg.get("pre_cool_max_total_minutes", 45)),
+        "pre_cool_stop_if_user_leaves_geofence": runtime.get("pre_cool_stop_if_user_leaves_geofence", cfg.get("pre_cool_stop_if_user_leaves_geofence", True)),
         "pre_cool_active": runtime.get("pre_cool_active", False),
         "pre_cool_requested_at": runtime.get("pre_cool_requested_at"),
         "pre_cool_until": runtime.get("pre_cool_until"),
@@ -1058,6 +1070,13 @@ async def _dashboard_status_payload(rid: str) -> Dict[str, Any]:
         "pre_cool_reason": runtime.get("pre_cool_reason"),
         "pre_cool_result": runtime.get("pre_cool_result"),
         "pre_cool_remaining_seconds": runtime.get("pre_cool_remaining_seconds", 0),
+        "pre_cool_trigger_source": runtime.get("pre_cool_trigger_source"),
+        "pre_cool_geofence_trigger_person": runtime.get("pre_cool_geofence_trigger_person"),
+        "pre_cool_started_at": runtime.get("pre_cool_started_at"),
+        "pre_cool_extension_count": runtime.get("pre_cool_extension_count", 0),
+        "pre_cool_total_runtime_seconds": runtime.get("pre_cool_total_runtime_seconds", 0),
+        "pre_cool_snoozed_until": runtime.get("pre_cool_snoozed_until"),
+        "pre_cool_suppressed_visit_id": runtime.get("pre_cool_suppressed_visit_id"),
         "vacancy_off_blocked_reason": runtime.get("vacancy_off_blocked_reason"),
         # ── Config ────────────────────────────────────────────────────────────
         "manual_override":  logic_engine.manual_override_enabled(cfg),
@@ -1329,6 +1348,7 @@ async def api_create_room(body: Dict[str, Any] = Body(...)):
         inc = dict(body["settings"])
         _sanitize_zone_room_settings(inc)
         _sanitize_control_mode_room_settings(inc)
+        _sanitize_pre_cool_room_settings(inc)
         _sanitize_lg_fan_guard_room_settings(inc)
         _normalize_manual_override_room_settings(inc, room_registry.merge_room_config(base, row))
         _sanitize_effective_target_room_settings(base, row, inc)
@@ -1387,6 +1407,66 @@ def _sanitize_control_mode_room_settings(incoming_settings: Dict[str, Any]) -> N
             continue
         try:
             incoming_settings[key] = max(lo, min(float(incoming_settings[key]), hi))
+        except (TypeError, ValueError):
+            incoming_settings[key] = default
+
+
+def _sanitize_pre_cool_room_settings(incoming_settings: Dict[str, Any]) -> None:
+    if not isinstance(incoming_settings, dict):
+        return
+    if "pre_cool_geofence_enabled" in incoming_settings:
+        incoming_settings["pre_cool_geofence_enabled"] = bool(incoming_settings.get("pre_cool_geofence_enabled"))
+    if "pre_cool_geofence_mode" in incoming_settings:
+        mode = str(incoming_settings.get("pre_cool_geofence_mode") or "suggest_only").strip().lower()
+        incoming_settings["pre_cool_geofence_mode"] = (
+            mode if mode in ("suggest_only", "auto_start") else "suggest_only"
+        )
+    if "pre_cool_geofence_radius_km" in incoming_settings:
+        try:
+            incoming_settings["pre_cool_geofence_radius_km"] = max(
+                0.5,
+                min(float(incoming_settings["pre_cool_geofence_radius_km"]), 10.0),
+            )
+        except (TypeError, ValueError):
+            incoming_settings["pre_cool_geofence_radius_km"] = 2.0
+    for key, lo, hi in (
+        ("pre_cool_home_latitude", -90.0, 90.0),
+        ("pre_cool_home_longitude", -180.0, 180.0),
+    ):
+        if key in incoming_settings:
+            raw = incoming_settings.get(key)
+            if raw in (None, ""):
+                incoming_settings[key] = None
+                continue
+            try:
+                value = float(raw)
+                incoming_settings[key] = max(lo, min(value, hi))
+            except (TypeError, ValueError):
+                incoming_settings[key] = None
+    if "pre_cool_allowed_people" in incoming_settings:
+        raw = incoming_settings.get("pre_cool_allowed_people")
+        if isinstance(raw, list):
+            incoming_settings["pre_cool_allowed_people"] = [
+                str(item).strip() for item in raw if str(item or "").strip()
+            ]
+        else:
+            incoming_settings["pre_cool_allowed_people"] = []
+    for key in (
+        "pre_cool_one_shot_per_window",
+        "pre_cool_allow_extension",
+        "pre_cool_stop_if_user_leaves_geofence",
+    ):
+        if key in incoming_settings:
+            incoming_settings[key] = bool(incoming_settings.get(key))
+    for key, default, lo, hi in (
+        ("pre_cool_geofence_cooldown_minutes", 30, 0, 1440),
+        ("pre_cool_extension_minutes", 10, 1, 45),
+        ("pre_cool_max_total_minutes", 45, 10, 180),
+    ):
+        if key not in incoming_settings or incoming_settings[key] is None:
+            continue
+        try:
+            incoming_settings[key] = max(lo, min(int(round(float(incoming_settings[key]))), hi))
         except (TypeError, ValueError):
             incoming_settings[key] = default
 
@@ -1597,6 +1677,7 @@ async def api_update_room(room_id: str, body: Dict[str, Any] = Body(...)):
             inc_applied = dict(inc)
             _sanitize_zone_room_settings(inc_applied)
             _sanitize_control_mode_room_settings(inc_applied)
+            _sanitize_pre_cool_room_settings(inc_applied)
             _sanitize_lg_fan_guard_room_settings(inc_applied)
             _sanitize_temperature_mode_room_settings(inc_applied)
             _normalize_manual_override_room_settings(inc_applied, old_effective)
@@ -1728,18 +1809,74 @@ async def api_start_pre_cool(room_id: str, body: Optional[Dict[str, Any]] = Body
     stored = _resolve_stored_room_id(base, rid)
     if not stored:
         raise HTTPException(status_code=404, detail="room not found")
-    duration = (body or {}).get("duration_minutes")
-    return await logic_engine.start_pre_cool(stored, duration)
+    payload = body or {}
+    duration = payload.get("duration_minutes")
+    source = payload.get("trigger_source") or "manual_button"
+    return await logic_engine.start_pre_cool(
+        stored,
+        source,
+        payload.get("person"),
+        duration_minutes=duration,
+        visit_id=payload.get("visit_id"),
+    )
 
 
-@app.post("/api/rooms/{room_id}/pre_cool/cancel")
-async def api_cancel_pre_cool(room_id: str):
+@app.post("/api/rooms/{room_id}/pre_cool/geofence")
+async def api_geofence_pre_cool(room_id: str, body: Optional[Dict[str, Any]] = Body(default=None)):
     rid = _require_room_query(room_id)
     base = config_manager.load_config()
     stored = _resolve_stored_room_id(base, rid)
     if not stored:
         raise HTTPException(status_code=404, detail="room not found")
-    return await logic_engine.cancel_pre_cool(stored)
+    payload = body or {}
+    return await logic_engine.start_pre_cool(
+        stored,
+        "geofence",
+        payload.get("person"),
+        duration_minutes=payload.get("duration_minutes"),
+        visit_id=payload.get("visit_id"),
+        inside_geofence=payload.get("inside_geofence", True),
+        approaching=payload.get("approaching", False),
+    )
+
+
+@app.post("/api/rooms/{room_id}/pre_cool/cancel")
+async def api_cancel_pre_cool(room_id: str, body: Optional[Dict[str, Any]] = Body(default=None)):
+    rid = _require_room_query(room_id)
+    base = config_manager.load_config()
+    stored = _resolve_stored_room_id(base, rid)
+    if not stored:
+        raise HTTPException(status_code=404, detail="room not found")
+    return await logic_engine.cancel_pre_cool(stored, visit_id=(body or {}).get("visit_id"))
+
+
+@app.post("/api/rooms/{room_id}/pre_cool/snooze")
+async def api_snooze_pre_cool(room_id: str, body: Optional[Dict[str, Any]] = Body(default=None)):
+    rid = _require_room_query(room_id)
+    base = config_manager.load_config()
+    stored = _resolve_stored_room_id(base, rid)
+    if not stored:
+        raise HTTPException(status_code=404, detail="room not found")
+    return await logic_engine.snooze_pre_cool(stored, minutes=(body or {}).get("minutes"))
+
+
+@app.post("/api/rooms/{room_id}/pre_cool/geofence/disable")
+async def api_disable_geofence_pre_cool(room_id: str):
+    rid = _require_room_query(room_id)
+    base = config_manager.load_config()
+    stored = _resolve_stored_room_id(base, rid)
+    if not stored:
+        raise HTTPException(status_code=404, detail="room not found")
+    rooms = [copy.deepcopy(r) for r in room_registry.list_room_dicts(base)]
+    idx = next((i for i, re in enumerate(rooms) if re.get("id") == stored), None)
+    if idx is None:
+        raise HTTPException(status_code=404, detail="room not found")
+    settings = dict(rooms[idx].get("settings") or {})
+    settings["pre_cool_geofence_enabled"] = False
+    rooms[idx]["settings"] = settings
+    if not config_manager.save_config({"rooms": rooms}):
+        raise HTTPException(status_code=500, detail="failed to save rooms")
+    return {"success": True, "room_id": stored, "pre_cool_geofence_enabled": False}
 
 
 @app.delete("/api/rooms/{room_id}")

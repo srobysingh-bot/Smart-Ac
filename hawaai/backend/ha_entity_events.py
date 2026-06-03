@@ -8,6 +8,7 @@ Only presence + indoor temp + (delay_elapsed in logic_engine) — not every HA u
 import asyncio
 import json
 import logging
+import math
 import os
 from collections import defaultdict
 from typing import Any, DefaultDict, Dict, List, Optional, Tuple
@@ -21,11 +22,13 @@ logger = logging.getLogger(__name__)
 
 _HA_WS = "ws://supervisor/core/api/websocket"
 _TOKEN = os.environ.get("SUPERVISOR_TOKEN", "")
+WatchTarget = Tuple[str, str, str]
+_missing_home_location_warned: set[str] = set()
 
 
-def _entity_watch_index(cfg: dict) -> DefaultDict[str, List[Tuple[str, str]]]:
-    """entity_id → [(stored_room_id, canonical_room_id), ...]"""
-    ix: DefaultDict[str, List[Tuple[str, str]]] = defaultdict(list)
+def _entity_watch_index(cfg: dict) -> DefaultDict[str, List[WatchTarget]]:
+    """entity_id -> [(stored_room_id, canonical_room_id, trigger_kind), ...]"""
+    ix: DefaultDict[str, List[WatchTarget]] = defaultdict(list)
     for r in room_registry.list_room_dicts(cfg):
         if r.get("disabled"):
             continue
@@ -37,9 +40,12 @@ def _entity_watch_index(cfg: dict) -> DefaultDict[str, List[Tuple[str, str]]]:
         pres = (merged.get("presence_entity") or "").strip()
         itemp = (merged.get("indoor_temp_entity") or "").strip()
         if pres:
-            ix[pres].append((rid_store, canon))
+            ix[pres].append((rid_store, canon, "presence"))
         if itemp:
-            ix[itemp].append((rid_store, canon))
+            ix[itemp].append((rid_store, canon, "temp"))
+        if bool(merged.get("pre_cool_geofence_enabled", False)):
+            for person in logic_engine._pre_cool_allowed_people(merged):
+                ix[person].append((rid_store, canon, "geofence_person"))
     return ix
 
 
@@ -65,6 +71,149 @@ def _float_state(so: Optional[dict]) -> Optional[float]:
 
 def _segment_crosses(prev: float, cur: float, line: float) -> bool:
     return (prev - line) * (cur - line) < 0
+
+
+def _float_attr(so: Optional[dict], name: str) -> Optional[float]:
+    attrs = (so or {}).get("attributes") or {}
+    raw = attrs.get(name)
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return None
+    return value if math.isfinite(value) else None
+
+
+def _state_location(so: Optional[dict]) -> Optional[Tuple[float, float]]:
+    lat = _float_attr(so, "latitude")
+    lon = _float_attr(so, "longitude")
+    if lat is None or lon is None:
+        return None
+    if lat < -90.0 or lat > 90.0 or lon < -180.0 or lon > 180.0:
+        return None
+    return lat, lon
+
+
+def _cfg_coord(cfg: dict, key: str, lo: float, hi: float) -> Optional[float]:
+    raw = cfg.get(key)
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(value) or value < lo or value > hi:
+        return None
+    return value
+
+
+def _home_location(cfg: dict) -> Optional[Tuple[float, float]]:
+    lat = _cfg_coord(cfg, "pre_cool_home_latitude", -90.0, 90.0)
+    lon = _cfg_coord(cfg, "pre_cool_home_longitude", -180.0, 180.0)
+    if lat is None or lon is None:
+        return None
+    return lat, lon
+
+
+def _radius_km(cfg: dict) -> float:
+    try:
+        radius = float(cfg.get("pre_cool_geofence_radius_km", 2.0))
+    except (TypeError, ValueError):
+        radius = 2.0
+    if not math.isfinite(radius):
+        radius = 2.0
+    return max(0.5, min(radius, 10.0))
+
+
+def _distance_km(a: Tuple[float, float], b: Tuple[float, float]) -> float:
+    lat1, lon1 = math.radians(a[0]), math.radians(a[1])
+    lat2, lon2 = math.radians(b[0]), math.radians(b[1])
+    dlat = lat2 - lat1
+    dlon = lon2 - lon1
+    h = (
+        math.sin(dlat / 2.0) ** 2
+        + math.cos(lat1) * math.cos(lat2) * math.sin(dlon / 2.0) ** 2
+    )
+    return 6371.0088 * 2.0 * math.asin(min(1.0, math.sqrt(h)))
+
+
+def _distance_to_home_km(cfg: dict, so: Optional[dict]) -> Optional[float]:
+    home = _home_location(cfg)
+    current = _state_location(so)
+    if home is None or current is None:
+        return None
+    return _distance_km(home, current)
+
+
+def _inside_addon_radius(cfg: dict, so: Optional[dict]) -> Optional[bool]:
+    distance = _distance_to_home_km(cfg, so)
+    if distance is None:
+        return None
+    return distance <= _radius_km(cfg)
+
+
+def _geofence_visit_id(person_entity: str, new_so: Optional[dict]) -> str:
+    changed = ""
+    if isinstance(new_so, dict):
+        changed = str(new_so.get("last_updated") or new_so.get("last_changed") or "").strip()
+    if not changed:
+        changed = str(asyncio.get_running_loop().time())
+    return f"{person_entity}:{changed}"
+
+
+def _warn_missing_home_location_once(rid_store: str) -> None:
+    if rid_store in _missing_home_location_warned:
+        return
+    _missing_home_location_warned.add(rid_store)
+    logger.warning(
+        "[PRECOOL] room=%s geofence_home_coordinates_missing "
+        "pre_cool_home_latitude/pre_cool_home_longitude required",
+        rid_store,
+    )
+
+
+async def _maybe_trigger_geofence_pre_cool(
+    rid_store: str,
+    merged_cfg: dict,
+    person_entity: str,
+    old_so: Optional[dict],
+    new_so: Optional[dict],
+) -> None:
+    if not bool(merged_cfg.get("pre_cool_geofence_enabled", False)):
+        return
+    if _home_location(merged_cfg) is None:
+        _warn_missing_home_location_once(rid_store)
+        return
+    old_distance = _distance_to_home_km(merged_cfg, old_so)
+    new_distance = _distance_to_home_km(merged_cfg, new_so)
+    old_inside = old_distance is not None and old_distance <= _radius_km(merged_cfg)
+    new_inside = new_distance is not None and new_distance <= _radius_km(merged_cfg)
+    if new_distance is None:
+        return
+    approaching = bool(
+        old_distance is not None
+        and new_distance < old_distance
+    )
+
+    if old_inside and not new_inside:
+        await logic_engine.start_pre_cool(
+            rid_store,
+            "geofence",
+            person_entity,
+            visit_id=_geofence_visit_id(person_entity, new_so),
+            inside_geofence=False,
+            approaching=False,
+        )
+        return
+
+    if old_inside or not new_inside:
+        return
+
+    await logic_engine.start_pre_cool(
+        rid_store,
+        "geofence",
+        person_entity,
+        visit_id=_geofence_visit_id(person_entity, new_so),
+        inside_geofence=True,
+        approaching=approaching,
+    )
 
 
 async def _maybe_trigger_temp_cross(
@@ -104,7 +253,7 @@ async def _maybe_trigger_temp_cross(
 
 async def _handle_state_changed(
     data: Dict[str, Any],
-    ix: DefaultDict[str, List[Tuple[str, str]]],
+    ix: DefaultDict[str, List[WatchTarget]],
 ) -> None:
     entity_id = (data.get("entity_id") or "").strip()
     if not entity_id:
@@ -119,25 +268,27 @@ async def _handle_state_changed(
     cfg = config_manager.load_config()
 
     seen: set[str] = set()
-    for rid_store, canon in targets:
-        if canon in seen:
+    for rid_store, canon, kind in targets:
+        seen_key = f"{canon}:{kind}"
+        if seen_key in seen:
             continue
-        seen.add(canon)
+        seen.add(seen_key)
 
         room_def = logic_engine.resolve_room_definition(cfg, rid_store)
         if not room_def or room_def.get("disabled"):
             continue
         merged = room_registry.merge_room_config(cfg, room_def)
 
-        pres_e = (merged.get("presence_entity") or "").strip()
-        tmp_e = (merged.get("indoor_temp_entity") or "").strip()
-
-        if entity_id == pres_e and _presence_changed(old_s, new_s):
+        if kind == "presence" and _presence_changed(old_s, new_s):
             logic_engine.trigger_tick(rid_store, reason="presence_change")
             continue
 
-        if entity_id == tmp_e:
+        if kind == "temp":
             await _maybe_trigger_temp_cross(rid_store, canon, merged, old_s, new_s)
+            continue
+
+        if kind == "geofence_person":
+            await _maybe_trigger_geofence_pre_cool(rid_store, merged, entity_id, old_s, new_s)
 
 
 async def run_forever(reconnect_pause: float = 5.0) -> None:

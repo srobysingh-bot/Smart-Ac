@@ -540,6 +540,15 @@ class RoomRuntime:
     pre_cool_reason: str = ""
     pre_cool_result: Optional[str] = None
     pre_cool_expiry_task: Optional[asyncio.Task] = None
+    pre_cool_trigger_source: str = ""
+    pre_cool_geofence_trigger_person: Optional[str] = None
+    pre_cool_extension_count: int = 0
+    pre_cool_snoozed_until: Optional[datetime] = None
+    pre_cool_suppressed_visit_id: Optional[str] = None
+    pre_cool_visit_id: Optional[str] = None
+    pre_cool_suggestion_created_at: Optional[datetime] = None
+    pre_cool_geofence_inside: bool = False
+    pre_cool_geofence_approaching: bool = False
 
     # â”€â”€ Startup recovery flag â”€â”€
     startup_state_loaded: bool = False
@@ -1242,6 +1251,8 @@ def _cfg_int(
 
 
 PRE_COOL_ALLOWED_DURATIONS_MINUTES = (10, 15, 20, 25, 30, 45)
+PRE_COOL_TRIGGER_SOURCES = frozenset({"manual_button", "geofence", "voice", "automation"})
+PRE_COOL_GEOFENCE_MODES = frozenset({"suggest_only", "auto_start"})
 
 
 def _pre_cool_remaining_seconds(st: RoomRuntime, now: datetime) -> int:
@@ -1282,16 +1293,13 @@ def _clear_pre_cool_state(
     st.pre_cool_result = result
     st.vacancy_off_blocked_reason = None
     if was_active and result == "handoff_presence_detected":
-        log_with_room("info", room_id, "[PRECOOL] room=%s handoff reason=presence_detected", room_id)
+        log_with_room("info", room_id, "[PRECOOL] room=%s handoff reason=room_presence_detected", room_id)
     elif was_active and result == "handoff_recent_presence":
         log_with_room("info", room_id, "[PRECOOL] room=%s handoff reason=recent_presence", room_id)
     elif was_active and result == "expired_no_show":
-        log_with_room(
-            "info",
-            room_id,
-            "[PRECOOL] room=%s expired reason=no_show normal_vacancy_logic_resumed",
-            room_id,
-        )
+        log_with_room("info", room_id, "[PRECOOL] room=%s no_show_expired", room_id)
+    elif was_active and result == "cancelled":
+        log_with_room("info", room_id, "[PRECOOL] room=%s cancelled", room_id)
 
 
 async def _pre_cool_expiry_runner(room_id: str, until: datetime) -> None:
@@ -1326,6 +1334,88 @@ def _pre_cool_duration_minutes(cfg: dict, requested: object) -> int:
     if minutes in PRE_COOL_ALLOWED_DURATIONS_MINUTES:
         return minutes
     return min(PRE_COOL_ALLOWED_DURATIONS_MINUTES, key=lambda item: abs(item - minutes))
+
+
+def _pre_cool_trigger_source(raw: object) -> str:
+    source = str(raw or "manual_button").strip().lower()
+    return source if source in PRE_COOL_TRIGGER_SOURCES else "manual_button"
+
+
+def _pre_cool_geofence_mode(cfg: dict) -> str:
+    mode = str(cfg.get("pre_cool_geofence_mode") or "suggest_only").strip().lower()
+    return mode if mode in PRE_COOL_GEOFENCE_MODES else "suggest_only"
+
+
+def _pre_cool_allowed_people(cfg: dict) -> List[str]:
+    raw = cfg.get("pre_cool_allowed_people")
+    if not isinstance(raw, list):
+        return []
+    return [str(item).strip().lower() for item in raw if str(item or "").strip()]
+
+
+def _person_allowed_for_pre_cool(cfg: dict, person: Optional[str]) -> bool:
+    allowed = _pre_cool_allowed_people(cfg)
+    if not allowed:
+        return False
+    p = str(person or "").strip().lower()
+    return bool(p and p in allowed)
+
+
+def _pre_cool_visit_id(person: Optional[str], explicit_visit_id: Optional[str] = None) -> str:
+    visit = str(explicit_visit_id or "").strip()
+    if visit:
+        return visit
+    p = str(person or "unknown").strip().lower() or "unknown"
+    return f"{p}:{datetime.now(timezone.utc).date().isoformat()}"
+
+
+async def _room_currently_occupied(cfg: dict) -> bool:
+    if not bool(cfg.get("use_presence", True)):
+        return False
+    presence_entity = str(cfg.get("presence_entity") or "").strip()
+    if not presence_entity:
+        return False
+    return bool(parse_presence(await ha_client.get_state(presence_entity)))
+
+
+def _pre_cool_total_runtime_seconds(st: RoomRuntime, now: datetime) -> int:
+    if st.pre_cool_requested_at is None:
+        return 0
+    return max(0, int((now - st.pre_cool_requested_at).total_seconds()))
+
+
+def _pre_cool_blocked_by_snooze(st: RoomRuntime, now: datetime) -> bool:
+    return bool(st.pre_cool_snoozed_until is not None and now < st.pre_cool_snoozed_until)
+
+
+def _pre_cool_geofence_cooldown_active(cfg: dict, st: RoomRuntime, now: datetime) -> bool:
+    minutes = _cfg_int(cfg, "pre_cool_geofence_cooldown_minutes", 30, lo=0, hi=1440)
+    if minutes <= 0:
+        return False
+    last = st.pre_cool_requested_at or st.pre_cool_suggestion_created_at
+    return bool(last is not None and (now - last).total_seconds() < minutes * 60)
+
+
+def _pre_cool_response(room_id: str, st: RoomRuntime, *, result: str, success: bool) -> Dict[str, object]:
+    now = datetime.now(timezone.utc)
+    return {
+        "success": bool(success),
+        "room_id": normalize_room_id(room_id),
+        "pre_cool_active": bool(st.pre_cool_active),
+        "pre_cool_result": result,
+        "pre_cool_requested_at": st.pre_cool_requested_at.isoformat() if st.pre_cool_requested_at else None,
+        "pre_cool_started_at": st.pre_cool_requested_at.isoformat() if st.pre_cool_requested_at else None,
+        "pre_cool_until": st.pre_cool_until.isoformat() if st.pre_cool_until else None,
+        "pre_cool_target": st.pre_cool_target,
+        "pre_cool_remaining_seconds": _pre_cool_remaining_seconds(st, now),
+        "vacancy_off_blocked_reason": st.vacancy_off_blocked_reason,
+        "pre_cool_trigger_source": st.pre_cool_trigger_source,
+        "pre_cool_geofence_trigger_person": st.pre_cool_geofence_trigger_person,
+        "pre_cool_extension_count": int(st.pre_cool_extension_count),
+        "pre_cool_total_runtime_seconds": _pre_cool_total_runtime_seconds(st, now),
+        "pre_cool_snoozed_until": st.pre_cool_snoozed_until.isoformat() if st.pre_cool_snoozed_until else None,
+        "pre_cool_suppressed_visit_id": st.pre_cool_suppressed_visit_id,
+    }
 
 
 def _parse_room_temp_sensor(raw: object) -> Optional[float]:
@@ -1479,22 +1569,64 @@ async def _resolve_current_effective_target_for_pre_cool(cfg: dict, st: RoomRunt
     return float(compute_effective_target(base_target, outdoor_temp, smart_curve))
 
 
-def _pre_cool_response(room_id: str, st: RoomRuntime, *, result: str, success: bool) -> Dict[str, object]:
-    now = datetime.now(timezone.utc)
-    return {
-        "success": bool(success),
-        "room_id": normalize_room_id(room_id),
-        "pre_cool_active": bool(st.pre_cool_active),
-        "pre_cool_result": result,
-        "pre_cool_requested_at": st.pre_cool_requested_at.isoformat() if st.pre_cool_requested_at else None,
-        "pre_cool_until": st.pre_cool_until.isoformat() if st.pre_cool_until else None,
-        "pre_cool_target": st.pre_cool_target,
-        "pre_cool_remaining_seconds": _pre_cool_remaining_seconds(st, now),
-        "vacancy_off_blocked_reason": st.vacancy_off_blocked_reason,
+async def _create_pre_cool_suggestion_notification(
+    room_id: str,
+    room_def: dict,
+    cfg: dict,
+    person: Optional[str],
+    indoor_temp: float,
+    target: float,
+) -> None:
+    room_label = str(room_def.get("name") or room_id).strip() or room_id
+    person_label = str(person or "allowed person").strip()
+    try:
+        radius = float(cfg.get("pre_cool_geofence_radius_km", 2.0))
+    except (TypeError, ValueError):
+        radius = 2.0
+    message = (
+        f"{room_label} is {float(indoor_temp):.1f}C and above the pre-cool target "
+        f"{float(target):.1f}C. {person_label} entered the add-on pre-cool radius "
+        f"({radius:.1f} km)."
+    )
+    payload = {
+        "title": "HawaAI pre-cool suggestion",
+        "message": message,
+        "notification_id": f"hawaai_pre_cool_{normalize_room_id(room_id)}",
     }
+    try:
+        ok = await ha_client.call_service("persistent_notification", "create", payload)
+        if not ok:
+            log_with_room(
+                "warning",
+                room_id,
+                "[PRECOOL] room=%s suggestion_notification_failed",
+                room_id,
+            )
+    except Exception as exc:
+        log_with_room(
+            "warning",
+            room_id,
+            "[PRECOOL] room=%s suggestion_notification_error error=%s",
+            room_id,
+            exc,
+        )
 
 
-async def start_pre_cool(room_id: str, duration_minutes: object = None) -> Dict[str, object]:
+async def start_pre_cool(
+    room_id: str,
+    trigger_source: object = "manual_button",
+    person: Optional[str] = None,
+    *,
+    duration_minutes: object = None,
+    visit_id: Optional[str] = None,
+    inside_geofence: bool = True,
+    approaching: bool = False,
+) -> Dict[str, object]:
+    if trigger_source is None or not isinstance(trigger_source, str):
+        if duration_minutes is None:
+            duration_minutes = trigger_source
+        trigger_source = "manual_button"
+    source = _pre_cool_trigger_source(trigger_source)
     rid_raw = (room_id or "").strip()
     canon = normalize_room_id(rid_raw)
     st = _rt(canon)
@@ -1512,6 +1644,60 @@ async def start_pre_cool(room_id: str, duration_minutes: object = None) -> Dict[
         return _pre_cool_response(canon, st, result=st.pre_cool_result, success=False)
 
     now = datetime.now(timezone.utc)
+    visit = _pre_cool_visit_id(person, visit_id) if source == "geofence" else None
+    if source == "geofence":
+        if not bool(cfg.get("pre_cool_geofence_enabled", False)):
+            st.pre_cool_result = "blocked_geofence_disabled"
+            return _pre_cool_response(canon, st, result=st.pre_cool_result, success=False)
+        if not _person_allowed_for_pre_cool(cfg, person):
+            st.pre_cool_result = "blocked_person_not_allowed"
+            return _pre_cool_response(canon, st, result=st.pre_cool_result, success=False)
+        if _pre_cool_blocked_by_snooze(st, now):
+            st.pre_cool_result = "blocked_snoozed"
+            return _pre_cool_response(canon, st, result=st.pre_cool_result, success=False)
+        incoming_person = str(person or "").strip().lower()
+        active_trigger_person = str(st.pre_cool_geofence_trigger_person or "").strip().lower()
+        is_active_geofence = bool(
+            st.pre_cool_active and st.pre_cool_trigger_source == "geofence"
+        )
+        is_triggering_person = bool(
+            incoming_person and active_trigger_person and incoming_person == active_trigger_person
+        )
+        if is_active_geofence and not bool(inside_geofence) and not is_triggering_person:
+            st.pre_cool_result = "skipped_non_triggering_person_left"
+            return _pre_cool_response(canon, st, result=st.pre_cool_result, success=True)
+        st.pre_cool_geofence_inside = bool(inside_geofence)
+        st.pre_cool_geofence_approaching = bool(approaching)
+        if (
+            is_active_geofence
+            and is_triggering_person
+            and bool(cfg.get("pre_cool_stop_if_user_leaves_geofence", True))
+            and not st.pre_cool_geofence_inside
+        ):
+            _clear_pre_cool_state(canon, st, result="geofence_left", reason="geofence_left")
+            await tick(canon, reason="pre_cool_geofence_left", skip_debounce=True)
+            return _pre_cool_response(canon, st, result="geofence_left", success=True)
+        if not st.pre_cool_geofence_inside:
+            st.pre_cool_result = "skipped_outside_geofence"
+            return _pre_cool_response(canon, st, result=st.pre_cool_result, success=True)
+        if st.pre_cool_active:
+            st.pre_cool_result = "skipped_already_active"
+            return _pre_cool_response(canon, st, result=st.pre_cool_result, success=True)
+        if (
+            bool(cfg.get("pre_cool_one_shot_per_window", True))
+            and st.pre_cool_suppressed_visit_id
+            and st.pre_cool_suppressed_visit_id == visit
+        ):
+            st.pre_cool_result = "blocked_visit_suppressed"
+            return _pre_cool_response(canon, st, result=st.pre_cool_result, success=False)
+        if _pre_cool_geofence_cooldown_active(cfg, st, now):
+            st.pre_cool_result = "blocked_geofence_cooldown"
+            return _pre_cool_response(canon, st, result=st.pre_cool_result, success=False)
+
+    if st.pre_cool_active:
+        st.pre_cool_result = "skipped_already_active"
+        return _pre_cool_response(canon, st, result=st.pre_cool_result, success=True)
+
     if manual_override_enabled(cfg) or _pre_cool_runtime_manual_active(st, now):
         st.pre_cool_result = "blocked_by_manual_override"
         return _pre_cool_response(canon, st, result=st.pre_cool_result, success=False)
@@ -1520,6 +1706,12 @@ async def start_pre_cool(room_id: str, duration_minutes: object = None) -> Dict[
     if not temp_entity:
         st.pre_cool_result = "blocked_room_temp_required"
         return _pre_cool_response(canon, st, result=st.pre_cool_result, success=False)
+
+    if await _room_currently_occupied(cfg):
+        st.pre_cool_result = "skipped_already_occupied"
+        log_with_room("info", canon, "[PRECOOL] room=%s skipped reason=already_occupied", canon)
+        return _pre_cool_response(canon, st, result="skipped_already_occupied", success=True)
+
     indoor_temp = _parse_room_temp_sensor(await ha_client.get_state(temp_entity))
     if indoor_temp is None:
         st.pre_cool_result = "blocked_room_temp_required"
@@ -1540,14 +1732,37 @@ async def start_pre_cool(room_id: str, duration_minutes: object = None) -> Dict[
         )
         return _pre_cool_response(canon, st, result="skipped_already_cool", success=True)
 
+    if source == "geofence" and _pre_cool_geofence_mode(cfg) == "suggest_only":
+        st.pre_cool_result = "suggestion_created"
+        st.pre_cool_trigger_source = source
+        st.pre_cool_geofence_trigger_person = person
+        st.pre_cool_visit_id = visit
+        st.pre_cool_suggestion_created_at = now
+        await _create_pre_cool_suggestion_notification(
+            canon,
+            room_def,
+            cfg,
+            person,
+            float(indoor_temp),
+            float(target),
+        )
+        log_with_room("info", canon, "[PRECOOL] room=%s suggestion_created", canon)
+        return _pre_cool_response(canon, st, result="suggestion_created", success=True)
+
     minutes = _pre_cool_duration_minutes(cfg, duration_minutes)
     until = now + timedelta(minutes=minutes)
     st.pre_cool_active = True
     st.pre_cool_requested_at = now
     st.pre_cool_until = until
     st.pre_cool_target = float(target)
-    st.pre_cool_reason = "user_requested"
+    st.pre_cool_reason = source
     st.pre_cool_result = "started"
+    st.pre_cool_trigger_source = source
+    st.pre_cool_geofence_trigger_person = person if source == "geofence" else None
+    st.pre_cool_visit_id = visit
+    st.pre_cool_extension_count = 0
+    st.pre_cool_geofence_inside = bool(inside_geofence)
+    st.pre_cool_geofence_approaching = bool(approaching)
     st.vacancy_off_blocked_reason = None
     _schedule_pre_cool_expiry(canon, st, until)
     log_with_room(
@@ -1560,16 +1775,78 @@ async def start_pre_cool(room_id: str, duration_minutes: object = None) -> Dict[
         float(indoor_temp),
         until.isoformat(),
     )
+    log_with_room("info", canon, "[PRECOOL] room=%s source=%s started", canon, source)
     await tick(canon, reason="pre_cool_started", skip_debounce=True)
     return _pre_cool_response(canon, st, result="started", success=True)
 
 
-async def cancel_pre_cool(room_id: str) -> Dict[str, object]:
+async def cancel_pre_cool(room_id: str, visit_id: Optional[str] = None) -> Dict[str, object]:
     canon = normalize_room_id(room_id)
     st = _rt(canon)
+    suppress = str(visit_id or st.pre_cool_visit_id or "").strip()
+    if suppress:
+        st.pre_cool_suppressed_visit_id = suppress
     _clear_pre_cool_state(canon, st, result="cancelled", reason="user_cancelled")
     await tick(canon, reason="pre_cool_cancelled", skip_debounce=True)
     return _pre_cool_response(canon, st, result="cancelled", success=True)
+
+
+async def snooze_pre_cool(room_id: str, minutes: object = None) -> Dict[str, object]:
+    canon = normalize_room_id(room_id)
+    st = _rt(canon)
+    try:
+        snooze_minutes = int(round(float(minutes if minutes is not None else 24 * 60)))
+    except (TypeError, ValueError):
+        snooze_minutes = 24 * 60
+    snooze_minutes = max(1, min(snooze_minutes, 24 * 60))
+    st.pre_cool_snoozed_until = datetime.now(timezone.utc) + timedelta(minutes=snooze_minutes)
+    if st.pre_cool_active:
+        _clear_pre_cool_state(canon, st, result="snoozed", reason="snoozed")
+        await tick(canon, reason="pre_cool_snoozed", skip_debounce=True)
+    st.pre_cool_result = "snoozed"
+    log_with_room(
+        "info",
+        canon,
+        "[PRECOOL] room=%s snoozed_until=%s",
+        canon,
+        st.pre_cool_snoozed_until.isoformat(),
+    )
+    return _pre_cool_response(canon, st, result="snoozed", success=True)
+
+
+def _pre_cool_extension_minutes(cfg: dict, st: RoomRuntime, now: datetime) -> int:
+    requested = _cfg_int(cfg, "pre_cool_extension_minutes", 10, lo=1, hi=45)
+    max_total = _cfg_int(cfg, "pre_cool_max_total_minutes", 45, lo=10, hi=180)
+    elapsed_minutes = _pre_cool_total_runtime_seconds(st, now) / 60.0
+    remaining = max(0, int(math.floor(float(max_total) - elapsed_minutes)))
+    return max(0, min(requested, remaining))
+
+
+def _should_extend_pre_cool(
+    cfg: dict,
+    st: RoomRuntime,
+    now: datetime,
+    indoor_temp: Optional[float],
+) -> bool:
+    if not bool(cfg.get("pre_cool_allow_extension", True)):
+        return False
+    if st.pre_cool_trigger_source != "geofence":
+        return False
+    if bool(cfg.get("pre_cool_stop_if_user_leaves_geofence", True)) and not st.pre_cool_geofence_inside:
+        return False
+    if not st.pre_cool_geofence_approaching:
+        return False
+    if st.pre_cool_target is None or indoor_temp is None:
+        return False
+    try:
+        if float(indoor_temp) <= float(st.pre_cool_target):
+            return False
+    except (TypeError, ValueError):
+        return False
+    max_total = _cfg_int(cfg, "pre_cool_max_total_minutes", 45, lo=10, hi=180)
+    if _pre_cool_total_runtime_seconds(st, now) >= int(max_total) * 60:
+        return False
+    return _pre_cool_extension_minutes(cfg, st, now) > 0
 
 
 def _reconcile_pre_cool_state(
@@ -1578,6 +1855,7 @@ def _reconcile_pre_cool_state(
     st: RoomRuntime,
     now: datetime,
     resolved_occupied: bool,
+    indoor_temp: Optional[float] = None,
 ) -> bool:
     if not st.pre_cool_active:
         st.vacancy_off_blocked_reason = None
@@ -1607,6 +1885,14 @@ def _reconcile_pre_cool_state(
             reason="recent_presence",
         )
         return True
+
+    if _should_extend_pre_cool(cfg, st, now, indoor_temp):
+        extension = _pre_cool_extension_minutes(cfg, st, now)
+        st.pre_cool_until = now + timedelta(minutes=extension)
+        st.pre_cool_extension_count += 1
+        _schedule_pre_cool_expiry(room_id, st, st.pre_cool_until)
+        log_with_room("info", room_id, "[PRECOOL] room=%s extended minutes=%s", room_id, extension)
+        return False
 
     _clear_pre_cool_state(
         room_id,
@@ -5586,6 +5872,7 @@ async def _tick_impl(rid_raw: str, room_id: str) -> None:
         st,
         now,
         bool(is_occupied_bool),
+        indoor_temp,
     )
 
     logger.info(
@@ -7563,6 +7850,32 @@ def get_runtime_state(room_id: str) -> dict:
             hi=3600,
         ),
         "pre_cool_no_show_action": str(merged.get("pre_cool_no_show_action") or "off"),
+        "pre_cool_geofence_enabled": bool(merged.get("pre_cool_geofence_enabled", False)),
+        "pre_cool_geofence_mode": _pre_cool_geofence_mode(merged),
+        "pre_cool_geofence_radius_km": _cfg_float(
+            merged,
+            "pre_cool_geofence_radius_km",
+            2.0,
+            lo=0.5,
+            hi=10.0,
+        ),
+        "pre_cool_home_latitude": merged.get("pre_cool_home_latitude"),
+        "pre_cool_home_longitude": merged.get("pre_cool_home_longitude"),
+        "pre_cool_allowed_people": list(merged.get("pre_cool_allowed_people") or []),
+        "pre_cool_geofence_cooldown_minutes": _cfg_int(
+            merged,
+            "pre_cool_geofence_cooldown_minutes",
+            30,
+            lo=0,
+            hi=1440,
+        ),
+        "pre_cool_one_shot_per_window": bool(merged.get("pre_cool_one_shot_per_window", True)),
+        "pre_cool_allow_extension": bool(merged.get("pre_cool_allow_extension", True)),
+        "pre_cool_extension_minutes": _cfg_int(merged, "pre_cool_extension_minutes", 10, lo=1, hi=45),
+        "pre_cool_max_total_minutes": _cfg_int(merged, "pre_cool_max_total_minutes", 45, lo=10, hi=180),
+        "pre_cool_stop_if_user_leaves_geofence": bool(
+            merged.get("pre_cool_stop_if_user_leaves_geofence", True)
+        ),
         "pre_cool_active": bool(st.pre_cool_active),
         "pre_cool_requested_at": (
             st.pre_cool_requested_at.isoformat() if st.pre_cool_requested_at else None
@@ -7572,6 +7885,15 @@ def get_runtime_state(room_id: str) -> dict:
         "pre_cool_reason": st.pre_cool_reason,
         "pre_cool_result": st.pre_cool_result,
         "pre_cool_remaining_seconds": _pre_cool_remaining_seconds(st, now),
+        "pre_cool_trigger_source": st.pre_cool_trigger_source,
+        "pre_cool_geofence_trigger_person": st.pre_cool_geofence_trigger_person,
+        "pre_cool_started_at": (
+            st.pre_cool_requested_at.isoformat() if st.pre_cool_requested_at else None
+        ),
+        "pre_cool_extension_count": int(st.pre_cool_extension_count),
+        "pre_cool_total_runtime_seconds": _pre_cool_total_runtime_seconds(st, now),
+        "pre_cool_snoozed_until": st.pre_cool_snoozed_until.isoformat() if st.pre_cool_snoozed_until else None,
+        "pre_cool_suppressed_visit_id": st.pre_cool_suppressed_visit_id,
         "min_command_interval_seconds": int(min_iv),
         "on_delay_seconds":           on_d,
         "off_delay_seconds":          off_d,

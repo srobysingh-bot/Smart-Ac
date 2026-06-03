@@ -139,16 +139,37 @@ export const resetAutoComfortLearning = roomId =>
   roomParam(roomId).then(rid =>
     request(`/rooms/${encodeURIComponent(rid)}/auto-comfort/reset`, { method: 'POST' }),
   )
-export const startPreCool = (roomId, durationMinutes = 25) =>
+export const startPreCool = (roomId, durationMinutes = 25, triggerSource = 'manual_button') =>
   roomParam(roomId).then(rid =>
     request(`/rooms/${encodeURIComponent(rid)}/pre_cool/start`, {
       method: 'POST',
-      body: JSON.stringify({ duration_minutes: durationMinutes }),
+      body: JSON.stringify({ duration_minutes: durationMinutes, trigger_source: triggerSource }),
     }),
   )
-export const cancelPreCool = roomId =>
+export const triggerGeofencePreCool = (roomId, payload = {}) =>
   roomParam(roomId).then(rid =>
-    request(`/rooms/${encodeURIComponent(rid)}/pre_cool/cancel`, { method: 'POST' }),
+    request(`/rooms/${encodeURIComponent(rid)}/pre_cool/geofence`, {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    }),
+  )
+export const cancelPreCool = (roomId, visitId = null) =>
+  roomParam(roomId).then(rid =>
+    request(`/rooms/${encodeURIComponent(rid)}/pre_cool/cancel`, {
+      method: 'POST',
+      body: JSON.stringify(visitId ? { visit_id: visitId } : {}),
+    }),
+  )
+export const snoozePreCool = (roomId, minutes = 1440) =>
+  roomParam(roomId).then(rid =>
+    request(`/rooms/${encodeURIComponent(rid)}/pre_cool/snooze`, {
+      method: 'POST',
+      body: JSON.stringify({ minutes }),
+    }),
+  )
+export const disableGeofencePreCool = roomId =>
+  roomParam(roomId).then(rid =>
+    request(`/rooms/${encodeURIComponent(rid)}/pre_cool/geofence/disable`, { method: 'POST' }),
   )
 export const getBrands = () => request('/brands')
 

@@ -199,6 +199,12 @@ const ROOM_SETTINGS_KEYS = [
   'physical_state_from_power', 'physical_on_watts', 'physical_off_watts', 'physical_state_confirm_seconds',
   'pre_cool_enabled', 'pre_cool_duration_minutes', 'pre_cool_min_temp_gap_deg',
   'pre_cool_target_offset_deg', 'pre_cool_arrival_grace_seconds', 'pre_cool_no_show_action',
+  'pre_cool_geofence_enabled', 'pre_cool_geofence_mode', 'pre_cool_geofence_radius_km',
+  'pre_cool_home_latitude', 'pre_cool_home_longitude',
+  'pre_cool_allowed_people', 'pre_cool_geofence_cooldown_minutes',
+  'pre_cool_one_shot_per_window', 'pre_cool_allow_extension',
+  'pre_cool_extension_minutes', 'pre_cool_max_total_minutes',
+  'pre_cool_stop_if_user_leaves_geofence',
   'on_delay_seconds', 'off_delay_seconds',
   'energy_tariff_per_kwh', 'currency', 'use_presence', 'use_outdoor_temp',
   'smart_temp_adjustment', 'smart_cooling_enabled', 'manual_override', 'manual_override_enabled',
@@ -1630,6 +1636,117 @@ export default function Settings() {
                 max={10}
                 step={1}
                 unit=" min"
+              />
+              <Toggle
+                label="Geofence pre-cool"
+                description="Suggest or start pre-cool when an allowed person enters the room's arrival radius"
+                checked={cfg.pre_cool_geofence_enabled ?? false}
+                onChange={v => patch('pre_cool_geofence_enabled', v)}
+              />
+              <label className="block">
+                <span className="text-xs font-semibold text-gray-400">Geofence mode</span>
+                <select
+                  value={cfg.pre_cool_geofence_mode || 'suggest_only'}
+                  onChange={e => patch('pre_cool_geofence_mode', e.target.value)}
+                  className="mt-1 w-full rounded-lg border border-gray-700 bg-gray-900 px-3 py-2 text-sm text-gray-100"
+                >
+                  <option value="suggest_only">Suggest only</option>
+                  <option value="auto_start">Auto start</option>
+                </select>
+              </label>
+              <label className="block">
+                <span className="text-xs font-semibold text-gray-400">Arrival radius</span>
+                <select
+                  value={[0.5, 1, 2, 3, 5, 10].includes(Number(cfg.pre_cool_geofence_radius_km)) ? Number(cfg.pre_cool_geofence_radius_km) : 'custom'}
+                  onChange={e => {
+                    if (e.target.value !== 'custom') patch('pre_cool_geofence_radius_km', Number(e.target.value))
+                  }}
+                  className="mt-1 w-full rounded-lg border border-gray-700 bg-gray-900 px-3 py-2 text-sm text-gray-100"
+                >
+                  {[0.5, 1, 2, 3, 5, 10].map(km => <option key={km} value={km}>{km} km</option>)}
+                  <option value="custom">Custom</option>
+                </select>
+              </label>
+              <Input
+                label="Custom radius km"
+                type="number"
+                value={cfg.pre_cool_geofence_radius_km ?? 2}
+                onChange={v => patch('pre_cool_geofence_radius_km', v)}
+                min={0.5}
+                max={10}
+                step={0.5}
+              />
+              <p className="sm:col-span-2 text-[11px] text-gray-500">
+                Uses phone latitude/longitude from Home Assistant and this add-on radius. Small radius starts closer to home. Recommended: 2 km.
+              </p>
+              <Input
+                label="Home latitude"
+                type="number"
+                value={cfg.pre_cool_home_latitude ?? ''}
+                onChange={v => patch('pre_cool_home_latitude', v === '' ? null : v)}
+                min={-90}
+                max={90}
+                step={0.000001}
+              />
+              <Input
+                label="Home longitude"
+                type="number"
+                value={cfg.pre_cool_home_longitude ?? ''}
+                onChange={v => patch('pre_cool_home_longitude', v === '' ? null : v)}
+                min={-180}
+                max={180}
+                step={0.000001}
+              />
+              <Input
+                label="Allowed people"
+                value={Array.isArray(cfg.pre_cool_allowed_people) ? cfg.pre_cool_allowed_people.join(', ') : ''}
+                onChange={v => patch('pre_cool_allowed_people', String(v || '').split(',').map(x => x.trim()).filter(Boolean))}
+                placeholder="person.amit, person.family"
+              />
+              <Slider
+                label="Geofence cooldown"
+                value={cfg.pre_cool_geofence_cooldown_minutes ?? 30}
+                onChange={v => patch('pre_cool_geofence_cooldown_minutes', v)}
+                min={5}
+                max={120}
+                step={5}
+                unit=" min"
+              />
+              <Toggle
+                label="One shot per visit"
+                description="Do not restart after cancel during the same geofence visit"
+                checked={cfg.pre_cool_one_shot_per_window ?? true}
+                onChange={v => patch('pre_cool_one_shot_per_window', v)}
+              />
+              <Toggle
+                label="Traffic extension"
+                description="Extend once the timer expires only when the latest location trend was moving toward home and the room is still hot"
+                checked={cfg.pre_cool_allow_extension ?? true}
+                onChange={v => patch('pre_cool_allow_extension', v)}
+              />
+              <Slider
+                label="Extension"
+                value={cfg.pre_cool_extension_minutes ?? 10}
+                onChange={v => patch('pre_cool_extension_minutes', v)}
+                min={5}
+                max={30}
+                step={5}
+                unit=" min"
+              />
+              <Slider
+                label="Max total"
+                value={cfg.pre_cool_max_total_minutes ?? 45}
+                onChange={v => patch('pre_cool_max_total_minutes', v)}
+                min={10}
+                max={90}
+                step={5}
+                unit=" min"
+              />
+              <Toggle
+                label="Stop if leaving radius"
+                description="Do not extend when the triggering person is no longer inside the geofence"
+                checked={cfg.pre_cool_stop_if_user_leaves_geofence ?? true}
+                onChange={v => patch('pre_cool_stop_if_user_leaves_geofence', v)}
               />
             </div>
           )}
