@@ -1061,6 +1061,7 @@ class TestLogicEngineHardening(unittest.TestCase):
         self.assertIsNone(st.pending_on_ir_sent_at)
         self.assertFalse(st.soft_start_ui)
         self.assertFalse(st.on_failed_retry_used)
+        self.assertTrue(st.on_confirmation_failed)
 
     def test_on_failed_retry_allowed_once_after_30s(self):
         st = logic_engine.RoomRuntime()
@@ -1073,6 +1074,7 @@ class TestLogicEngineHardening(unittest.TestCase):
             self.assertFalse(logic_engine._on_failed_retry_allowed("room-x", st, now))
 
         self.assertTrue(st.on_failed_retry_used)
+        self.assertEqual(st.on_confirmation_retry_count, 1)
         self.assertTrue(
             any("[CONTROL] on_retry_allowed" in str(call.args) for call in log_with_room.call_args_list)
         )
@@ -3263,12 +3265,85 @@ class TestLogicEngineHardening(unittest.TestCase):
             tuya_turn_on.assert_awaited_once_with(
                 "climate.tuya",
                 24.0,
-                fan_mode="auto",
                 hvac_mode="cool",
+                last_commanded_temperature=None,
+                force_physical_on=False,
+                physical_power_watts=None,
             )
             aerostate_turn_on.assert_not_called()
 
         asyncio.run(run_case())
+
+    def test_turn_ac_on_tuya_force_physical_when_ha_cool_but_power_zero(self):
+        logic_engine._runtime_by_room.clear()
+        rid = "ir-tuya-force"
+        st = logic_engine._rt(rid)
+        st.energy_configured = True
+        st.energy_power_entity = "sensor.tuya_power"
+        st.telemetry_power_live_valid = True
+        st.energy_watts = 0.0
+        st.physical_ac_on = False
+        cfg = {
+            "climate_entity": "climate.tuya",
+            "ir_backend": "tuya",
+            "min_command_interval_seconds": 0,
+            "compressor_min_off_seconds": 0,
+            "physical_on_watts": 100,
+        }
+
+        async def run_case():
+            with (
+                mock.patch.object(logic_engine.ac_tuya_adapter, "turn_on", return_value=True) as tuya_turn_on,
+                mock.patch.object(logic_engine, "log_with_room"),
+            ):
+                ok = await logic_engine._turn_ac_on(rid, cfg, 27.0, 24.0)
+            self.assertTrue(ok)
+            tuya_turn_on.assert_awaited_once_with(
+                "climate.tuya",
+                24.0,
+                hvac_mode="cool",
+                last_commanded_temperature=None,
+                force_physical_on=True,
+                physical_power_watts=0.0,
+            )
+
+        asyncio.run(run_case())
+
+    def test_tuya_power_increase_confirms_on_and_clears_pending_state(self):
+        logic_engine._runtime_by_room.clear()
+        rid = "tuya-confirm-power"
+        st = logic_engine._rt(rid)
+        st.pending_action = "on"
+        st.pending_on_ir_sent = True
+        st.pending_on_ir_sent_at = datetime.now(timezone.utc)
+        st.on_confirmation_failed = True
+        st.on_confirmation_retry_count = 1
+        st.energy_configured = True
+        st.energy_power_entity = "sensor.tuya_power"
+        st.telemetry_power_live_valid = True
+        cfg = {
+            "ir_backend": "tuya",
+            "physical_on_watts": 100,
+            "physical_state_confirm_seconds": 0,
+        }
+
+        with mock.patch.object(logic_engine, "log_with_room") as log_with_room:
+            applied = logic_engine._reconcile_physical_ac_from_power(
+                rid,
+                cfg,
+                st,
+                datetime.now(timezone.utc),
+                150.0,
+            )
+
+        self.assertTrue(applied)
+        self.assertTrue(st.physical_ac_on)
+        self.assertIsNone(st.pending_action)
+        self.assertFalse(st.on_confirmation_failed)
+        self.assertEqual(st.on_confirmation_retry_count, 0)
+        self.assertTrue(
+            any("[CONTROL][tuya] on_confirmed power=%.0f" in str(call.args) for call in log_with_room.call_args_list)
+        )
 
     def test_pending_on_duplicate_guard_blocks_all_ir_backends(self):
         logic_engine._runtime_by_room.clear()

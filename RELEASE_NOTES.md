@@ -1,5 +1,9 @@
 # HawaAI add-on — release notes
 
+## 1.4.94
+
+- **Tuya IR ON reliability:** Automated Tuya ON now uses the proven `set_hvac_mode(cool)` physical command, confirms via power telemetry, preserves fan/swing by default, and avoids extra temperature/fan/swing IR beeps unless a real change is needed.
+
 ## 1.4.91
 
 - **LG fan guard:** Added a room-scoped guard for LG F1-F5/Turbo fan modes so automation never sends Turbo, while explicit user Turbo remains allowed and can time out back to the last safe fan.

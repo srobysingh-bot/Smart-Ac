@@ -584,6 +584,8 @@ class RoomRuntime:
     # Pending ON visual state while runtime waits for IR confirmation.
     soft_start_ui: bool = False
     on_failed_retry_used: bool = False
+    on_confirmation_failed: bool = False
+    on_confirmation_retry_count: int = 0
     # FP2 zone (optional): live occupancy reconciliation plus dwell/confirmation for ON gating.
     zone_present: bool = False
     zone_entered_at: Optional[datetime] = None
@@ -1171,6 +1173,8 @@ _COOLDOWN_SECS: int = 60
 # After first delayed-path ON IR in a pending cycle, wait this long for runtime
 # confirmation before surfacing on_failed and clearing pending.
 PENDING_ON_CONFIRM_TIMEOUT_SECS: float = 20.0
+ON_CONFIRMATION_RETRY_BACKOFF_SECS: float = 30.0
+ON_CONFIRMATION_MAX_RETRIES: int = 1
 IR_SEND_LOCK_SECONDS: float = 10.0
 POST_ON_STABILIZATION_SECONDS: float = 20.0
 
@@ -1467,6 +1471,28 @@ def _power_says_physical_on(cfg: dict, st: RoomRuntime, power_watts: object) -> 
     return float(power_watts) >= _cfg_float(cfg, "physical_on_watts", 100.0, lo=0.0)
 
 
+def _current_valid_power_watts(st: RoomRuntime) -> Optional[float]:
+    power = st.energy_watts
+    if power is None:
+        return None
+    try:
+        return float(power)
+    except (TypeError, ValueError):
+        return None
+
+
+def _power_says_physical_off(cfg: dict, st: RoomRuntime, power_watts: object) -> bool:
+    if not _power_physical_state_enabled(cfg, st, power_watts):
+        return False
+    return float(power_watts) < _cfg_float(cfg, "physical_on_watts", 100.0, lo=0.0)
+
+
+def _reset_on_confirmation_failure(st: RoomRuntime) -> None:
+    st.on_confirmation_failed = False
+    st.on_confirmation_retry_count = 0
+    st.on_failed_retry_used = False
+
+
 def _power_candidate_confirmed(
     st: RoomRuntime,
     desired: str,
@@ -1524,6 +1550,14 @@ def _reconcile_physical_ac_from_power(
             st.ac_is_on = True
             st.ac_state_source = "power_telemetry"
             if st.pending_action == "on":
+                if normalize_ir_backend(cfg) == "tuya":
+                    log_with_room(
+                        "info",
+                        room_id,
+                        "[CONTROL][tuya] on_confirmed power=%.0f",
+                        watts,
+                    )
+                _reset_on_confirmation_failure(st)
                 _clear_pending_command_state(st)
             applied = True
     elif watts <= off_watts:
@@ -3424,9 +3458,13 @@ def _sync_pending_for_action(st: RoomRuntime, decision_action: str) -> None:
         return
     if decision_action not in ("on", "off"):
         _clear_pending_command_state(st)
+        if decision_action != "on":
+            _reset_on_confirmation_failure(st)
         return
     if st.pending_action is not None and st.pending_action != decision_action:
         _clear_pending_command_state(st)
+        if decision_action != "on":
+            _reset_on_confirmation_failure(st)
 
 
 def _seconds_since_effective_on_or_command(st: RoomRuntime, now: datetime) -> float:
@@ -3537,6 +3575,7 @@ async def _clear_timed_out_pending_on(
     room_id: str,
     st: RoomRuntime,
     now: datetime,
+    cfg: Optional[dict] = None,
 ) -> bool:
     if (
         st.pending_action != "on"
@@ -3551,6 +3590,14 @@ async def _clear_timed_out_pending_on(
         return False
 
     st.soft_start_ui = False
+    power_watts = _current_valid_power_watts(st)
+    if cfg is not None and normalize_ir_backend(cfg) == "tuya":
+        log_with_room(
+            "error",
+            room_id,
+            "[CONTROL][tuya] on_confirmation_failed power=%s",
+            f"{power_watts:.0f}" if power_watts is not None else "n/a",
+        )
     log_with_room(
         "error",
         room_id,
@@ -3560,6 +3607,7 @@ async def _clear_timed_out_pending_on(
     )
     st.ac_state = "on_failed"
     st.last_command = "on_failed"
+    st.on_confirmation_failed = True
     st.on_failed_retry_used = False
     try:
         await live_broadcast.broadcast_room_update(room_id)
@@ -3572,11 +3620,14 @@ async def _clear_timed_out_pending_on(
 def _on_failed_retry_allowed(room_id: str, st: RoomRuntime, now: datetime) -> bool:
     if st.ac_state != "on_failed" or st.on_failed_retry_used:
         return False
+    if st.on_confirmation_retry_count >= int(ON_CONFIRMATION_MAX_RETRIES):
+        return False
     if st.last_command_time is None:
         return False
     elapsed = (now - st.last_command_time).total_seconds()
-    if elapsed < 30.0:
+    if elapsed < float(ON_CONFIRMATION_RETRY_BACKOFF_SECS):
         return False
+    st.on_confirmation_retry_count += 1
     st.on_failed_retry_used = True
     log_with_room("info", room_id, "[CONTROL] on_retry_allowed")
     return True
@@ -5452,6 +5503,8 @@ async def _tick_presence_only_mode(
             st.effective_on_since_ts = now.timestamp()
     else:
         st.effective_on_since_ts = None
+    if normalize_ir_backend(cfg) == "tuya" and _power_says_physical_off(cfg, st, telemetry_power_reading):
+        confirmed_ac_on = False
 
     _clear_pending_when_physically_satisfied(
         st,
@@ -5564,7 +5617,7 @@ async def _tick_presence_only_mode(
         and st.pending_on_ir_sent_at is not None
         and not st.physical_ac_on
     ):
-        await _clear_timed_out_pending_on(room_id, st, now)
+        await _clear_timed_out_pending_on(room_id, st, now, cfg)
 
     log_with_room(
         "info",
@@ -6301,6 +6354,8 @@ async def _tick_impl(rid_raw: str, room_id: str) -> None:
             st.effective_on_since_ts = now_ts
     else:
         st.effective_on_since_ts = None
+    if normalize_ir_backend(cfg) == "tuya" and _power_says_physical_off(cfg, st, telemetry_power_reading):
+        confirmed_ac_on = False
 
     if await _handle_pending_off_confirmation(
         room_id,
@@ -6479,7 +6534,7 @@ async def _tick_impl(rid_raw: str, room_id: str) -> None:
         and st.pending_on_ir_sent_at is not None
         and not st.physical_ac_on
     ):
-        await _clear_timed_out_pending_on(room_id, st, now)
+        await _clear_timed_out_pending_on(room_id, st, now, cfg)
 
     delta_audit = indoor_temp - et_eff
     in_cd_audit = _is_in_cooldown(st, now)
@@ -6918,6 +6973,7 @@ async def _tuya_double_emit(room_id: str, cfg: dict, target: float, now: datetim
         target,
         now=datetime.now(timezone.utc),
         allow_pending_on_emit=True,
+        force_physical_on=True,
     )
 
 
@@ -7166,6 +7222,7 @@ async def _turn_ac_on(
     now: Optional[datetime] = None,
     *,
     allow_pending_on_emit: bool = False,
+    force_physical_on: bool = False,
 ) -> bool:
     """Turn AC ON for one room; updates RoomRuntime + per-room session. Returns False if IR not sent."""
     st = _rt(room_id)
@@ -7223,11 +7280,18 @@ async def _turn_ac_on(
 
     ir_backend = await resolve_ir_backend(room_id, cfg, climate_entity)
     if ir_backend == "tuya":
+        current_power = _current_valid_power_watts(st)
+        force_tuya_physical_on = bool(
+            force_physical_on
+            or _power_says_physical_off(cfg, st, current_power)
+        )
         success = await ac_tuya_adapter.turn_on(
             climate_entity,
             target,
-            fan_mode="auto",
             hvac_mode="cool",
+            last_commanded_temperature=st.last_applied_setpoint,
+            force_physical_on=force_tuya_physical_on,
+            physical_power_watts=current_power,
         )
     elif ir_backend == "aerostate":
         success = await ac_aerostate_adapter.turn_on(
@@ -7256,7 +7320,6 @@ async def _turn_ac_on(
     st.last_command = "on"
     st.off_reason = None
     st.last_sent_command_key = _fingerprint_turn_on(target)
-    st.on_failed_retry_used = False
     st.compressor_on_since = None
     st.compressor_off_since = None
     record_setpoint_command(room_id, target, cmd_ts)

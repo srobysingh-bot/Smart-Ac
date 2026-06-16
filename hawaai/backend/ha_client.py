@@ -105,6 +105,21 @@ async def get_climate_state(entity_id: str) -> Dict[str, Any]:
         fan_modes: List[str] = [str(x) for x in raw_fan_modes if x is not None]
     else:
         fan_modes = []
+    raw_swing_modes = attrs.get("swing_modes") or attrs.get("swing_mode_list")
+    if isinstance(raw_swing_modes, (list, tuple)):
+        swing_modes: List[str] = [str(x) for x in raw_swing_modes if x is not None]
+    else:
+        swing_modes = []
+    raw_hvac_modes = attrs.get("hvac_modes") or attrs.get("hvac_mode_list")
+    if isinstance(raw_hvac_modes, (list, tuple)):
+        hvac_modes: List[str] = [str(x) for x in raw_hvac_modes if x is not None]
+    else:
+        hvac_modes = []
+    supported_features = attrs.get("supported_features")
+    try:
+        supported_features_int = int(supported_features)
+    except (TypeError, ValueError):
+        supported_features_int = 0
 
     return {
         "state":        state,
@@ -114,6 +129,19 @@ async def get_climate_state(entity_id: str) -> Dict[str, Any]:
         "fan_mode":     attrs.get("fan_mode"),
         "fan_modes":    fan_modes,             # supported fan speeds for smart_cooling mapping
         "swing_mode":   attrs.get("swing_mode"),
+        "swing_modes":  swing_modes,
+        "hvac_modes":   hvac_modes,
+        "supported_features": supported_features_int,
+        "power_on_supported": bool(
+            attrs.get("power_on_supported")
+            or attrs.get("supports_power_on")
+            or attrs.get("power_on_command")
+        ),
+        "full_state_on_supported": bool(
+            attrs.get("full_state_on_supported")
+            or attrs.get("supports_full_state_on")
+            or attrs.get("tuya_full_state_on_supported")
+        ),
         "is_on":        is_on,
         "last_changed": full.get("last_changed"),
         "last_updated": full.get("last_updated"),
