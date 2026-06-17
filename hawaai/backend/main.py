@@ -541,7 +541,7 @@ async def lifespan(app: FastAPI):
     logger.info("[HawaAI] Add-on stopped")
 
 
-app = FastAPI(title="HawaAI API", version="1.4.96", lifespan=lifespan)
+app = FastAPI(title="HawaAI API", version="1.4.97", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -731,7 +731,8 @@ def _runtime_block(runtime: Dict[str, Any]) -> Dict[str, Any]:
     now = datetime.now(timezone.utc)
     start_iso = runtime.get("active_session_started_at") or runtime.get("session_start_time")
     sid = runtime.get("session_id")
-    active = bool(sid and start_iso)
+    continuity = bool(runtime.get("active_session_continuity_confirmed"))
+    active = bool(sid and start_iso and continuity)
     elapsed_seconds = runtime.get("active_session_elapsed_seconds")
     if elapsed_seconds is None and active and start_iso:
         try:
@@ -751,6 +752,8 @@ def _runtime_block(runtime: Dict[str, Any]) -> Dict[str, Any]:
         "active_session_started_at": start_iso,
         "active_session_elapsed_seconds": elapsed_seconds,
         "active_session_state": runtime.get("active_session_state") or ("active" if active else "idle"),
+        "active_session_continuity_confirmed": continuity,
+        "active_session_recovery_state": runtime.get("active_session_recovery_state") or "idle",
     }
 
 
@@ -1035,6 +1038,8 @@ async def _dashboard_status_payload(rid: str) -> Dict[str, Any]:
         "active_session_started_at": runtime.get("active_session_started_at"),
         "active_session_elapsed_seconds": runtime.get("active_session_elapsed_seconds"),
         "active_session_state": runtime.get("active_session_state"),
+        "active_session_continuity_confirmed": runtime.get("active_session_continuity_confirmed"),
+        "active_session_recovery_state": runtime.get("active_session_recovery_state"),
         "runtime":          rt,
         "zone_status": {
             "phase": runtime.get("zone_ui_phase") or "inactive",

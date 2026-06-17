@@ -1504,7 +1504,7 @@ function RoomLogsCard({ activeRoomId, rooms }) {
 
   return (
     <div className="card">
-      <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3 mb-3">
+      <div className="sticky top-0 z-10 -mx-4 -mt-4 mb-3 flex flex-col gap-3 border-b border-gray-800 bg-gray-950/95 px-4 py-3 sm:flex-row sm:items-center sm:justify-between">
         <p className="text-xs text-gray-500 uppercase tracking-wide">Room Logs</p>
         <div className="flex flex-wrap items-center gap-2">
           <select
@@ -1538,7 +1538,7 @@ function RoomLogsCard({ activeRoomId, rooms }) {
           const el = e.currentTarget
           shouldAutoScrollRef.current = el.scrollHeight - el.scrollTop - el.clientHeight < 50
         }}
-        className="overflow-y-auto overflow-x-hidden rounded border border-gray-800 bg-gray-950/70 p-2 font-mono text-xs"
+        className="h-[260px] max-h-[260px] overflow-y-auto overflow-x-auto rounded border border-gray-800 bg-gray-950/70 p-2 font-mono text-xs [scrollbar-color:rgba(148,163,184,0.35)_transparent] [scrollbar-width:thin] sm:h-[320px] sm:max-h-[320px] lg:h-[360px] lg:max-h-[360px]"
       >
         {busy && logs.length === 0 ? <p className="text-gray-500">Loading logs...</p> : null}
         {!busy && logs.length === 0 ? <p className="text-gray-600">No room logs yet.</p> : null}
@@ -1648,12 +1648,6 @@ export default function Dashboard() {
 
           {configIncomplete && <ConfigWarning roomId={activeRoomId} />}
 
-          {activeRoomId && status && (
-            <div className="container-app px-4 sm:px-6 pb-2 shrink-0 min-w-0">
-              <TemperaturePlanCard status={status} />
-            </div>
-          )}
-
           <div className="container-app overflow-x-hidden px-4 sm:px-6 py-3 sm:py-4 pb-8 space-y-4 min-w-0">
             {/* Cards — 1 col · 2 cols tablet · 3 lg · 4 xl */}
             <div className="grid grid-cols-1 items-start sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-4 min-w-0">
@@ -1664,6 +1658,7 @@ export default function Dashboard() {
             indoorFromAC={displayStatus?.indoor_temp == null && displayStatus?.ac_current_temp != null}
           />
           <ACStatusCard
+            variant="summary"
             acPhase={displayStatus?.ac_state || 'off'}
             acIdle={displayStatus?.ac_idle ?? false}
             acStateSource={displayStatus?.ac_state_source}
@@ -1782,8 +1777,71 @@ export default function Dashboard() {
           </div>
         </div>
 
-        <AiStatusCard ai={ai} />
-        <RoomHealthCard health={displayStatus?.health} />
+        <div className="grid grid-cols-1 gap-4 lg:grid-cols-2">
+          {status && <TemperaturePlanCard status={status} />}
+          <ACStatusCard
+            acPhase={displayStatus?.ac_state || 'off'}
+            acIdle={displayStatus?.ac_idle ?? false}
+            acStateSource={displayStatus?.ac_state_source}
+            sessionStart={
+              displayStatus?.active_session_started_at
+              || displayStatus?.runtime?.active_session_started_at
+              || displayStatus?.session_start
+              || displayStatus?.runtime?.session_start
+            }
+            runtime={displayStatus?.runtime}
+            wattDraw={displayStatus?.watt_draw}
+            sessionKwh={displayStatus?.session_kwh}
+            lastAcOnAt={displayStatus?.last_ac_on_at}
+            lastAcOffAt={displayStatus?.last_ac_off_at}
+            pendingAction={displayStatus?.pending_action}
+            pendingRemainSec={displayStatus?.pending_remaining_seconds}
+            preCoolEnabled={displayStatus?.pre_cool_enabled}
+            preCoolActive={displayStatus?.pre_cool_active}
+            preCoolDurationMinutes={displayStatus?.pre_cool_duration_minutes}
+            preCoolRemainingSeconds={displayStatus?.pre_cool_remaining_seconds}
+            preCoolTarget={displayStatus?.pre_cool_target}
+            preCoolResult={displayStatus?.pre_cool_result}
+            preCoolTriggerSource={displayStatus?.pre_cool_trigger_source}
+            preCoolPerson={displayStatus?.pre_cool_geofence_trigger_person}
+            preCoolSnoozedUntil={displayStatus?.pre_cool_snoozed_until}
+            preCoolExtensionCount={displayStatus?.pre_cool_extension_count}
+            vacancyOffBlockedReason={displayStatus?.vacancy_off_blocked_reason}
+            onPreCoolStart={handlePreCoolStart}
+            onPreCoolCancel={handlePreCoolCancel}
+            onPreCoolSnooze={handlePreCoolSnooze}
+            onPreCoolDisableGeofence={handlePreCoolDisableGeofence}
+            hasClimateEntity={!!(displayStatus?.climate_entity || displayStatus?.ac_entity)}
+            acCurrentTemp={displayStatus?.ac_current_temp}
+            acTargetTemp={displayStatus?.ac_target_temp}
+            acMode={displayStatus?.ac_mode}
+            acFanMode={displayStatus?.ac_fan_mode}
+            acSwingMode={displayStatus?.ac_swing_mode}
+            smartCoolingEnabled={displayStatus?.smart_cooling_enabled ?? false}
+            smartMode={displayStatus?.smart_mode}
+            smartFanMode={displayStatus?.smart_fan_mode}
+            smartDelta={displayStatus?.smart_delta}
+            sleepOptimizationActive={displayStatus?.sleep_optimization_active}
+            sleepPhase={displayStatus?.sleep_phase}
+            sleepOffset={displayStatus?.sleep_offset}
+            humidityPercent={displayStatus?.humidity_percent}
+            feelsLikeTemp={displayStatus?.feels_like_temp}
+            dewPoint={displayStatus?.dew_point}
+            humidityOffset={displayStatus?.humidity_offset}
+            comfortLevel={displayStatus?.comfort_level}
+            humidityBand={displayStatus?.humidity_band}
+            dryModeRecommended={displayStatus?.dry_mode_recommended}
+            thermalLoadLevel={displayStatus?.thermal_load_level}
+            thermalLoadConfidence={displayStatus?.thermal_load_confidence}
+            thermalLoadActive={displayStatus?.thermal_load_active}
+            thermalLoadSummary={displayStatus?.thermal_load_summary}
+            thermalLoadOffset={displayStatus?.thermal_load_offset}
+            coolingSaturated={displayStatus?.cooling_saturated}
+          />
+          <AiStatusCard ai={ai} />
+          <RoomHealthCard health={displayStatus?.health} />
+        </div>
+
         <RoomLogsCard activeRoomId={activeRoomId} rooms={rooms} />
 
         {/* Climate card — only shown when a climate entity is configured */}

@@ -22,11 +22,8 @@ function useElapsed(startIso, backendElapsedSeconds) {
       const id = setInterval(tick, 1000)
       return () => clearInterval(id)
     }
-    if (!startIso) { setElapsed(0); return undefined }
-    const tick = () => setElapsed(Math.max(0, Math.floor((Date.now() - new Date(startIso)) / 1000)))
-    tick()
-    const id = setInterval(tick, 1000)
-    return () => clearInterval(id)
+    setElapsed(0)
+    return undefined
   }, [startIso, backendElapsedSeconds])
 
   return elapsed
@@ -81,10 +78,12 @@ export default function LiveSessionCard({ status }) {
   const isOn = Boolean(status?.physical_ac_on ?? status?.ac_on ?? effective_ac_on)
 
   const startIso = runtime?.active_session_started_at || session_start || runtime?.session_start
-  const elapsed = useElapsed(startIso, runtime?.active_session_elapsed_seconds)
+  const continuityConfirmed = Boolean(runtime?.active_session_continuity_confirmed)
+  const elapsed = useElapsed(startIso, continuityConfirmed ? runtime?.active_session_elapsed_seconds : null)
   const isActive = !!(
     (startIso || runtime?.active)
     && (isOn || ac_idle)
+    && continuityConfirmed
   )
 
   if (!isActive) return null

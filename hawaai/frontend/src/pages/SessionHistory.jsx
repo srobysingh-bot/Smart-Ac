@@ -40,6 +40,10 @@ function formatGroupDate(iso) {
 }
 
 function sessionQuality(s) {
+  const q = String(s.energy_quality || '').toLowerCase()
+  if (q === 'legacy_unverified') return 'legacy'
+  if (q === 'energy_unknown') return 'unknown'
+  if (q === 'telemetry_gap') return 'gap'
   const dt = s.delta_temp ??
     (s.indoor_temp_start != null && s.indoor_temp_end != null
       ? s.indoor_temp_start - s.indoor_temp_end
@@ -85,7 +89,11 @@ const QUALITY_CFG = {
   good: { label: 'Good', dot: 'bg-green-400', text: 'text-green-400' },
   weak: { label: 'Weak', dot: 'bg-yellow-400', text: 'text-yellow-400' },
   invalid: { label: 'Invalid', dot: 'bg-red-500', text: 'text-red-400' },
+  legacy: { label: 'Legacy unverified', dot: 'bg-gray-400', text: 'text-gray-300' },
+  unknown: { label: 'Energy unknown', dot: 'bg-amber-300', text: 'text-amber-300' },
+  gap: { label: 'Telemetry gap', dot: 'bg-sky-300', text: 'text-sky-300' },
 }
+const LOW_QUALITY = new Set(['invalid', 'legacy', 'unknown', 'gap'])
 
 function QualityBadge({ quality }) {
   const q = QUALITY_CFG[quality] || QUALITY_CFG.invalid
@@ -214,8 +222,8 @@ export default function SessionHistory() {
   if (filter === 'valid') displayed = enriched.filter(s => s._quality === 'good')
   if (filter === 'fast') displayed = enriched.filter(s => s._fast)
 
-  const validRows = filter === 'all' ? displayed.filter(s => s._quality !== 'invalid') : displayed
-  const invalidRows = filter === 'all' ? displayed.filter(s => s._quality === 'invalid') : []
+  const validRows = filter === 'all' ? displayed.filter(s => !LOW_QUALITY.has(s._quality)) : displayed
+  const invalidRows = filter === 'all' ? displayed.filter(s => LOW_QUALITY.has(s._quality)) : []
   const toRender = filter === 'all' && !showInvalid ? validRows : displayed
   const groupedRows = groupByDate(toRender)
   const totalPages = Math.ceil(total / PAGE_SIZE)

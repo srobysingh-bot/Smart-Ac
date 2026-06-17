@@ -192,6 +192,11 @@ async def _persist_active_session_metadata(room_id: str, st: "RoomRuntime") -> N
             "meter_start_kwh": st.session_start_kwh,
             "accumulated_energy_wh": round(st.session_energy_wh, 4),
             "session_telemetry_gap_seconds": round(st.session_telemetry_gap_seconds, 1),
+            "last_confirmed_physical_on_at": st.last_ac_on_at,
+            "last_valid_power_sample_at": (
+                st.last_valid_timestamp.isoformat() if st.last_valid_timestamp else None
+            ),
+            "last_valid_power_watts": st.last_valid_power_watts,
         },
     )
 
@@ -199,6 +204,7 @@ async def _persist_active_session_metadata(room_id: str, st: "RoomRuntime") -> N
 TELEMETRY_STALE_SECONDS: float = 60.0
 TELEMETRY_OFFLINE_SECONDS: float = 180.0
 TELEMETRY_LONG_OUTAGE_LOG_SECONDS: float = 300.0
+ACTIVE_SESSION_CONTINUITY_MAX_GAP_SECONDS: float = 900.0
 
 
 def _telemetry_status_from_invalid_age(age_seconds: float) -> str:
@@ -543,6 +549,8 @@ class RoomRuntime:
     session_last_power_sample_at: Optional[datetime] = None
     session_telemetry_gap_seconds: float = 0.0
     session_telemetry_gap_started_at: Optional[datetime] = None
+    active_session_continuity_confirmed: bool = False
+    active_session_recovery_state: str = "idle"
     last_command_time: Optional[datetime] = None
     last_command: str = ""
     # Anti-spam: last temperature we commanded to the AC (setpoint) + wall time
@@ -2871,6 +2879,10 @@ async def _finalize_presence_only_idle(
     st.active_session_started_at_utc = None
     st.watts_samples = []
     _reset_session_energy_tracking(st)
+    st.active_session_continuity_confirmed = False
+    st.active_session_recovery_state = "idle"
+    st.active_session_continuity_confirmed = False
+    st.active_session_recovery_state = "idle"
     st.session_state = "idle"
     st.compressor_on_since = None
     st.compressor_off_since = now
@@ -3113,15 +3125,28 @@ async def _load_startup_state(room_id: str, cfg: dict) -> None:
         )
         power_reading, _kwh_reading = await _read_runtime_energy(room_id, cfg, st)
         open_row = await database.get_open_session(room_id)
-        if open_row and _power_says_physical_on(cfg, st, power_reading):
+        current_power_on = _power_says_physical_on(cfg, st, power_reading)
+        if open_row and current_power_on:
             started = _parse_dt_utc(
                 open_row.get("active_session_started_at_utc") or open_row.get("start_time")
             )
+            sample_at = _parse_dt_utc(open_row.get("last_valid_power_sample_at"))
+            try:
+                sample_watts = float(open_row.get("last_valid_power_watts"))
+            except (TypeError, ValueError):
+                sample_watts = None
             restart_now = datetime.now(timezone.utc)
+            recent_sample = (
+                sample_at is not None
+                and sample_watts is not None
+                and sample_watts >= _cfg_float(cfg, "physical_on_watts", 100.0, lo=0.0)
+                and 0 <= (restart_now - sample_at).total_seconds() <= ACTIVE_SESSION_CONTINUITY_MAX_GAP_SECONDS
+            )
             fresh_enough = (
                 started is not None
                 and started <= restart_now + timedelta(seconds=5)
                 and (restart_now - started).total_seconds() <= 48 * 3600
+                and recent_sample
             )
             if fresh_enough and await session_logger.restore_open_session(room_id, open_row):
                 st.session_start_time = started
@@ -3141,27 +3166,33 @@ async def _load_startup_state(room_id: str, cfg: dict) -> None:
                 except (TypeError, ValueError):
                     st.session_telemetry_gap_seconds = 0.0
                 st.session_state = "provisional" if session_logger.current_session_is_provisional(room_id) else "confirmed"
+                st.active_session_continuity_confirmed = True
+                st.active_session_recovery_state = "confirmed"
                 log_with_room("info", room_id, "[SESSION_RESTORE] active_session_resumed")
             elif not fresh_enough:
                 await database.update_session_end(
                     str(open_row.get("session_id")),
                     {
                         "end_time": datetime.now(timezone.utc).isoformat(),
-                        "reason_stopped": "startup_stale_open_session",
+                        "reason_stopped": "recovery_gap",
                         "is_record_valid": 0,
-                        "energy_quality": "invalid",
+                        "energy_quality": "recovered",
                     },
                 )
+                st.active_session_continuity_confirmed = False
+                st.active_session_recovery_state = "recovery_gap"
         elif open_row:
             await database.update_session_end(
                 str(open_row.get("session_id")),
                 {
                     "end_time": datetime.now(timezone.utc).isoformat(),
-                    "reason_stopped": "startup_stale_open_session",
+                    "reason_stopped": "recovery_gap",
                     "is_record_valid": 0,
-                    "energy_quality": "invalid",
+                    "energy_quality": "recovered",
                 },
             )
+            st.active_session_continuity_confirmed = False
+            st.active_session_recovery_state = "power_off"
     except Exception as e:
         logger.warning("[HawaAI] Could not load startup state for room=%s: %s", room_id, e)
     finally:
@@ -7060,6 +7091,8 @@ async def _start_provisional_session(
     st.compressor_off_since = None
     st.watts_samples = []
     _reset_session_energy_tracking(st)
+    st.active_session_continuity_confirmed = True
+    st.active_session_recovery_state = "confirmed"
     st.session_state = "provisional"
     st.session_runtime_confirmed = False
     weather = await weather_api.get_cached()
@@ -7080,6 +7113,11 @@ async def _start_provisional_session(
             "active_session_started_at_utc": st.active_session_started_at_utc.isoformat(),
             "accumulated_energy_wh":  0.0,
             "session_telemetry_gap_seconds": 0.0,
+            "last_confirmed_physical_on_at": st.last_ac_on_at,
+            "last_valid_power_sample_at": (
+                st.last_valid_timestamp.isoformat() if st.last_valid_timestamp else None
+            ),
+            "last_valid_power_watts": st.last_valid_power_watts,
             "provisional":            True,
             "is_record_valid":       1,
         },
@@ -7916,12 +7954,13 @@ def get_runtime_state(room_id: str) -> dict:
         sp_secs = round((now - st.last_setpoint_command_at).total_seconds(), 1)
     active_started = st.active_session_started_at_utc or st.session_start_time
     has_active_session = bool(session_logger.current_session_id(canonical))
+    continuity_confirmed = bool(has_active_session and st.active_session_continuity_confirmed)
     active_elapsed_seconds = (
         max(0, int((now - active_started).total_seconds()))
-        if active_started is not None and has_active_session
+        if active_started is not None and continuity_confirmed
         else None
     )
-    active_session_state = st.session_state if has_active_session else "idle"
+    active_session_state = st.session_state if continuity_confirmed else "reconnecting" if has_active_session else "idle"
 
     on_d = _nonnegative_delay_seconds(merged, "on_delay_seconds")
     off_d = _nonnegative_delay_seconds(merged, "off_delay_seconds")
@@ -8093,6 +8132,8 @@ def get_runtime_state(room_id: str) -> dict:
         ),
         "active_session_elapsed_seconds": active_elapsed_seconds,
         "active_session_state": active_session_state,
+        "active_session_continuity_confirmed": continuity_confirmed,
+        "active_session_recovery_state": st.active_session_recovery_state,
         "session_start_kwh":     st.session_start_kwh,
         "cooldown_active":       in_cooldown,
         "last_command":          st.last_command or None,

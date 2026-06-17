@@ -1,5 +1,9 @@
 # HawaAI add-on — release notes
 
+## 1.4.97
+
+- **Dashboard UI and timer continuity:** Restored bounded internal scrolling for Room Logs and Recent Sessions, split compact dashboard summary cards from taller runtime/detail cards to remove grid whitespace, made active-session timers require recent persisted power continuity, and reclassified legacy zero-energy vacancy rows as low-quality instead of Good.
+
 ## 1.4.96
 
 - **Telemetry/session blocker fixes:** Added HA WebSocket telemetry watches with reconnect snapshot refresh, persisted active-session restore metadata, timestamp-integrated power energy, cumulative telemetry gap tracking, stricter valid-session analytics filters, and safe legacy invalid-session repair.

@@ -196,6 +196,9 @@ async def init_db() -> None:
             "ALTER TABLE sessions ADD COLUMN active_session_started_at_utc TEXT",
             "ALTER TABLE sessions ADD COLUMN accumulated_energy_wh REAL",
             "ALTER TABLE sessions ADD COLUMN session_telemetry_gap_seconds REAL",
+            "ALTER TABLE sessions ADD COLUMN last_confirmed_physical_on_at REAL",
+            "ALTER TABLE sessions ADD COLUMN last_valid_power_sample_at TEXT",
+            "ALTER TABLE sessions ADD COLUMN last_valid_power_watts REAL",
         ):
             try:
                 await db.execute(stmt)
@@ -240,6 +243,18 @@ async def _repair_legacy_bad_sessions(db: aiosqlite.Connection) -> None:
             WHERE COALESCE(s1.is_archived, 0) = 0
               AND COALESCE(s2.is_archived, 0) = 0
         )
+        """
+    )
+    await db.execute(
+        """
+        UPDATE sessions
+        SET is_record_valid = 0,
+            energy_quality = 'legacy_unverified'
+        WHERE end_time IS NOT NULL
+          AND COALESCE(is_record_valid, 1) != 0
+          AND COALESCE(energy_consumed_kwh, 0) <= 0.0001
+          AND LOWER(COALESCE(reason_stopped, '')) IN ('vacant', 'vacancy', 'presence_vacant')
+          AND (JULIANDAY(end_time) - JULIANDAY(start_time)) * 1440 < 10
         """
     )
 
@@ -393,6 +408,7 @@ def _enrich_session(row: Dict[str, Any]) -> Dict[str, Any]:
         "telemetry_gap": "Telemetry gap",
         "energy_unknown": "Energy unknown",
         "recovered": "Recovered",
+        "legacy_unverified": "Legacy unverified",
         "invalid": "Invalid",
     }
     s["quality_label"] = quality_labels.get(energy_quality, "Partial")
@@ -435,7 +451,9 @@ def _enrich_session(row: Dict[str, Any]) -> Dict[str, Any]:
         and energy_ok
         and evidence_ok
     )
-    if not s["valid"]:
+    if energy_quality == "legacy_unverified":
+        s["quality_label"] = "Legacy unverified"
+    elif not s["valid"]:
         s["quality_label"] = "Invalid"
     elif s["energy_consumed_kwh"] is None:
         s["quality_label"] = "Energy unknown"
@@ -465,8 +483,9 @@ async def insert_session_start(session: Dict[str, Any]) -> None:
                  day_of_week, hour_of_day, room_id, provisional, is_record_valid,
                  meter_start_kwh, energy_source, energy_quality,
                  active_session_started_at_utc, accumulated_energy_wh,
-                 session_telemetry_gap_seconds)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                 session_telemetry_gap_seconds, last_confirmed_physical_on_at,
+                 last_valid_power_sample_at, last_valid_power_watts)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             """,
             (
                 session["session_id"],
@@ -492,6 +511,9 @@ async def insert_session_start(session: Dict[str, Any]) -> None:
                 session.get("active_session_started_at_utc"),
                 session.get("accumulated_energy_wh"),
                 session.get("session_telemetry_gap_seconds"),
+                session.get("last_confirmed_physical_on_at"),
+                session.get("last_valid_power_sample_at"),
+                session.get("last_valid_power_watts"),
             ),
         )
         await db.commit()
@@ -529,6 +551,9 @@ async def update_session_runtime_metadata(session_id: str, data: Dict[str, Any])
                 meter_start_kwh = COALESCE(meter_start_kwh, ?),
                 accumulated_energy_wh = ?,
                 session_telemetry_gap_seconds = ?,
+                last_confirmed_physical_on_at = COALESCE(?, last_confirmed_physical_on_at),
+                last_valid_power_sample_at = ?,
+                last_valid_power_watts = ?,
                 telemetry_gap_seconds = ?
             WHERE session_id = ?
               AND end_time IS NULL
@@ -538,6 +563,9 @@ async def update_session_runtime_metadata(session_id: str, data: Dict[str, Any])
                 data.get("meter_start_kwh"),
                 data.get("accumulated_energy_wh"),
                 data.get("session_telemetry_gap_seconds"),
+                data.get("last_confirmed_physical_on_at"),
+                data.get("last_valid_power_sample_at"),
+                data.get("last_valid_power_watts"),
                 data.get("session_telemetry_gap_seconds"),
                 session_id,
             ),

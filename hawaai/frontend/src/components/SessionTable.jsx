@@ -56,6 +56,10 @@ function reasonLabel(reason) {
 }
 
 function sessionQuality(s) {
+  const q = String(s.energy_quality || '').toLowerCase()
+  if (q === 'legacy_unverified') return 'legacy'
+  if (q === 'energy_unknown') return 'unknown'
+  if (q === 'telemetry_gap') return 'gap'
   const dt = s.delta_temp ??
     (s.indoor_temp_start != null && s.indoor_temp_end != null
       ? s.indoor_temp_start - s.indoor_temp_end
@@ -89,7 +93,26 @@ const QUALITY_BADGE = {
     text: 'text-red-200',
     bg: 'border-red-400/20 bg-red-400/[0.07]',
   },
+  legacy: {
+    label: 'Legacy unverified',
+    dot: 'bg-gray-400',
+    text: 'text-gray-300',
+    bg: 'border-gray-400/20 bg-gray-400/[0.07]',
+  },
+  unknown: {
+    label: 'Energy unknown',
+    dot: 'bg-amber-300',
+    text: 'text-amber-200',
+    bg: 'border-amber-400/20 bg-amber-400/[0.07]',
+  },
+  gap: {
+    label: 'Telemetry gap',
+    dot: 'bg-sky-300',
+    text: 'text-sky-200',
+    bg: 'border-sky-400/20 bg-sky-400/[0.07]',
+  },
 }
+const LOW_QUALITY = new Set(['invalid', 'legacy', 'unknown', 'gap'])
 
 function QualityBadge({ quality }) {
   const q = QUALITY_BADGE[quality] || QUALITY_BADGE.invalid
@@ -194,8 +217,8 @@ export default function SessionTable({ limit = 10, roomId }) {
     () => sessions.map(s => ({ ...s, _quality: sessionQuality(s) })),
     [sessions],
   )
-  const visible = enriched.filter(s => s._quality !== 'invalid')
-  const invalidRows = enriched.filter(s => s._quality === 'invalid')
+  const visible = enriched.filter(s => !LOW_QUALITY.has(s._quality))
+  const invalidRows = enriched.filter(s => LOW_QUALITY.has(s._quality))
   const toRender = showInvalid ? [...visible, ...invalidRows] : visible
   const grouped = groupByDate(toRender)
 
@@ -214,13 +237,13 @@ export default function SessionTable({ limit = 10, roomId }) {
     <div className="relative">
       <div className="pointer-events-none absolute inset-x-0 top-0 z-20 h-6 rounded-t-xl bg-gradient-to-b from-gray-950/90 to-transparent" aria-hidden />
       <div className="pointer-events-none absolute inset-x-0 bottom-0 z-20 h-8 rounded-b-xl bg-gradient-to-t from-gray-950/90 to-transparent" aria-hidden />
-      <div className="overflow-x-auto scroll-smooth rounded-xl border border-white/10 bg-black/10 [scrollbar-color:rgba(148,163,184,0.35)_transparent] [scrollbar-width:thin]">
+      <div className="max-h-[300px] overflow-auto scroll-smooth rounded-xl border border-white/10 bg-black/10 [scrollbar-color:rgba(148,163,184,0.35)_transparent] [scrollbar-width:thin] sm:max-h-[360px] lg:max-h-[420px]">
         {toRender.length === 0 ? (
           <p className="py-4 text-center text-sm text-gray-600">No valid sessions recorded yet</p>
         ) : (
-          <table className="w-full min-w-[820px] text-sm">
-            <thead>
-              <tr className="sticky top-0 z-10 border-b border-white/10 bg-gray-950/95 text-left text-[10px] uppercase tracking-[0.16em] text-gray-500 backdrop-blur">
+          <table className="w-full min-w-[900px] text-sm">
+            <thead className="sticky top-0 z-10">
+              <tr className="border-b border-white/10 bg-gray-950/95 text-left text-[10px] uppercase tracking-[0.16em] text-gray-500 backdrop-blur">
                 <th className="px-3 py-2 font-semibold">Start</th>
                 <th className="px-3 py-2 font-semibold">End</th>
                 <th className="px-3 py-2 font-semibold">Duration</th>

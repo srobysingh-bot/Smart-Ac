@@ -632,6 +632,7 @@ export default function ACStatusCard({
   acFanMode,
   acSwingMode,
   hasClimateEntity,
+  variant = 'full',
 }) {
   const [timer, setTimer] = useState(null)
   const runningCompress = acPhase === 'on' || acPhase === 'pending_off'
@@ -640,23 +641,28 @@ export default function ACStatusCard({
 
   // Timer runs while compressor is running (incl. pending OFF) or idle fan
   const sessionActive = runningCompress || acIdle
+  const continuityConfirmed = Boolean(runtime?.active_session_continuity_confirmed)
+  const reconnectingSession = Boolean(
+    sessionActive
+    && runtime?.active_session_recovery_state
+    && runtime.active_session_recovery_state !== 'idle'
+    && !continuityConfirmed
+  )
 
   useEffect(() => {
     const backendElapsed = runtime?.active_session_elapsed_seconds
-    if (!sessionActive || (backendElapsed == null && !sessionStart)) { setTimer(null); return }
+    if (!sessionActive || !continuityConfirmed || backendElapsed == null) { setTimer(null); return }
     const startedAt = Date.now()
     const baseSeconds = backendElapsed != null ? Number(backendElapsed) : null
     const update = () => {
       if (baseSeconds != null && Number.isFinite(baseSeconds)) {
         setTimer(elapsedFromSeconds(baseSeconds + Math.floor((Date.now() - startedAt) / 1000)))
-      } else {
-        setTimer(elapsed(sessionStart))
       }
     }
     const id = setInterval(update, 1000)
     update()
     return () => clearInterval(id)
-  }, [sessionActive, sessionStart, runtime?.active_session_elapsed_seconds])
+  }, [sessionActive, continuityConfirmed, runtime?.active_session_elapsed_seconds])
 
   const [adjPendingRemain, setAdjPendingRemain] = useState(null)
   useEffect(() => {
@@ -681,6 +687,53 @@ export default function ACStatusCard({
       : pendingAction === 'off'
         ? 'Waiting to turn OFF'
         : null
+
+  if (variant === 'summary') {
+    return (
+      <div className="card flex flex-col gap-3">
+        <div className="flex items-center justify-between flex-wrap gap-2">
+          <p className="text-xs text-gray-500 uppercase tracking-wide">AC Status</p>
+          <StateChip acPhase={acPhase} acIdle={acIdle} />
+        </div>
+
+        {pendingLabel && adjPendingRemain != null && (
+          <div className="rounded-lg border border-amber-700/45 bg-amber-950/25 px-3 py-2 text-sm">
+            <p className="text-amber-200/95 font-medium">{pendingLabel}</p>
+            <p className="mt-0.5 font-mono text-xs text-gray-400">
+              {formatDelayCountdown(adjPendingRemain)} remaining
+            </p>
+          </div>
+        )}
+
+        {acPhase === 'on_failed' && (
+          <div className="rounded-lg border border-red-800/50 bg-red-950/30 px-3 py-2 text-sm text-red-100">
+            Failed to turn ON
+          </div>
+        )}
+
+        <div className="grid grid-cols-2 gap-x-3 gap-y-2 text-xs">
+          <span className="text-gray-500">Runtime</span>
+          <span className="text-right font-semibold text-gray-100">
+            {runningCompress && !acIdle ? 'Running' : acIdle ? 'Idle' : 'Off'}
+          </span>
+          <span className="text-gray-500">Power</span>
+          <span className="text-right font-mono text-yellow-300">
+            {wattDraw != null && Number.isFinite(Number(wattDraw)) ? `${Number(wattDraw).toFixed(0)} W` : '—'}
+          </span>
+          <span className="text-gray-500">Mode</span>
+          <span className={`text-right font-semibold ${MODE_COLORS[acMode] ?? 'text-gray-300'}`}>
+            {acMode ? (MODE_LABELS[acMode] ?? acMode) : '—'}
+          </span>
+          <span className="text-gray-500">Setpoint</span>
+          <span className="text-right font-mono text-gray-100">
+            {acTargetTemp != null ? `${acTargetTemp}°C` : '—'}
+          </span>
+        </div>
+
+        <StateSourceHint source={acStateSource} show={runningCompress && !acIdle} />
+      </div>
+    )
+  }
 
   return (
     <div className="card flex flex-col gap-3">
@@ -796,6 +849,8 @@ export default function ACStatusCard({
               {wattDraw > 0 ? ` · ${Number(wattDraw).toFixed(0)} W` : ''}
             </span>
           </>
+        ) : reconnectingSession ? (
+          <span className="text-sm text-blue-300">Reconnecting session...</span>
         ) : (runningCompress || acIdle) && runtime?.active && runtime?.formatted && runtime.formatted !== '—' ? (
           <>
             <div className="flex items-center gap-2 text-sm text-gray-400">
@@ -803,7 +858,7 @@ export default function ACStatusCard({
               <span>Session</span>
             </div>
             <span className="text-2xl font-mono font-bold text-blue-400">{runtime.formatted}</span>
-            <span className="text-xs text-gray-500">Live timer syncs when session start is available</span>
+            <span className="text-xs text-gray-500">Live timer syncs from backend confirmation</span>
           </>
         ) : (
           <span className="text-gray-600 text-sm">Not running</span>

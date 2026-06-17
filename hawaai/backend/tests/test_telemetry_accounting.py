@@ -276,6 +276,9 @@ class SessionStatsTests(unittest.IsolatedAsyncioTestCase):
             "active_session_started_at_utc": now.isoformat(),
             "accumulated_energy_wh": 12.5,
             "session_telemetry_gap_seconds": 7.0,
+            "last_valid_power_sample_at": now.isoformat(),
+            "last_valid_power_watts": 420.0,
+            "last_confirmed_physical_on_at": now.timestamp(),
         }
         await database.insert_session_start(row)
         st = logic_engine._rt(room_id)
@@ -327,6 +330,68 @@ class SessionStatsTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNotNone(stored)
         self.assertEqual(stored[0], 0)
         self.assertIsNotNone(stored[1])
+
+    async def test_old_open_session_with_long_gap_and_power_on_does_not_resume_old_timer(self):
+        room_id = "bedroom"
+        old = datetime.now(timezone.utc) - timedelta(hours=10)
+        row = {
+            "session_id": "old-powered",
+            "room_id": room_id,
+            "start_time": old.isoformat(),
+            "indoor_temp_start": 28.0,
+            "day_of_week": old.weekday(),
+            "hour_of_day": old.hour,
+            "is_record_valid": 1,
+            "provisional": 1,
+            "active_session_started_at_utc": old.isoformat(),
+            "last_valid_power_sample_at": old.isoformat(),
+            "last_valid_power_watts": 450.0,
+        }
+        await database.insert_session_start(row)
+        st = logic_engine._rt(room_id)
+        st.energy_configured = True
+        st.energy_power_entity = "sensor.ac_power"
+        st.telemetry_power_live_valid = True
+        cfg = {"climate_entity": "climate.ac", "energy_power_entity": "sensor.ac_power", "physical_on_watts": 100.0}
+        with (
+            mock.patch.object(logic_engine.ha_client, "get_climate_state", new=mock.AsyncMock(return_value={"state": "cool"})),
+            mock.patch.object(logic_engine, "_read_runtime_energy", new=mock.AsyncMock(return_value=(430.0, None))),
+        ):
+            await logic_engine._load_startup_state(room_id, cfg)
+        self.assertIsNone(session_logger.current_session_id(room_id))
+        self.assertFalse(st.active_session_continuity_confirmed)
+        self.assertEqual(st.active_session_recovery_state, "recovery_gap")
+
+    async def test_open_session_power_off_clears_timer(self):
+        room_id = "bedroom"
+        now = datetime.now(timezone.utc)
+        row = {
+            "session_id": "off-open",
+            "room_id": room_id,
+            "start_time": now.isoformat(),
+            "indoor_temp_start": 28.0,
+            "day_of_week": now.weekday(),
+            "hour_of_day": now.hour,
+            "is_record_valid": 1,
+            "provisional": 1,
+            "active_session_started_at_utc": now.isoformat(),
+            "last_valid_power_sample_at": now.isoformat(),
+            "last_valid_power_watts": 0.0,
+        }
+        await database.insert_session_start(row)
+        st = logic_engine._rt(room_id)
+        st.energy_configured = True
+        st.energy_power_entity = "sensor.ac_power"
+        st.telemetry_power_live_valid = True
+        cfg = {"climate_entity": "climate.ac", "energy_power_entity": "sensor.ac_power", "physical_on_watts": 100.0}
+        with (
+            mock.patch.object(logic_engine.ha_client, "get_climate_state", new=mock.AsyncMock(return_value={"state": "off"})),
+            mock.patch.object(logic_engine, "_read_runtime_energy", new=mock.AsyncMock(return_value=(0.0, None))),
+        ):
+            await logic_engine._load_startup_state(room_id, cfg)
+        self.assertIsNone(session_logger.current_session_id(room_id))
+        self.assertFalse(st.active_session_continuity_confirmed)
+        self.assertEqual(st.active_session_recovery_state, "power_off")
 
     async def test_invalid_sessions_do_not_affect_ml_stats(self):
         now = datetime.now(timezone.utc)
