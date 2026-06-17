@@ -541,7 +541,7 @@ async def lifespan(app: FastAPI):
     logger.info("[HawaAI] Add-on stopped")
 
 
-app = FastAPI(title="HawaAI API", version="1.4.94", lifespan=lifespan)
+app = FastAPI(title="HawaAI API", version="1.4.95", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -727,24 +727,30 @@ async def get_weather_cached():
 # ── LIVE STATUS ───────────────────────────────────────────────────────────────
 
 def _runtime_block(runtime: Dict[str, Any]) -> Dict[str, Any]:
-    """Session runtime for UI timer (minutes + formatted)."""
+    """Session runtime for UI timer (authoritative backend elapsed seconds)."""
     now = datetime.now(timezone.utc)
-    start_iso = runtime.get("session_start_time")
+    start_iso = runtime.get("active_session_started_at") or runtime.get("session_start_time")
     sid = runtime.get("session_id")
     active = bool(sid and start_iso)
-    minutes = 0
-    if active and start_iso:
+    elapsed_seconds = runtime.get("active_session_elapsed_seconds")
+    if elapsed_seconds is None and active and start_iso:
         try:
             iso = start_iso.replace("Z", "+00:00")
             st = datetime.fromisoformat(iso)
-            minutes = max(0, int((now - st).total_seconds() // 60))
+            elapsed_seconds = max(0, int((now - st).total_seconds()))
         except (TypeError, ValueError):
-            minutes = 0
+            elapsed_seconds = 0
+    if not active:
+        elapsed_seconds = None
+    minutes = int((elapsed_seconds or 0) // 60)
     return {
         "active":      active,
         "minutes":     minutes,
         "formatted":   f"{minutes} min" if active else "—",
         "session_start": start_iso,
+        "active_session_started_at": start_iso,
+        "active_session_elapsed_seconds": elapsed_seconds,
+        "active_session_state": runtime.get("active_session_state") or ("active" if active else "idle"),
     }
 
 
@@ -843,7 +849,7 @@ async def _dashboard_status_payload(rid: str) -> Dict[str, Any]:
     runtime = logic_engine.get_runtime_state(rid)
     energy_watts = runtime.get("energy_watts")
     energy_kwh = runtime.get("energy_kwh_total")
-    telemetry_status = str(runtime.get("telemetry_status") or "unconfigured")
+    telemetry_status = str(runtime.get("telemetry_status") or "not_configured")
     telemetry_gap = bool(runtime.get("telemetry_gap"))
     energy_power_raw = runtime.get("energy_power_raw_state")
     energy_kwh_raw = runtime.get("energy_kwh_raw_state")
@@ -870,7 +876,7 @@ async def _dashboard_status_payload(rid: str) -> Dict[str, Any]:
     energy_status = (
         "ok"
         if telemetry_status == "healthy"
-        else ("unconfigured" if not energy_configured else "unavailable")
+        else ("not_configured" if not energy_configured else telemetry_status)
     )
     _log_dashboard_energy_trace(
         rid,
@@ -959,12 +965,12 @@ async def _dashboard_status_payload(rid: str) -> Dict[str, Any]:
             "energy_power": (
                 None
                 if not energy_configured
-                else telemetry_status in ("healthy", "recovering")
+                else telemetry_status == "healthy"
             ),
             "energy_kwh": (
                 None
                 if not effective_kwh_entity
-                else bool(runtime.get("telemetry_kwh_live_valid")) or telemetry_status in ("recovering", "stale")
+                else bool(runtime.get("telemetry_kwh_live_valid"))
             ),
             "humidity": (
                 None if not humidity_entity else runtime.get("humidity_percent") is not None
@@ -995,7 +1001,7 @@ async def _dashboard_status_payload(rid: str) -> Dict[str, Any]:
         "outdoor_humidity": weather.get("humidity") if weather else None,
         "presence":         is_occupied,
         # ── Energy ────────────────────────────────────────────────────────────
-        "watt_draw":        energy_watts or 0.0,
+        "watt_draw":        energy_watts,
         "energy_watts":     energy_watts,
         "energy_kwh_total": energy_kwh,
         "energy_live_available": telemetry_live_available,
@@ -1004,6 +1010,7 @@ async def _dashboard_status_payload(rid: str) -> Dict[str, Any]:
         "telemetry_confidence": runtime.get("telemetry_confidence"),
         "telemetry_gap": telemetry_gap,
         "telemetry_invalid_since": runtime.get("telemetry_invalid_since"),
+        "telemetry_invalid_age_seconds": runtime.get("telemetry_invalid_age_seconds"),
         "telemetry_stale_after_seconds": runtime.get("telemetry_stale_after_seconds"),
         "telemetry_offline_after_seconds": runtime.get("telemetry_offline_after_seconds"),
         "last_valid_power_watts": runtime.get("last_valid_power_watts"),
@@ -1025,6 +1032,9 @@ async def _dashboard_status_payload(rid: str) -> Dict[str, Any]:
         "session_kwh":      runtime.get("session_start_kwh"),
         "session_id":       runtime.get("session_id"),
         "session_start":    runtime.get("session_start_time"),
+        "active_session_started_at": runtime.get("active_session_started_at"),
+        "active_session_elapsed_seconds": runtime.get("active_session_elapsed_seconds"),
+        "active_session_state": runtime.get("active_session_state"),
         "runtime":          rt,
         "zone_status": {
             "phase": runtime.get("zone_ui_phase") or "inactive",
@@ -1966,6 +1976,15 @@ def _analytics_tariff_for_room(room_id: str) -> float:
         return 8.0
 
 
+async def _ha_timezone_name() -> str:
+    try:
+        cfg = await ha_client.get_ha_config()
+        tz = str(cfg.get("time_zone") or cfg.get("timezone") or "").strip()
+        return tz or "UTC"
+    except Exception:
+        return "UTC"
+
+
 @app.get("/api/sessions")
 async def get_sessions(
     room_id: str = Query(..., min_length=1),
@@ -1992,7 +2011,8 @@ async def get_stats(room_id: str = Query(..., min_length=1)):
     """Today + ML quality stats (used by Dashboard and Analytics pages)."""
     rid = _require_room_query(room_id)
     tariff = _analytics_tariff_for_room(rid)
-    today = await database.get_today_stats(rid, tariff)
+    timezone_name = await _ha_timezone_name()
+    today = await database.get_today_stats(rid, tariff, timezone_name)
     ml = await database.get_ml_stats(rid)
     return {"today": today, "ml": ml, "tariff_per_kwh": tariff}
 
@@ -2001,7 +2021,11 @@ async def get_stats(room_id: str = Query(..., min_length=1)):
 async def get_today_stats_route(room_id: str = Query(..., min_length=1)):
     """Today stats only."""
     rid = _require_room_query(room_id)
-    return await database.get_today_stats(rid, _analytics_tariff_for_room(rid))
+    return await database.get_today_stats(
+        rid,
+        _analytics_tariff_for_room(rid),
+        await _ha_timezone_name(),
+    )
 
 
 # ── INSIGHTS ──────────────────────────────────────────────────────────────────

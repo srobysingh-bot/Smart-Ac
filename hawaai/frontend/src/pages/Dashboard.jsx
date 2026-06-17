@@ -351,6 +351,7 @@ const TELEMETRY_STYLE = {
   recovering: 'text-sky-200 bg-sky-950/35 border-sky-800/55',
   stale: 'text-amber-200 bg-amber-950/35 border-amber-800/55',
   offline: 'text-red-200 bg-red-950/35 border-red-800/55',
+  not_configured: 'text-gray-400 bg-gray-900/55 border-gray-800',
   unconfigured: 'text-gray-400 bg-gray-900/55 border-gray-800',
 }
 
@@ -361,6 +362,7 @@ function telemetryLabel(status) {
     recovering: 'Recovering',
     stale: 'Stale',
     offline: 'Offline',
+    not_configured: 'Not configured',
     unconfigured: 'Unconfigured',
   }[key] || 'Unknown'
 }
@@ -453,7 +455,7 @@ function LiveStatusBar({ status }) {
             🎛 system
           </span>
         )}
-        {watt_draw > 0 && (
+        {watt_draw != null && Number.isFinite(Number(watt_draw)) && Number(watt_draw) > 0 && (
           <span className="text-gray-400">· {Number(watt_draw).toFixed(0)} W</span>
         )}
         {power_source === 'internal' && !physicalCore && phase !== 'pending_on' && phase !== 'on_failed' && (
@@ -503,9 +505,13 @@ function StatsStrip({ stats, roomName }) {
           <span className="text-gray-400">Total AC time</span>
           <span className="font-semibold">{formatMinutes(today.total_ac_minutes)}</span>
           <span className="text-gray-400">Energy used</span>
-          <span className="font-semibold">{(today.total_kwh ?? 0).toFixed(2)} kWh</span>
+          <span className="font-semibold">
+            {today.total_kwh == null ? 'Unknown' : `${Number(today.total_kwh).toFixed(2)} kWh`}
+          </span>
           <span className="text-gray-400">Cost</span>
-          <span className="font-semibold text-yellow-400">₹{(today.total_cost ?? 0).toFixed(2)}</span>
+          <span className="font-semibold text-yellow-400">
+            {today.total_cost == null ? 'Unknown' : `${Number(today.total_cost).toFixed(2)}`}
+          </span>
         </div>
       </div>
 
@@ -1648,9 +1654,9 @@ export default function Dashboard() {
             </div>
           )}
 
-          <div className="container-app overflow-x-hidden px-4 sm:px-6 py-4 sm:py-6 pb-8 space-y-6 min-w-0">
+          <div className="container-app overflow-x-hidden px-4 sm:px-6 py-3 sm:py-4 pb-8 space-y-4 min-w-0">
             {/* Cards — 1 col · 2 cols tablet · 3 lg · 4 xl */}
-            <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-4 min-w-0">
+            <div className="grid grid-cols-1 items-start sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-4 min-w-0">
           <TempGauge
             indoor={displayStatus?.indoor_temp ?? displayStatus?.ac_current_temp}
             outdoor={displayStatus?.outdoor_temp}
@@ -1661,7 +1667,12 @@ export default function Dashboard() {
             acPhase={displayStatus?.ac_state || 'off'}
             acIdle={displayStatus?.ac_idle ?? false}
             acStateSource={displayStatus?.ac_state_source}
-            sessionStart={displayStatus?.session_start || displayStatus?.runtime?.session_start}
+            sessionStart={
+              displayStatus?.active_session_started_at
+              || displayStatus?.runtime?.active_session_started_at
+              || displayStatus?.session_start
+              || displayStatus?.runtime?.session_start
+            }
             runtime={displayStatus?.runtime}
             wattDraw={displayStatus?.watt_draw}
             sessionKwh={displayStatus?.session_kwh}
@@ -1733,21 +1744,21 @@ export default function Dashboard() {
                 </span>
               </div>
             )}
-            <div className="flex-1 flex flex-col justify-center items-center gap-1">
+            <div className="flex flex-col items-center justify-center gap-1 py-3">
               {displayStatus?.energy_watts != null ? (
                 <>
                   <span className="text-4xl font-bold text-yellow-400">
                     {displayStatus.energy_watts.toFixed(0)} W
                   </span>
                   <span className="text-xs text-gray-500">
-                    {displayStatus.telemetry_gap ? 'Last valid power reading' : 'Room total consumption'}
+                    Live power reading
                   </span>
                   {displayStatus.energy_kwh_total != null && (
                     <span className="text-xs text-gray-400 mt-1">
                       Meter: {displayStatus.energy_kwh_total.toFixed(2)} kWh
                     </span>
                   )}
-                  {displayStatus.session_start
+                  {(displayStatus.active_session_started_at || displayStatus.session_start)
                     ? <span className="text-xs text-blue-400 mt-1">Session: tracking kWh…</span>
                     : <span className="text-xs text-gray-600">No active session</span>
                   }
@@ -1757,9 +1768,14 @@ export default function Dashboard() {
                   <span className="text-2xl font-bold text-gray-600">— W</span>
                   <span className="text-xs text-gray-600 text-center">
                     {displayStatus?.energy_configured
-                      ? 'Waiting for live power reading'
+                      ? telemetryLabel(displayStatus?.telemetry_status)
                       : 'Configure Live Power Sensor in Settings'}
                   </span>
+                  {displayStatus?.last_valid_power_watts != null && (
+                    <span className="text-xs text-gray-500">
+                      Last known: {Number(displayStatus.last_valid_power_watts).toFixed(0)} W
+                    </span>
+                  )}
                 </>
               )}
             </div>

@@ -165,14 +165,16 @@ export function RoomDataProvider({ children }) {
         const { type: _tickType, ...tickFields } = msg
         const physicalAcOn =
           tickFields.physical_ac_on ?? tickFields.ac_is_on ?? prev.status.physical_ac_on
-        const energyWatts = tickFields.energy_watts ?? prev.status.energy_watts
+        const hasEnergyWatts = Object.prototype.hasOwnProperty.call(tickFields, 'energy_watts')
+        const hasWattDraw = Object.prototype.hasOwnProperty.call(tickFields, 'watt_draw')
+        const energyWatts = hasEnergyWatts ? tickFields.energy_watts : prev.status.energy_watts
         return {
           ...prev,
           status: {
             ...prev.status,
             ...tickFields,
             presence: tickFields.presence ?? tickFields.occupied ?? prev.status.presence,
-            watt_draw: tickFields.watt_draw ?? energyWatts ?? prev.status.watt_draw,
+            watt_draw: hasWattDraw ? tickFields.watt_draw : energyWatts,
             energy_watts: energyWatts,
             effective_target:
               tickFields.effective_target ?? tickFields.target_temp ?? prev.status.effective_target,

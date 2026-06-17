@@ -5,9 +5,10 @@ import json
 import logging
 import shutil
 from collections import defaultdict
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
+from zoneinfo import ZoneInfo
 
 logger = logging.getLogger(__name__)
 
@@ -187,6 +188,11 @@ async def init_db() -> None:
             "ALTER TABLE snapshots ADD COLUMN hvac_mode TEXT",
             "ALTER TABLE sessions ADD COLUMN provisional INTEGER DEFAULT 0",
             "ALTER TABLE sessions ADD COLUMN is_record_valid INTEGER DEFAULT 1",
+            "ALTER TABLE sessions ADD COLUMN energy_source TEXT",
+            "ALTER TABLE sessions ADD COLUMN energy_quality TEXT",
+            "ALTER TABLE sessions ADD COLUMN telemetry_gap_seconds REAL",
+            "ALTER TABLE sessions ADD COLUMN meter_start_kwh REAL",
+            "ALTER TABLE sessions ADD COLUMN meter_end_kwh REAL",
         ):
             try:
                 await db.execute(stmt)
@@ -331,6 +337,24 @@ def _enrich_session(row: Dict[str, Any]) -> Dict[str, Any]:
 
     # Backward-compatible aliases for UI/export consumers.
     s["energy_used"] = s["energy_consumed_kwh"]
+    energy_quality = str(s.get("energy_quality") or "").strip().lower()
+    if not energy_quality:
+        if s["energy_consumed_kwh"] is None:
+            energy_quality = "energy_unknown"
+        elif s.get("energy_source") == "meter_delta":
+            energy_quality = "good"
+        else:
+            energy_quality = "partial"
+    s["energy_quality"] = energy_quality
+    quality_labels = {
+        "good": "Good",
+        "partial": "Partial",
+        "telemetry_gap": "Telemetry gap",
+        "energy_unknown": "Energy unknown",
+        "recovered": "Recovered",
+        "invalid": "Invalid",
+    }
+    s["quality_label"] = quality_labels.get(energy_quality, "Partial")
 
     # ── Validity flag ─────────────────────────────────────────────────────────
     energy_ok = s["energy_consumed_kwh"] is None or s["energy_consumed_kwh"] >= 0
@@ -370,6 +394,12 @@ def _enrich_session(row: Dict[str, Any]) -> Dict[str, Any]:
         and energy_ok
         and evidence_ok
     )
+    if not s["valid"]:
+        s["quality_label"] = "Invalid"
+    elif s["energy_consumed_kwh"] is None:
+        s["quality_label"] = "Energy unknown"
+    elif energy_quality == "good":
+        s["quality_label"] = "Good"
 
     return s
 
@@ -391,8 +421,9 @@ async def insert_session_start(session: Dict[str, Any]) -> None:
                 (session_id, start_time, indoor_temp_start, outdoor_temp_start,
                  outdoor_humidity_start, target_temp, ac_entity_id, ac_brand,
                  ac_model, room_name, presence_trigger, energy_start_kwh,
-                 day_of_week, hour_of_day, room_id, provisional, is_record_valid)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                 day_of_week, hour_of_day, room_id, provisional, is_record_valid,
+                 meter_start_kwh, energy_source, energy_quality)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             """,
             (
                 session["session_id"],
@@ -412,6 +443,9 @@ async def insert_session_start(session: Dict[str, Any]) -> None:
                 rid,
                 int(session.get("provisional", 0) or 0),
                 int(session.get("is_record_valid", 1)),
+                session.get("meter_start_kwh"),
+                session.get("energy_source"),
+                session.get("energy_quality"),
             ),
         )
         await db.commit()
@@ -438,6 +472,11 @@ async def update_session_end(session_id: str, end_data: Dict[str, Any]) -> None:
                 user_override        = ?,
                 time_to_target_minutes = ?,
                 temp_drop_rate       = ?,
+                energy_source        = ?,
+                energy_quality       = ?,
+                telemetry_gap_seconds = ?,
+                meter_start_kwh      = COALESCE(meter_start_kwh, ?),
+                meter_end_kwh        = ?,
                 is_record_valid      = COALESCE(?, is_record_valid)
             WHERE session_id = ?
             """,
@@ -458,6 +497,11 @@ async def update_session_end(session_id: str, end_data: Dict[str, Any]) -> None:
                 end_data.get("user_override"),
                 end_data.get("time_to_target_minutes"),
                 end_data.get("temp_drop_rate"),
+                end_data.get("energy_source"),
+                end_data.get("energy_quality"),
+                end_data.get("telemetry_gap_seconds"),
+                end_data.get("meter_start_kwh"),
+                end_data.get("meter_end_kwh"),
                 end_data.get("is_record_valid"),
                 session_id,
             ),
@@ -842,7 +886,25 @@ async def get_snapshots_for_ml(room_id: str, limit: int = 10000) -> List[Dict[st
 # Stats
 # ─────────────────────────────────────────────────────────────────────────────
 
-async def get_today_stats(room_id: str, tariff_per_kwh: float = 8.0) -> Dict[str, Any]:
+def _today_utc_bounds(timezone_name: str = "UTC") -> Tuple[str, str]:
+    try:
+        tz = ZoneInfo(str(timezone_name or "UTC"))
+    except Exception:
+        tz = timezone.utc
+    local_today = datetime.now(tz).date()
+    local_start = datetime.combine(local_today, datetime.min.time(), tzinfo=tz)
+    local_end = local_start + timedelta(days=1)
+    return (
+        local_start.astimezone(timezone.utc).isoformat(),
+        local_end.astimezone(timezone.utc).isoformat(),
+    )
+
+
+async def get_today_stats(
+    room_id: str,
+    tariff_per_kwh: float = 8.0,
+    timezone_name: str = "UTC",
+) -> Dict[str, Any]:
     rid = (room_id or "").strip()
     try:
         tariff = float(tariff_per_kwh)
@@ -850,14 +912,14 @@ async def get_today_stats(room_id: str, tariff_per_kwh: float = 8.0) -> Dict[str
             tariff = 8.0
     except (TypeError, ValueError):
         tariff = 8.0
-    today = datetime.utcnow().date().isoformat()
-    tomorrow = (datetime.utcnow().date() + timedelta(days=1)).isoformat()
+    today, tomorrow = _today_utc_bounds(timezone_name)
     async with aiosqlite.connect(DB_PATH) as db:
         async with db.execute(
             """
             SELECT
                 COUNT(*)                              AS session_count,
-                COALESCE(SUM(energy_consumed_kwh), 0) AS total_kwh,
+                SUM(energy_consumed_kwh)              AS total_kwh,
+                COUNT(energy_consumed_kwh)            AS energy_session_count,
                 COALESCE(SUM(
                     (JULIANDAY(end_time) - JULIANDAY(start_time)) * 1440
                 ), 0)                                 AS total_ac_minutes
@@ -866,19 +928,28 @@ async def get_today_stats(room_id: str, tariff_per_kwh: float = 8.0) -> Dict[str
               AND is_archived = 0
               AND end_time IS NOT NULL
               AND room_id = ?
+              AND COALESCE(is_record_valid, 1) != 0
+              AND COALESCE(provisional, 0) != 1
             """,
             (today, tomorrow, rid),
         ) as cursor:
             row = await cursor.fetchone()
             if row:
-                total_kwh = max(0.0, float(row[1] or 0.0))
+                total_kwh = None if row[1] is None else max(0.0, float(row[1]))
                 return {
                     "session_count": row[0],
-                    "total_kwh": round(total_kwh, 3),
-                    "total_cost": round(total_kwh * tariff, 2),
-                    "total_ac_minutes": round(row[2], 1),
+                    "total_kwh": round(total_kwh, 3) if total_kwh is not None else None,
+                    "total_cost": round(total_kwh * tariff, 2) if total_kwh is not None else None,
+                    "energy_session_count": int(row[2] or 0),
+                    "total_ac_minutes": round(row[3], 1),
                 }
-    return {"session_count": 0, "total_kwh": 0.0, "total_cost": 0.0, "total_ac_minutes": 0.0}
+    return {
+        "session_count": 0,
+        "total_kwh": None,
+        "total_cost": None,
+        "energy_session_count": 0,
+        "total_ac_minutes": 0.0,
+    }
 
 
 async def get_daily_stats(days: int = 7, room_id: str = "", tariff_per_kwh: float = 8.0) -> List[Dict]:
@@ -895,7 +966,8 @@ async def get_daily_stats(days: int = 7, room_id: str = "", tariff_per_kwh: floa
             SELECT
                 DATE(start_time)                       AS date,
                 COUNT(*)                               AS sessions,
-                COALESCE(SUM(energy_consumed_kwh), 0)  AS kwh,
+                SUM(energy_consumed_kwh)               AS kwh,
+                COUNT(energy_consumed_kwh)             AS energy_sessions,
                 COALESCE(AVG(
                     (JULIANDAY(end_time) - JULIANDAY(start_time)) * 1440
                 ), 0)                                  AS avg_cool_time
@@ -904,6 +976,8 @@ async def get_daily_stats(days: int = 7, room_id: str = "", tariff_per_kwh: floa
               AND is_archived = 0
               AND end_time IS NOT NULL
               AND room_id = ?
+              AND COALESCE(is_record_valid, 1) != 0
+              AND COALESCE(provisional, 0) != 1
             GROUP BY DATE(start_time)
             ORDER BY date ASC
             """,
@@ -914,9 +988,18 @@ async def get_daily_stats(days: int = 7, room_id: str = "", tariff_per_kwh: floa
                 {
                     "date": r[0],
                     "sessions": r[1],
-                    "kwh": round(max(0.0, float(r[2] or 0.0)), 3),
-                    "cost": round(max(0.0, float(r[2] or 0.0)) * tariff, 2),
-                    "avg_cool_time": round(r[3], 1),
+                    "kwh": (
+                        round(max(0.0, float(r[2])), 3)
+                        if r[2] is not None
+                        else None
+                    ),
+                    "cost": (
+                        round(max(0.0, float(r[2])) * tariff, 2)
+                        if r[2] is not None
+                        else None
+                    ),
+                    "energy_sessions": int(r[3] or 0),
+                    "avg_cool_time": round(r[4], 1),
                 }
                 for r in rows
             ]

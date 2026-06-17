@@ -1,5 +1,9 @@
 # HawaAI add-on — release notes
 
+## 1.4.95
+
+- **Dashboard and energy accounting:** Preserves unavailable telemetry as unknown instead of `0 W`, exposes recovering/offline/not-configured telemetry states, starts active-session timers only after physical ON confirmation, closes sessions after OFF confirmation, records meter/quality metadata, and excludes invalid or missing-energy sessions from daily totals.
+
 ## 1.4.94
 
 - **Tuya IR ON reliability:** Automated Tuya ON now uses the proven `set_hvac_mode(cool)` physical command, confirms via power telemetry, preserves fan/swing by default, and avoids extra temperature/fan/swing IR beeps unless a real change is needed.

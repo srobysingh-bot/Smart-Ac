@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import math
+import time
 from dataclasses import dataclass, replace
 from enum import Enum
 from typing import Any, Dict, Mapping, Optional, Tuple
@@ -17,6 +18,8 @@ from typing import Any, Dict, Mapping, Optional, Tuple
 from . import ha_client
 
 logger = logging.getLogger(__name__)
+_VALIDATION_LOG_INTERVAL_SECONDS = 300.0
+_validation_log_state: Dict[Tuple[str, str], Tuple[str, float]] = {}
 
 
 class EnergyConfigMode(str, Enum):
@@ -398,6 +401,12 @@ def validate_energy_entity(
 def log_energy_validation(room_id: str, entity_id: str, reason: str) -> None:
     if reason == "ok":
         return
+    key = (room_id or "unknown", entity_id or "none")
+    now = time.monotonic()
+    last_reason, last_at = _validation_log_state.get(key, ("", 0.0))
+    if last_reason == reason and now - last_at < _VALIDATION_LOG_INTERVAL_SECONDS:
+        return
+    _validation_log_state[key] = (reason, now)
     logger.warning(
         "[ENERGY_VALIDATE] room=%s entity=%s reason=%s",
         room_id or "unknown",

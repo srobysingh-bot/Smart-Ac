@@ -10,16 +10,24 @@ import { Activity, Thermometer, Zap, Clock } from 'lucide-react'
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
-function useElapsed(startIso) {
+function useElapsed(startIso, backendElapsedSeconds) {
   const [elapsed, setElapsed] = useState(0)
 
   useEffect(() => {
-    if (!startIso) { setElapsed(0); return }
-    const tick = () => setElapsed(Math.floor((Date.now() - new Date(startIso)) / 1000))
+    if (backendElapsedSeconds != null && Number.isFinite(Number(backendElapsedSeconds))) {
+      const base = Number(backendElapsedSeconds)
+      const startedAt = Date.now()
+      const tick = () => setElapsed(Math.max(0, Math.floor(base + (Date.now() - startedAt) / 1000)))
+      tick()
+      const id = setInterval(tick, 1000)
+      return () => clearInterval(id)
+    }
+    if (!startIso) { setElapsed(0); return undefined }
+    const tick = () => setElapsed(Math.max(0, Math.floor((Date.now() - new Date(startIso)) / 1000)))
     tick()
     const id = setInterval(tick, 1000)
     return () => clearInterval(id)
-  }, [startIso])
+  }, [startIso, backendElapsedSeconds])
 
   return elapsed
 }
@@ -72,8 +80,8 @@ export default function LiveSessionCard({ status }) {
 
   const isOn = Boolean(status?.physical_ac_on ?? status?.ac_on ?? effective_ac_on)
 
-  const startIso = session_start || runtime?.session_start
-  const elapsed = useElapsed(startIso)
+  const startIso = runtime?.active_session_started_at || session_start || runtime?.session_start
+  const elapsed = useElapsed(startIso, runtime?.active_session_elapsed_seconds)
   const isActive = !!(
     (startIso || runtime?.active)
     && (isOn || ac_idle)

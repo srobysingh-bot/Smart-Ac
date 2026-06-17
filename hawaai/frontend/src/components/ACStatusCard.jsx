@@ -78,6 +78,15 @@ function formatDelayCountdown(totalSec) {
   return `${m}:${String(r).padStart(2, '0')}`
 }
 
+function elapsedFromSeconds(totalSeconds) {
+  if (totalSeconds == null || !Number.isFinite(Number(totalSeconds))) return null
+  const secs = Math.max(0, Math.floor(Number(totalSeconds)))
+  const h = Math.floor(secs / 3600)
+  const m = Math.floor((secs % 3600) / 60)
+  const s = secs % 60
+  return `${String(h).padStart(2,'0')}:${String(m).padStart(2,'0')}:${String(s).padStart(2,'0')}`
+}
+
 const PRE_COOL_DURATIONS = [10, 15, 20, 25, 30, 45]
 
 function preCoolMessage(result) {
@@ -633,11 +642,21 @@ export default function ACStatusCard({
   const sessionActive = runningCompress || acIdle
 
   useEffect(() => {
-    if (!sessionActive || !sessionStart) { setTimer(null); return }
-    const id = setInterval(() => setTimer(elapsed(sessionStart)), 1000)
-    setTimer(elapsed(sessionStart))
+    const backendElapsed = runtime?.active_session_elapsed_seconds
+    if (!sessionActive || (backendElapsed == null && !sessionStart)) { setTimer(null); return }
+    const startedAt = Date.now()
+    const baseSeconds = backendElapsed != null ? Number(backendElapsed) : null
+    const update = () => {
+      if (baseSeconds != null && Number.isFinite(baseSeconds)) {
+        setTimer(elapsedFromSeconds(baseSeconds + Math.floor((Date.now() - startedAt) / 1000)))
+      } else {
+        setTimer(elapsed(sessionStart))
+      }
+    }
+    const id = setInterval(update, 1000)
+    update()
     return () => clearInterval(id)
-  }, [sessionActive, sessionStart])
+  }, [sessionActive, sessionStart, runtime?.active_session_elapsed_seconds])
 
   const [adjPendingRemain, setAdjPendingRemain] = useState(null)
   useEffect(() => {

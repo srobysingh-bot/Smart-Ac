@@ -124,8 +124,6 @@ TELEMETRY_LONG_OUTAGE_LOG_SECONDS: float = 300.0
 def _telemetry_status_from_invalid_age(age_seconds: float) -> str:
     if age_seconds >= TELEMETRY_OFFLINE_SECONDS:
         return "offline"
-    if age_seconds >= TELEMETRY_STALE_SECONDS:
-        return "stale"
     return "recovering"
 
 
@@ -135,6 +133,7 @@ def _telemetry_confidence_for_status(status: str) -> str:
         "recovering": "medium",
         "stale": "low",
         "offline": "none",
+        "not_configured": "none",
         "unconfigured": "none",
     }.get(status, "none")
 
@@ -177,7 +176,7 @@ def _apply_telemetry_cache(
     if not configured:
         st.telemetry_gap = False
         st.telemetry_invalid_since = None
-        st.telemetry_status = "unconfigured"
+        st.telemetry_status = "not_configured"
         st.telemetry_confidence = "none"
     else:
         invalid_power = power_configured and not power_live
@@ -201,13 +200,8 @@ def _apply_telemetry_cache(
             st.telemetry_status = status
             st.telemetry_confidence = _telemetry_confidence_for_status(status)
 
-            use_cache = status != "offline"
             effective_power = parsed_power
             effective_kwh = parsed_kwh
-            if effective_power is None and use_cache:
-                effective_power = st.last_valid_power_watts
-            if effective_kwh is None and use_cache:
-                effective_kwh = st.last_valid_energy_kwh
 
     st.energy_watts = effective_power
     st.energy_kwh = effective_kwh
@@ -462,6 +456,7 @@ class RoomRuntime:
     session_start_time: Optional[datetime] = None
     session_start_temp: Optional[float] = None
     session_start_kwh: Optional[float] = None
+    active_session_started_at_utc: Optional[datetime] = None
     watts_samples: List[float] = field(default_factory=list)
     last_command_time: Optional[datetime] = None
     last_command: str = ""
@@ -1576,8 +1571,6 @@ def _reconcile_physical_ac_from_power(
             st.ac_state_source = "power_telemetry"
             if st.pending_action == "off":
                 _clear_pending_command_state(st)
-            if st.pending_off_confirmation:
-                _clear_pending_off_confirmation(st)
             applied = True
     else:
         st.physical_power_candidate = None
@@ -2790,6 +2783,7 @@ async def _finalize_presence_only_idle(
     st.session_start_time = None
     st.session_start_temp = None
     st.session_start_kwh = None
+    st.active_session_started_at_utc = None
     st.watts_samples = []
     st.session_state = "idle"
     st.compressor_on_since = None
@@ -6055,8 +6049,8 @@ async def _tick_impl(rid_raw: str, room_id: str) -> None:
         room_id, cfg, st, now=now
     )
     telemetry_power_valid = telemetry_power_reading is not None
-    telemetry_power_watts: float = (
-        float(telemetry_power_reading) if telemetry_power_reading is not None else 0.0
+    telemetry_power_watts: Optional[float] = (
+        float(telemetry_power_reading) if telemetry_power_reading is not None else None
     )
 
     in_cooldown = _is_in_cooldown(st, now)
@@ -6834,7 +6828,13 @@ async def _maintain_session_lifecycle(
     sid_open = session_logger.current_session_id(room_id)
 
     eligibility = _session_creation_eligible(st, now)
-    eligible_confirmed_session = eligibility and confirmed_ac_on and not inferred_only_physical
+    physical_confirmed = bool(st.physical_ac_on)
+    eligible_confirmed_session = (
+        eligibility
+        and confirmed_ac_on
+        and physical_confirmed
+        and not inferred_only_physical
+    )
 
     runtime_confirm = False
     if st.ac_is_on and st.last_ac_on_at is not None:
@@ -6914,6 +6914,7 @@ async def _start_provisional_session(
 
     st.session_start_kwh = start_kwh
     st.session_start_time = now
+    st.active_session_started_at_utc = now
     st.session_start_temp = indoor_temp
     st.compressor_on_since = now
     st.compressor_off_since = None
@@ -6934,6 +6935,7 @@ async def _start_provisional_session(
             "ac_model":               cfg.get("ac_model"),
             "room_name":              cfg.get("room_name"),
             "energy_kwh_start":       start_kwh,
+            "meter_start_kwh":        start_kwh,
             "provisional":            True,
             "is_record_valid":       1,
         },
@@ -7470,25 +7472,50 @@ async def _close_session(room_id: str, cfg: dict, indoor_temp: float, reason: st
         avg_watts = sum(st.watts_samples) / len(st.watts_samples)
         peak_watts = max(st.watts_samples)
     else:
-        avg_watts = 0.0
+        avg_watts = None
         peak_watts = None
 
-    logger.info("[HawaAI][%s] Avg watts: %.0f W (%d samples)", room_id, avg_watts, len(st.watts_samples))
+    logger.info(
+        "[HawaAI][%s] Avg watts: %s W (%d samples)",
+        room_id,
+        f"{avg_watts:.0f}" if avg_watts is not None else "N/A",
+        len(st.watts_samples),
+    )
 
     kwh_consumed: Optional[float] = None
-    energy_from_meter = False
+    energy_source = "unknown"
+    energy_quality = "energy_unknown"
+    meter_start_kwh = st.session_start_kwh
+    meter_end_kwh = st.energy_kwh if st.energy_kwh_entity else None
     if st.energy_kwh_entity and st.session_start_kwh is not None and st.energy_kwh is not None:
         try:
             end_k = float(st.energy_kwh)
-            kwh_consumed = max(0.0, round(end_k - float(st.session_start_kwh), 4))
-            energy_from_meter = True
+            start_k = float(st.session_start_kwh)
+            if end_k >= start_k:
+                kwh_consumed = round(end_k - start_k, 4)
+                energy_source = "meter_delta"
+                energy_quality = "good"
+            else:
+                kwh_consumed = None
+                energy_source = "meter_delta"
+                energy_quality = "energy_unknown"
         except (ValueError, TypeError):
             kwh_consumed = None
 
     if kwh_consumed is None:
-        if st.watts_samples and avg_watts >= 100.0 and duration_secs > 0:
+        if st.watts_samples and avg_watts is not None and avg_watts >= 100.0 and duration_secs > 0:
             kwh_consumed = max(0.0, (avg_watts * duration_secs) / 3_600_000.0)
             kwh_consumed = round(kwh_consumed, 4)
+            energy_source = "power_integrated"
+            energy_quality = "partial"
+
+    telemetry_gap_seconds = (
+        max(0.0, (now - st.telemetry_invalid_since).total_seconds())
+        if st.telemetry_gap and st.telemetry_invalid_since is not None
+        else 0.0
+    )
+    if st.telemetry_gap and energy_quality == "good":
+        energy_quality = "telemetry_gap"
 
     try:
         temp_drop = (
@@ -7502,7 +7529,7 @@ async def _close_session(room_id: str, cfg: dict, indoor_temp: float, reason: st
         st,
         start_ref,
         duration_secs,
-        avg_watts=avg_watts,
+        avg_watts=avg_watts or 0.0,
         peak_watts=peak_watts,
         kwh_consumed=kwh_consumed,
     )
@@ -7550,7 +7577,7 @@ async def _close_session(room_id: str, cfg: dict, indoor_temp: float, reason: st
             "[HawaAI][%s] Session energy: %.4f kWh (%s) | Cost: â‚¹%.2f",
             room_id,
             kwh_consumed,
-            "meter" if energy_from_meter else "estimated from power",
+            energy_source,
             cost or 0.0,
         )
     else:
@@ -7563,8 +7590,13 @@ async def _close_session(room_id: str, cfg: dict, indoor_temp: float, reason: st
         "reason_stopped":        reason,
         "energy_kwh":            kwh_consumed,
         "cost":                  cost,
-        "avg_watts":             round(avg_watts, 1) if avg_watts else None,
+        "avg_watts":             round(avg_watts, 1) if avg_watts is not None else None,
         "peak_watts":            round(peak_watts, 1) if peak_watts is not None else None,
+        "energy_source":         energy_source,
+        "energy_quality":        energy_quality,
+        "telemetry_gap_seconds": round(telemetry_gap_seconds, 1),
+        "meter_start_kwh":       meter_start_kwh,
+        "meter_end_kwh":         meter_end_kwh,
         "user_override":         1 if reason in ("power_off", "manual", "manual_off") else 0,
         "is_record_valid":       0 if short_invalid else 1,
     })
@@ -7581,6 +7613,7 @@ async def _close_session(room_id: str, cfg: dict, indoor_temp: float, reason: st
     st.session_start_time = None
     st.session_start_temp = None
     st.session_start_kwh = None
+    st.active_session_started_at_utc = None
     st.watts_samples = []
     st.session_state = "idle"
     st.session_runtime_confirmed = False
@@ -7683,18 +7716,17 @@ async def _turn_ac_off(
     st.off_finalized = False
     st.off_settled_at = None
     st.off_confirmation_failed = False
-    if vacancy_off:
-        st.pending_off_confirmation = True
-        st.pending_off_sent_at = cmd_ts
-        st.pending_off_retry_count = 0
-        st.pending_action = "off"
-        st.pending_since = st.pending_since or time.time()
-        st.ac_state = "pending_off"
-        log_with_room("info", room_id, "[OFF_CONFIRM] pending reason=%s", reason)
-    else:
+    st.pending_off_confirmation = True
+    st.pending_off_sent_at = cmd_ts
+    st.pending_off_retry_count = 0
+    st.pending_action = "off"
+    st.pending_since = st.pending_since or time.time()
+    st.ac_state = "pending_off"
+    log_with_room("info", room_id, "[OFF_CONFIRM] pending reason=%s", reason)
+    if not vacancy_off:
         log_with_room("info", room_id, "[RUNTIME] entering_idle reason=%s", reason)
 
-    if close_session_on_send and not vacancy_off:
+    if close_session_on_send and not st.pending_off_confirmation:
         await _close_session(room_id, cfg, indoor_temp, reason)
     return True
 
@@ -7732,6 +7764,14 @@ def get_runtime_state(room_id: str) -> dict:
     sp_secs = None
     if st.last_setpoint_command_at is not None:
         sp_secs = round((now - st.last_setpoint_command_at).total_seconds(), 1)
+    active_started = st.active_session_started_at_utc or st.session_start_time
+    has_active_session = bool(session_logger.current_session_id(canonical))
+    active_elapsed_seconds = (
+        max(0, int((now - active_started).total_seconds()))
+        if active_started is not None and has_active_session
+        else None
+    )
+    active_session_state = st.session_state if has_active_session else "idle"
 
     on_d = _nonnegative_delay_seconds(merged, "on_delay_seconds")
     off_d = _nonnegative_delay_seconds(merged, "off_delay_seconds")
@@ -7880,6 +7920,11 @@ def get_runtime_state(room_id: str) -> dict:
         "telemetry_invalid_since": (
             st.telemetry_invalid_since.isoformat() if st.telemetry_invalid_since else None
         ),
+        "telemetry_invalid_age_seconds": (
+            round(_telemetry_age(st, now), 1)
+            if _telemetry_age(st, now) is not None
+            else None
+        ),
         "telemetry_stale_after_seconds": float(TELEMETRY_STALE_SECONDS),
         "telemetry_offline_after_seconds": float(TELEMETRY_OFFLINE_SECONDS),
         "last_valid_power_watts": st.last_valid_power_watts,
@@ -7893,6 +7938,11 @@ def get_runtime_state(room_id: str) -> dict:
         "session_start_time":    (
             st.session_start_time.isoformat() if st.session_start_time else None
         ),
+        "active_session_started_at": (
+            active_started.isoformat() if active_started else None
+        ),
+        "active_session_elapsed_seconds": active_elapsed_seconds,
+        "active_session_state": active_session_state,
         "session_start_kwh":     st.session_start_kwh,
         "cooldown_active":       in_cooldown,
         "last_command":          st.last_command or None,
