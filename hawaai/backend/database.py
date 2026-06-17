@@ -193,6 +193,9 @@ async def init_db() -> None:
             "ALTER TABLE sessions ADD COLUMN telemetry_gap_seconds REAL",
             "ALTER TABLE sessions ADD COLUMN meter_start_kwh REAL",
             "ALTER TABLE sessions ADD COLUMN meter_end_kwh REAL",
+            "ALTER TABLE sessions ADD COLUMN active_session_started_at_utc TEXT",
+            "ALTER TABLE sessions ADD COLUMN accumulated_energy_wh REAL",
+            "ALTER TABLE sessions ADD COLUMN session_telemetry_gap_seconds REAL",
         ):
             try:
                 await db.execute(stmt)
@@ -200,7 +203,45 @@ async def init_db() -> None:
                 pass  # column already exists — safe to ignore
 
         await db.commit()
+        await _repair_legacy_bad_sessions(db)
+        await db.commit()
     logger.info("Database ready at %s", DB_PATH)
+
+
+async def _repair_legacy_bad_sessions(db: aiosqlite.Connection) -> None:
+    """Mark obvious legacy duplicates/short corrupt rows invalid; never deletes data."""
+    await db.execute(
+        """
+        UPDATE sessions
+        SET is_record_valid = 0,
+            energy_quality = COALESCE(energy_quality, 'invalid')
+        WHERE end_time IS NOT NULL
+          AND COALESCE(is_record_valid, 1) != 0
+          AND (
+            (JULIANDAY(end_time) - JULIANDAY(start_time)) * 86400 < 60
+            OR start_time IS NULL
+            OR room_id IS NULL
+            OR TRIM(COALESCE(room_id, '')) = ''
+          )
+        """
+    )
+    await db.execute(
+        """
+        UPDATE sessions
+        SET is_record_valid = 0,
+            energy_quality = COALESCE(energy_quality, 'invalid')
+        WHERE session_id IN (
+            SELECT s2.session_id
+            FROM sessions s1
+            JOIN sessions s2
+              ON s1.session_id < s2.session_id
+             AND COALESCE(s1.room_id, '') = COALESCE(s2.room_id, '')
+             AND ABS((JULIANDAY(s1.start_time) - JULIANDAY(s2.start_time)) * 86400) < 30
+            WHERE COALESCE(s1.is_archived, 0) = 0
+              AND COALESCE(s2.is_archived, 0) = 0
+        )
+        """
+    )
 
 
 async def get_auto_comfort_profile(room_id: str) -> Optional[Dict[str, Any]]:
@@ -422,8 +463,10 @@ async def insert_session_start(session: Dict[str, Any]) -> None:
                  outdoor_humidity_start, target_temp, ac_entity_id, ac_brand,
                  ac_model, room_name, presence_trigger, energy_start_kwh,
                  day_of_week, hour_of_day, room_id, provisional, is_record_valid,
-                 meter_start_kwh, energy_source, energy_quality)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                 meter_start_kwh, energy_source, energy_quality,
+                 active_session_started_at_utc, accumulated_energy_wh,
+                 session_telemetry_gap_seconds)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             """,
             (
                 session["session_id"],
@@ -446,6 +489,57 @@ async def insert_session_start(session: Dict[str, Any]) -> None:
                 session.get("meter_start_kwh"),
                 session.get("energy_source"),
                 session.get("energy_quality"),
+                session.get("active_session_started_at_utc"),
+                session.get("accumulated_energy_wh"),
+                session.get("session_telemetry_gap_seconds"),
+            ),
+        )
+        await db.commit()
+
+
+async def get_open_session(room_id: str) -> Optional[Dict[str, Any]]:
+    rid = (room_id or "").strip()
+    if not rid:
+        return None
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            """
+            SELECT * FROM sessions
+            WHERE room_id = ?
+              AND end_time IS NULL
+              AND is_archived = 0
+            ORDER BY start_time DESC
+            LIMIT 1
+            """,
+            (rid,),
+        ) as cursor:
+            row = await cursor.fetchone()
+            return dict(row) if row else None
+
+
+async def update_session_runtime_metadata(session_id: str, data: Dict[str, Any]) -> None:
+    if not session_id:
+        return
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            """
+            UPDATE sessions SET
+                active_session_started_at_utc = COALESCE(?, active_session_started_at_utc),
+                meter_start_kwh = COALESCE(meter_start_kwh, ?),
+                accumulated_energy_wh = ?,
+                session_telemetry_gap_seconds = ?,
+                telemetry_gap_seconds = ?
+            WHERE session_id = ?
+              AND end_time IS NULL
+            """,
+            (
+                data.get("active_session_started_at_utc"),
+                data.get("meter_start_kwh"),
+                data.get("accumulated_energy_wh"),
+                data.get("session_telemetry_gap_seconds"),
+                data.get("session_telemetry_gap_seconds"),
+                session_id,
             ),
         )
         await db.commit()
@@ -477,6 +571,8 @@ async def update_session_end(session_id: str, end_data: Dict[str, Any]) -> None:
                 telemetry_gap_seconds = ?,
                 meter_start_kwh      = COALESCE(meter_start_kwh, ?),
                 meter_end_kwh        = ?,
+                accumulated_energy_wh = ?,
+                session_telemetry_gap_seconds = ?,
                 is_record_valid      = COALESCE(?, is_record_valid)
             WHERE session_id = ?
             """,
@@ -502,6 +598,8 @@ async def update_session_end(session_id: str, end_data: Dict[str, Any]) -> None:
                 end_data.get("telemetry_gap_seconds"),
                 end_data.get("meter_start_kwh"),
                 end_data.get("meter_end_kwh"),
+                end_data.get("accumulated_energy_wh"),
+                end_data.get("session_telemetry_gap_seconds", end_data.get("telemetry_gap_seconds")),
                 end_data.get("is_record_valid"),
                 session_id,
             ),
@@ -1075,6 +1173,8 @@ async def get_insights(room_id: str) -> Dict[str, Any]:
                 WHERE end_time IS NOT NULL
                   AND is_archived = 0
                   AND room_id = ?
+                  AND COALESCE(is_record_valid, 1) != 0
+                  AND COALESCE(provisional, 0) != 1
                 ORDER BY start_time DESC
                 LIMIT 200
                 """,
@@ -1089,23 +1189,8 @@ async def get_insights(room_id: str) -> Dict[str, Any]:
 
         # ── Select analysis pool ──────────────────────────────────────────────
         valid_pool = [s for s in sessions if s.get("valid")]
-        fallback_used = False
-
         if not valid_pool:
-            # Relaxed fallback: duration >= 2 min, positive cooling
-            valid_pool = [
-                s for s in sessions
-                if (s.get("duration_minutes") or 0) >= 2.0
-                and (s.get("delta_temp") or 0) > 0.0
-            ][:5]
-            if valid_pool:
-                fallback_used = True
-                logger.info(
-                    "[HawaAI] Insights: no strict-valid sessions; using %d fallback sessions",
-                    len(valid_pool),
-                )
-            else:
-                return _build_empty_insights("insufficient_data")
+            return _build_empty_insights("insufficient_valid_sessions")
 
         # ── Compute metrics in Python ─────────────────────────────────────────
         cooling_rates: List[float] = []
@@ -1206,7 +1291,7 @@ async def get_insights(room_id: str) -> Dict[str, Any]:
             "has_data":           True,
             "reason":             None,
             "sessions_analyzed":  n,
-            "fallback_used":      fallback_used,
+            "fallback_used":      False,
             # Flat backward-compatible keys
             "avg_cooling_rate":   metrics["avg_cooling_rate"],
             "avg_efficiency":     metrics["avg_efficiency"],
@@ -1231,10 +1316,13 @@ async def get_ml_stats(room_id: str) -> Dict[str, Any]:
             SELECT
                 COUNT(*) AS total,
                 AVG((JULIANDAY(end_time) - JULIANDAY(start_time)) * 1440) AS avg_cool,
-                COUNT(CASE WHEN COALESCE(is_record_valid, 1) != 0 AND COALESCE(provisional, 0) != 1 THEN 1 END) * 100.0 / MAX(COUNT(*), 1) AS completeness
+                100.0 AS completeness
             FROM sessions
             WHERE room_id = ?
               AND end_time IS NOT NULL
+              AND is_archived = 0
+              AND COALESCE(is_record_valid, 1) != 0
+              AND COALESCE(provisional, 0) != 1
             """,
             (rid,),
         ) as cursor:

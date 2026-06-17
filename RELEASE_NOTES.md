@@ -1,5 +1,9 @@
 # HawaAI add-on — release notes
 
+## 1.4.96
+
+- **Telemetry/session blocker fixes:** Added HA WebSocket telemetry watches with reconnect snapshot refresh, persisted active-session restore metadata, timestamp-integrated power energy, cumulative telemetry gap tracking, stricter valid-session analytics filters, and safe legacy invalid-session repair.
+
 ## 1.4.95
 
 - **Dashboard and energy accounting:** Preserves unavailable telemetry as unknown instead of `0 W`, exposes recovering/offline/not-configured telemetry states, starts active-session timers only after physical ON confirmation, closes sessions after OFF confirmation, records meter/quality metadata, and excludes invalid or missing-energy sessions from daily totals.

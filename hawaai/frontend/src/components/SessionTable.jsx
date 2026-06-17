@@ -214,7 +214,7 @@ export default function SessionTable({ limit = 10, roomId }) {
     <div className="relative">
       <div className="pointer-events-none absolute inset-x-0 top-0 z-20 h-6 rounded-t-xl bg-gradient-to-b from-gray-950/90 to-transparent" aria-hidden />
       <div className="pointer-events-none absolute inset-x-0 bottom-0 z-20 h-8 rounded-b-xl bg-gradient-to-t from-gray-950/90 to-transparent" aria-hidden />
-      <div className="max-h-[360px] overflow-auto scroll-smooth rounded-xl border border-white/10 bg-black/10 [scrollbar-color:rgba(148,163,184,0.35)_transparent] [scrollbar-width:thin] sm:max-h-[420px]">
+      <div className="overflow-x-auto scroll-smooth rounded-xl border border-white/10 bg-black/10 [scrollbar-color:rgba(148,163,184,0.35)_transparent] [scrollbar-width:thin]">
         {toRender.length === 0 ? (
           <p className="py-4 text-center text-sm text-gray-600">No valid sessions recorded yet</p>
         ) : (

@@ -171,7 +171,7 @@ export default function Analytics() {
       {/* Daily energy bar chart */}
       <div className="card min-w-0">
         <p className="text-xs text-gray-500 uppercase tracking-wide mb-4">Daily Energy (kWh)</p>
-        <div className="w-full min-h-[200px] h-[clamp(188px,42vw,272px)]">
+        <div className="w-full aspect-[16/7] max-h-[272px]">
         <ResponsiveContainer width="100%" height="100%">
           <BarChart data={daily} margin={{ left: 0, right: 10, top: 4, bottom: 0 }}>
             <CartesianGrid strokeDasharray="3 3" stroke="#1f2937" />
@@ -187,7 +187,7 @@ export default function Analytics() {
       {/* Daily cost line chart */}
       <div className="card min-w-0">
         <p className="text-xs text-gray-500 uppercase tracking-wide mb-4">Daily Cost (₹)</p>
-        <div className="w-full min-h-[184px] h-[clamp(176px,40vw,240px)]">
+        <div className="w-full aspect-[16/7] max-h-[240px]">
         <ResponsiveContainer width="100%" height="100%">
           <LineChart data={daily} margin={{ left: 0, right: 10, top: 4, bottom: 0 }}>
             <CartesianGrid strokeDasharray="3 3" stroke="#1f2937" />
@@ -211,7 +211,7 @@ export default function Analytics() {
       <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
         <div className="card min-w-0">
           <p className="text-xs text-gray-500 uppercase tracking-wide mb-4">Sessions per Day</p>
-          <div className="w-full min-h-[160px] h-[clamp(148px,36vw,200px)]">
+          <div className="w-full aspect-[16/8] max-h-[200px]">
           <ResponsiveContainer width="100%" height="100%">
             <BarChart data={daily} margin={{ left: 0, right: 10, top: 4, bottom: 0 }}>
               <CartesianGrid strokeDasharray="3 3" stroke="#1f2937" />
@@ -226,7 +226,7 @@ export default function Analytics() {
 
         <div className="card min-w-0">
           <p className="text-xs text-gray-500 uppercase tracking-wide mb-4">Avg Cool Time (min)</p>
-          <div className="w-full min-h-[160px] h-[clamp(148px,36vw,200px)]">
+          <div className="w-full aspect-[16/8] max-h-[200px]">
           <ResponsiveContainer width="100%" height="100%">
             <LineChart data={daily} margin={{ left: 0, right: 10, top: 4, bottom: 0 }}>
               <CartesianGrid strokeDasharray="3 3" stroke="#1f2937" />

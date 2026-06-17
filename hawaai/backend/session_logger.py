@@ -65,6 +65,9 @@ async def start_session(room_id: str, data: Dict[str, Any]) -> str:
         "meter_start_kwh": data.get("meter_start_kwh", data.get("energy_kwh_start")),
         "energy_source": data.get("energy_source"),
         "energy_quality": data.get("energy_quality"),
+        "active_session_started_at_utc": data.get("active_session_started_at_utc", data.get("start_time")),
+        "accumulated_energy_wh": data.get("accumulated_energy_wh", 0.0),
+        "session_telemetry_gap_seconds": data.get("session_telemetry_gap_seconds", 0.0),
         "day_of_week": now.weekday(),
         "hour_of_day": now.hour,
         "provisional": int(1 if data.get("provisional") else 0),
@@ -215,6 +218,8 @@ async def end_session(room_id: str, data: Dict[str, Any]) -> None:
         "telemetry_gap_seconds": data.get("telemetry_gap_seconds"),
         "meter_start_kwh": data.get("meter_start_kwh"),
         "meter_end_kwh": data.get("meter_end_kwh"),
+        "accumulated_energy_wh": data.get("accumulated_energy_wh"),
+        "session_telemetry_gap_seconds": data.get("session_telemetry_gap_seconds", data.get("telemetry_gap_seconds")),
     }
     if data.get("is_record_valid") is not None:
         end_data["is_record_valid"] = int(data["is_record_valid"])
@@ -233,6 +238,35 @@ async def end_session(room_id: str, data: Dict[str, Any]) -> None:
     s.session_start_temp = None
     s.cooled_at = None
     s.session_provisional = False
+
+
+async def restore_open_session(room_id: str, row: Dict[str, Any]) -> bool:
+    rid = _require_room(room_id)
+    sid = str((row or {}).get("session_id") or "").strip()
+    if not sid:
+        return False
+    s = _room(rid)
+    s.current_session_id = sid
+    start_iso = str(row.get("active_session_started_at_utc") or row.get("start_time") or "")
+    try:
+        s.session_start_time = datetime.fromisoformat(start_iso.replace("Z", "+00:00"))
+    except ValueError:
+        s.session_start_time = datetime.now(timezone.utc)
+    s.session_start_temp = row.get("indoor_temp_start")
+    s.cooled_at = None
+    try:
+        s.session_provisional = int(row.get("provisional", 1) or 0) == 1
+    except (TypeError, ValueError):
+        s.session_provisional = True
+    logger.info("[SESSION_RESTORE] [%s] session=%s provisional=%s", rid, sid, s.session_provisional)
+    return True
+
+
+async def persist_runtime_metadata(room_id: str, data: Dict[str, Any]) -> None:
+    sid = current_session_id(room_id)
+    if not sid:
+        return
+    await database.update_session_runtime_metadata(sid, data)
 
 
 async def upgrade_current_session_to_confirmed(room_id: str) -> None:

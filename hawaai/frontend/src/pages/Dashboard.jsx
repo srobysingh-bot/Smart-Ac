@@ -1538,7 +1538,7 @@ function RoomLogsCard({ activeRoomId, rooms }) {
           const el = e.currentTarget
           shouldAutoScrollRef.current = el.scrollHeight - el.scrollTop - el.clientHeight < 50
         }}
-        className="h-[300px] max-h-[300px] overflow-y-auto overflow-x-hidden rounded border border-gray-800 bg-gray-950/70 p-2 font-mono text-xs"
+        className="overflow-y-auto overflow-x-hidden rounded border border-gray-800 bg-gray-950/70 p-2 font-mono text-xs"
       >
         {busy && logs.length === 0 ? <p className="text-gray-500">Loading logs...</p> : null}
         {!busy && logs.length === 0 ? <p className="text-gray-600">No room logs yet.</p> : null}

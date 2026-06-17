@@ -16,6 +16,7 @@ from typing import Any, DefaultDict, Dict, List, Optional, Tuple
 import aiohttp
 
 from . import config_manager, logic_engine, room_registry
+from .energy_config import resolve_energy_config
 from .utils import parse_presence
 
 logger = logging.getLogger(__name__)
@@ -39,10 +40,17 @@ def _entity_watch_index(cfg: dict) -> DefaultDict[str, List[WatchTarget]]:
         merged = room_registry.merge_room_config(cfg, r)
         pres = (merged.get("presence_entity") or "").strip()
         itemp = (merged.get("indoor_temp_entity") or "").strip()
+        energy = resolve_energy_config(merged)
+        power_entity = (energy.power_entity or merged.get("energy_power_entity") or "").strip()
+        kwh_entity = (energy.kwh_entity or merged.get("energy_kwh_entity") or "").strip()
         if pres:
             ix[pres].append((rid_store, canon, "presence"))
         if itemp:
             ix[itemp].append((rid_store, canon, "temp"))
+        if power_entity:
+            ix[power_entity].append((rid_store, canon, "power"))
+        if kwh_entity:
+            ix[kwh_entity].append((rid_store, canon, "kwh"))
         if bool(merged.get("pre_cool_geofence_enabled", False)):
             for person in logic_engine._pre_cool_allowed_people(merged):
                 ix[person].append((rid_store, canon, "geofence_person"))
@@ -287,8 +295,29 @@ async def _handle_state_changed(
             await _maybe_trigger_temp_cross(rid_store, canon, merged, old_s, new_s)
             continue
 
+        if kind in ("power", "kwh"):
+            await logic_engine.refresh_runtime_energy(canon, merged)
+            if kind == "power" and _float_state(new_s) is not None:
+                logic_engine.trigger_tick(rid_store, reason="power_event", skip_debounce=True)
+            continue
+
         if kind == "geofence_person":
             await _maybe_trigger_geofence_pre_cool(rid_store, merged, entity_id, old_s, new_s)
+
+
+async def _refresh_energy_snapshots(ix: DefaultDict[str, List[WatchTarget]]) -> None:
+    cfg = config_manager.load_config()
+    seen: set[str] = set()
+    for targets in ix.values():
+        for rid_store, canon, kind in targets:
+            if kind not in ("power", "kwh") or canon in seen:
+                continue
+            seen.add(canon)
+            room_def = logic_engine.resolve_room_definition(cfg, rid_store)
+            if not room_def or room_def.get("disabled"):
+                continue
+            merged = room_registry.merge_room_config(cfg, room_def)
+            await logic_engine.refresh_runtime_energy(canon, merged)
 
 
 async def run_forever(reconnect_pause: float = 5.0) -> None:
@@ -342,6 +371,7 @@ async def run_forever(reconnect_pause: float = 5.0) -> None:
                         continue
 
                     logger.info("[HA_EVENTS] state_changed subscription active (%d watched entities)", len(ix))
+                    await _refresh_energy_snapshots(ix)
 
                     while True:
                         msg_raw = await ws.receive(timeout=None)
