@@ -7072,12 +7072,21 @@ async def _start_provisional_session(
     Start a DB session after runtime/IR ON intent.
     Same session_id is upgraded later when runtime remains stable (provisional=0).
     """
+    room_id = normalize_room_id(room_id)
     if session_logger.current_session_id(room_id) is not None:
+        log_with_room(
+            "info",
+            room_id,
+            "[SESSION] already_active room=%s session=%s",
+            room_id,
+            session_logger.current_session_id(room_id),
+        )
         return
 
     st = _rt(room_id)
     # No DB session until delayed ON executes; avoids phantom sessions.
     if st.pending_action == "on":
+        log_with_room("info", room_id, "[SESSION] skipped_start reason=pending_on")
         return
 
     target = float(et_eff)
@@ -7105,9 +7114,10 @@ async def _start_provisional_session(
             "outdoor_temp_start":     weather.get("temp") if weather else None,
             "outdoor_humidity_start": weather.get("humidity") if weather else None,
             "target_temp":            target,
+            "ac_entity_id":           cfg.get("climate_entity") or cfg.get("ac_entity"),
             "ac_brand":               cfg.get("ac_brand"),
             "ac_model":               cfg.get("ac_model"),
-            "room_name":              cfg.get("room_name"),
+            "room_name":              cfg.get("room_name") or cfg.get("name"),
             "energy_kwh_start":       start_kwh,
             "meter_start_kwh":        start_kwh,
             "active_session_started_at_utc": st.active_session_started_at_utc.isoformat(),
@@ -7121,6 +7131,15 @@ async def _start_provisional_session(
             "provisional":            True,
             "is_record_valid":       1,
         },
+    )
+    log_with_room(
+        "info",
+        room_id,
+        "[SESSION] start room=%s session=%s power=%s meter_start=%s",
+        room_id,
+        sid,
+        f"{st.last_valid_power_watts:.1f}" if st.last_valid_power_watts is not None else "unknown",
+        f"{start_kwh:.4f}" if start_kwh is not None else "none",
     )
     log_with_room(
         "info",
@@ -7592,9 +7611,11 @@ async def _stop_room_locked(room_id_raw: str, canon: str, shutdown_reason: str) 
 
 async def _close_session(room_id: str, cfg: dict, indoor_temp: float, reason: str) -> None:
     """Finalize session for one room; always closes DB row (short runs flagged is_record_valid=0)."""
+    room_id = normalize_room_id(room_id)
     st = _rt(room_id)
     open_sid = session_logger.current_session_id(room_id)
     if open_sid is None:
+        log_with_room("info", room_id, "[SESSION] skipped_close reason=no_active_session")
         logger.debug("[HawaAI][%s] _close_session(%s) â€” no open session, skipping", room_id, reason)
         return
 
@@ -7787,6 +7808,15 @@ async def _close_session(room_id: str, cfg: dict, indoor_temp: float, reason: st
         "user_override":         1 if reason in ("power_off", "manual", "manual_off") else 0,
         "is_record_valid":       0 if short_invalid else 1,
     })
+    log_with_room(
+        "info",
+        room_id,
+        "[SESSION] close room=%s session=%s duration=%.0f kwh=%s provisional=0",
+        room_id,
+        open_sid,
+        duration_secs,
+        f"{kwh_consumed:.4f}" if kwh_consumed is not None else "none",
+    )
     log_with_room(
         "info",
         room_id,

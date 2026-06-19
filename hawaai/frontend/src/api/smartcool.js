@@ -13,7 +13,7 @@ const INGRESS_PATH = (typeof window !== 'undefined' && window.__INGRESS_PATH__) 
 const BASE = INGRESS_PATH + '/api'
 
 /** Match backend `normalize_room_id` (trim + lowercase) — WS payloads use canonical room_id. */
-function normalizeRoomKey(id) {
+export function normalizeRoomKey(id) {
   return id != null ? String(id).trim().toLowerCase() : ''
 }
 
@@ -47,7 +47,7 @@ export const getWeather = () => request('/weather')
 
 // ── Sessions ─────────────────────────────────────────────────────────────────
 export const getSessions = (params = {}) => {
-  const rid = params.room_id != null ? String(params.room_id).trim() : ''
+  const rid = normalizeRoomKey(params.room_id)
   if (!rid) return Promise.reject(new Error('room_id is required'))
   const q = new URLSearchParams({ ...params, room_id: rid }).toString()
   return request(`/sessions?${q}`)
@@ -55,7 +55,7 @@ export const getSessions = (params = {}) => {
 
 export const getSessionStats = (roomId) =>
   roomParam(roomId).then((rid) =>
-    request(`/sessions/stats?room_id=${encodeURIComponent(rid)}`),
+    request(`/sessions/stats?room_id=${encodeURIComponent(normalizeRoomKey(rid))}`),
   )
 
 // ── Snapshots ────────────────────────────────────────────────────────────────
@@ -67,7 +67,7 @@ export const getSnapshots = (minutes = 120, roomId) =>
 // ── Daily stats ───────────────────────────────────────────────────────────────
 export const getDailyStats = (days = 7, roomId) =>
   roomParam(roomId).then((rid) =>
-    request(`/daily?days=${days}&room_id=${encodeURIComponent(rid)}`),
+    request(`/daily?days=${days}&room_id=${encodeURIComponent(normalizeRoomKey(rid))}`),
   )
 
 // ── Config ───────────────────────────────────────────────────────────────────

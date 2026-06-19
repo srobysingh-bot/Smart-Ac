@@ -30,11 +30,15 @@ _last_snapshot_id: Dict[str, int] = {}
 
 
 def _room(room_id: str) -> _RoomSession:
-    return _rs[room_id]
+    return _rs[_canonical_room_id(room_id)]
+
+
+def _canonical_room_id(room_id: str) -> str:
+    return (room_id or "").strip().lower()
 
 
 def _require_room(room_id: str) -> str:
-    rid = (room_id or "").strip()
+    rid = _canonical_room_id(room_id)
     if not rid:
         raise ValueError("room_id is required")
     return rid
@@ -380,19 +384,16 @@ async def ensure_snapshot_id_for_ai(room_id: str) -> int:
 
 
 def has_open_session(room_id: str) -> bool:
-    """True if logger still tracks an open SQLite session for this room (raw or lower-cased key)."""
-    raw = (room_id or "").strip()
-    if not raw:
+    """True if logger still tracks an open SQLite session for this canonical room."""
+    rid = _canonical_room_id(room_id)
+    if not rid:
         return False
-    for key in {raw, raw.lower()}:
-        s = _rs.get(key)
-        if s is not None and s.current_session_id:
-            return True
-    return False
+    s = _rs.get(rid)
+    return bool(s is not None and s.current_session_id)
 
 
-async def get_sessions(room_id: str, limit: int = 50, offset: int = 0) -> List[Dict]:
-    return await database.get_sessions(room_id, limit, offset)
+async def get_sessions(room_id: str, limit: int = 50, offset: int = 0, include_open: bool = False) -> List[Dict]:
+    return await database.get_sessions(room_id, limit, offset, include_open=include_open)
 
 
 async def get_session_count(room_id: str) -> int:
@@ -408,7 +409,7 @@ async def get_snapshots(hours: int = 2, room_id: str = "") -> List[Dict]:
 
 
 def current_session_id(room_id: str) -> Optional[str]:
-    rid = (room_id or "").strip()
+    rid = _canonical_room_id(room_id)
     if not rid:
         return None
     return _room(rid).current_session_id
@@ -416,7 +417,7 @@ def current_session_id(room_id: str) -> Optional[str]:
 
 def current_session_is_provisional(room_id: str) -> bool:
     """True if runtime shows an open session marked provisional."""
-    rid = (room_id or "").strip()
+    rid = _canonical_room_id(room_id)
     if not rid:
         return False
     s = _room(rid)
@@ -424,7 +425,7 @@ def current_session_is_provisional(room_id: str) -> bool:
 
 
 def session_start_time(room_id: str) -> Optional[datetime]:
-    rid = (room_id or "").strip()
+    rid = _canonical_room_id(room_id)
     if not rid:
         return None
     return _room(rid).session_start_time
@@ -432,9 +433,8 @@ def session_start_time(room_id: str) -> Optional[datetime]:
 
 def clear_room_buffers(room_id: str) -> None:
     """Drop in-memory session/snapshot trackers after a room is removed or purged."""
-    raw = (room_id or "").strip()
-    if not raw:
+    rid = _canonical_room_id(room_id)
+    if not rid:
         return
-    for k in {raw, raw.lower()}:
-        _rs.pop(k, None)
-        _last_snapshot_id.pop(k, None)
+    _rs.pop(rid, None)
+    _last_snapshot_id.pop(rid, None)

@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useState } from 'react'
-import { getSessions } from '../api/smartcool.js'
+import { getSessions, normalizeRoomKey } from '../api/smartcool.js'
 import { useRoom } from '../context/RoomContext.jsx'
-import { ChevronLeft, ChevronRight, ChevronDown, ChevronUp, Filter } from 'lucide-react'
+import { ChevronLeft, ChevronRight, Filter } from 'lucide-react'
 
 const PAGE_SIZE = 20
 
@@ -40,7 +40,9 @@ function formatGroupDate(iso) {
 }
 
 function sessionQuality(s) {
+  if (!s.end_time || String(s.quality_label || '').toLowerCase().includes('open')) return 'open'
   const q = String(s.energy_quality || '').toLowerCase()
+  if (q === 'open_recovery') return 'open'
   if (q === 'legacy_unverified') return 'legacy'
   if (q === 'energy_unknown') return 'unknown'
   if (q === 'telemetry_gap') return 'gap'
@@ -92,6 +94,7 @@ const QUALITY_CFG = {
   legacy: { label: 'Legacy unverified', dot: 'bg-gray-400', text: 'text-gray-300' },
   unknown: { label: 'Energy unknown', dot: 'bg-amber-300', text: 'text-amber-300' },
   gap: { label: 'Telemetry gap', dot: 'bg-sky-300', text: 'text-sky-300' },
+  open: { label: 'Open / recovering', dot: 'bg-blue-300', text: 'text-blue-300' },
 }
 const LOW_QUALITY = new Set(['invalid', 'legacy', 'unknown', 'gap'])
 
@@ -106,6 +109,13 @@ function QualityBadge({ quality }) {
 }
 
 function StorageBadge({ session }) {
+  if (!session.end_time) {
+    return (
+      <span className="inline-flex items-center rounded px-2 py-0.5 text-xs font-medium bg-blue-900/40 text-blue-300">
+        Open
+      </span>
+    )
+  }
   const stored = session.is_record_valid !== 0 && session.provisional !== 1
   return (
     <span className={`inline-flex items-center rounded px-2 py-0.5 text-xs font-medium ${
@@ -148,7 +158,8 @@ function groupByDate(rows) {
 const FILTER_OPTS = [
   { id: 'all', label: 'All' },
   { id: 'valid', label: 'Valid only' },
-  { id: 'fast', label: 'Fast cooling' },
+  { id: 'low_quality', label: 'Low quality' },
+  { id: 'open', label: 'Open/recovery' },
 ]
 
 function FilterBar({ active, onChange }) {
@@ -179,8 +190,7 @@ export default function SessionHistory() {
   const [page, setPage] = useState(0)
   const [dateFrom, setDateFrom] = useState('')
   const [dateTo, setDateTo] = useState('')
-  const [filter, setFilter] = useState('all')
-  const [showInvalid, setShowInvalid] = useState(false)
+  const [filter, setFilter] = useState('valid')
   const [loading, setLoading] = useState(false)
   const [tariffPerKwh, setTariffPerKwh] = useState(8.0)
 
@@ -188,8 +198,15 @@ export default function SessionHistory() {
     setPage(0)
   }, [activeRoomId])
 
+  const canonicalRoomId = useMemo(() => normalizeRoomKey(activeRoomId), [activeRoomId])
+  const activeRoom = useMemo(
+    () => rooms.find(r => normalizeRoomKey(r.id) === canonicalRoomId),
+    [rooms, canonicalRoomId],
+  )
+  const activeRoomLabel = activeRoom?.name || activeRoom?.id || canonicalRoomId
+
   const load = useCallback(() => {
-    if (!activeRoomId) {
+    if (!canonicalRoomId) {
       setSessions([])
       setTotal(0)
       setTariffPerKwh(8.0)
@@ -197,7 +214,7 @@ export default function SessionHistory() {
       return
     }
     setLoading(true)
-    const params = { limit: PAGE_SIZE, offset: page * PAGE_SIZE, room_id: activeRoomId }
+    const params = { limit: PAGE_SIZE, offset: page * PAGE_SIZE, room_id: canonicalRoomId, include_open: true }
     if (dateFrom) params.date_from = dateFrom
     if (dateTo) params.date_to = `${dateTo}T23:59:59`
     getSessions(params)
@@ -208,7 +225,7 @@ export default function SessionHistory() {
       })
       .catch(console.error)
       .finally(() => setLoading(false))
-  }, [page, dateFrom, dateTo, activeRoomId])
+  }, [page, dateFrom, dateTo, canonicalRoomId])
 
   useEffect(() => { load() }, [load])
 
@@ -220,19 +237,35 @@ export default function SessionHistory() {
 
   let displayed = enriched
   if (filter === 'valid') displayed = enriched.filter(s => s._quality === 'good')
-  if (filter === 'fast') displayed = enriched.filter(s => s._fast)
+  if (filter === 'low_quality') displayed = enriched.filter(s => LOW_QUALITY.has(s._quality))
+  if (filter === 'open') displayed = enriched.filter(s => s._quality === 'open' || s.provisional === 1)
 
-  const validRows = filter === 'all' ? displayed.filter(s => !LOW_QUALITY.has(s._quality)) : displayed
-  const invalidRows = filter === 'all' ? displayed.filter(s => LOW_QUALITY.has(s._quality)) : []
-  const toRender = filter === 'all' && !showInvalid ? validRows : displayed
+  const lowQualityRows = enriched.filter(s => LOW_QUALITY.has(s._quality))
+  const openRows = enriched.filter(s => s._quality === 'open' || s.provisional === 1)
+  const toRender = displayed
   const groupedRows = groupByDate(toRender)
   const totalPages = Math.ceil(total / PAGE_SIZE)
+  const emptyReason = !canonicalRoomId
+    ? 'Choose a room to view session history for that room only.'
+    : loading
+      ? 'Loading...'
+      : filter === 'valid' && openRows.length > 0
+        ? 'No completed sessions yet. One or more sessions are still open/recovering.'
+        : filter === 'valid' && lowQualityRows.length > 0
+          ? 'No valid completed sessions. Low-quality records are available in the Low quality filter.'
+          : filter === 'open'
+            ? 'No open or recovery sessions for this room.'
+            : filter === 'low_quality'
+              ? 'No low-quality, legacy, or telemetry-gap sessions for this room.'
+              : total > 0 && toRender.length === 0
+                ? 'Sessions exist for this room but are filtered out.'
+                : 'No sessions recorded for this room. Check telemetry and the room ID debug endpoint if AC has run.'
 
   return (
     <div className="container-app px-4 sm:px-6 py-4 sm:py-6 pb-24 md:pb-12 space-y-4 min-w-0">
       <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
         <h1 className="text-xl font-bold">Session History</h1>
-        <span className="text-sm text-gray-500 shrink-0">{activeRoomId ? `${total} sessions (this room)` : 'Select a room'}</span>
+        <span className="text-sm text-gray-500 shrink-0">{canonicalRoomId ? `${total} records` : 'Select a room'}</span>
       </div>
 
       <div className="card flex flex-col sm:flex-row flex-wrap items-stretch gap-3">
@@ -254,6 +287,13 @@ export default function SessionHistory() {
           </select>
         </div>
       </div>
+
+      {canonicalRoomId && (
+        <div className="card flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2">
+          <p className="text-sm text-gray-300">Sessions for: <span className="font-semibold text-blue-300">{activeRoomLabel}</span></p>
+          <p className="text-xs text-gray-500 font-mono truncate">room_id: {canonicalRoomId}</p>
+        </div>
+      )}
 
       <div className="card flex flex-col md:flex-row md:flex-wrap md:items-end gap-4">
         <div>
@@ -281,11 +321,11 @@ export default function SessionHistory() {
           Clear
         </button>
         <div className="md:ml-auto w-full md:w-auto">
-          <FilterBar active={filter} onChange={f => { setFilter(f); setShowInvalid(false); setPage(0) }} />
+          <FilterBar active={filter} onChange={f => { setFilter(f); setPage(0) }} />
         </div>
       </div>
 
-      {!activeRoomId ? (
+      {!canonicalRoomId ? (
         <div className="card">
           <p className="text-sm text-gray-500 p-6 text-center">Choose a room to view session history for that room only.</p>
         </div>
@@ -314,7 +354,7 @@ export default function SessionHistory() {
               ) : toRender.length === 0 ? (
                 <tr>
                   <td colSpan={10} className="py-8 text-center text-gray-500">
-                    {filter !== 'all' ? 'No sessions match this filter' : 'No valid sessions recorded yet'}
+                    {emptyReason}
                   </td>
                 </tr>
               ) : groupedRows.map(group => (
@@ -323,21 +363,15 @@ export default function SessionHistory() {
             </tbody>
           </table>
 
-          {filter === 'all' && invalidRows.length > 0 && (
-            <button
-              onClick={() => setShowInvalid(v => !v)}
-              className="flex items-center gap-1.5 mt-3 text-xs text-gray-500 hover:text-gray-300 transition-colors"
-            >
-              {showInvalid ? <ChevronUp size={13} /> : <ChevronDown size={13} />}
-              {showInvalid
-                ? `Hide ${invalidRows.length} low-quality session${invalidRows.length !== 1 ? 's' : ''}`
-                : `Show ${invalidRows.length} low-quality session${invalidRows.length !== 1 ? 's' : ''}`}
-            </button>
+          {filter === 'valid' && (lowQualityRows.length > 0 || openRows.length > 0) && (
+            <p className="mt-3 text-xs text-gray-500">
+              Hidden here: {lowQualityRows.length} low-quality, {openRows.length} open/recovery.
+            </p>
           )}
         </div>
       )}
 
-      {activeRoomId && totalPages > 1 && (
+      {canonicalRoomId && totalPages > 1 && (
         <div className="flex items-center justify-center gap-4 pt-2">
           <button
             onClick={() => setPage(p => Math.max(0, p - 1))}

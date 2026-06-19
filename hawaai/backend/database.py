@@ -17,6 +17,15 @@ BACKUP_DIR = "/data/hawaai_db_backups"
 MAX_DB_BACKUPS = 8
 
 
+def canonical_room_id(room_id: str) -> str:
+    """Stable room key used for session storage and analytics queries."""
+    return (room_id or "").strip().lower()
+
+
+def _room_match_sql(alias: str = "room_id") -> str:
+    return f"LOWER(TRIM(COALESCE({alias}, ''))) = ?"
+
+
 def backup_db(tag: str = "manual") -> None:
     """
     Copy SQLite DB to /data/hawaai_db_backups/ (survives addon image rebuilds when map data:rw).
@@ -213,6 +222,60 @@ async def init_db() -> None:
 
 async def _repair_legacy_bad_sessions(db: aiosqlite.Connection) -> None:
     """Mark obvious legacy duplicates/short corrupt rows invalid; never deletes data."""
+    async def _scalar(sql: str, params: tuple = ()) -> int:
+        async with db.execute(sql, params) as cur:
+            row = await cur.fetchone()
+            return int(row[0] or 0) if row else 0
+
+    short_count = await _scalar(
+        """
+        SELECT COUNT(*) FROM sessions
+        WHERE end_time IS NOT NULL
+          AND COALESCE(is_record_valid, 1) != 0
+          AND (
+            (JULIANDAY(end_time) - JULIANDAY(start_time)) * 86400 < 60
+            OR start_time IS NULL
+            OR room_id IS NULL
+            OR TRIM(COALESCE(room_id, '')) = ''
+          )
+        """
+    )
+    dup_count = await _scalar(
+        """
+        SELECT COUNT(*) FROM sessions
+        WHERE session_id IN (
+            SELECT s2.session_id
+            FROM sessions s1
+            JOIN sessions s2
+              ON s1.session_id < s2.session_id
+             AND LOWER(TRIM(COALESCE(s1.room_id, ''))) = LOWER(TRIM(COALESCE(s2.room_id, '')))
+             AND ABS((JULIANDAY(s1.start_time) - JULIANDAY(s2.start_time)) * 86400) < 30
+            WHERE COALESCE(s1.is_archived, 0) = 0
+              AND COALESCE(s2.is_archived, 0) = 0
+        )
+        """
+    )
+    legacy_count = await _scalar(
+        """
+        SELECT COUNT(*) FROM sessions
+        WHERE end_time IS NOT NULL
+          AND COALESCE(is_record_valid, 1) != 0
+          AND COALESCE(energy_consumed_kwh, 0) <= 0.0001
+          AND LOWER(COALESCE(reason_stopped, '')) IN ('vacant', 'vacancy', 'presence_vacant')
+          AND (JULIANDAY(end_time) - JULIANDAY(start_time)) * 1440 < 10
+        """
+    )
+    remap_count = await _scalar(
+        """
+        SELECT COUNT(*) FROM sessions
+        WHERE room_id IS NOT NULL
+          AND room_id != LOWER(TRIM(room_id))
+          AND TRIM(room_id) != ''
+        """
+    )
+    logger.info("[SESSION_REPAIR] would_mark_invalid count=%s", short_count + dup_count + legacy_count)
+    logger.info("[SESSION_REPAIR] would_remap_room from=%s to=%s count=%s", "case_or_space_variant", "canonical", remap_count)
+
     await db.execute(
         """
         UPDATE sessions
@@ -238,7 +301,7 @@ async def _repair_legacy_bad_sessions(db: aiosqlite.Connection) -> None:
             FROM sessions s1
             JOIN sessions s2
               ON s1.session_id < s2.session_id
-             AND COALESCE(s1.room_id, '') = COALESCE(s2.room_id, '')
+             AND LOWER(TRIM(COALESCE(s1.room_id, ''))) = LOWER(TRIM(COALESCE(s2.room_id, '')))
              AND ABS((JULIANDAY(s1.start_time) - JULIANDAY(s2.start_time)) * 86400) < 30
             WHERE COALESCE(s1.is_archived, 0) = 0
               AND COALESCE(s2.is_archived, 0) = 0
@@ -255,6 +318,15 @@ async def _repair_legacy_bad_sessions(db: aiosqlite.Connection) -> None:
           AND COALESCE(energy_consumed_kwh, 0) <= 0.0001
           AND LOWER(COALESCE(reason_stopped, '')) IN ('vacant', 'vacancy', 'presence_vacant')
           AND (JULIANDAY(end_time) - JULIANDAY(start_time)) * 1440 < 10
+        """
+    )
+    await db.execute(
+        """
+        UPDATE sessions
+        SET room_id = LOWER(TRIM(room_id))
+        WHERE room_id IS NOT NULL
+          AND TRIM(room_id) != ''
+          AND room_id != LOWER(TRIM(room_id))
         """
     )
 
@@ -423,6 +495,12 @@ def _enrich_session(row: Dict[str, Any]) -> Dict[str, Any]:
         provisional = int(s.get("provisional", 0) or 0) == 1
     except (TypeError, ValueError):
         provisional = False
+    if s.get("end_time") is None:
+        s["valid"] = False
+        s["quality_label"] = "Open / recovering"
+        if energy_quality not in ("legacy_unverified", "invalid"):
+            s["energy_quality"] = "open_recovery"
+        return s
     try:
         cooling_time = float(s.get("cooling_time")) if s.get("cooling_time") is not None else None
     except (TypeError, ValueError):
@@ -468,7 +546,7 @@ def _enrich_session(row: Dict[str, Any]) -> Dict[str, Any]:
 # ─────────────────────────────────────────────────────────────────────────────
 
 async def insert_session_start(session: Dict[str, Any]) -> None:
-    rid = (session.get("room_id") or "").strip()
+    rid = canonical_room_id(session.get("room_id") or "")
     if not rid:
         logger.error("[DB] insert_session_start rejected — missing room_id (session_id=%s)", session.get("session_id"))
         raise ValueError("room_id is required for insert_session_start")
@@ -520,7 +598,7 @@ async def insert_session_start(session: Dict[str, Any]) -> None:
 
 
 async def get_open_session(room_id: str) -> Optional[Dict[str, Any]]:
-    rid = (room_id or "").strip()
+    rid = canonical_room_id(room_id)
     if not rid:
         return None
     async with aiosqlite.connect(DB_PATH) as db:
@@ -528,7 +606,7 @@ async def get_open_session(room_id: str) -> Optional[Dict[str, Any]]:
         async with db.execute(
             """
             SELECT * FROM sessions
-            WHERE room_id = ?
+            WHERE LOWER(TRIM(COALESCE(room_id, ''))) = ?
               AND end_time IS NULL
               AND is_archived = 0
             ORDER BY start_time DESC
@@ -601,7 +679,11 @@ async def update_session_end(session_id: str, end_data: Dict[str, Any]) -> None:
                 meter_end_kwh        = ?,
                 accumulated_energy_wh = ?,
                 session_telemetry_gap_seconds = ?,
-                is_record_valid      = COALESCE(?, is_record_valid)
+                is_record_valid      = COALESCE(?, is_record_valid),
+                provisional          = CASE
+                    WHEN ? IS NOT NULL AND COALESCE(?, is_record_valid) != 0 THEN 0
+                    ELSE provisional
+                END
             WHERE session_id = ?
             """,
             (
@@ -629,6 +711,8 @@ async def update_session_end(session_id: str, end_data: Dict[str, Any]) -> None:
                 end_data.get("accumulated_energy_wh"),
                 end_data.get("session_telemetry_gap_seconds", end_data.get("telemetry_gap_seconds")),
                 end_data.get("is_record_valid"),
+                end_data.get("end_time"),
+                end_data.get("is_record_valid"),
                 session_id,
             ),
         )
@@ -651,12 +735,15 @@ async def get_sessions(
     offset: int = 0,
     date_from: Optional[str] = None,
     date_to: Optional[str] = None,
+    include_open: bool = False,
 ) -> List[Dict]:
-    rid = (room_id or "").strip()
+    rid = canonical_room_id(room_id)
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
-        query = "SELECT * FROM sessions WHERE is_archived = 0 AND end_time IS NOT NULL AND room_id = ?"
+        query = "SELECT * FROM sessions WHERE is_archived = 0 AND LOWER(TRIM(COALESCE(room_id, ''))) = ?"
         params: list = [rid]
+        if not include_open:
+            query += " AND end_time IS NOT NULL"
         if date_from:
             query += " AND start_time >= ?"
             params.append(date_from)
@@ -668,18 +755,24 @@ async def get_sessions(
         async with db.execute(query, params) as cursor:
             rows = await cursor.fetchall()
             # Enrich at API layer — adds valid, delta_temp, duration_minutes
-            return [_enrich_session(dict(r)) for r in rows]
+            enriched = [_enrich_session(dict(r)) for r in rows]
+        hidden = await _session_hidden_count(db, rid, date_from, date_to)
+        logger.info("[SESSION] query room=%s returned=%s hidden=%s", rid, len(enriched), hidden)
+        return enriched
 
 
 async def get_session_count(
     room_id: str,
     date_from: Optional[str] = None,
     date_to: Optional[str] = None,
+    include_open: bool = False,
 ) -> int:
-    rid = (room_id or "").strip()
+    rid = canonical_room_id(room_id)
     async with aiosqlite.connect(DB_PATH) as db:
-        query = "SELECT COUNT(*) FROM sessions WHERE is_archived = 0 AND end_time IS NOT NULL AND room_id = ?"
+        query = "SELECT COUNT(*) FROM sessions WHERE is_archived = 0 AND LOWER(TRIM(COALESCE(room_id, ''))) = ?"
         params: list = [rid]
+        if not include_open:
+            query += " AND end_time IS NOT NULL"
         if date_from:
             query += " AND start_time >= ?"
             params.append(date_from)
@@ -692,15 +785,166 @@ async def get_session_count(
 
 
 async def get_all_sessions_for_export(room_id: str) -> List[Dict]:
-    rid = (room_id or "").strip()
+    rid = canonical_room_id(room_id)
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         async with db.execute(
-            "SELECT * FROM sessions WHERE room_id = ? ORDER BY start_time DESC",
+            "SELECT * FROM sessions WHERE LOWER(TRIM(COALESCE(room_id, ''))) = ? ORDER BY start_time DESC",
             (rid,),
         ) as cursor:
             rows = await cursor.fetchall()
             return [_enrich_session(dict(r)) for r in rows]
+
+
+async def _session_hidden_count(
+    db: aiosqlite.Connection,
+    rid: str,
+    date_from: Optional[str] = None,
+    date_to: Optional[str] = None,
+) -> int:
+    query = """
+        SELECT COUNT(*) FROM sessions
+        WHERE is_archived = 0
+          AND LOWER(TRIM(COALESCE(room_id, ''))) = ?
+          AND (
+            end_time IS NULL
+            OR COALESCE(is_record_valid, 1) = 0
+            OR COALESCE(provisional, 0) = 1
+            OR LOWER(COALESCE(energy_quality, '')) IN ('legacy_unverified', 'invalid')
+          )
+    """
+    params: list = [rid]
+    if date_from:
+        query += " AND start_time >= ?"
+        params.append(date_from)
+    if date_to:
+        query += " AND start_time <= ?"
+        params.append(date_to)
+    async with db.execute(query, params) as cursor:
+        row = await cursor.fetchone()
+        return int(row[0] or 0) if row else 0
+
+
+async def get_sessions_debug_snapshot(room_id: str) -> Dict[str, Any]:
+    rid = canonical_room_id(room_id)
+
+    async def _count_map(db: aiosqlite.Connection, sql: str, params: tuple = ()) -> Dict[str, int]:
+        out: Dict[str, int] = {}
+        async with db.execute(sql, params) as cur:
+            for row in await cur.fetchall():
+                key = str(row[0] if row[0] is not None else "null")
+                out[key] = int(row[1] or 0)
+        return out
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        match = _room_match_sql("room_id")
+        async with db.execute(
+            f"""
+            SELECT * FROM sessions
+            WHERE is_archived = 0 AND {match} AND end_time IS NULL
+            ORDER BY start_time DESC
+            LIMIT 1
+            """,
+            (rid,),
+        ) as cur:
+            open_row = await cur.fetchone()
+        async with db.execute(
+            f"""
+            SELECT * FROM sessions
+            WHERE is_archived = 0 AND {match}
+            ORDER BY start_time DESC
+            LIMIT 20
+            """,
+            (rid,),
+        ) as cur:
+            latest_for_room = [_enrich_session(dict(r)) for r in await cur.fetchall()]
+        async with db.execute(
+            """
+            SELECT * FROM sessions
+            WHERE is_archived = 0
+            ORDER BY start_time DESC
+            LIMIT 20
+            """
+        ) as cur:
+            latest_all_rooms = [_enrich_session(dict(r)) for r in await cur.fetchall()]
+
+        counts_by_room_id = await _count_map(
+            db,
+            """
+            SELECT COALESCE(room_id, 'null') AS key, COUNT(*)
+            FROM sessions
+            WHERE is_archived = 0
+            GROUP BY key
+            ORDER BY COUNT(*) DESC
+            """,
+        )
+        counts_by_validity = await _count_map(
+            db,
+            "SELECT COALESCE(CAST(is_record_valid AS TEXT), 'null'), COUNT(*) FROM sessions WHERE is_archived = 0 GROUP BY 1",
+        )
+        counts_by_provisional = await _count_map(
+            db,
+            "SELECT COALESCE(CAST(provisional AS TEXT), 'null'), COUNT(*) FROM sessions WHERE is_archived = 0 GROUP BY 1",
+        )
+        counts_by_energy_quality = await _count_map(
+            db,
+            "SELECT COALESCE(energy_quality, 'null'), COUNT(*) FROM sessions WHERE is_archived = 0 GROUP BY 1",
+        )
+        counts_by_date = await _count_map(
+            db,
+            """
+            SELECT COALESCE(DATE(start_time), 'null'), COUNT(*)
+            FROM sessions
+            WHERE is_archived = 0
+            GROUP BY 1
+            ORDER BY 1 DESC
+            LIMIT 30
+            """,
+        )
+
+        async with db.execute(
+            f"""
+            SELECT
+                COUNT(*) AS total_rows,
+                SUM(CASE WHEN end_time IS NULL THEN 1 ELSE 0 END) AS open_rows,
+                SUM(CASE WHEN end_time IS NOT NULL THEN 1 ELSE 0 END) AS completed_rows,
+                SUM(CASE WHEN end_time IS NOT NULL
+                          AND COALESCE(is_record_valid, 1) != 0
+                          AND COALESCE(provisional, 0) != 1
+                          AND LOWER(COALESCE(energy_quality, '')) NOT IN ('legacy_unverified', 'invalid')
+                    THEN 1 ELSE 0 END) AS valid_completed_rows,
+                SUM(CASE WHEN COALESCE(is_record_valid, 1) = 0 THEN 1 ELSE 0 END) AS invalid_rows,
+                SUM(CASE WHEN COALESCE(provisional, 0) = 1 THEN 1 ELSE 0 END) AS provisional_rows,
+                SUM(CASE WHEN LOWER(COALESCE(energy_quality, '')) IN ('legacy_unverified', 'invalid', 'energy_unknown', 'telemetry_gap')
+                    THEN 1 ELSE 0 END) AS low_quality_rows
+            FROM sessions
+            WHERE is_archived = 0 AND {match}
+            """,
+            (rid,),
+        ) as cur:
+            ui_row = await cur.fetchone()
+
+    summary = dict(ui_row) if ui_row else {}
+    for key, value in list(summary.items()):
+        summary[key] = int(value or 0)
+    summary["default_valid_only_hidden_rows"] = max(
+        0,
+        int(summary.get("total_rows", 0)) - int(summary.get("valid_completed_rows", 0)),
+    )
+
+    return {
+        "canonical_room_id": rid,
+        "open_session": _enrich_session(dict(open_row)) if open_row else None,
+        "latest_for_room": latest_for_room,
+        "latest_all_rooms": latest_all_rooms,
+        "counts_by_room_id": counts_by_room_id,
+        "counts_by_validity": counts_by_validity,
+        "counts_by_provisional": counts_by_provisional,
+        "counts_by_energy_quality": counts_by_energy_quality,
+        "counts_by_date": counts_by_date,
+        "ui_filter_summary": summary,
+    }
 
 
 async def archive_old_sessions(days: int = 90) -> int:
@@ -946,13 +1190,13 @@ async def get_ai_decisions_recent(
     room_id: str,
     limit: int = 50,
 ) -> List[Dict[str, Any]]:
-    rid = (room_id or "").strip()
+    rid = canonical_room_id(room_id)
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         async with db.execute(
             """
             SELECT * FROM ai_decisions
-            WHERE room_id = ?
+            WHERE LOWER(TRIM(COALESCE(room_id, ''))) = ?
             ORDER BY ts DESC
             LIMIT ?
             """,
@@ -964,13 +1208,13 @@ async def get_ai_decisions_recent(
 
 async def get_snapshots_recent(minutes: int = 120, room_id: str = "") -> List[Dict]:
     since = (datetime.utcnow() - timedelta(minutes=minutes)).isoformat()
-    rid = (room_id or "").strip()
+    rid = canonical_room_id(room_id)
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         async with db.execute(
             """
             SELECT * FROM snapshots
-            WHERE timestamp >= ? AND room_id = ?
+            WHERE timestamp >= ? AND LOWER(TRIM(COALESCE(room_id, ''))) = ?
             ORDER BY timestamp ASC
             """,
             (since, rid),
@@ -981,7 +1225,7 @@ async def get_snapshots_recent(minutes: int = 120, room_id: str = "") -> List[Di
 
 async def get_snapshots_for_ml(room_id: str, limit: int = 10000) -> List[Dict[str, Any]]:
     """Rows with non-null ML-critical fields for export."""
-    rid = (room_id or "").strip()
+    rid = canonical_room_id(room_id)
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         async with db.execute(
@@ -992,7 +1236,7 @@ async def get_snapshots_for_ml(room_id: str, limit: int = 10000) -> List[Dict[st
                 ac_state, power_watts, fan_mode, hvac_mode, presence,
                 control_source, schedule_slot, ai_adjust_applied
             FROM snapshots
-            WHERE room_id = ?
+            WHERE LOWER(TRIM(COALESCE(room_id, ''))) = ?
               AND session_id IS NOT NULL
               AND indoor_temp IS NOT NULL
               AND ac_state IS NOT NULL
@@ -1031,7 +1275,7 @@ async def get_today_stats(
     tariff_per_kwh: float = 8.0,
     timezone_name: str = "UTC",
 ) -> Dict[str, Any]:
-    rid = (room_id or "").strip()
+    rid = canonical_room_id(room_id)
     try:
         tariff = float(tariff_per_kwh)
         if tariff < 0:
@@ -1053,7 +1297,7 @@ async def get_today_stats(
             WHERE start_time >= ? AND start_time < ?
               AND is_archived = 0
               AND end_time IS NOT NULL
-              AND room_id = ?
+              AND LOWER(TRIM(COALESCE(room_id, ''))) = ?
               AND COALESCE(is_record_valid, 1) != 0
               AND COALESCE(provisional, 0) != 1
             """,
@@ -1079,7 +1323,7 @@ async def get_today_stats(
 
 
 async def get_daily_stats(days: int = 7, room_id: str = "", tariff_per_kwh: float = 8.0) -> List[Dict]:
-    rid = (room_id or "").strip()
+    rid = canonical_room_id(room_id)
     try:
         tariff = float(tariff_per_kwh)
         if tariff < 0:
@@ -1101,7 +1345,7 @@ async def get_daily_stats(days: int = 7, room_id: str = "", tariff_per_kwh: floa
             WHERE start_time >= DATE('now', ?)
               AND is_archived = 0
               AND end_time IS NOT NULL
-              AND room_id = ?
+              AND LOWER(TRIM(COALESCE(room_id, ''))) = ?
               AND COALESCE(is_record_valid, 1) != 0
               AND COALESCE(provisional, 0) != 1
             GROUP BY DATE(start_time)
@@ -1191,7 +1435,7 @@ async def get_insights(room_id: str) -> Dict[str, Any]:
     Never raises. Always returns valid JSON.
     """
     try:
-        rid = (room_id or "").strip()
+        rid = canonical_room_id(room_id)
         # ── Fetch recent completed sessions ───────────────────────────────────
         async with aiosqlite.connect(DB_PATH) as db:
             db.row_factory = aiosqlite.Row
@@ -1200,7 +1444,7 @@ async def get_insights(room_id: str) -> Dict[str, Any]:
                 SELECT * FROM sessions
                 WHERE end_time IS NOT NULL
                   AND is_archived = 0
-                  AND room_id = ?
+                  AND LOWER(TRIM(COALESCE(room_id, ''))) = ?
                   AND COALESCE(is_record_valid, 1) != 0
                   AND COALESCE(provisional, 0) != 1
                 ORDER BY start_time DESC
@@ -1337,7 +1581,7 @@ async def get_insights(room_id: str) -> Dict[str, Any]:
 
 
 async def get_ml_stats(room_id: str) -> Dict[str, Any]:
-    rid = (room_id or "").strip()
+    rid = canonical_room_id(room_id)
     async with aiosqlite.connect(DB_PATH) as db:
         async with db.execute(
             """
@@ -1346,7 +1590,7 @@ async def get_ml_stats(room_id: str) -> Dict[str, Any]:
                 AVG((JULIANDAY(end_time) - JULIANDAY(start_time)) * 1440) AS avg_cool,
                 100.0 AS completeness
             FROM sessions
-            WHERE room_id = ?
+            WHERE LOWER(TRIM(COALESCE(room_id, ''))) = ?
               AND end_time IS NOT NULL
               AND is_archived = 0
               AND COALESCE(is_record_valid, 1) != 0

@@ -158,7 +158,11 @@ class SessionStatsTests(unittest.IsolatedAsyncioTestCase):
 
     async def asyncTearDown(self):
         session_logger.clear_room_buffers("bedroom")
+        session_logger.clear_room_buffers("study room")
+        session_logger.clear_room_buffers("dining room")
         logic_engine._runtime_by_room.pop("bedroom", None)
+        logic_engine._runtime_by_room.pop("study room", None)
+        logic_engine._runtime_by_room.pop("dining room", None)
         database.DB_PATH = self.old_db_path
         try:
             os.unlink(self.tmp.name)
@@ -259,6 +263,118 @@ class SessionStatsTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(stats["session_count"], 1)
         self.assertEqual(stats["energy_session_count"], 1)
         self.assertEqual(stats["total_kwh"], 0.42)
+
+    async def test_canonical_room_query_survives_display_name_and_casing_changes(self):
+        now = datetime.now(timezone.utc)
+        await database.insert_session_start({
+            "session_id": "study-old-name",
+            "room_id": " Study Room ",
+            "room_name": "Study",
+            "start_time": now.isoformat(),
+            "day_of_week": now.weekday(),
+            "hour_of_day": now.hour,
+            "is_record_valid": 1,
+            "provisional": 1,
+        })
+        await database.update_session_end("study-old-name", {
+            "end_time": (now + timedelta(minutes=15)).isoformat(),
+            "time_to_cool_minutes": 15.0,
+            "energy_consumed_kwh": 0.2,
+            "energy_quality": "good",
+            "is_record_valid": 1,
+        })
+
+        rows = await database.get_sessions("study room")
+        self.assertEqual([r["session_id"] for r in rows], ["study-old-name"])
+        self.assertEqual(rows[0]["room_id"], "study room")
+        self.assertEqual(rows[0]["provisional"], 0)
+
+    async def test_querying_one_room_never_returns_another_room(self):
+        now = datetime.now(timezone.utc)
+        for sid, rid in (("study-session", "Study Room"), ("dining-session", "Dining Room")):
+            await database.insert_session_start({
+                "session_id": sid,
+                "room_id": rid,
+                "start_time": now.isoformat(),
+                "day_of_week": now.weekday(),
+                "hour_of_day": now.hour,
+                "is_record_valid": 1,
+                "provisional": 1,
+            })
+            await database.update_session_end(sid, {
+                "end_time": (now + timedelta(minutes=10)).isoformat(),
+                "time_to_cool_minutes": 10.0,
+                "energy_consumed_kwh": 0.1,
+                "energy_quality": "good",
+                "is_record_valid": 1,
+            })
+
+        study = await database.get_sessions("study room")
+        dining = await database.get_sessions("dining room")
+        self.assertEqual([r["session_id"] for r in study], ["study-session"])
+        self.assertEqual([r["session_id"] for r in dining], ["dining-session"])
+
+    async def test_open_session_visible_only_when_requested(self):
+        now = datetime.now(timezone.utc)
+        await database.insert_session_start({
+            "session_id": "open-study",
+            "room_id": "Study Room",
+            "start_time": now.isoformat(),
+            "day_of_week": now.weekday(),
+            "hour_of_day": now.hour,
+            "is_record_valid": 1,
+            "provisional": 1,
+        })
+
+        self.assertEqual(await database.get_sessions("study room"), [])
+        rows = await database.get_sessions("study room", include_open=True)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["session_id"], "open-study")
+        self.assertEqual(rows[0]["quality_label"], "Open / recovering")
+
+    async def test_session_debug_snapshot_exposes_filter_and_room_counts(self):
+        now = datetime.now(timezone.utc)
+        await database.insert_session_start({
+            "session_id": "debug-open",
+            "room_id": "Study Room",
+            "start_time": now.isoformat(),
+            "day_of_week": now.weekday(),
+            "hour_of_day": now.hour,
+            "is_record_valid": 1,
+            "provisional": 1,
+        })
+        await database.insert_session_start({
+            "session_id": "debug-invalid",
+            "room_id": "Dining Room",
+            "start_time": now.isoformat(),
+            "day_of_week": now.weekday(),
+            "hour_of_day": now.hour,
+            "is_record_valid": 0,
+            "provisional": 0,
+        })
+        snapshot = await database.get_sessions_debug_snapshot("study room")
+        self.assertEqual(snapshot["canonical_room_id"], "study room")
+        self.assertEqual(snapshot["open_session"]["session_id"], "debug-open")
+        self.assertEqual(snapshot["counts_by_room_id"]["study room"], 1)
+        self.assertEqual(snapshot["counts_by_room_id"]["dining room"], 1)
+        self.assertEqual(snapshot["ui_filter_summary"]["open_rows"], 1)
+        self.assertEqual(snapshot["ui_filter_summary"]["default_valid_only_hidden_rows"], 1)
+
+    async def test_multiple_confirmed_on_ticks_do_not_create_duplicate_session_rows(self):
+        room_id = "Study Room"
+        cfg = {"target_temp": 24.0, "energy_tariff_per_kwh": 8.0, "name": "Study"}
+        st = logic_engine._rt(room_id)
+        st.physical_ac_on = True
+        st.ac_is_on = True
+        st.last_valid_power_watts = 420.0
+        with mock.patch.object(logic_engine.weather_api, "get_cached", new=mock.AsyncMock(return_value={})):
+            await logic_engine._start_provisional_session(room_id, cfg, 28.0, datetime.now(timezone.utc), 24.0)
+            first_sid = session_logger.current_session_id("study room")
+            await logic_engine._start_provisional_session("study room", cfg, 27.9, datetime.now(timezone.utc), 24.0)
+
+        rows = await database.get_sessions("study room", include_open=True)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["session_id"], first_sid)
 
     async def test_restart_while_power_on_resumes_open_session(self):
         room_id = "bedroom"

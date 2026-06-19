@@ -471,6 +471,10 @@ def _require_room_query(room_id_raw: str) -> str:
     return rid
 
 
+def _canonical_room_query(room_id_raw: str) -> str:
+    return logic_engine.normalize_room_id(_require_room_query(room_id_raw))
+
+
 def _resolve_stored_room_id(cfg: dict, room_id_raw: str) -> Optional[str]:
     """Return persisted `rooms[].id` for this path/query (case-insensitive match), or None."""
     rq = (room_id_raw or "").strip()
@@ -541,7 +545,7 @@ async def lifespan(app: FastAPI):
     logger.info("[HawaAI] Add-on stopped")
 
 
-app = FastAPI(title="HawaAI API", version="1.4.97", lifespan=lifespan)
+app = FastAPI(title="HawaAI API", version="1.4.98", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -1997,24 +2001,53 @@ async def get_sessions(
     offset: int = Query(0, ge=0),
     date_from: Optional[str] = None,
     date_to: Optional[str] = None,
+    include_open: bool = Query(False),
 ):
-    rid = _require_room_query(room_id)
+    rid = _canonical_room_query(room_id)
     tariff = _analytics_tariff_for_room(rid)
-    sessions = await database.get_sessions(rid, limit, offset, date_from, date_to)
-    total = await database.get_session_count(rid, date_from, date_to)
+    sessions = await database.get_sessions(rid, limit, offset, date_from, date_to, include_open=include_open)
+    total = await database.get_session_count(rid, date_from, date_to, include_open=include_open)
     return {
         "sessions": sessions,
         "total": total,
         "limit": limit,
         "offset": offset,
         "tariff_per_kwh": tariff,
+        "canonical_room_id": rid,
     }
+
+
+@app.get("/api/sessions/debug")
+async def get_sessions_debug(room_id: str = Query(..., min_length=1)):
+    requested = _require_room_query(room_id)
+    rid = logic_engine.normalize_room_id(requested)
+    base = config_manager.load_config()
+    room_def = logic_engine.resolve_room_definition(base, requested) or logic_engine.resolve_room_definition(base, rid)
+    eff = room_registry.merge_room_config(base, room_def) if room_def else {}
+    snapshot = await database.get_sessions_debug_snapshot(rid)
+    payload = {
+        "requested_room_id": requested,
+        "canonical_room_id": rid,
+        "room_name": eff.get("room_name") or eff.get("name") or (room_def or {}).get("name") or rid,
+        "active_session_id": session_logger.current_session_id(rid),
+        **snapshot,
+    }
+    logger.info(
+        "[SESSION_DEBUG] requested=%s canonical=%s room=%s active=%s counts=%s ui=%s",
+        requested,
+        rid,
+        payload["room_name"],
+        payload["active_session_id"],
+        snapshot.get("counts_by_room_id"),
+        snapshot.get("ui_filter_summary"),
+    )
+    return payload
 
 
 @app.get("/api/sessions/stats")
 async def get_stats(room_id: str = Query(..., min_length=1)):
     """Today + ML quality stats (used by Dashboard and Analytics pages)."""
-    rid = _require_room_query(room_id)
+    rid = _canonical_room_query(room_id)
     tariff = _analytics_tariff_for_room(rid)
     timezone_name = await _ha_timezone_name()
     today = await database.get_today_stats(rid, tariff, timezone_name)
@@ -2025,7 +2058,7 @@ async def get_stats(room_id: str = Query(..., min_length=1)):
 @app.get("/api/sessions/today")
 async def get_today_stats_route(room_id: str = Query(..., min_length=1)):
     """Today stats only."""
-    rid = _require_room_query(room_id)
+    rid = _canonical_room_query(room_id)
     return await database.get_today_stats(
         rid,
         _analytics_tariff_for_room(rid),
@@ -2046,7 +2079,7 @@ async def get_insights(room_id: str = Query(..., min_length=1)):
     Always returns valid JSON — never a 500 error.
     """
     try:
-        return await database.get_insights(_require_room_query(room_id))
+        return await database.get_insights(_canonical_room_query(room_id))
     except Exception as exc:
         logger.error("[HawaAI] /api/insights error: %s", exc, exc_info=True)
         return {
@@ -2068,7 +2101,7 @@ async def get_snapshots(
     minutes: int = Query(120, ge=5, le=1440),
     room_id: str = Query(..., min_length=1),
 ):
-    return await database.get_snapshots_recent(minutes, _require_room_query(room_id))
+    return await database.get_snapshots_recent(minutes, _canonical_room_query(room_id))
 
 
 # ── DAILY STATS ───────────────────────────────────────────────────────────────
@@ -2078,7 +2111,7 @@ async def get_daily(
     days: int = Query(7, ge=1, le=90),
     room_id: str = Query(..., min_length=1),
 ):
-    rid = _require_room_query(room_id)
+    rid = _canonical_room_query(room_id)
     return await database.get_daily_stats(days, rid, _analytics_tariff_for_room(rid))
 
 
@@ -2341,7 +2374,7 @@ async def list_brands():
 async def export_csv(room_id: str = Query(..., min_length=1)):
     import io
     import csv
-    rid = _require_room_query(room_id)
+    rid = _canonical_room_query(room_id)
     sessions = await database.get_all_sessions_for_export(rid)
     output = io.StringIO()
     if sessions:
@@ -2358,7 +2391,7 @@ async def export_csv(room_id: str = Query(..., min_length=1)):
 
 @app.get("/api/export/json")
 async def export_json_route(room_id: str = Query(..., min_length=1)):
-    rid = _require_room_query(room_id)
+    rid = _canonical_room_query(room_id)
     sessions = await database.get_all_sessions_for_export(rid)
     return Response(
         content=json.dumps(sessions, indent=2, ensure_ascii=False),
@@ -2373,7 +2406,7 @@ async def export_ml_snapshots(room_id: str = Query(..., min_length=1), limit: in
     Export clean ML training data.
     Filters out any row with null in critical columns.
     """
-    rid = _require_room_query(room_id)
+    rid = _canonical_room_query(room_id)
     rows = await database.get_snapshots_for_ml(room_id=rid, limit=limit)
 
     required = [
