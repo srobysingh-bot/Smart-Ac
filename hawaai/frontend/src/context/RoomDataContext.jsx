@@ -168,6 +168,20 @@ export function RoomDataProvider({ children }) {
         const hasEnergyWatts = Object.prototype.hasOwnProperty.call(tickFields, 'energy_watts')
         const hasWattDraw = Object.prototype.hasOwnProperty.call(tickFields, 'watt_draw')
         const energyWatts = hasEnergyWatts ? tickFields.energy_watts : prev.status.energy_watts
+        const runtime = tickFields.runtime ?? {
+          ...prev.status.runtime,
+          active: Boolean(
+            tickFields.session_id
+            && tickFields.active_session_continuity_confirmed
+            && tickFields.active_session_started_at
+          ),
+          session_start: tickFields.active_session_started_at,
+          active_session_started_at: tickFields.active_session_started_at,
+          active_session_elapsed_seconds: tickFields.active_session_elapsed_seconds,
+          active_session_state: tickFields.active_session_state,
+          active_session_continuity_confirmed: tickFields.active_session_continuity_confirmed,
+          active_session_recovery_state: tickFields.active_session_recovery_state,
+        }
         return {
           ...prev,
           status: {
@@ -178,7 +192,7 @@ export function RoomDataProvider({ children }) {
             energy_watts: energyWatts,
             effective_target:
               tickFields.effective_target ?? tickFields.target_temp ?? prev.status.effective_target,
-            runtime: tickFields.runtime ?? prev.status.runtime,
+            runtime,
             effective_ac_on:
               tickFields.effective_ac_on ?? prev.status.effective_ac_on,
             physical_ac_on: physicalAcOn,

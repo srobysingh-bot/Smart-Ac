@@ -23,15 +23,7 @@ import {
   Droplets,
   Flame,
 } from 'lucide-react'
-
-function elapsed(startIso) {
-  if (!startIso) return null
-  const secs = Math.floor((Date.now() - new Date(startIso)) / 1000)
-  const h = Math.floor(secs / 3600)
-  const m = Math.floor((secs % 3600) / 60)
-  const s = secs % 60
-  return `${String(h).padStart(2,'0')}:${String(m).padStart(2,'0')}:${String(s).padStart(2,'0')}`
-}
+import { authoritativeSessionDisplay } from '../utils/sessionTelemetry.js'
 
 const MODE_COLORS = {
   cool:     'text-blue-400',
@@ -576,6 +568,20 @@ function formatEpochLine(epochSec, label) {
   return `${label}: ${clock} (${ago})`
 }
 
+function formatSessionStartLine(startIso, elapsedSeconds) {
+  if (!startIso || !Number.isFinite(Number(elapsedSeconds))) return null
+  const d = new Date(startIso)
+  if (Number.isNaN(d.getTime())) return null
+  const clock = d.toLocaleTimeString(undefined, { hour: 'numeric', minute: '2-digit' })
+  const seconds = Math.max(0, Number(elapsedSeconds))
+  const ago = seconds < 90
+    ? `${Math.floor(seconds)}s ago`
+    : seconds < 3600
+      ? `${Math.floor(seconds / 60)} min ago`
+      : `${Math.floor(seconds / 3600)}h ago`
+  return `Running since: ${clock} (${ago})`
+}
+
 export default function ACStatusCard({
   acPhase = 'off',
   acIdle = false,
@@ -634,35 +640,20 @@ export default function ACStatusCard({
   hasClimateEntity,
   variant = 'full',
 }) {
-  const [timer, setTimer] = useState(null)
   const runningCompress = acPhase === 'on' || acPhase === 'pending_off'
-  const acOnLine = formatEpochLine(lastAcOnAt, runningCompress && !acIdle ? 'Running since' : 'Last ON')
-  const acOffLine = formatEpochLine(lastAcOffAt, 'Last OFF')
-
-  // Timer runs while compressor is running (incl. pending OFF) or idle fan
   const sessionActive = runningCompress || acIdle
-  const continuityConfirmed = Boolean(runtime?.active_session_continuity_confirmed)
-  const reconnectingSession = Boolean(
-    sessionActive
-    && runtime?.active_session_recovery_state
-    && runtime.active_session_recovery_state !== 'idle'
-    && !continuityConfirmed
-  )
-
-  useEffect(() => {
-    const backendElapsed = runtime?.active_session_elapsed_seconds
-    if (!sessionActive || !continuityConfirmed || backendElapsed == null) { setTimer(null); return }
-    const startedAt = Date.now()
-    const baseSeconds = backendElapsed != null ? Number(backendElapsed) : null
-    const update = () => {
-      if (baseSeconds != null && Number.isFinite(baseSeconds)) {
-        setTimer(elapsedFromSeconds(baseSeconds + Math.floor((Date.now() - startedAt) / 1000)))
-      }
-    }
-    const id = setInterval(update, 1000)
-    update()
-    return () => clearInterval(id)
-  }, [sessionActive, continuityConfirmed, runtime?.active_session_elapsed_seconds])
+  const sessionDisplay = authoritativeSessionDisplay(runtime || {})
+  const continuityConfirmed = sessionDisplay.elapsedSeconds != null
+  const backendElapsed = sessionDisplay.elapsedSeconds
+  const timer = sessionActive && backendElapsed != null
+    ? elapsedFromSeconds(backendElapsed)
+    : null
+  const activeStart = sessionDisplay.startedAt || sessionStart
+  const acOnLine = runningCompress && !acIdle
+    ? (continuityConfirmed ? formatSessionStartLine(activeStart, backendElapsed) : null)
+    : formatEpochLine(lastAcOnAt, 'Last ON')
+  const acOffLine = formatEpochLine(lastAcOffAt, 'Last OFF')
+  const reconnectingSession = sessionDisplay.reconnecting
 
   const [adjPendingRemain, setAdjPendingRemain] = useState(null)
   useEffect(() => {

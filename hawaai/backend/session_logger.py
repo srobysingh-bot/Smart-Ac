@@ -249,6 +249,14 @@ async def end_session(room_id: str, data: Dict[str, Any]) -> None:
 
 async def restore_open_session(room_id: str, row: Dict[str, Any]) -> bool:
     rid = _require_room(room_id)
+    row_rid = _canonical_room_id(str((row or {}).get("room_id") or ""))
+    if not row_rid or row_rid != rid:
+        logger.warning(
+            "[SESSION_RESTORE] rejected room mismatch requested=%s stored=%s",
+            rid,
+            row_rid or "missing",
+        )
+        return False
     sid = str((row or {}).get("session_id") or "").strip()
     if not sid:
         return False

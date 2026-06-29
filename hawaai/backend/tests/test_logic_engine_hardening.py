@@ -619,7 +619,7 @@ class TestLogicEngineHardening(unittest.TestCase):
                 )
             self.assertTrue(sent)
             dispatch.assert_awaited_once_with(rid, cfg, "climate.dining")
-            self.assertFalse(st.pending_off_confirmation)
+            self.assertTrue(st.pending_off_confirmation)
             self.assertFalse(st.ac_is_on)
 
         asyncio.run(run_case())
@@ -828,10 +828,10 @@ class TestLogicEngineHardening(unittest.TestCase):
                     },
                     st,
                 )
-            self.assertEqual(watts2, 611.5)
-            self.assertEqual(kwh2, 42.25)
-            self.assertEqual(st.energy_watts, 611.5)
-            self.assertEqual(st.energy_kwh, 42.25)
+            self.assertIsNone(watts2)
+            self.assertIsNone(kwh2)
+            self.assertIsNone(st.energy_watts)
+            self.assertIsNone(st.energy_kwh)
             self.assertFalse(st.telemetry_power_live_valid)
             self.assertFalse(st.telemetry_kwh_live_valid)
             self.assertTrue(st.telemetry_gap)
@@ -917,7 +917,7 @@ class TestLogicEngineHardening(unittest.TestCase):
             parsed_power=None,
             parsed_kwh=None,
         )
-        self.assertEqual((recovering_watts, recovering_kwh), (700.0, 10.0))
+        self.assertEqual((recovering_watts, recovering_kwh), (None, None))
         self.assertEqual(st.telemetry_status, "recovering")
 
         stale_watts, stale_kwh = logic_engine._apply_telemetry_cache(
@@ -929,7 +929,7 @@ class TestLogicEngineHardening(unittest.TestCase):
             parsed_power=None,
             parsed_kwh=None,
         )
-        self.assertEqual((stale_watts, stale_kwh), (700.0, 10.0))
+        self.assertEqual((stale_watts, stale_kwh), (None, None))
         self.assertEqual(st.telemetry_status, "stale")
         self.assertTrue(st.telemetry_gap)
         self.assertTrue(st.ac_is_on)

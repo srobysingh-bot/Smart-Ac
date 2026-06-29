@@ -375,6 +375,7 @@ function LiveStatusBar({ status }) {
     ac_state_source,
     ac_state: acPhase,
     physical_ac_on,
+    physical_ac_state_verified,
     manual_override_active,
     manual_override_enabled,
     manual_override_persisted,
@@ -394,7 +395,9 @@ function LiveStatusBar({ status }) {
   // State display — prefer explicit ac_phase; pending_on never shows as green ON
   const phase = acPhase || 'off'
   const acColor =
-    phase === 'on_failed'
+    phase === 'reconnecting'
+      ? 'text-sky-300'
+      : phase === 'on_failed'
       ? 'text-red-400'
       : phase === 'pending_on'
       ? 'text-amber-400'
@@ -404,7 +407,9 @@ function LiveStatusBar({ status }) {
           ? 'text-yellow-400'
           : 'text-gray-500'
   const acLabel =
-    phase === 'on_failed'
+    phase === 'reconnecting'
+      ? 'RECONNECTING'
+      : phase === 'on_failed'
       ? 'ON FAIL'
       : phase === 'pending_on'
       ? 'WAIT ON'
@@ -450,7 +455,7 @@ function LiveStatusBar({ status }) {
             🧠 est.
           </span>
         )}
-        {ac_state_source === 'system' && physicalCore && (
+        {ac_state_source === 'system' && physicalCore && physical_ac_state_verified !== false && (
           <span className="text-xs text-gray-500 ml-1" title="Runtime state from IR/control path">
             🎛 system
           </span>
@@ -812,7 +817,10 @@ function sameClimateTemperature(a, b) {
 
 function PremiumClimateStatePills({ status, climate, busy }) {
   const phase = String(status?.ac_state || '').toLowerCase()
-  const telemetry = String(status?.telemetry_status || 'unconfigured').toLowerCase()
+  const telemetry = String(
+    status?.power_telemetry_status || status?.telemetry_status || 'unconfigured'
+  ).toLowerCase()
+  const physicalVerified = status?.physical_ac_state_verified !== false
   const overrideActive = Boolean(
     status?.automation_paused_by_user
     || status?.manual_override_active
@@ -832,7 +840,7 @@ function PremiumClimateStatePills({ status, climate, busy }) {
     pills.push({ key: 'pending-on', label: 'Waiting ON', Icon: TimerReset, cls: 'border-amber-700/60 bg-amber-950/30 text-amber-200' })
   } else if (phase === 'pending_off') {
     pills.push({ key: 'pending-off', label: 'Pending OFF', Icon: TimerReset, cls: 'border-amber-700/60 bg-amber-950/30 text-amber-200' })
-  } else if (phase === 'on' || status?.ac_on || status?.effective_ac_on) {
+  } else if ((phase === 'on' || status?.ac_on || status?.effective_ac_on) && physicalVerified) {
     pills.push({ key: 'running', label: 'Running', Icon: Zap, cls: 'border-emerald-700/60 bg-emerald-950/30 text-emerald-200' })
   }
 
@@ -1726,18 +1734,31 @@ export default function Dashboard() {
           <div className="card flex flex-col gap-3">
             <p className="text-xs text-gray-500 uppercase tracking-wide">Energy Now</p>
             {displayStatus && (
+              <>
               <div className="flex items-center justify-between gap-2">
-                <span className="text-xs text-gray-500">Telemetry</span>
+                <span className="text-xs text-gray-500">Power telemetry</span>
                 <span
                   className={`inline-flex items-center gap-1 rounded border px-2 py-0.5 text-[11px] ${
-                    TELEMETRY_STYLE[String(displayStatus.telemetry_status || 'unconfigured').toLowerCase()]
+                    TELEMETRY_STYLE[String(displayStatus.power_telemetry_status || displayStatus.telemetry_status || 'unconfigured').toLowerCase()]
                     || TELEMETRY_STYLE.unconfigured
                   }`}
                 >
                   <Zap size={11} aria-hidden />
-                  {telemetryLabel(displayStatus.telemetry_status)}
+                  {telemetryLabel(displayStatus.power_telemetry_status || displayStatus.telemetry_status)}
                 </span>
               </div>
+              <div className="flex items-center justify-between gap-2">
+                <span className="text-xs text-gray-500">Energy meter</span>
+                <span
+                  className={`inline-flex items-center gap-1 rounded border px-2 py-0.5 text-[11px] ${
+                    TELEMETRY_STYLE[String(displayStatus.kwh_telemetry_status || 'not_configured').toLowerCase()]
+                    || TELEMETRY_STYLE.unconfigured
+                  }`}
+                >
+                  {telemetryLabel(displayStatus.kwh_telemetry_status)}
+                </span>
+              </div>
+              </>
             )}
             <div className="flex flex-col items-center justify-center gap-1 py-3">
               {displayStatus?.energy_watts != null ? (
@@ -1746,7 +1767,7 @@ export default function Dashboard() {
                     {displayStatus.energy_watts.toFixed(0)} W
                   </span>
                   <span className="text-xs text-gray-500">
-                    Live power reading
+                    Power: Live
                   </span>
                   {displayStatus.energy_kwh_total != null && (
                     <span className="text-xs text-gray-400 mt-1">
@@ -1754,7 +1775,9 @@ export default function Dashboard() {
                     </span>
                   )}
                   {(displayStatus.active_session_started_at || displayStatus.session_start)
-                    ? <span className="text-xs text-blue-400 mt-1">Session: tracking kWh…</span>
+                    ? <span className="text-xs text-blue-400 mt-1">
+                        This session energy: {(displayStatus.session_energy_source || 'energy_unknown').replace(/_/g, ' ')}
+                      </span>
                     : <span className="text-xs text-gray-600">No active session</span>
                   }
                 </>
@@ -1763,7 +1786,7 @@ export default function Dashboard() {
                   <span className="text-2xl font-bold text-gray-600">— W</span>
                   <span className="text-xs text-gray-600 text-center">
                     {displayStatus?.energy_configured
-                      ? telemetryLabel(displayStatus?.telemetry_status)
+                      ? telemetryLabel(displayStatus?.power_telemetry_status || displayStatus?.telemetry_status)
                       : 'Configure Live Power Sensor in Settings'}
                   </span>
                   {displayStatus?.last_valid_power_watts != null && (

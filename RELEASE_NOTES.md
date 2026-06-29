@@ -1,5 +1,10 @@
 # HawaAI add-on — release notes
 
+## 1.4.99
+
+- **Telemetry truth and session recovery:** Separated live power health from kWh meter health, made fresh power authoritative for physical ON/OFF and session timing, restarted stale open sessions safely, throttled invalid-meter warnings, and prevented false long-running timers after telemetry gaps or restarts.
+- **Dashboard clarity:** Added independent Power telemetry and Energy meter states, backend-authoritative elapsed timers, reconnecting-session presentation, power-integrated energy quality, and strict canonical-room session isolation.
+
 ## 1.4.97
 
 - **Dashboard UI and timer continuity:** Restored bounded internal scrolling for Room Logs and Recent Sessions, split compact dashboard summary cards from taller runtime/detail cards to remove grid whitespace, made active-session timers require recent persisted power continuity, and reclassified legacy zero-energy vacancy rows as low-quality instead of Good.

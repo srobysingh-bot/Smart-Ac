@@ -7,11 +7,11 @@ Authority separation:
   Presence/zone signals decide occupancy and vacancy.
   Thermostat logic decides target temperature and ON/OFF intent.
   IR/runtime state (`RoomRuntime.ac_is_on`) is the HVAC state authority.
-  Breaker power/kWh telemetry is observational only.
+  Fresh breaker power is the physical AC ON/OFF confirmation source.
+  kWh telemetry is used only for energy and cost accounting.
 
-Breaker telemetry feeds UI, diagnostics, confidence, and session analytics. It
-must never drive occupancy, vacancy, thermostat gating, pending-action
-reconciliation, physical AC truth, or runtime ON/OFF transitions.
+Power telemetry may reconcile physical state and session lifecycle, but neither
+power nor kWh may drive occupancy, vacancy, thermostat intent, or IR dispatch.
 
 Hardware ON/OFF: only `tick()` -> `_turn_ac_on` / `_turn_ac_off` -> backend adapter.
 AI adjusts targets only; it never invokes backend adapters or turn helpers.
@@ -194,7 +194,8 @@ async def _persist_active_session_metadata(room_id: str, st: "RoomRuntime") -> N
             "session_telemetry_gap_seconds": round(st.session_telemetry_gap_seconds, 1),
             "last_confirmed_physical_on_at": st.last_ac_on_at,
             "last_valid_power_sample_at": (
-                st.last_valid_timestamp.isoformat() if st.last_valid_timestamp else None
+                st.last_valid_power_timestamp.isoformat()
+                if st.last_valid_power_timestamp else None
             ),
             "last_valid_power_watts": st.last_valid_power_watts,
         },
@@ -210,6 +211,8 @@ ACTIVE_SESSION_CONTINUITY_MAX_GAP_SECONDS: float = 900.0
 def _telemetry_status_from_invalid_age(age_seconds: float) -> str:
     if age_seconds >= TELEMETRY_OFFLINE_SECONDS:
         return "offline"
+    if age_seconds >= TELEMETRY_STALE_SECONDS:
+        return "stale"
     return "recovering"
 
 
@@ -230,6 +233,23 @@ def _telemetry_age(st: "RoomRuntime", now: datetime) -> Optional[float]:
     return max(0.0, (now - st.telemetry_invalid_since).total_seconds())
 
 
+def _channel_telemetry_status(
+    *,
+    now: datetime,
+    entity_configured: bool,
+    live_valid: bool,
+    invalid_since: Optional[datetime],
+) -> Tuple[str, Optional[datetime]]:
+    """Return health for one telemetry channel without coupling it to another."""
+    if not entity_configured:
+        return "not_configured", None
+    if live_valid:
+        return "healthy", None
+    since = invalid_since or now
+    age = max(0.0, (now - since).total_seconds())
+    return _telemetry_status_from_invalid_age(age), since
+
+
 def _apply_telemetry_cache(
     st: "RoomRuntime",
     *,
@@ -240,7 +260,7 @@ def _apply_telemetry_cache(
     parsed_power: Optional[float],
     parsed_kwh: Optional[float],
 ) -> Tuple[Optional[float], Optional[float]]:
-    """Update observational telemetry state without changing HVAC authority."""
+    """Update independent power and kWh health channels from live samples."""
     power_configured = bool(power_entity)
     kwh_configured = bool(kwh_entity)
     power_live = parsed_power is not None
@@ -248,46 +268,53 @@ def _apply_telemetry_cache(
 
     st.telemetry_power_live_valid = power_live
     st.telemetry_kwh_live_valid = kwh_live
+    if power_configured and not power_live:
+        st.physical_ac_state_verified = False
 
     if parsed_power is not None:
         st.last_valid_power_watts = parsed_power
+        st.last_valid_power_timestamp = now
         st.last_valid_timestamp = now
     if parsed_kwh is not None:
         st.last_valid_energy_kwh = parsed_kwh
+        st.last_valid_kwh_timestamp = now
         st.last_valid_timestamp = now
 
-    effective_power: Optional[float] = None
-    effective_kwh: Optional[float] = None
+    power_status, power_invalid_since = _channel_telemetry_status(
+        now=now,
+        entity_configured=bool(configured and power_configured),
+        live_valid=power_live,
+        invalid_since=st.power_telemetry_invalid_since,
+    )
+    kwh_status, kwh_invalid_since = _channel_telemetry_status(
+        now=now,
+        entity_configured=bool(configured and kwh_configured),
+        live_valid=kwh_live,
+        invalid_since=st.kwh_telemetry_invalid_since,
+    )
+    st.power_telemetry_status = power_status
+    st.kwh_telemetry_status = kwh_status
+    st.power_telemetry_invalid_since = power_invalid_since
+    st.kwh_telemetry_invalid_since = kwh_invalid_since
+    st.power_telemetry_confidence = _telemetry_confidence_for_status(power_status)
+    st.kwh_telemetry_confidence = _telemetry_confidence_for_status(kwh_status)
+    st.power_telemetry_gap = power_status not in ("healthy", "not_configured")
+    st.kwh_telemetry_gap = kwh_status not in ("healthy", "not_configured")
 
-    if not configured:
-        st.telemetry_gap = False
-        st.telemetry_invalid_since = None
-        st.telemetry_status = "not_configured"
-        st.telemetry_confidence = "none"
-    else:
-        invalid_power = power_configured and not power_live
-        invalid_kwh = kwh_configured and not kwh_live
-        has_invalid = invalid_power or invalid_kwh
+    # Backward-compatible aggregate fields deliberately follow power whenever a
+    # power entity exists. A broken optional kWh meter must not make physical
+    # telemetry unhealthy.
+    legacy_status = power_status if power_configured else kwh_status
+    legacy_invalid_since = (
+        power_invalid_since if power_configured else kwh_invalid_since
+    )
+    st.telemetry_status = legacy_status
+    st.telemetry_confidence = _telemetry_confidence_for_status(legacy_status)
+    st.telemetry_gap = st.power_telemetry_gap if power_configured else st.kwh_telemetry_gap
+    st.telemetry_invalid_since = legacy_invalid_since
 
-        if not has_invalid:
-            st.telemetry_gap = False
-            st.telemetry_invalid_since = None
-            st.telemetry_status = "healthy"
-            st.telemetry_confidence = "high"
-            effective_power = parsed_power
-            effective_kwh = parsed_kwh
-        else:
-            if st.telemetry_invalid_since is None:
-                st.telemetry_invalid_since = now
-            invalid_age = _telemetry_age(st, now) or 0.0
-            status = _telemetry_status_from_invalid_age(invalid_age)
-
-            st.telemetry_gap = True
-            st.telemetry_status = status
-            st.telemetry_confidence = _telemetry_confidence_for_status(status)
-
-            effective_power = parsed_power
-            effective_kwh = parsed_kwh
+    effective_power: Optional[float] = parsed_power
+    effective_kwh: Optional[float] = parsed_kwh
 
     st.energy_watts = effective_power
     st.energy_kwh = effective_kwh
@@ -303,18 +330,16 @@ def _should_log_telemetry_invalid(
     raw_state: object,
     reason: str,
 ) -> bool:
-    sig = (kind, status, reason, str(raw_state))
-    transition = st.telemetry_invalid_log_sig != sig
+    sig = (status, reason, str(raw_state))
+    previous = st.telemetry_invalid_log_by_kind.get(kind)
+    transition = previous is None or previous[0] != sig
     long_outage = False
     if not transition and status in ("stale", "offline"):
-        if st.telemetry_last_invalid_log_at is None:
-            long_outage = True
-        else:
-            age = (now - st.telemetry_last_invalid_log_at).total_seconds()
-            long_outage = age >= TELEMETRY_LONG_OUTAGE_LOG_SECONDS
+        last_log_at = previous[1]
+        age = (now - last_log_at).total_seconds()
+        long_outage = age >= TELEMETRY_LONG_OUTAGE_LOG_SECONDS
     if transition or long_outage:
-        st.telemetry_invalid_log_sig = sig
-        st.telemetry_last_invalid_log_at = now
+        st.telemetry_invalid_log_by_kind[kind] = (sig, now)
         return True
     return False
 
@@ -346,12 +371,13 @@ def _log_energy_runtime_diagnostic(
         device_lookup_skipped,
         power_entity,
         power_status,
-        st.telemetry_status,
+        st.power_telemetry_status,
         power_validation_reason,
         power_confidence,
         power_suspicious,
         kwh_entity,
         kwh_status,
+        st.kwh_telemetry_status,
     )
     if sig == st.energy_runtime_log_sig:
         return
@@ -378,7 +404,7 @@ def _log_energy_runtime_diagnostic(
             st,
             now=now,
             kind="power",
-            status=st.telemetry_status,
+            status=st.power_telemetry_status,
             raw_state=raw_power_state,
             reason=power_validation_reason or power_status,
         ):
@@ -390,8 +416,8 @@ def _log_energy_runtime_diagnostic(
                 power_entity,
                 raw_power_state,
                 power_validation_reason or power_status,
-                st.telemetry_status,
-                st.telemetry_confidence,
+                st.power_telemetry_status,
+                st.power_telemetry_confidence,
             )
     elif power_confidence:
         logger.debug(
@@ -416,7 +442,7 @@ def _log_energy_runtime_diagnostic(
             st,
             now=now,
             kind="kwh",
-            status=st.telemetry_status,
+            status=st.kwh_telemetry_status,
             raw_state=raw_kwh_state,
             reason=kwh_status,
         ):
@@ -427,8 +453,8 @@ def _log_energy_runtime_diagnostic(
                 room_id,
                 kwh_entity,
                 raw_kwh_state,
-                st.telemetry_status,
-                st.telemetry_confidence,
+                st.kwh_telemetry_status,
+                st.kwh_telemetry_confidence,
             )
 
 
@@ -570,6 +596,7 @@ class RoomRuntime:
     # â”€â”€ Single source of truth â€” set once per tick, read everywhere â”€â”€
     # Physical compressor / HA / inferred truth (never masked by pending ON).
     physical_ac_on: bool = False
+    physical_ac_state_verified: bool = False
     physical_power_candidate: Optional[str] = None
     physical_power_candidate_since: Optional[datetime] = None
     physical_power_last_sample_at: Optional[datetime] = None
@@ -705,15 +732,26 @@ class RoomRuntime:
     energy_runtime_log_sig: Optional[tuple] = None
     telemetry_power_live_valid: bool = False
     telemetry_kwh_live_valid: bool = False
+    power_telemetry_status: str = "not_configured"
+    kwh_telemetry_status: str = "not_configured"
+    power_telemetry_confidence: str = "none"
+    kwh_telemetry_confidence: str = "none"
+    power_telemetry_gap: bool = False
+    kwh_telemetry_gap: bool = False
+    power_telemetry_invalid_since: Optional[datetime] = None
+    kwh_telemetry_invalid_since: Optional[datetime] = None
     telemetry_status: str = "unconfigured"
     telemetry_confidence: str = "none"
     telemetry_gap: bool = False
     telemetry_invalid_since: Optional[datetime] = None
     telemetry_last_invalid_log_at: Optional[datetime] = None
     telemetry_invalid_log_sig: Optional[tuple] = None
+    telemetry_invalid_log_by_kind: Dict[str, Tuple[tuple, datetime]] = field(default_factory=dict)
     hvac_control_confidence: str = "medium"
     last_valid_power_watts: Optional[float] = None
     last_valid_energy_kwh: Optional[float] = None
+    last_valid_power_timestamp: Optional[datetime] = None
+    last_valid_kwh_timestamp: Optional[datetime] = None
     last_valid_timestamp: Optional[datetime] = None
     # Hybrid event triggers â€” last sampled values from HA WS (not authoritative for control)
     last_event_presence_bool: Optional[bool] = None
@@ -1572,7 +1610,11 @@ def _current_valid_power_watts(st: RoomRuntime) -> Optional[float]:
 def _power_says_physical_off(cfg: dict, st: RoomRuntime, power_watts: object) -> bool:
     if not _power_physical_state_enabled(cfg, st, power_watts):
         return False
-    return float(power_watts) < _cfg_float(cfg, "physical_on_watts", 100.0, lo=0.0)
+    on_watts = _cfg_float(cfg, "physical_on_watts", 100.0, lo=0.0)
+    off_watts = _cfg_float(cfg, "physical_off_watts", 30.0, lo=0.0)
+    if off_watts >= on_watts:
+        off_watts = max(0.0, on_watts - 1.0)
+    return float(power_watts) <= off_watts
 
 
 def _reset_on_confirmation_failure(st: RoomRuntime) -> None:
@@ -1636,6 +1678,7 @@ def _reconcile_physical_ac_from_power(
                 )
             st.physical_ac_on = True
             st.ac_is_on = True
+            st.physical_ac_state_verified = True
             st.ac_state_source = "power_telemetry"
             if st.pending_action == "on":
                 if normalize_ir_backend(cfg) == "tuya":
@@ -1661,8 +1704,10 @@ def _reconcile_physical_ac_from_power(
                 )
             st.physical_ac_on = False
             st.ac_is_on = False
+            st.physical_ac_state_verified = True
             st.ac_state_source = "power_telemetry"
             if st.pending_action == "off":
+                _clear_pending_off_confirmation(st)
                 _clear_pending_command_state(st)
             applied = True
     else:
@@ -3097,7 +3142,7 @@ async def _load_startup_state(room_id: str, cfg: dict) -> None:
 
         climate_data = await ha_client.get_climate_state(str(climate_entity).strip())
         if not climate_data:
-            return
+            climate_data = {}
         observe_fan_mode(room_id, cfg, climate_data.get("fan_mode"), source="startup_climate")
 
         ha_state = (climate_data.get("state") or "off").lower()
@@ -3125,8 +3170,21 @@ async def _load_startup_state(room_id: str, cfg: dict) -> None:
         )
         power_reading, _kwh_reading = await _read_runtime_energy(room_id, cfg, st)
         open_row = await database.get_open_session(room_id)
+        restart_now = datetime.now(timezone.utc)
+        power_available = _power_physical_state_enabled(cfg, st, power_reading)
+        if power_available:
+            st.power_telemetry_status = "healthy"
+            st.power_telemetry_confidence = "high"
+            st.last_valid_power_timestamp = restart_now
         current_power_on = _power_says_physical_on(cfg, st, power_reading)
-        if open_row and current_power_on:
+        current_power_off = _power_says_physical_off(cfg, st, power_reading)
+        canonical_row = bool(
+            open_row
+            and normalize_room_id(str(open_row.get("room_id") or "")) == normalize_room_id(room_id)
+        )
+        continuity = False
+        started = None
+        if open_row:
             started = _parse_dt_utc(
                 open_row.get("active_session_started_at_utc") or open_row.get("start_time")
             )
@@ -3135,20 +3193,45 @@ async def _load_startup_state(room_id: str, cfg: dict) -> None:
                 sample_watts = float(open_row.get("last_valid_power_watts"))
             except (TypeError, ValueError):
                 sample_watts = None
-            restart_now = datetime.now(timezone.utc)
             recent_sample = (
                 sample_at is not None
                 and sample_watts is not None
                 and sample_watts >= _cfg_float(cfg, "physical_on_watts", 100.0, lo=0.0)
                 and 0 <= (restart_now - sample_at).total_seconds() <= ACTIVE_SESSION_CONTINUITY_MAX_GAP_SECONDS
             )
-            fresh_enough = (
-                started is not None
+            continuity = bool(
+                canonical_row
+                and started is not None
                 and started <= restart_now + timedelta(seconds=5)
-                and (restart_now - started).total_seconds() <= 48 * 3600
+                and (restart_now - started).total_seconds()
+                    <= _cfg_float(
+                        cfg, "max_reasonable_runtime_hours", 12.0, lo=1.0, hi=168.0
+                    ) * 3600.0
                 and recent_sample
+                and current_power_on
             )
-            if fresh_enough and await session_logger.restore_open_session(room_id, open_row):
+
+        log_with_room(
+            "info",
+            room_id,
+            "[SESSION_DEBUG] room=%s open_session=%s started=%s power=%s power_status=%s continuity=%s",
+            normalize_room_id(room_id),
+            open_row.get("session_id") if open_row else "none",
+            started.isoformat() if started else "none",
+            f"{float(power_reading):.1f}" if power_reading is not None else "unavailable",
+            st.power_telemetry_status,
+            str(continuity).lower(),
+        )
+
+        if open_row and power_available and current_power_on:
+            st.physical_ac_on = True
+            st.effective_ac_on = True
+            st.ac_is_on = True
+            st.physical_ac_state_verified = True
+            st.ac_state = "on"
+            st.ac_state_source = "power_telemetry"
+            st.last_ac_on_at = restart_now.timestamp()
+            if continuity and await session_logger.restore_open_session(room_id, open_row):
                 st.session_start_time = started
                 st.active_session_started_at_utc = started
                 st.session_start_temp = open_row.get("indoor_temp_start")
@@ -3169,7 +3252,7 @@ async def _load_startup_state(room_id: str, cfg: dict) -> None:
                 st.active_session_continuity_confirmed = True
                 st.active_session_recovery_state = "confirmed"
                 log_with_room("info", room_id, "[SESSION_RESTORE] active_session_resumed")
-            elif not fresh_enough:
+            else:
                 await database.update_session_end(
                     str(open_row.get("session_id")),
                     {
@@ -3181,18 +3264,69 @@ async def _load_startup_state(room_id: str, cfg: dict) -> None:
                 )
                 st.active_session_continuity_confirmed = False
                 st.active_session_recovery_state = "recovery_gap"
-        elif open_row:
+                try:
+                    indoor_start = float(
+                        climate_data.get("current_temp")
+                        if climate_data.get("current_temp") is not None
+                        else open_row.get("indoor_temp_start") or 0.0
+                    )
+                except (TypeError, ValueError):
+                    indoor_start = 0.0
+                try:
+                    target_start = float(climate_data.get("target_temp") or cfg.get("target_temp", 24.0))
+                except (TypeError, ValueError):
+                    target_start = 24.0
+                await _start_provisional_session(
+                    room_id, cfg, indoor_start, restart_now, target_start
+                )
+                st.active_session_recovery_state = "restarted_after_gap"
+        elif open_row and power_available and current_power_off:
+            st.physical_ac_on = False
+            st.effective_ac_on = False
+            st.ac_is_on = False
+            st.physical_ac_state_verified = True
+            st.ac_state = "off"
+            st.ac_state_source = "power_telemetry"
             await database.update_session_end(
                 str(open_row.get("session_id")),
                 {
-                    "end_time": datetime.now(timezone.utc).isoformat(),
-                    "reason_stopped": "recovery_gap",
+                    "end_time": restart_now.isoformat(),
+                    "reason_stopped": "stale_open_session",
                     "is_record_valid": 0,
                     "energy_quality": "recovered",
                 },
             )
             st.active_session_continuity_confirmed = False
             st.active_session_recovery_state = "power_off"
+        elif open_row and not power_available:
+            # Keep the canonical DB session pending so the next fresh power
+            # sample can reconcile it, but never expose its old elapsed time.
+            if canonical_row and await session_logger.restore_open_session(room_id, open_row):
+                st.session_start_time = started
+                st.active_session_started_at_utc = started
+                st.session_start_temp = open_row.get("indoor_temp_start")
+                st.session_start_kwh = open_row.get("meter_start_kwh", open_row.get("energy_start_kwh"))
+            st.active_session_continuity_confirmed = False
+            st.active_session_recovery_state = "recovery_pending"
+            st.physical_ac_state_verified = False
+            st.ac_state_source = "power_unverified"
+        elif not open_row and power_available and current_power_on:
+            st.physical_ac_on = True
+            st.effective_ac_on = True
+            st.ac_is_on = True
+            st.physical_ac_state_verified = True
+            st.ac_state = "on"
+            st.ac_state_source = "power_telemetry"
+            st.last_ac_on_at = restart_now.timestamp()
+            try:
+                indoor_start = float(climate_data.get("current_temp") or 0.0)
+            except (TypeError, ValueError):
+                indoor_start = 0.0
+            try:
+                target_start = float(climate_data.get("target_temp") or cfg.get("target_temp", 24.0))
+            except (TypeError, ValueError):
+                target_start = 24.0
+            await _start_provisional_session(room_id, cfg, indoor_start, restart_now, target_start)
     except Exception as e:
         logger.warning("[HawaAI] Could not load startup state for room=%s: %s", room_id, e)
     finally:
@@ -4891,8 +5025,9 @@ async def _apply_runtime_self_heal(
             climate_state=(climate_data or {}).get("mode") or (climate_data or {}).get("state"),
             climate_available=bool(climate_data),
             climate_last_updated=(climate_data or {}).get("last_updated"),
-            # Breaker telemetry is observational only; never feed it into
-            # runtime self-heal recommendations that can rebuild HVAC state.
+            # Physical power reconciliation is handled in its dedicated path.
+            # Do not duplicate it in self-heal, whose recommendations may also
+            # mutate command/runtime recovery state.
             power_entity="",
             power_watts=None,
             power_available=True,
@@ -5882,7 +6017,7 @@ async def _tick_presence_only_mode(
             st,
             now=now,
             power_watts=telemetry_power_watts,
-            live_valid=bool(st.telemetry_power_live_valid and not st.telemetry_gap),
+            live_valid=bool(st.telemetry_power_live_valid),
         )
         await _persist_active_session_metadata(room_id, st)
 
@@ -5969,7 +6104,7 @@ async def _tick_manual_override_observe_only(
             st,
             now=now,
             power_watts=telemetry_power_watts,
-            live_valid=bool(st.telemetry_power_live_valid and not st.telemetry_gap),
+            live_valid=bool(st.telemetry_power_live_valid),
         )
         await _persist_active_session_metadata(room_id, st)
     log_with_room("info", room_id, "[OVERRIDE] active persistent=true automation_paused=true")
@@ -6906,7 +7041,7 @@ async def _tick_impl(rid_raw: str, room_id: str) -> None:
             st,
             now=now,
             power_watts=telemetry_power_watts,
-            live_valid=bool(st.telemetry_power_live_valid and not st.telemetry_gap),
+            live_valid=bool(st.telemetry_power_live_valid),
         )
         await _persist_active_session_metadata(room_id, st)
 
@@ -6989,22 +7124,61 @@ async def _maintain_session_lifecycle(
     confirmed_ac_on: bool,
     inferred_only_physical: bool,
 ) -> None:
-    """
-    Open provisional session on command/runtime ON; never inferred-only pending path.
-
-    Gating uses ``confirmed_ac_on`` / ``_session_creation_eligible`` (runtime / IR),
-    not thermostat ``effective_target`` alone â€” switching comfort effective_mode does not start sessions by itself.
-    """
+    """Maintain sessions from physical confirmation, independently of kWh health."""
     st = _rt(room_id)
     sid_open = session_logger.current_session_id(room_id)
+
+    power_configured = bool(st.energy_configured and str(st.energy_power_entity or "").strip())
+    fresh_power = bool(
+        power_configured
+        and st.telemetry_power_live_valid
+        and st.power_telemetry_status == "healthy"
+        and st.energy_watts is not None
+    )
+    fresh_power_on = bool(fresh_power and _power_says_physical_on(cfg, st, st.energy_watts))
+    fresh_power_off = bool(fresh_power and _power_says_physical_off(cfg, st, st.energy_watts))
+
+    if sid_open and power_configured:
+        if fresh_power_off:
+            close_cfg = {**cfg, "session_finalization_grace_seconds": 0}
+            await _close_session(room_id, close_cfg, indoor_temp, reason="power_off")
+            st.active_session_continuity_confirmed = False
+            st.active_session_recovery_state = "power_off"
+            return
+        if not fresh_power:
+            if st.session_telemetry_gap_started_at is None:
+                st.session_telemetry_gap_started_at = now
+            st.active_session_continuity_confirmed = False
+            st.active_session_recovery_state = "recovery_pending"
+            return
+        if fresh_power_on and not st.active_session_continuity_confirmed:
+            gap_started = st.session_telemetry_gap_started_at
+            gap_age = (
+                max(0.0, (now - gap_started).total_seconds())
+                if gap_started is not None
+                else float("inf")
+            )
+            if gap_age <= ACTIVE_SESSION_CONTINUITY_MAX_GAP_SECONDS:
+                st.active_session_continuity_confirmed = True
+                st.active_session_recovery_state = "confirmed"
+            else:
+                close_cfg = {**cfg, "session_finalization_grace_seconds": 0}
+                await _close_session(room_id, close_cfg, indoor_temp, reason="recovery_gap")
+                sid_open = None
+                st.active_session_continuity_confirmed = False
+                st.active_session_recovery_state = "recovery_gap"
 
     eligibility = _session_creation_eligible(st, now)
     physical_confirmed = bool(st.physical_ac_on)
     eligible_confirmed_session = (
-        eligibility
-        and confirmed_ac_on
-        and physical_confirmed
-        and not inferred_only_physical
+        fresh_power_on
+        if power_configured
+        else (
+            eligibility
+            and confirmed_ac_on
+            and physical_confirmed
+            and not inferred_only_physical
+        )
     )
 
     runtime_confirm = False
@@ -7125,7 +7299,8 @@ async def _start_provisional_session(
             "session_telemetry_gap_seconds": 0.0,
             "last_confirmed_physical_on_at": st.last_ac_on_at,
             "last_valid_power_sample_at": (
-                st.last_valid_timestamp.isoformat() if st.last_valid_timestamp else None
+                st.last_valid_power_timestamp.isoformat()
+                if st.last_valid_power_timestamp else None
             ),
             "last_valid_power_watts": st.last_valid_power_watts,
             "provisional":            True,
@@ -7710,8 +7885,11 @@ async def _close_session(room_id: str, cfg: dict, indoor_temp: float, reason: st
             kwh_consumed = None
 
     if kwh_consumed is None:
-        if st.session_energy_wh > 0:
-            kwh_consumed = max(0.0, st.session_energy_wh / 1000.0)
+        integrated_wh = max(0.0, st.session_energy_wh)
+        if integrated_wh <= 0 and avg_watts is not None and duration_secs > 0:
+            integrated_wh = max(0.0, avg_watts) * duration_secs / 3600.0
+        if integrated_wh > 0:
+            kwh_consumed = integrated_wh / 1000.0
             kwh_consumed = round(kwh_consumed, 4)
             energy_source = "power_integrated"
             energy_quality = "partial"
@@ -7984,13 +8162,70 @@ def get_runtime_state(room_id: str) -> dict:
         sp_secs = round((now - st.last_setpoint_command_at).total_seconds(), 1)
     active_started = st.active_session_started_at_utc or st.session_start_time
     has_active_session = bool(session_logger.current_session_id(canonical))
-    continuity_confirmed = bool(has_active_session and st.active_session_continuity_confirmed)
+    power_configured = bool(st.energy_configured and str(st.energy_power_entity or "").strip())
+    power_continuity_proven = bool(
+        st.power_telemetry_status == "healthy"
+        and st.telemetry_power_live_valid
+        and st.last_valid_power_timestamp is not None
+        and 0 <= (now - st.last_valid_power_timestamp).total_seconds() <= TELEMETRY_STALE_SECONDS
+    )
+    continuity_confirmed = bool(
+        has_active_session
+        and st.active_session_continuity_confirmed
+        and (not power_configured or power_continuity_proven)
+    )
     active_elapsed_seconds = (
         max(0, int((now - active_started).total_seconds()))
         if active_started is not None and continuity_confirmed
         else None
     )
-    active_session_state = st.session_state if continuity_confirmed else "reconnecting" if has_active_session else "idle"
+    max_runtime_hours = _cfg_float(
+        merged, "max_reasonable_runtime_hours", 12.0, lo=1.0, hi=168.0
+    )
+    if (
+        active_elapsed_seconds is not None
+        and active_elapsed_seconds > max_runtime_hours * 3600.0
+        and not power_continuity_proven
+    ):
+        active_elapsed_seconds = None
+        continuity_confirmed = False
+    active_session_state = (
+        st.session_state
+        if continuity_confirmed
+        else "reconnecting" if has_active_session else "idle"
+    )
+    display_active_started = active_started if continuity_confirmed else None
+    display_ac_state = (
+        "reconnecting"
+        if has_active_session and power_configured and not power_continuity_proven
+        else st.ac_state
+    )
+    session_energy_kwh: Optional[float] = None
+    session_energy_source = "energy_unknown"
+    session_energy_quality = "energy_unknown"
+    if has_active_session:
+        if st.session_start_kwh is not None and st.energy_kwh is not None:
+            try:
+                meter_delta = float(st.energy_kwh) - float(st.session_start_kwh)
+            except (TypeError, ValueError):
+                meter_delta = -1.0
+            if meter_delta >= 0:
+                session_energy_kwh = round(meter_delta, 4)
+                session_energy_source = "meter_delta"
+                session_energy_quality = "meter_delta"
+        if session_energy_kwh is None and (
+            st.session_energy_wh > 0
+            or (continuity_confirmed and st.telemetry_power_live_valid)
+        ):
+            session_energy_kwh = round(max(0.0, st.session_energy_wh) / 1000.0, 4)
+            session_energy_source = "power_integrated"
+            session_energy_quality = "power_integrated"
+    tariff = _cfg_float(merged, "energy_tariff_per_kwh", 8.0, lo=0.0)
+    session_cost = (
+        round(session_energy_kwh * tariff, 2)
+        if session_energy_kwh is not None
+        else None
+    )
 
     on_d = _nonnegative_delay_seconds(merged, "on_delay_seconds")
     off_d = _nonnegative_delay_seconds(merged, "off_delay_seconds")
@@ -8042,8 +8277,9 @@ def get_runtime_state(room_id: str) -> dict:
     return {
         "ac_is_on":              st.physical_ac_on,
         "physical_ac_on":        st.physical_ac_on,
+        "physical_ac_state_verified": st.physical_ac_state_verified,
         "effective_ac_on":       st.effective_ac_on,
-        "ac_state":              st.ac_state,
+        "ac_state":              display_ac_state,
         "ac_idle":               st.effective_ac_idle,
         "power_source":          st.effective_power_source,
         "ac_state_source":       st.ac_state_source,
@@ -8133,6 +8369,20 @@ def get_runtime_state(room_id: str) -> dict:
         "energy_power_suspicious": st.energy_power_suspicious,
         "telemetry_power_live_valid": st.telemetry_power_live_valid,
         "telemetry_kwh_live_valid": st.telemetry_kwh_live_valid,
+        "power_telemetry_status": st.power_telemetry_status,
+        "kwh_telemetry_status": st.kwh_telemetry_status,
+        "power_telemetry_confidence": st.power_telemetry_confidence,
+        "kwh_telemetry_confidence": st.kwh_telemetry_confidence,
+        "power_telemetry_gap": st.power_telemetry_gap,
+        "kwh_telemetry_gap": st.kwh_telemetry_gap,
+        "power_telemetry_invalid_since": (
+            st.power_telemetry_invalid_since.isoformat()
+            if st.power_telemetry_invalid_since else None
+        ),
+        "kwh_telemetry_invalid_since": (
+            st.kwh_telemetry_invalid_since.isoformat()
+            if st.kwh_telemetry_invalid_since else None
+        ),
         "telemetry_status": st.telemetry_status,
         "telemetry_confidence": st.telemetry_confidence,
         "telemetry_gap": st.telemetry_gap,
@@ -8148,6 +8398,14 @@ def get_runtime_state(room_id: str) -> dict:
         "telemetry_offline_after_seconds": float(TELEMETRY_OFFLINE_SECONDS),
         "last_valid_power_watts": st.last_valid_power_watts,
         "last_valid_energy_kwh": st.last_valid_energy_kwh,
+        "last_valid_power_timestamp": (
+            st.last_valid_power_timestamp.isoformat()
+            if st.last_valid_power_timestamp else None
+        ),
+        "last_valid_kwh_timestamp": (
+            st.last_valid_kwh_timestamp.isoformat()
+            if st.last_valid_kwh_timestamp else None
+        ),
         "last_valid_timestamp": (
             st.last_valid_timestamp.isoformat() if st.last_valid_timestamp else None
         ),
@@ -8155,15 +8413,24 @@ def get_runtime_state(room_id: str) -> dict:
         "ai_cached":             _ce is not None,
         "session_id":            session_logger.current_session_id(canonical),
         "session_start_time":    (
-            st.session_start_time.isoformat() if st.session_start_time else None
+            display_active_started.isoformat() if display_active_started else None
         ),
         "active_session_started_at": (
-            active_started.isoformat() if active_started else None
+            display_active_started.isoformat() if display_active_started else None
         ),
         "active_session_elapsed_seconds": active_elapsed_seconds,
         "active_session_state": active_session_state,
         "active_session_continuity_confirmed": continuity_confirmed,
         "active_session_recovery_state": st.active_session_recovery_state,
+        "max_reasonable_runtime_hours": max_runtime_hours,
+        "active_session_energy_kwh": session_energy_kwh,
+        "active_session_energy_source": session_energy_source,
+        "active_session_energy_quality": session_energy_quality,
+        "active_session_cost": session_cost,
+        "session_kwh": session_energy_kwh,
+        "session_energy_source": session_energy_source,
+        "session_energy_quality": session_energy_quality,
+        "session_cost": session_cost,
         "session_start_kwh":     st.session_start_kwh,
         "cooldown_active":       in_cooldown,
         "last_command":          st.last_command or None,

@@ -1,11 +1,12 @@
 {
   "name": "smartcool-frontend",
   "private": true,
-  "version": "1.4.98",
+  "version": "1.4.99",
   "type": "module",
   "scripts": {
     "dev": "vite",
     "build": "vite build",
+    "test": "node --test tests/*.test.js",
     "preview": "vite preview"
   },
   "dependencies": {

@@ -545,7 +545,7 @@ async def lifespan(app: FastAPI):
     logger.info("[HawaAI] Add-on stopped")
 
 
-app = FastAPI(title="HawaAI API", version="1.4.98", lifespan=lifespan)
+app = FastAPI(title="HawaAI API", version="1.4.99", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -732,19 +732,11 @@ async def get_weather_cached():
 
 def _runtime_block(runtime: Dict[str, Any]) -> Dict[str, Any]:
     """Session runtime for UI timer (authoritative backend elapsed seconds)."""
-    now = datetime.now(timezone.utc)
     start_iso = runtime.get("active_session_started_at") or runtime.get("session_start_time")
     sid = runtime.get("session_id")
     continuity = bool(runtime.get("active_session_continuity_confirmed"))
     active = bool(sid and start_iso and continuity)
     elapsed_seconds = runtime.get("active_session_elapsed_seconds")
-    if elapsed_seconds is None and active and start_iso:
-        try:
-            iso = start_iso.replace("Z", "+00:00")
-            st = datetime.fromisoformat(iso)
-            elapsed_seconds = max(0, int((now - st).total_seconds()))
-        except (TypeError, ValueError):
-            elapsed_seconds = 0
     if not active:
         elapsed_seconds = None
     minutes = int((elapsed_seconds or 0) // 60)
@@ -857,6 +849,12 @@ async def _dashboard_status_payload(rid: str) -> Dict[str, Any]:
     energy_watts = runtime.get("energy_watts")
     energy_kwh = runtime.get("energy_kwh_total")
     telemetry_status = str(runtime.get("telemetry_status") or "not_configured")
+    power_telemetry_status = str(
+        runtime.get("power_telemetry_status") or telemetry_status or "not_configured"
+    )
+    kwh_telemetry_status = str(
+        runtime.get("kwh_telemetry_status") or "not_configured"
+    )
     telemetry_gap = bool(runtime.get("telemetry_gap"))
     energy_power_raw = runtime.get("energy_power_raw_state")
     energy_kwh_raw = runtime.get("energy_kwh_raw_state")
@@ -882,8 +880,8 @@ async def _dashboard_status_payload(rid: str) -> Dict[str, Any]:
     telemetry_live_available = bool(runtime.get("telemetry_power_live_valid"))
     energy_status = (
         "ok"
-        if telemetry_status == "healthy"
-        else ("not_configured" if not energy_configured else telemetry_status)
+        if power_telemetry_status == "healthy"
+        else ("not_configured" if not energy_configured else power_telemetry_status)
     )
     _log_dashboard_energy_trace(
         rid,
@@ -972,7 +970,7 @@ async def _dashboard_status_payload(rid: str) -> Dict[str, Any]:
             "energy_power": (
                 None
                 if not energy_configured
-                else telemetry_status == "healthy"
+                else power_telemetry_status == "healthy"
             ),
             "energy_kwh": (
                 None
@@ -998,6 +996,7 @@ async def _dashboard_status_payload(rid: str) -> Dict[str, Any]:
         # ── Core state ────────────────────────────────────────────────────────
         "ac_on":             ac_on_compat,
         "physical_ac_on":    physical_ac_on,
+        "physical_ac_state_verified": runtime.get("physical_ac_state_verified"),
         "ac_state":          ac_state,
         "effective_ac_on":   effective_ac_on,
         "ac_state_source":  runtime.get("ac_state_source", "system"),
@@ -1014,6 +1013,12 @@ async def _dashboard_status_payload(rid: str) -> Dict[str, Any]:
         "energy_live_available": telemetry_live_available,
         "energy_status": energy_status,
         "telemetry_status": telemetry_status,
+        "power_telemetry_status": power_telemetry_status,
+        "kwh_telemetry_status": kwh_telemetry_status,
+        "power_telemetry_confidence": runtime.get("power_telemetry_confidence"),
+        "kwh_telemetry_confidence": runtime.get("kwh_telemetry_confidence"),
+        "power_telemetry_gap": runtime.get("power_telemetry_gap"),
+        "kwh_telemetry_gap": runtime.get("kwh_telemetry_gap"),
         "telemetry_confidence": runtime.get("telemetry_confidence"),
         "telemetry_gap": telemetry_gap,
         "telemetry_invalid_since": runtime.get("telemetry_invalid_since"),
@@ -1023,6 +1028,8 @@ async def _dashboard_status_payload(rid: str) -> Dict[str, Any]:
         "last_valid_power_watts": runtime.get("last_valid_power_watts"),
         "last_valid_energy_kwh": runtime.get("last_valid_energy_kwh"),
         "last_valid_timestamp": runtime.get("last_valid_timestamp"),
+        "last_valid_power_timestamp": runtime.get("last_valid_power_timestamp"),
+        "last_valid_kwh_timestamp": runtime.get("last_valid_kwh_timestamp"),
         "hvac_control_confidence": runtime.get("hvac_control_confidence"),
         "energy_config_mode": energy_mode,
         "energy_configured": energy_configured,
@@ -1036,7 +1043,10 @@ async def _dashboard_status_payload(rid: str) -> Dict[str, Any]:
         "energy_power_validation_reason": runtime.get("energy_power_validation_reason"),
         "energy_power_suspicious": runtime.get("energy_power_suspicious"),
         # ── Session ───────────────────────────────────────────────────────────
-        "session_kwh":      runtime.get("session_start_kwh"),
+        "session_kwh":      runtime.get("active_session_energy_kwh"),
+        "session_energy_source": runtime.get("active_session_energy_source"),
+        "session_energy_quality": runtime.get("active_session_energy_quality"),
+        "session_cost": runtime.get("active_session_cost"),
         "session_id":       runtime.get("session_id"),
         "session_start":    runtime.get("session_start_time"),
         "active_session_started_at": runtime.get("active_session_started_at"),

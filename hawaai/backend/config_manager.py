@@ -63,6 +63,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "physical_on_watts": 100,
     "physical_off_watts": 30,
     "physical_state_confirm_seconds": 5,
+    "max_reasonable_runtime_hours": 12,
     "vacancy_timeout_minutes": 5,
     "presence_only_on_dwell_seconds": 20,
     "presence_only_max_runtime_minutes": 240,

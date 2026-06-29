@@ -58,6 +58,60 @@ class TelemetryRuntimeTests(unittest.TestCase):
         self.assertEqual(st.energy_watts, 0.0)
         self.assertEqual(st.telemetry_status, "healthy")
 
+    def test_live_power_stays_healthy_when_kwh_is_unknown(self):
+        st = logic_engine.RoomRuntime()
+        power, kwh = logic_engine._apply_telemetry_cache(
+            st,
+            now=datetime.now(timezone.utc),
+            configured=True,
+            power_entity="sensor.study_power",
+            kwh_entity="sensor.study_energy",
+            parsed_power=1416.0,
+            parsed_kwh=None,
+        )
+        self.assertEqual(power, 1416.0)
+        self.assertIsNone(kwh)
+        self.assertEqual(st.power_telemetry_status, "healthy")
+        self.assertEqual(st.kwh_telemetry_status, "recovering")
+        self.assertEqual(st.telemetry_status, "healthy")
+        self.assertFalse(st.telemetry_gap)
+
+    def test_zero_power_can_confirm_off_when_kwh_is_unknown(self):
+        st = logic_engine.RoomRuntime(
+            energy_configured=True,
+            energy_power_entity="sensor.study_power",
+            physical_ac_on=True,
+            ac_is_on=True,
+        )
+        logic_engine._apply_telemetry_cache(
+            st,
+            now=datetime.now(timezone.utc),
+            configured=True,
+            power_entity="sensor.study_power",
+            kwh_entity="sensor.study_energy",
+            parsed_power=0.0,
+            parsed_kwh=None,
+        )
+        applied = logic_engine._reconcile_physical_ac_from_power(
+            "study room",
+            {"physical_on_watts": 100, "physical_off_watts": 30, "physical_state_confirm_seconds": 0},
+            st,
+            datetime.now(timezone.utc),
+            0.0,
+        )
+        self.assertTrue(applied)
+        self.assertFalse(st.physical_ac_on)
+        self.assertEqual(st.power_telemetry_status, "healthy")
+        self.assertEqual(st.kwh_telemetry_status, "recovering")
+
+    def test_invalid_warning_throttle_is_independent_per_channel(self):
+        st = logic_engine.RoomRuntime()
+        now = datetime.now(timezone.utc)
+        kwargs = dict(now=now, status="recovering", raw_state="unknown", reason="invalid")
+        self.assertTrue(logic_engine._should_log_telemetry_invalid(st, kind="kwh", **kwargs))
+        self.assertFalse(logic_engine._should_log_telemetry_invalid(st, kind="kwh", **kwargs))
+        self.assertTrue(logic_engine._should_log_telemetry_invalid(st, kind="power", **kwargs))
+
     def test_not_configured_status_is_explicit(self):
         st = logic_engine.RoomRuntime()
         power, kwh = logic_engine._apply_telemetry_cache(
@@ -73,7 +127,7 @@ class TelemetryRuntimeTests(unittest.TestCase):
         self.assertIsNone(kwh)
         self.assertEqual(st.telemetry_status, "not_configured")
 
-    def test_power_off_reconciliation_keeps_pending_confirmation_for_session_close(self):
+    def test_power_off_reconciliation_clears_pending_confirmation(self):
         st = logic_engine.RoomRuntime(
             energy_configured=True,
             energy_power_entity="sensor.ac_power",
@@ -92,7 +146,7 @@ class TelemetryRuntimeTests(unittest.TestCase):
         )
         self.assertTrue(applied)
         self.assertFalse(st.physical_ac_on)
-        self.assertTrue(st.pending_off_confirmation)
+        self.assertFalse(st.pending_off_confirmation)
 
     def test_timestamp_power_integration_and_gap_survives_recovery(self):
         st = logic_engine.RoomRuntime()
@@ -376,6 +430,93 @@ class SessionStatsTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0]["session_id"], first_sid)
 
+    async def test_kwh_unavailable_does_not_block_power_session_start_or_stop(self):
+        room_id = "study room"
+        now = datetime.now(timezone.utc)
+        cfg = {
+            "energy_power_entity": "sensor.study_power",
+            "energy_kwh_entity": "sensor.study_energy",
+            "physical_on_watts": 100.0,
+            "physical_off_watts": 30.0,
+            "physical_state_confirm_seconds": 0,
+            "target_temp": 24.0,
+        }
+        st = logic_engine._rt(room_id)
+        st.energy_configured = True
+        st.energy_power_entity = cfg["energy_power_entity"]
+        st.energy_kwh_entity = cfg["energy_kwh_entity"]
+        logic_engine._apply_telemetry_cache(
+            st,
+            now=now,
+            configured=True,
+            power_entity=cfg["energy_power_entity"],
+            kwh_entity=cfg["energy_kwh_entity"],
+            parsed_power=1416.0,
+            parsed_kwh=None,
+        )
+        logic_engine._reconcile_physical_ac_from_power(room_id, cfg, st, now, 1416.0)
+        with mock.patch.object(logic_engine.weather_api, "get_cached", new=mock.AsyncMock(return_value={})):
+            await logic_engine._maintain_session_lifecycle(
+                room_id, cfg, 28.0, now, 24.0,
+                in_cooldown=False, confirmed_ac_on=True, inferred_only_physical=False,
+            )
+        self.assertIsNotNone(session_logger.current_session_id(room_id))
+        self.assertEqual(st.power_telemetry_status, "healthy")
+        self.assertEqual(st.kwh_telemetry_status, "recovering")
+
+        off_now = now + timedelta(seconds=10)
+        logic_engine._apply_telemetry_cache(
+            st,
+            now=off_now,
+            configured=True,
+            power_entity=cfg["energy_power_entity"],
+            kwh_entity=cfg["energy_kwh_entity"],
+            parsed_power=0.0,
+            parsed_kwh=None,
+        )
+        logic_engine._reconcile_physical_ac_from_power(room_id, cfg, st, off_now, 0.0)
+        await logic_engine._maintain_session_lifecycle(
+            room_id, cfg, 27.8, off_now, 24.0,
+            in_cooldown=False, confirmed_ac_on=False, inferred_only_physical=False,
+        )
+        self.assertIsNone(session_logger.current_session_id(room_id))
+        self.assertFalse(st.physical_ac_on)
+
+    async def test_power_unavailable_keeps_recovery_pending_without_old_timer(self):
+        room_id = "study room"
+        now = datetime.now(timezone.utc)
+        await database.insert_session_start({
+            "session_id": "pending-study",
+            "room_id": room_id,
+            "start_time": (now - timedelta(hours=6)).isoformat(),
+            "active_session_started_at_utc": (now - timedelta(hours=6)).isoformat(),
+            "indoor_temp_start": 28.0,
+            "day_of_week": now.weekday(),
+            "hour_of_day": now.hour,
+            "is_record_valid": 1,
+            "provisional": 1,
+        })
+        st = logic_engine._rt(room_id)
+        st.energy_configured = True
+        st.energy_power_entity = "sensor.study_power"
+        st.telemetry_power_live_valid = False
+        st.power_telemetry_status = "recovering"
+        cfg = {
+            "climate_entity": "climate.study",
+            "energy_power_entity": "sensor.study_power",
+            "physical_on_watts": 100.0,
+        }
+        with (
+            mock.patch.object(logic_engine.ha_client, "get_climate_state", new=mock.AsyncMock(return_value={"state": "cool"})),
+            mock.patch.object(logic_engine, "_read_runtime_energy", new=mock.AsyncMock(return_value=(None, None))),
+        ):
+            await logic_engine._load_startup_state(room_id, cfg)
+        runtime = logic_engine.get_runtime_state(room_id)
+        self.assertEqual(session_logger.current_session_id(room_id), "pending-study")
+        self.assertEqual(runtime["active_session_state"], "reconnecting")
+        self.assertIsNone(runtime["active_session_elapsed_seconds"])
+        self.assertIsNone(runtime["active_session_started_at"])
+
     async def test_restart_while_power_on_resumes_open_session(self):
         room_id = "bedroom"
         now = datetime.now(timezone.utc)
@@ -436,7 +577,7 @@ class SessionStatsTests(unittest.IsolatedAsyncioTestCase):
             mock.patch.object(logic_engine, "_read_runtime_energy", new=mock.AsyncMock(return_value=(420.0, None))),
         ):
             await logic_engine._load_startup_state(room_id, cfg)
-        self.assertIsNone(session_logger.current_session_id(room_id))
+        self.assertNotEqual(session_logger.current_session_id(room_id), "future-session")
         async with aiosqlite.connect(database.DB_PATH) as db:
             async with db.execute(
                 "SELECT is_record_valid, end_time FROM sessions WHERE session_id = ?",
@@ -449,7 +590,8 @@ class SessionStatsTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_old_open_session_with_long_gap_and_power_on_does_not_resume_old_timer(self):
         room_id = "bedroom"
-        old = datetime.now(timezone.utc) - timedelta(hours=10)
+        old = datetime.now(timezone.utc) - timedelta(hours=78)
+        recent = datetime.now(timezone.utc)
         row = {
             "session_id": "old-powered",
             "room_id": room_id,
@@ -460,7 +602,7 @@ class SessionStatsTests(unittest.IsolatedAsyncioTestCase):
             "is_record_valid": 1,
             "provisional": 1,
             "active_session_started_at_utc": old.isoformat(),
-            "last_valid_power_sample_at": old.isoformat(),
+            "last_valid_power_sample_at": recent.isoformat(),
             "last_valid_power_watts": 450.0,
         }
         await database.insert_session_start(row)
@@ -474,9 +616,13 @@ class SessionStatsTests(unittest.IsolatedAsyncioTestCase):
             mock.patch.object(logic_engine, "_read_runtime_energy", new=mock.AsyncMock(return_value=(430.0, None))),
         ):
             await logic_engine._load_startup_state(room_id, cfg)
-        self.assertIsNone(session_logger.current_session_id(room_id))
-        self.assertFalse(st.active_session_continuity_confirmed)
-        self.assertEqual(st.active_session_recovery_state, "recovery_gap")
+        new_sid = session_logger.current_session_id(room_id)
+        self.assertIsNotNone(new_sid)
+        self.assertNotEqual(new_sid, "old-powered")
+        runtime = logic_engine.get_runtime_state(room_id)
+        self.assertLess(runtime["active_session_elapsed_seconds"], 60)
+        self.assertTrue(st.active_session_continuity_confirmed)
+        self.assertEqual(st.active_session_recovery_state, "restarted_after_gap")
 
     async def test_open_session_power_off_clears_timer(self):
         room_id = "bedroom"

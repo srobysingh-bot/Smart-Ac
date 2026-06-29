@@ -5,28 +5,16 @@
  * Data sourced exclusively from /api/status props (no extra API calls).
  * Read-only — does NOT modify backend logic.
  */
-import { useEffect, useState } from 'react'
 import { Activity, Thermometer, Zap, Clock } from 'lucide-react'
+import { authoritativeSessionDisplay } from '../utils/sessionTelemetry.js'
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 function useElapsed(startIso, backendElapsedSeconds) {
-  const [elapsed, setElapsed] = useState(0)
-
-  useEffect(() => {
-    if (backendElapsedSeconds != null && Number.isFinite(Number(backendElapsedSeconds))) {
-      const base = Number(backendElapsedSeconds)
-      const startedAt = Date.now()
-      const tick = () => setElapsed(Math.max(0, Math.floor(base + (Date.now() - startedAt) / 1000)))
-      tick()
-      const id = setInterval(tick, 1000)
-      return () => clearInterval(id)
-    }
-    setElapsed(0)
-    return undefined
-  }, [startIso, backendElapsedSeconds])
-
-  return elapsed
+  void startIso
+  return backendElapsedSeconds != null && Number.isFinite(Number(backendElapsedSeconds))
+    ? Math.max(0, Math.floor(Number(backendElapsedSeconds)))
+    : 0
 }
 
 function fmtElapsed(secs) {
@@ -77,9 +65,10 @@ export default function LiveSessionCard({ status }) {
 
   const isOn = Boolean(status?.physical_ac_on ?? status?.ac_on ?? effective_ac_on)
 
-  const startIso = runtime?.active_session_started_at || session_start || runtime?.session_start
-  const continuityConfirmed = Boolean(runtime?.active_session_continuity_confirmed)
-  const elapsed = useElapsed(startIso, continuityConfirmed ? runtime?.active_session_elapsed_seconds : null)
+  const sessionDisplay = authoritativeSessionDisplay(runtime || {})
+  const startIso = sessionDisplay.startedAt || session_start || runtime?.session_start
+  const continuityConfirmed = sessionDisplay.elapsedSeconds != null
+  const elapsed = useElapsed(startIso, sessionDisplay.elapsedSeconds)
   const isActive = !!(
     (startIso || runtime?.active)
     && (isOn || ac_idle)
